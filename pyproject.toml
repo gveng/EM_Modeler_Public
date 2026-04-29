@@ -1,0 +1,16 @@
+[project]
+name = "em-3d-modeler"
+version = "0.1.0"
+description = "A Python-based 3D electromagnetic modeling project."
+authors = ["Your Name <your.email@example.com>"]
+readme = "README.md"
+requires-python = ">=3.8"
+dependencies = [
+    "numpy",
+    "scipy",
+    "matplotlib",
+    "mayavi"
+]
+
+[tool.setuptools]
+package-dir = {"" = "src"}
