@@ -1,16 +1,27 @@
 [project]
 name = "em-3d-modeler"
-version = "0.1.0"
+version = "0.0.2"
 description = "A Python-based 3D electromagnetic modeling project."
-authors = ["Your Name <your.email@example.com>"]
+authors = [{name = "EM3D Developer"}]
 readme = "README.md"
 requires-python = ">=3.8"
 dependencies = [
     "numpy",
     "scipy",
     "matplotlib",
-    "mayavi"
+    "PyQt5",
+    "vtk",
 ]
+
+[project.scripts]
+em3d-modeler = "em3d_modeler.main:main"
+
+[build-system]
+requires = ["setuptools>=64"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
 
 [tool.setuptools]
 package-dir = {"" = "src"}

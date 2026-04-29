@@ -1,0 +1,17 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <defs>
+    <linearGradient id="coneSide" x1="0%" y1="0%" x2="100%" y2="0%">
+      <stop offset="0%"   style="stop-color:#285880"/>
+      <stop offset="40%"  style="stop-color:#60A0D0"/>
+      <stop offset="100%" style="stop-color:#1A3860"/>
+    </linearGradient>
+  </defs>
+  <!-- Left face of cone -->
+  <path d="M12,2 L4,21" fill="none" stroke="#1A4070" stroke-width="0.7"/>
+  <!-- Right face of cone -->
+  <path d="M12,2 L20,21" fill="none" stroke="#1A4070" stroke-width="0.7"/>
+  <!-- Cone body (filled) -->
+  <path d="M12,2 L4,21 Q12,24 20,21 Z" fill="url(#coneSide)" stroke="#1A4070" stroke-width="0.7" stroke-linejoin="round"/>
+  <!-- Base ellipse -->
+  <ellipse cx="12" cy="21" rx="8" ry="2.8" fill="#285880" stroke="#1A4070" stroke-width="0.7"/>
+</svg>

@@ -1,0 +1,11 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <!-- Shape A: box bottom-left -->
+  <polygon points="9,5 16,8.5 9,12 2,8.5" fill="#7ABDE8" stroke="#1A4070" stroke-width="0.6" stroke-linejoin="round"/>
+  <polygon points="16,8.5 16,15.5 9,19 9,12" fill="#2A6090" stroke="#1A4070" stroke-width="0.6" stroke-linejoin="round"/>
+  <polygon points="2,8.5 9,12 9,19 2,15.5" fill="#4070A0" stroke="#1A4070" stroke-width="0.6" stroke-linejoin="round"/>
+  <!-- Shape B: box top-right (slightly lighter) -->
+  <polygon points="15,2 22,5.5 15,9 8,5.5" fill="#A0D0F0" stroke="#1A4070" stroke-width="0.6" stroke-linejoin="round"/>
+  <polygon points="22,5.5 22,12.5 15,16 15,9" fill="#4080B0" stroke="#1A4070" stroke-width="0.6" stroke-linejoin="round"/>
+  <!-- Merge symbol: small "+" in centre -->
+  <text x="11" y="23" font-family="sans-serif" font-size="5" font-weight="bold" fill="#1A4070">∪</text>
+</svg>

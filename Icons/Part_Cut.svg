@@ -1,0 +1,19 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 24 24" width="24" height="24">
+  <defs>
+    <mask id="cutHole">
+      <rect width="24" height="24" fill="white"/>
+      <ellipse cx="17" cy="7" rx="5.5" ry="5.5" fill="black"/>
+    </mask>
+  </defs>
+  <!-- Isometric box with hole punched out -->
+  <polygon points="11,2 21,7 11,12 1,7" fill="#A8D8F8" stroke="none" mask="url(#cutHole)"/>
+  <polygon points="21,7 21,17 11,22 11,12" fill="#285880" stroke="none" mask="url(#cutHole)"/>
+  <polygon points="1,7 11,12 11,22 1,17" fill="#4070A0" stroke="none" mask="url(#cutHole)"/>
+  <!-- Box outline (with hole) -->
+  <polyline points="1,7 11,2 21,7 21,17 11,22 1,17 1,7" fill="none" stroke="#1A4070" stroke-width="0.7" mask="url(#cutHole)"/>
+  <polyline points="11,12 11,22" stroke="#1A4070" stroke-width="0.7" mask="url(#cutHole)"/>
+  <polyline points="11,12 21,7" stroke="#1A4070" stroke-width="0.7" mask="url(#cutHole)"/>
+  <polyline points="11,12 1,7" stroke="#1A4070" stroke-width="0.7" mask="url(#cutHole)"/>
+  <!-- Cutter circle (red dashed) -->
+  <ellipse cx="17" cy="7" rx="5.5" ry="5.5" fill="none" stroke="#C83030" stroke-width="1.0" stroke-dasharray="2.5,1.2"/>
+</svg>
