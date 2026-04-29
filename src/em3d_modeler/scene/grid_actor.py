@@ -6,13 +6,20 @@ PLANES = ("XY", "XZ", "YZ")
 
 
 def build_grid_actor(
+
     size: float = 200.0,
     spacing: float = 10.0,
     plane: str = "XY",
     color: tuple = (0.45, 0.45, 0.45),
     opacity: float = 0.40,
+    origin: tuple = (0.0, 0.0, 0.0),
+    normal: tuple = None,
 ) -> vtk.vtkActor:
-    """Return a VTK actor that draws a uniform grid on *plane* centred at origin."""
+    """
+    Return a VTK actor that draws a uniform grid on *plane* centred at origin.
+    If normal is provided, grid is built on the arbitrary plane defined by (origin, normal).
+    """
+    import numpy as np
     points = vtk.vtkPoints()
     lines  = vtk.vtkCellArray()
     half   = size / 2.0
@@ -26,17 +33,49 @@ def build_grid_actor(
         cell.GetPointIds().SetId(1, i2)
         lines.InsertNextCell(cell)
 
-    for i in range(-n, n + 1):
-        c = i * spacing
-        if plane == "XY":
-            add_line((-half, c,     0),  (half, c,     0))
-            add_line((c,    -half,  0),  (c,    half,  0))
-        elif plane == "XZ":
-            add_line((-half, 0, c),      (half, 0, c))
-            add_line((c,     0, -half),  (c,    0,  half))
-        elif plane == "YZ":
-            add_line((0, -half, c),      (0, half, c))
-            add_line((0, c,    -half),   (0, c,     half))
+    if normal is None:
+        # Standard planes
+        for i in range(-n, n + 1):
+            c = i * spacing
+            if plane == "XY":
+                add_line((-half, c,     0),  (half, c,     0))
+                add_line((c,    -half,  0),  (c,    half,  0))
+            elif plane == "XZ":
+                add_line((-half, 0, c),      (half, 0, c))
+                add_line((c,     0, -half),  (c,    0,  half))
+            elif plane == "YZ":
+                add_line((0, -half, c),      (0, half, c))
+                add_line((0, c,    -half),   (0, c,     half))
+        # Apply translation if origin is not (0,0,0)
+        if origin != (0.0, 0.0, 0.0):
+            for i in range(points.GetNumberOfPoints()):
+                p = np.array(points.GetPoint(i)) + np.array(origin)
+                points.SetPoint(i, *p)
+    else:
+        # Arbitrary plane
+        # Build local axes
+        o = np.array(origin)
+        nrm = np.array(normal)
+        nrm = nrm / np.linalg.norm(nrm)
+        # Find a vector not parallel to nrm
+        if abs(nrm[2]) < 0.99:
+            v = np.array([0,0,1])
+        else:
+            v = np.array([0,1,0])
+        x_axis = np.cross(v, nrm)
+        x_axis = x_axis / np.linalg.norm(x_axis)
+        y_axis = np.cross(nrm, x_axis)
+        # Build grid in local 2D, then map to 3D
+        for i in range(-n, n + 1):
+            c = i * spacing
+            # Lines parallel to x_axis
+            p1 = o + (-half)*x_axis + c*y_axis
+            p2 = o + (half)*x_axis + c*y_axis
+            add_line(tuple(p1), tuple(p2))
+            # Lines parallel to y_axis
+            p3 = o + c*x_axis + (-half)*y_axis
+            p4 = o + c*x_axis + (half)*y_axis
+            add_line(tuple(p3), tuple(p4))
 
     poly = vtk.vtkPolyData()
     poly.SetPoints(points)

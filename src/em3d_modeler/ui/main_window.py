@@ -37,19 +37,22 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt, QSettings
 from PyQt5.QtGui  import QIcon, QKeySequence
 
-from .viewport_widget      import Viewport3DWidget
-from .project_tree_widget  import ProjectTreeWidget
-from .block_params_widget  import BlockParamsWidget
-from .materials_widget     import MaterialsWidget
-from .info_bar_widget      import InfoBarWidget
+from .viewport_widget        import Viewport3DWidget
+from .project_tree_widget    import ProjectTreeWidget
+from .body_properties_widget import BodyPropertiesWidget
+from .materials_widget       import MaterialsWidget
+from .info_bar_widget        import InfoBarWidget
+from .reference_plane_dialog import ReferencePlaneDialog
+from .sketch_widget          import SketchDialog
 
 from ..emerge.project_file    import ProjectFile
 from ..emerge.script_exporter import export_emerge_script
+from ..emerge.step_importer   import import_step
 
 
 # ──────────────────────────────────────────────────────────────────────────────
 _PLANES = ["XY", "XZ", "YZ"]
-_UNITS  = ["mm", "cm", "m", "mil", "inch"]
+_UNITS  = ["mm", "um", "cm", "m", "mil", "inch"]
 
 
 class MainWindow(QMainWindow):
@@ -74,16 +77,16 @@ class MainWindow(QMainWindow):
     # ─────────────────────────────────────────────────── UI construction
     def _build_ui(self) -> None:
         # ── panels ────────────────────────────────────────────────────────────
-        self._project_tree  = ProjectTreeWidget()
-        self._block_params  = BlockParamsWidget()
-        self._viewport      = Viewport3DWidget()
-        self._materials     = MaterialsWidget()
-        self._info_bar      = InfoBarWidget()
+        self._project_tree   = ProjectTreeWidget()
+        self._body_props     = BodyPropertiesWidget()
+        self._viewport       = Viewport3DWidget()
+        self._materials      = MaterialsWidget()
+        self._info_bar       = InfoBarWidget()
 
-        # ── left column: project tree (top) + block params (bottom) ───────────
+        # ── left column: project tree (top) + body props (bottom) ───────────
         left_splitter = QSplitter(Qt.Vertical)
         left_splitter.addWidget(self._project_tree)
-        left_splitter.addWidget(self._block_params)
+        left_splitter.addWidget(self._body_props)
         left_splitter.setSizes([350, 300])
         left_splitter.setMinimumWidth(210)
 
@@ -118,6 +121,8 @@ class MainWindow(QMainWindow):
         self._act_save   = file_menu.addAction("&Save Project",   self._save_project, QKeySequence.Save)
         self._act_saveas = file_menu.addAction("Save Project &As…", self._save_project_as)
         file_menu.addSeparator()
+        file_menu.addAction("&Import STEP…",            self._import_step)
+        file_menu.addSeparator()
         act_export = file_menu.addAction("&Export EMERGE Script…", self._export_emerge)
         file_menu.addSeparator()
         file_menu.addAction("E&xit", self.close, QKeySequence.Quit)
@@ -134,6 +139,9 @@ class MainWindow(QMainWindow):
         view_menu.addAction("Front (XZ)",         lambda: self._set_view("front"))
         view_menu.addAction("Right (YZ)",         lambda: self._set_view("right"))
         view_menu.addAction("Isometric",          lambda: self._set_view("iso"))
+        view_menu.addSeparator()
+        view_menu.addAction("Set Reference Plane…", self._open_reference_plane_dialog)
+        view_menu.addAction("Reset Reference Plane", self._viewport.reset_reference_plane)
 
     # ─────────────────────────────────────────────────── toolbar
     def _build_toolbar(self) -> None:
@@ -155,6 +163,12 @@ class MainWindow(QMainWindow):
             act.triggered.connect(lambda checked, m=mode: self._start_draw(m))
             tb.addAction(act)
 
+        # Sketch tool
+        act_sketch = QAction(_icon("Part_Sketch"), "Sketch", self)
+        act_sketch.setToolTip("Open parametric sketch canvas (extrude or revolve)")
+        act_sketch.triggered.connect(self._open_sketch)
+        tb.addAction(act_sketch)
+
         tb.addSeparator()
 
         # ── Boolean operations ────────────────────────────────────
@@ -175,37 +189,45 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
+        # ── STEP import ──────────────────────────────────────────────
+        act_step = QAction(_icon("Part_STEP"), "Import STEP", self)
+        act_step.setToolTip("Import a STEP file (.step / .stp)")
+        act_step.triggered.connect(self._import_step)
+        tb.addAction(act_step)
+
+        tb.addSeparator()
+
         # ── Drawing plane ───────────────────────────────────────────
         tb.addWidget(QLabel(" Plane: "))
         self._plane_combo = QComboBox()
         self._plane_combo.addItems(_PLANES)
-        self._plane_combo.setToolTip("Drawing plane")
+        self._plane_combo.setToolTip("Drawing plane (also orients the grid)")
+        self._plane_combo.currentTextChanged.connect(self._on_plane_changed)
         tb.addWidget(self._plane_combo)
-
-        tb.addSeparator()
-
-        # ── Material ─────────────────────────────────────────────────
-        tb.addWidget(QLabel(" Material: "))
-        self._mat_combo = QComboBox()
-        from ..scene.em_objects import MATERIAL_COLORS
-        self._mat_combo.addItems(list(MATERIAL_COLORS.keys()) + ["Custom"])
-        self._mat_combo.setToolTip("Material for new objects")
-        self._mat_combo.currentTextChanged.connect(
-            lambda t: setattr(self, "_draw_material", t)
-        )
-        tb.addWidget(self._mat_combo)
 
         tb.addSeparator()
 
         # ── Grid spacing ───────────────────────────────────────────
         tb.addWidget(QLabel(" Grid: "))
         self._grid_spacing_spin = QDoubleSpinBox()
-        self._grid_spacing_spin.setRange(0.1, 1000)
+        self._grid_spacing_spin.setDecimals(3)
+        self._grid_spacing_spin.setRange(0.001, 10000)
         self._grid_spacing_spin.setValue(10.0)
         self._grid_spacing_spin.setSuffix(" mm")
-        self._grid_spacing_spin.setToolTip("Grid snap spacing")
+        self._grid_spacing_spin.setToolTip("Grid snap spacing (redraws grid)")
         self._grid_spacing_spin.valueChanged.connect(self._on_grid_changed)
         tb.addWidget(self._grid_spacing_spin)
+
+        # ── Workspace size ─────────────────────────────────────────
+        tb.addWidget(QLabel(" Workspace: "))
+        self._workspace_spin = QDoubleSpinBox()
+        self._workspace_spin.setDecimals(1)
+        self._workspace_spin.setRange(1.0, 100000.0)
+        self._workspace_spin.setValue(200.0)
+        self._workspace_spin.setSuffix(" mm")
+        self._workspace_spin.setToolTip("Workspace extent (grid total size)")
+        self._workspace_spin.valueChanged.connect(self._on_workspace_changed)
+        tb.addWidget(self._workspace_spin)
 
         tb.addWidget(QLabel(" Units: "))
         self._units_combo = QComboBox()
@@ -213,18 +235,40 @@ class MainWindow(QMainWindow):
         self._units_combo.currentTextChanged.connect(self._on_units_changed)
         tb.addWidget(self._units_combo)
 
+        tb.addSeparator()
+
+        # ── Selection mode ─────────────────────────────────────────
+        tb.addWidget(QLabel(" Select: "))
+        self._sel_mode_combo = QComboBox()
+        self._sel_mode_combo.addItems(["All", "Face", "Edge", "Vertex"])
+        self._sel_mode_combo.setToolTip(
+            "Selection mode:\n"
+            "  All    – pick whole bodies\n"
+            "  Face   – pick a single face\n"
+            "  Edge   – pick a single edge\n"
+            "  Vertex – pick a single vertex"
+        )
+        self._sel_mode_combo.currentTextChanged.connect(self._on_selection_mode_changed)
+        tb.addWidget(self._sel_mode_combo)
+
     # ─────────────────────────────────────────────────── signal wiring
     def _connect_signals(self) -> None:
-        # Viewport → block params + materials
+        # Viewport → body props + materials
         self._viewport.object_selected.connect(self._on_object_selected)
+        self._viewport.selection_changed.connect(self._on_selection_changed)
         self._viewport.scene_changed.connect(self._refresh_materials)
         self._viewport.status_message.connect(self._info_bar.set_info)
 
-        # Block params → viewport render
-        self._block_params.params_changed.connect(self._on_params_changed)
+        # Body props → viewport render
+        self._body_props.params_changed.connect(self._on_params_changed)
+        self._body_props.bulk_material_changed.connect(self._on_bulk_material)
 
-        # Materials tree → selection
+        # Materials tree → selection (single + multi)
         self._materials.object_selected.connect(self._on_material_tree_select)
+        self._materials.selection_changed.connect(self._on_material_tree_multi_select)
+        self._materials.plane_make_active.connect(self._on_plane_make_active)
+        self._materials.plane_delete.connect(self._on_plane_delete)
+        self._materials.plane_rename.connect(self._on_plane_rename)
 
         # EMERGE settings changed
         self._project_tree.settings_changed.connect(self._on_settings_changed)
@@ -240,7 +284,7 @@ class MainWindow(QMainWindow):
         if obj:
             self._viewport.scene.remove_object(obj)
             self._viewport.scene.select(None)
-            self._block_params.set_object(None)
+            self._body_props.set_object(None)
             self._refresh_materials()
             self._viewport._render()
             self._info_bar.set_info(f"Deleted: {obj.name}")
@@ -279,35 +323,250 @@ class MainWindow(QMainWindow):
 
     # ─────────────────────────────────────────────────── object selection
     def _on_object_selected(self, obj) -> None:
-        self._block_params.set_object(obj)
+        self._body_props.set_object(obj)
         self._materials.highlight(obj)
         if obj:
             self._info_bar.set_info(f"Selected: {obj.name}  [{type(obj).__name__}]")
+
+    def _on_selection_changed(self, objects: list) -> None:
+        self._body_props.set_selection(objects)
+        self._materials.highlight(objects)
+        if len(objects) > 1:
+            self._info_bar.set_info(f"{len(objects)} objects selected (Ctrl+click to extend)")
 
     def _on_params_changed(self, obj, _params) -> None:
         self._viewport._render()
         self._refresh_materials()
 
+    def _on_bulk_material(self, material: str, objects: list) -> None:
+        self._viewport._render()
+        self._refresh_materials()
+        self._info_bar.set_info(f"Material '{material}' applied to {len(objects)} objects")
+
     def _on_material_tree_select(self, obj) -> None:
         self._viewport.scene.select(obj)
-        self._block_params.set_object(obj)
+        self._body_props.set_object(obj)
         self._viewport._render()
 
-    # ─────────────────────────────────────────────────── grid / units
+    def _on_material_tree_multi_select(self, objects: list) -> None:
+        if not objects:
+            return
+        # Update SceneManager selection to match tree selection
+        self._viewport.scene.deselect_all()
+        for o in objects:
+            self._viewport.scene.select_add(o)
+        self._body_props.set_selection(objects)
+        self._viewport._render()
+
+    # ─────────────────────────────────────────────────── STEP import
+    def _import_step(self) -> None:
+        path, _ = QFileDialog.getOpenFileName(
+            self, "Import STEP File", "",
+            "STEP Files (*.step *.stp);;All Files (*)"
+        )
+        if not path:
+            return
+        try:
+            solids = import_step(path)
+        except RuntimeError as exc:
+            QMessageBox.warning(
+                self, "STEP Import",
+                str(exc)
+            )
+            return
+        except Exception as exc:
+            QMessageBox.critical(self, "STEP Import Error", str(exc))
+            return
+
+        from ..scene.em_objects import MeshObject
+        added = []
+        for solid in solids:
+            obj = MeshObject(
+                name     = solid["name"],
+                polydata = solid["polydata"],
+                material = self._draw_material,
+            )
+            self._viewport.scene.add_object(obj)
+            added.append(obj)
+
+        if added:
+            self._viewport.scene.select(added[-1])
+            self._viewport.object_selected.emit(added[-1])
+            self._viewport.selection_changed.emit([added[-1]])
+            self._viewport.scene_changed.emit()
+            self._viewport._render()
+            self._refresh_materials()
+            self._info_bar.set_info(
+                f"STEP imported: {len(added)} solid(s) from {Path(path).name}"
+            )
+
+    # ─────────────────────────────────────────────────── sketch
+    def _open_sketch(self) -> None:
+        vp = self._viewport
+        dlg = SketchDialog(
+            self,
+            plane_origin=vp._custom_plane_origin,
+            plane_normal=vp._custom_plane_normal,
+        )
+        dlg.extrude_requested.connect(self._on_extrude_requested)
+        dlg.revolve_requested.connect(self._on_revolve_requested)
+        dlg.show()
+
+    def _on_extrude_requested(self, profile, depth, origin, normal) -> None:
+        from ..scene.em_objects import ExtrudedObject
+        obj = ExtrudedObject(
+            profile_pts  = profile,
+            depth        = depth,
+            plane_origin = origin,
+            plane_normal = normal,
+            material     = self._draw_material,
+        )
+        self._viewport.scene.add_object(obj)
+        self._viewport.scene.select(obj)
+        self._viewport.object_selected.emit(obj)
+        self._viewport.selection_changed.emit([obj])
+        self._viewport.scene_changed.emit()
+        self._viewport._render()
+        self._refresh_materials()
+        self._info_bar.set_info(f"Extruded body created: {obj.name}")
+
+    def _on_revolve_requested(self, profile, angle, axis_pt1, axis_pt2) -> None:
+        from ..scene.em_objects import RevolvedObject
+        obj = RevolvedObject(
+            profile_pts = profile,
+            angle       = angle,
+            axis_pt1    = axis_pt1,
+            axis_pt2    = axis_pt2,
+            material    = self._draw_material,
+        )
+        self._viewport.scene.add_object(obj)
+        self._viewport.scene.select(obj)
+        self._viewport.object_selected.emit(obj)
+        self._viewport.selection_changed.emit([obj])
+        self._viewport.scene_changed.emit()
+        self._viewport._render()
+        self._refresh_materials()
+        self._info_bar.set_info(f"Revolved body created: {obj.name}")
+
+    # ─────────────────────────────────────────────────── reference plane
+    def _open_reference_plane_dialog(self) -> None:
+        vp = self._viewport
+        # Reuse a single dialog instance so it survives hide/show during 3D picking
+        dlg = getattr(self, "_ref_plane_dlg", None)
+        if dlg is None:
+            dlg = ReferencePlaneDialog(
+                self,
+                current_origin=vp._custom_plane_origin,
+                current_normal=vp._custom_plane_normal,
+                viewport=vp,
+            )
+            dlg.plane_defined.connect(self._on_plane_defined)
+            self._ref_plane_dlg = dlg
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _on_plane_defined(self, origin, normal, name) -> None:
+        """Slot for ReferencePlaneDialog.plane_defined."""
+        scene = self._viewport.scene
+        plane = scene.add_reference_plane(
+            name or f"Plane {len(scene.reference_planes)+1}",
+            origin, normal, make_active=True,
+        )
+        self._viewport.set_reference_plane(origin, normal)
+        self._refresh_materials()
+        self._info_bar.set_info(f"Reference plane '{plane.name}' added and made active.")
+
+    def _on_plane_make_active(self, plane) -> None:
+        scene = self._viewport.scene
+        scene.set_active_plane(plane)
+        # Aggiorna la griglia per allinearla al nuovo piano attivo
+        self._viewport.set_reference_plane(plane.origin, plane.normal)
+        # Se il piano è uno dei classici XY/XZ/YZ, aggiorna anche la combo e la griglia nativa
+        plane_map = {
+            (0.0, 0.0, 1.0): "XY",
+            (0.0, 1.0, 0.0): "XZ",
+            (1.0, 0.0, 0.0): "YZ",
+        }
+        # Tolleranza per confrontare i float
+        def _eq(a, b, eps=1e-6):
+            return all(abs(x-y) < eps for x, y in zip(a, b))
+        found = None
+        for nrm, pname in plane_map.items():
+            if _eq(plane.normal, nrm):
+                found = pname
+                break
+        if found:
+            self._plane_combo.setCurrentText(found)
+            # set_grid già chiamato da _on_plane_changed
+        else:
+            # Custom plane: la griglia rimane, ma si può migliorare in futuro per supportare piani arbitrari
+            pass
+        self._refresh_materials()
+        self._info_bar.set_info(f"Active reference plane: {plane.name}")
+
+    def _on_plane_delete(self, plane) -> None:
+        scene = self._viewport.scene
+        # Don't allow deleting the last remaining plane
+        if len(scene.reference_planes) <= 1:
+            QMessageBox.warning(self, "Delete Plane",
+                                "Cannot delete the last reference plane.")
+            return
+        was_active = (scene.active_plane is plane)
+        scene.remove_reference_plane(plane)
+        if was_active and scene.active_plane is not None:
+            self._viewport.set_reference_plane(
+                scene.active_plane.origin, scene.active_plane.normal
+            )
+        self._refresh_materials()
+        self._info_bar.set_info(f"Plane deleted: {plane.name}")
+
+    def _on_plane_rename(self, plane, new_name: str) -> None:
+        plane.name = new_name
+        self._refresh_materials()
+
+    # ─────────────────────────────────────────────────── grid / units / workspace
     def _on_grid_changed(self, value: float) -> None:
         plane = self._plane_combo.currentText()
-        size  = value * 20   # grid extent = 20 × spacing
+        size  = self._workspace_spin.value()
         self._viewport.set_grid(size, value, plane, self._units)
+
+    def _on_workspace_changed(self, value: float) -> None:
+        plane   = self._plane_combo.currentText()
+        spacing = self._grid_spacing_spin.value()
+        self._viewport.set_grid(value, spacing, plane, self._units)
+        self._info_bar.set_info(f"Workspace size: {value} {self._units}")
+
+    def _on_plane_changed(self, plane: str) -> None:
+        spacing = self._grid_spacing_spin.value()
+        size    = self._workspace_spin.value()
+        self._viewport.set_grid(size, spacing, plane, self._units)
+        self._info_bar.set_info(f"Drawing plane: {plane}")
 
     def _on_units_changed(self, units: str) -> None:
         self._units = units
         self._grid_spacing_spin.setSuffix(f" {units}")
+        self._workspace_spin.setSuffix(f" {units}")
         self._on_grid_changed(self._grid_spacing_spin.value())
+
+    def _on_selection_mode_changed(self, mode: str) -> None:
+        """Switch viewport between Object / Face / Edge / Vertex picking."""
+        m = mode.lower()
+        # "All" in the combo means "whole object"
+        if m == "all":
+            m = "object"
+        self._viewport.set_selection_mode(m)
+        self._info_bar.set_info(f"Selection mode: {mode}")
 
     # ─────────────────────────────────────────────────── scene refresh
     def _refresh_materials(self) -> None:
-        by_mat = self._viewport.scene.by_material()
-        self._materials.refresh(by_mat)
+        scene = self._viewport.scene
+        by_mat = scene.by_material()
+        self._materials.refresh(
+            by_mat,
+            planes=scene.reference_planes,
+            active_plane=scene.active_plane,
+        )
 
     def _on_settings_changed(self) -> None:
         self._info_bar.set_info("EMERGE settings updated.")
@@ -341,7 +600,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"EM 3D Modeler – {self._project_name}")
         self._project_tree.set_project_name(self._project_name)
         self._viewport.scene.clear()
-        self._block_params.set_object(None)
+        self._body_props.set_object(None)
         self._refresh_materials()
         self._viewport._render()
         self._info_bar.set_info("New project created.")
@@ -367,6 +626,7 @@ class MainWindow(QMainWindow):
                 grid.get("plane",  "XY"),
                 data.get("units", "mm"),
             )
+            self._body_props.set_object(None)
             self._refresh_materials()
             self._viewport._render()
             self._info_bar.set_info(f"Project loaded: {path}")

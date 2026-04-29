@@ -49,7 +49,9 @@ class Viewport3DWidget(QWidget):
     """Central 3D viewport widget."""
 
     # Emitted when an object is selected / deselected
-    object_selected   = pyqtSignal(object)   # EMObject | None
+    object_selected   = pyqtSignal(object)        # EMObject | None
+    # Emitted when the multi-selection changes
+    selection_changed = pyqtSignal(list)           # List[EMObject]
     # Emitted when the scene changes (add/remove objects)
     scene_changed     = pyqtSignal()
     # Status-bar message
@@ -96,10 +98,23 @@ class Viewport3DWidget(QWidget):
         self._draw_pts: list = []               # world-coord points collected so far
         self._preview_actor: Optional[vtk.vtkActor] = None
 
+        # Custom reference plane (set via ReferencePlaneDialog)
+        self._custom_plane_active: bool = False
+        self._custom_plane_origin: Tuple[float,float,float] = (0.0, 0.0, 0.0)
+        self._custom_plane_normal: Tuple[float,float,float] = (0.0, 0.0, 1.0)
+
         # Grid settings
         self._grid_size    = 200.0
         self._grid_spacing = 10.0
         self._units        = "mm"
+
+        # Selection mode: 'object' | 'face' | 'edge' | 'vertex'
+        self._selection_mode: str = "object"
+        self._sub_pick_actor: Optional[vtk.vtkActor] = None
+
+        # One-shot pick request from external dialogs
+        # tuple (kind, callback) where kind ∈ {'point','vertex','face_normal','face_origin_normal'}
+        self._pick_request = None
 
     # ──────────────────────────────────────────────────────── public API
     def start_draw(self, mode: str, plane: str = "XY",
@@ -117,6 +132,7 @@ class Viewport3DWidget(QWidget):
 
     def cancel_draw(self) -> None:
         self._cancel_draw()
+        self.cancel_pick()
         self.status_message.emit("Drawing cancelled.")
 
     def set_grid(self, size: float, spacing: float,
@@ -145,6 +161,142 @@ class Viewport3DWidget(QWidget):
         if self._render_window:
             self._render_window.Render()
 
+    # ──────────────────────────────────────────────────────── public reference plane API
+    def set_reference_plane(self, origin: tuple, normal: tuple) -> None:
+        """Set a custom drawing plane.  Activated immediately. Ricostruisce la griglia su questo piano."""
+        self._custom_plane_active = True
+        self._custom_plane_origin = tuple(origin)
+        self._custom_plane_normal = tuple(normal)
+        # Ricostruisci la griglia su questo piano
+        self.scene._grid_plane = "CUSTOM"
+        self.scene._rebuild_grid()
+        self.status_message.emit(
+            f"Reference plane set: origin {origin}  normal {normal}"
+        )
+
+    def reset_reference_plane(self) -> None:
+        """Revert to axis-aligned plane selected in the toolbar combo. Ricostruisce la griglia su XY/XZ/YZ."""
+        self._custom_plane_active = False
+        # Ricostruisci la griglia sul piano selezionato
+        self.scene._grid_plane = self._draw_plane if hasattr(self, '_draw_plane') else "XY"
+        self.scene._rebuild_grid()
+        self.status_message.emit("Reference plane reset to axis-aligned plane.")
+
+    # ─────────────────────────────────────────────────── selection mode
+    def set_selection_mode(self, mode: str) -> None:
+        """Set sub-element selection: 'object' | 'face' | 'edge' | 'vertex'."""
+        if mode not in ("object", "face", "edge", "vertex"):
+            return
+        self._selection_mode = mode
+        self._clear_sub_pick_marker()
+        self._render()
+
+    def _clear_sub_pick_marker(self) -> None:
+        if self._sub_pick_actor is not None:
+            self._renderer.RemoveActor(self._sub_pick_actor)
+            self._sub_pick_actor = None
+    # ────────────────────────────────────────────────── one-shot pick API
+    def request_pick(self, kind: str, callback) -> None:
+        """Arm a one-shot pick. The next left-click will invoke *callback*.
+
+        Parameters
+        ----------
+        kind : 'point' | 'vertex' | 'face_normal' | 'face_origin_normal'
+            - 'point'              : callback(world_xyz)
+            - 'vertex'             : callback(world_xyz)  (snaps to nearest mesh vertex)
+            - 'face_normal'        : callback(world_normal_xyz)
+            - 'face_origin_normal' : callback(world_xyz, world_normal_xyz)
+        callback : callable
+        """
+        if kind not in ("point", "vertex", "face_normal", "face_origin_normal"):
+            raise ValueError(f"Unknown pick kind: {kind}")
+        self._cancel_draw()
+        self._pick_request = (kind, callback)
+        self.setCursor(Qt.CrossCursor)
+        msg = {
+            "point":              "Click on geometry to pick a point",
+            "vertex":             "Click near a vertex to snap to it",
+            "face_normal":        "Click on a face to capture its normal",
+            "face_origin_normal": "Click on a face to set origin + normal",
+        }[kind]
+        self.status_message.emit(f"{msg}  (Esc to cancel)")
+
+    def cancel_pick(self) -> None:
+        if self._pick_request is not None:
+            self._pick_request = None
+            self.unsetCursor()
+            self.status_message.emit("Pick cancelled.")
+
+    def _handle_pick_request(self, sx: int, sy: int) -> bool:
+        """If a pick request is armed, fulfil it. Returns True if consumed."""
+        if self._pick_request is None:
+            return False
+        kind, callback = self._pick_request
+
+        picker = vtk.vtkCellPicker()
+        picker.SetTolerance(0.005)
+        picker.Pick(sx, sy, 0, self._renderer)
+        actor = picker.GetActor()
+        if actor is None:
+            self.status_message.emit("Nothing under cursor – try again.")
+            return True   # keep request armed
+
+        pos = picker.GetPickPosition()
+
+        # Compute world-space normal of the picked cell (face)
+        normal_world = None
+        cell_id = picker.GetCellId()
+        ds = picker.GetDataSet()
+        if cell_id >= 0 and ds is not None:
+            cell = ds.GetCell(cell_id)
+            if cell is not None and cell.GetNumberOfPoints() >= 3:
+                p0 = cell.GetPoints().GetPoint(0)
+                p1 = cell.GetPoints().GetPoint(1)
+                p2 = cell.GetPoints().GetPoint(2)
+                e1 = (p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2])
+                e2 = (p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2])
+                nx = e1[1]*e2[2] - e1[2]*e2[1]
+                ny = e1[2]*e2[0] - e1[0]*e2[2]
+                nz = e1[0]*e2[1] - e1[1]*e2[0]
+                # Transform local-cell normal to world via actor's matrix
+                m = actor.GetMatrix()
+                w = m.MultiplyPoint([nx, ny, nz, 0.0])
+                mag = math.sqrt(w[0]**2 + w[1]**2 + w[2]**2)
+                if mag > 1e-12:
+                    normal_world = (w[0]/mag, w[1]/mag, w[2]/mag)
+
+        # Reset state BEFORE invoking callback (callback may re-arm)
+        self._pick_request = None
+        self.unsetCursor()
+
+        try:
+            if kind == "point":
+                callback(tuple(pos))
+            elif kind == "vertex":
+                pp = vtk.vtkPointPicker()
+                pp.SetTolerance(0.01)
+                pp.Pick(sx, sy, 0, self._renderer)
+                pid = pp.GetPointId()
+                if pid >= 0 and pp.GetDataSet() is not None:
+                    local = pp.GetDataSet().GetPoint(pid)
+                    m = actor.GetMatrix()
+                    w = m.MultiplyPoint([local[0], local[1], local[2], 1.0])
+                    callback((w[0], w[1], w[2]))
+                else:
+                    callback(tuple(pos))
+            elif kind == "face_normal":
+                if normal_world is None:
+                    self.status_message.emit("Could not compute face normal.")
+                    return True
+                callback(normal_world)
+            elif kind == "face_origin_normal":
+                if normal_world is None:
+                    self.status_message.emit("Could not compute face normal.")
+                    return True
+                callback(tuple(pos), normal_world)
+        except Exception as exc:
+            self.status_message.emit(f"Pick callback error: {exc}")
+        return True
     # ──────────────────────────────────────────────────────── coordinate utils
     def _ray_plane_intersect(
         self, screen_x: int, screen_y: int
@@ -164,8 +316,13 @@ class Viewport3DWidget(QWidget):
             return None
         rd = [v / length for v in rd]
 
-        normal = PLANE_NORMAL[self._draw_plane]
-        origin = PLANE_ORIGIN[self._draw_plane]
+        # Choose plane: custom or axis-aligned
+        if self._custom_plane_active:
+            normal = self._custom_plane_normal
+            origin = self._custom_plane_origin
+        else:
+            normal = PLANE_NORMAL[self._draw_plane]
+            origin = PLANE_ORIGIN[self._draw_plane]
 
         denom = sum(normal[i] * rd[i] for i in range(3))
         if abs(denom) < 1e-10:
@@ -288,22 +445,202 @@ class Viewport3DWidget(QWidget):
         self._set_preview(actor)
 
     # ──────────────────────────────────────────────────────── mouse events
-    def _on_left_press(self, sx: int, sy: int) -> None:
+    def _on_left_press(self, sx: int, sy: int, ctrl: bool = False) -> None:
+        # One-shot pick takes priority over everything else
+        if self._handle_pick_request(sx, sy):
+            return
         if self._draw_mode:
             self._drawing_click(sx, sy)
         else:
-            self._selection_click(sx, sy)
+            self._selection_click(sx, sy, ctrl)
 
     def _on_mouse_move(self, sx: int, sy: int) -> None:
         if self._draw_mode and self._draw_state > 0:
             self._drawing_preview(sx, sy)
 
     # ──────────────────────────────────────────────────────── selection
-    def _selection_click(self, sx: int, sy: int) -> None:
-        obj = self.scene.pick_at(sx, sy)
-        self.scene.select(obj)
-        self.object_selected.emit(obj)
+    def _selection_click(self, sx: int, sy: int, ctrl: bool = False) -> None:
+        # Object-level selection (default)
+        if self._selection_mode == "object":
+            self._clear_sub_pick_marker()
+            obj = self.scene.pick_at(sx, sy)
+            if ctrl and obj:
+                self.scene.select_add(obj)
+            else:
+                self.scene.select(obj)
+            self.object_selected.emit(obj)
+            self.selection_changed.emit(list(self.scene.selection))
+            self._render()
+            return
+
+        # Sub-element selection (face / edge / vertex)
+        self._sub_element_pick(sx, sy)
+
+    def _sub_element_pick(self, sx: int, sy: int) -> None:
+        """Pick a single face / edge / vertex on the topmost actor."""
+        picker = vtk.vtkCellPicker()
+        picker.SetTolerance(0.005)
+        picker.Pick(sx, sy, 0, self._renderer)
+        actor = picker.GetActor()
+        if actor is None:
+            self._clear_sub_pick_marker()
+            self.status_message.emit("No object under cursor.")
+            self._render()
+            return
+
+        cell_id = picker.GetCellId()
+        pos     = picker.GetPickPosition()
+        ds      = picker.GetDataSet()
+        if ds is None or cell_id < 0:
+            self.status_message.emit("Pick failed.")
+            return
+
+        # Find owning EMObject (for status)
+        owner = None
+        for o in self.scene.objects:
+            if any(a is actor for a in o.all_actors):
+                owner = o
+                break
+
+        self._clear_sub_pick_marker()
+        mode = self._selection_mode
+
+        if mode == "face":
+            marker = self._build_face_marker(ds, cell_id, actor)
+            self.status_message.emit(
+                f"Face picked  cell={cell_id}  on {owner.name if owner else '?'}"
+            )
+        elif mode == "edge":
+            marker = self._build_edge_marker(ds, cell_id, actor, pos)
+            self.status_message.emit(
+                f"Edge picked  on {owner.name if owner else '?'}"
+            )
+        else:  # vertex
+            point_picker = vtk.vtkPointPicker()
+            point_picker.SetTolerance(0.01)
+            point_picker.Pick(sx, sy, 0, self._renderer)
+            pid = point_picker.GetPointId()
+            if pid >= 0 and point_picker.GetDataSet() is not None:
+                vp = point_picker.GetDataSet().GetPoint(pid)
+            else:
+                vp = pos
+            marker = self._build_vertex_marker(vp, actor)
+            self.status_message.emit(
+                f"Vertex picked  ({vp[0]:.2f}, {vp[1]:.2f}, {vp[2]:.2f})"
+            )
+
+        if marker is not None:
+            self._renderer.AddActor(marker)
+            self._sub_pick_actor = marker
         self._render()
+
+    def _build_face_marker(self, dataset, cell_id: int, ref_actor) -> Optional[vtk.vtkActor]:
+        ids = vtk.vtkIdTypeArray()
+        ids.InsertNextValue(cell_id)
+        sel_node = vtk.vtkSelectionNode()
+        sel_node.SetFieldType(vtk.vtkSelectionNode.CELL)
+        sel_node.SetContentType(vtk.vtkSelectionNode.INDICES)
+        sel_node.SetSelectionList(ids)
+        sel = vtk.vtkSelection()
+        sel.AddNode(sel_node)
+        extract = vtk.vtkExtractSelection()
+        extract.SetInputData(0, dataset)
+        extract.SetInputData(1, sel)
+        extract.Update()
+        surf = vtk.vtkDataSetSurfaceFilter()
+        surf.SetInputConnection(extract.GetOutputPort())
+        surf.Update()
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(surf.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        # Inherit transform of original actor so marker overlays exactly
+        actor.SetUserMatrix(ref_actor.GetMatrix())
+        actor.GetProperty().SetColor(1.0, 0.6, 0.0)
+        actor.GetProperty().SetOpacity(0.85)
+        actor.GetProperty().EdgeVisibilityOn()
+        actor.GetProperty().SetEdgeColor(1.0, 0.9, 0.0)
+        actor.GetProperty().SetLineWidth(2.0)
+        actor.PickableOff()
+        return actor
+
+    def _build_edge_marker(self, dataset, cell_id: int, ref_actor, pos) -> Optional[vtk.vtkActor]:
+        cell = dataset.GetCell(cell_id)
+        if cell is None or cell.GetNumberOfEdges() == 0:
+            return None
+
+        # Find the edge of this cell closest to pos (in dataset-local coords)
+        # Convert pos (world) to dataset-local using inverse user-matrix
+        m = ref_actor.GetMatrix()
+        inv = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.Invert(m, inv)
+        local = inv.MultiplyPoint([pos[0], pos[1], pos[2], 1.0])
+        lp = (local[0], local[1], local[2])
+
+        best_edge = None
+        best_d    = float("inf")
+        for ei in range(cell.GetNumberOfEdges()):
+            e = cell.GetEdge(ei)
+            p0 = e.GetPoints().GetPoint(0)
+            p1 = e.GetPoints().GetPoint(1)
+            d = self._point_segment_distance(lp, p0, p1)
+            if d < best_d:
+                best_d    = d
+                best_edge = (p0, p1)
+        if best_edge is None:
+            return None
+
+        pts = vtk.vtkPoints()
+        pts.InsertNextPoint(*best_edge[0])
+        pts.InsertNextPoint(*best_edge[1])
+        line = vtk.vtkCellArray()
+        seg = vtk.vtkLine()
+        seg.GetPointIds().SetId(0, 0)
+        seg.GetPointIds().SetId(1, 1)
+        line.InsertNextCell(seg)
+        poly = vtk.vtkPolyData()
+        poly.SetPoints(pts)
+        poly.SetLines(line)
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(poly)
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.SetUserMatrix(ref_actor.GetMatrix())
+        actor.GetProperty().SetColor(1.0, 0.85, 0.0)
+        actor.GetProperty().SetLineWidth(4.0)
+        actor.PickableOff()
+        return actor
+
+    def _build_vertex_marker(self, world_pt, ref_actor) -> vtk.vtkActor:
+        # World-space sphere marker (no user matrix needed)
+        size = max(self._grid_spacing * 0.15, 0.5)
+        src = vtk.vtkSphereSource()
+        src.SetCenter(world_pt[0], world_pt[1], world_pt[2])
+        src.SetRadius(size)
+        src.SetPhiResolution(16)
+        src.SetThetaResolution(16)
+        src.Update()
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(src.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(1.0, 0.3, 0.0)
+        actor.PickableOff()
+        return actor
+
+    @staticmethod
+    def _point_segment_distance(p, a, b) -> float:
+        ax, ay, az = a
+        bx, by, bz = b
+        px, py, pz = p
+        dx, dy, dz = bx - ax, by - ay, bz - az
+        denom = dx*dx + dy*dy + dz*dz
+        if denom < 1e-12:
+            return math.sqrt((px-ax)**2 + (py-ay)**2 + (pz-az)**2)
+        t = ((px-ax)*dx + (py-ay)*dy + (pz-az)*dz) / denom
+        t = max(0.0, min(1.0, t))
+        cx, cy, cz = ax + t*dx, ay + t*dy, az + t*dz
+        return math.sqrt((px-cx)**2 + (py-cy)**2 + (pz-cz)**2)
 
     # ──────────────────────────────────────────────────────── drawing FSM
     def _drawing_click(self, sx: int, sy: int) -> None:
@@ -522,6 +859,7 @@ class Viewport3DWidget(QWidget):
         self.scene.add_object(obj)
         self.scene.select(obj)
         self.object_selected.emit(obj)
+        self.selection_changed.emit(list(self.scene.selection))
         self.scene_changed.emit()
         self.status_message.emit(
             f"Created {type(obj).__name__}: {obj.name}"

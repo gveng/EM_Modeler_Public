@@ -37,6 +37,10 @@ class EMInteractorStyle(vtk.vtkInteractorStyleUser):
         self.AddObserver("LeftButtonReleaseEvent",   self._on_left_release)
 
     # ------------------------------------------------------------------ helpers
+    def _ctrl(self) -> bool:
+        """Return True if Ctrl is held."""
+        iren = self.GetInteractor()
+        return bool(iren and iren.GetControlKey())
     def _ren(self):
         iren = self.GetInteractor()
         if iren:
@@ -86,7 +90,7 @@ class EMInteractorStyle(vtk.vtkInteractorStyleUser):
         cam = ren.GetActiveCamera()
         w, h = self.GetInteractor().GetRenderWindow().GetSize()
         cam.Azimuth(-360.0 * dx / max(w, 1))
-        cam.Elevation( 360.0 * dy / max(h, 1))
+        cam.Elevation(-360.0 * dy / max(h, 1))   # negated: screen-Y grows downward
         cam.OrthogonalizeViewUp()
         ren.ResetCameraClippingRange()
 
@@ -136,9 +140,9 @@ class EMInteractorStyle(vtk.vtkInteractorStyleUser):
     def _on_left_press(self, _obj, _ev):
         x, y = self.GetInteractor().GetEventPosition()
         if self.left_press_callback:
-            self.left_press_callback(x, y)
+            self.left_press_callback(x, y, self._ctrl())
 
     def _on_left_release(self, _obj, _ev):
         x, y = self.GetInteractor().GetEventPosition()
         if self.left_release_callback:
-            self.left_release_callback(x, y)
+            self.left_release_callback(x, y, self._ctrl())

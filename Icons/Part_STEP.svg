@@ -1,0 +1,20 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 64 64" width="64" height="64">
+  <!-- Document base -->
+  <rect x="10" y="8" width="34" height="44" rx="3" ry="3"
+        fill="#ddeeff" stroke="#4477bb" stroke-width="2"/>
+  <!-- Folded corner -->
+  <polygon points="34,8 44,18 34,18" fill="#aaccee" stroke="#4477bb" stroke-width="1.5"/>
+  <!-- "STEP" text lines -->
+  <text x="14" y="28" font-family="monospace" font-size="8"
+        fill="#225588" font-weight="bold">STEP</text>
+  <line x1="14" y1="34" x2="40" y2="34" stroke="#4477bb" stroke-width="1.5"/>
+  <line x1="14" y1="40" x2="36" y2="40" stroke="#4477bb" stroke-width="1.2"/>
+  <!-- Import arrow -->
+  <g transform="translate(42,38)">
+    <polygon points="0,0 14,0 14,5 20,0 14,-5 14,0"
+             fill="#44aa44" stroke="none" transform="rotate(-90,10,0)"/>
+  </g>
+  <polygon points="46,42 55,32 55,37 62,37 62,47 55,47 55,52"
+           fill="#44aa44" stroke="#228822" stroke-width="1"/>
+</svg>

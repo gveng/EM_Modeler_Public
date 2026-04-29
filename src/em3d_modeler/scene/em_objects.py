@@ -330,3 +330,240 @@ class SphereObject(EMObject):
             f"  Radius = {abs(self.radius)}\n"
             "EndSphere\n"
         )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+class ExtrudedObject(EMObject):
+    """Solid created by linearly extruding a 2-D sketch profile.
+
+    Parameters
+    ----------
+    profile_pts : list of (x, y) tuples  – 2-D polyline in the sketch plane
+    depth       : extrusion depth along the plane normal
+    plane_origin: 3-D origin of the sketch plane
+    plane_normal: unit normal of the sketch plane
+    material    : material name
+    """
+
+    def __init__(self, name: str = "",
+                 profile_pts=None,
+                 depth: float = 10.0,
+                 plane_origin=(0.0, 0.0, 0.0),
+                 plane_normal=(0.0, 0.0, 1.0),
+                 material: str = "PEC"):
+        self._profile_pts  = list(profile_pts or [(0,0),(10,0),(10,10),(0,10)])
+        self._depth        = depth
+        self._plane_origin = tuple(plane_origin)
+        self._plane_normal = tuple(plane_normal)
+        super().__init__(name or _auto_name("Extrude"), material)
+
+    # ── build ────────────────────────────────────────────────────────
+    def _build(self) -> None:
+        poly = self._profile_to_polydata()
+        self._extrude = vtk.vtkLinearExtrusionFilter()
+        self._extrude.SetInputData(poly)
+        nx, ny, nz = self._plane_normal
+        self._extrude.SetExtrusionTypeToVectorExtrusion()
+        self._extrude.SetVector(nx * self._depth,
+                                ny * self._depth,
+                                nz * self._depth)
+        self._extrude.CappingOn()
+        self._extrude.Update()
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(self._extrude.GetOutputPort())
+        self._actor = vtk.vtkActor()
+        self._actor.SetMapper(mapper)
+        self._apply_appearance(self._actor)
+
+    def _profile_to_polydata(self) -> vtk.vtkPolyData:
+        """Convert 2-D profile points to vtkPolyData in the sketch plane."""
+        import math
+        pts = self._profile_pts
+        # Build orthonormal basis in the plane
+        n = list(self._plane_normal)
+        # Find a vector not parallel to n
+        ref = [1, 0, 0] if abs(n[1]) > 0.1 or abs(n[2]) > 0.1 else [0, 1, 0]
+        # u = n × ref  (cross product)
+        u = [n[1]*ref[2] - n[2]*ref[1],
+             n[2]*ref[0] - n[0]*ref[2],
+             n[0]*ref[1] - n[1]*ref[0]]
+        um = math.sqrt(sum(v*v for v in u))
+        u = [v/um for v in u]
+        # v = u × n
+        v = [u[1]*n[2] - u[2]*n[1],
+             u[2]*n[0] - u[0]*n[2],
+             u[0]*n[1] - u[1]*n[0]]
+
+        ox, oy, oz = self._plane_origin
+        vtk_pts = vtk.vtkPoints()
+        polygon  = vtk.vtkPolygon()
+        polygon.GetPointIds().SetNumberOfIds(len(pts))
+        for i, (px, py) in enumerate(pts):
+            wx = ox + px*u[0] + py*v[0]
+            wy = oy + px*u[1] + py*v[1]
+            wz = oz + px*u[2] + py*v[2]
+            vtk_pts.InsertNextPoint(wx, wy, wz)
+            polygon.GetPointIds().SetId(i, i)
+
+        cells = vtk.vtkCellArray()
+        cells.InsertNextCell(polygon)
+        poly = vtk.vtkPolyData()
+        poly.SetPoints(vtk_pts)
+        poly.SetPolys(cells)
+        return poly
+
+    def _rebuild(self) -> None:
+        poly = self._profile_to_polydata()
+        self._extrude.SetInputData(poly)
+        nx, ny, nz = self._plane_normal
+        self._extrude.SetVector(nx * self._depth,
+                                ny * self._depth,
+                                nz * self._depth)
+        self._extrude.Update()
+        self.refresh_appearance()
+
+    # ── parameters ───────────────────────────────────────────────────
+    def get_parameters(self) -> Dict[str, Any]:
+        return dict(
+            Depth      = self._depth,
+            PlaneOriginX = self._plane_origin[0],
+            PlaneOriginY = self._plane_origin[1],
+            PlaneOriginZ = self._plane_origin[2],
+            PlaneNormalX = self._plane_normal[0],
+            PlaneNormalY = self._plane_normal[1],
+            PlaneNormalZ = self._plane_normal[2],
+            ProfilePts = str(self._profile_pts),
+            Material   = self.material,
+            Opacity    = self.opacity,
+        )
+
+    def set_parameters(self, params: Dict[str, Any]) -> None:
+        self._depth = float(params.get("Depth", self._depth))
+        self.material = params.get("Material", self.material)
+        self.opacity  = float(params.get("Opacity", self.opacity))
+        self._rebuild()
+
+    def to_emerge_script(self) -> str:
+        return (
+            f'# ExtrudedObject "{self.name}" — export via EMERGE extrude command\n'
+            f'# Depth = {self._depth}, Material = "{self.material}"\n'
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+class RevolvedObject(EMObject):
+    """Solid created by revolving a 2-D sketch profile around an axis.
+
+    Parameters
+    ----------
+    profile_pts : list of (x, y) tuples – 2-D profile (x=radial, y=axial)
+    angle       : sweep angle in degrees (0–360)
+    axis_pt1    : first point of revolution axis (world coords)
+    axis_pt2    : second point of revolution axis (world coords)
+    material    : material name
+    """
+
+    def __init__(self, name: str = "",
+                 profile_pts=None,
+                 angle: float = 360.0,
+                 axis_pt1=(0.0, 0.0, 0.0),
+                 axis_pt2=(0.0, 0.0, 1.0),
+                 material: str = "PEC"):
+        self._profile_pts = list(profile_pts or [(2,0),(5,0),(5,10),(2,10)])
+        self._angle       = angle
+        self._axis_pt1    = tuple(axis_pt1)
+        self._axis_pt2    = tuple(axis_pt2)
+        super().__init__(name or _auto_name("Revolve"), material)
+
+    def _build(self) -> None:
+        poly = self._profile_to_polydata()
+        self._revolve = vtk.vtkRotationalExtrusionFilter()
+        self._revolve.SetInputData(poly)
+        self._revolve.SetAngle(self._angle)
+        self._revolve.SetResolution(60)
+        self._revolve.Update()
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(self._revolve.GetOutputPort())
+        self._actor = vtk.vtkActor()
+        self._actor.SetMapper(mapper)
+        self._apply_appearance(self._actor)
+
+    def _profile_to_polydata(self) -> vtk.vtkPolyData:
+        """Convert 2-D profile to polydata; vtkRotationalExtrusionFilter
+        revolves around the *local* Y axis, so the profile sits in the XY plane."""
+        vtk_pts = vtk.vtkPoints()
+        lines   = vtk.vtkCellArray()
+        n = len(self._profile_pts)
+        for px, py in self._profile_pts:
+            vtk_pts.InsertNextPoint(px, py, 0.0)
+        for i in range(n - 1):
+            line = vtk.vtkLine()
+            line.GetPointIds().SetId(0, i)
+            line.GetPointIds().SetId(1, i + 1)
+            lines.InsertNextCell(line)
+        poly = vtk.vtkPolyData()
+        poly.SetPoints(vtk_pts)
+        poly.SetLines(lines)
+        return poly
+
+    def get_parameters(self) -> Dict[str, Any]:
+        return dict(
+            Angle      = self._angle,
+            AxisPt1X   = self._axis_pt1[0],
+            AxisPt1Y   = self._axis_pt1[1],
+            AxisPt1Z   = self._axis_pt1[2],
+            AxisPt2X   = self._axis_pt2[0],
+            AxisPt2Y   = self._axis_pt2[1],
+            AxisPt2Z   = self._axis_pt2[2],
+            ProfilePts = str(self._profile_pts),
+            Material   = self.material,
+            Opacity    = self.opacity,
+        )
+
+    def set_parameters(self, params: Dict[str, Any]) -> None:
+        self._angle = float(params.get("Angle", self._angle))
+        self.material = params.get("Material", self.material)
+        self.opacity  = float(params.get("Opacity", self.opacity))
+        self._revolve.SetAngle(self._angle)
+        self._revolve.Update()
+        self.refresh_appearance()
+
+    def to_emerge_script(self) -> str:
+        return (
+            f'# RevolvedObject "{self.name}" — export via EMERGE revolve command\n'
+            f'# Angle = {self._angle}, Material = "{self.material}"\n'
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
+class MeshObject(EMObject):
+    """Generic triangulated mesh (e.g. imported from STEP via pythonOCC)."""
+
+    def __init__(self, name: str = "",
+                 polydata: "vtk.vtkPolyData | None" = None,
+                 material: str = "PEC"):
+        self._polydata = polydata
+        super().__init__(name or _auto_name("Mesh"), material)
+
+    def _build(self) -> None:
+        if self._polydata is None:
+            self._polydata = vtk.vtkPolyData()
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(self._polydata)
+        self._actor = vtk.vtkActor()
+        self._actor.SetMapper(mapper)
+        self._apply_appearance(self._actor)
+
+    def get_parameters(self) -> Dict[str, Any]:
+        return dict(Material=self.material, Opacity=self.opacity)
+
+    def set_parameters(self, params: Dict[str, Any]) -> None:
+        self.material = params.get("Material", self.material)
+        self.opacity  = float(params.get("Opacity", self.opacity))
+        self.refresh_appearance()
+
+    def to_emerge_script(self) -> str:
+        return f'# MeshObject "{self.name}" — Material = "{self.material}"\n'
+

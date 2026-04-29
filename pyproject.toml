@@ -1,6 +1,6 @@
 [project]
 name = "em-3d-modeler"
-version = "0.0.2"
+version = "0.0.3"
 description = "A Python-based 3D electromagnetic modeling project."
 authors = [{name = "EM3D Developer"}]
 readme = "README.md"
