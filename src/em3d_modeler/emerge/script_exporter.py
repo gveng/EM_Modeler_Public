@@ -7,6 +7,7 @@ from __future__ import annotations
 from typing import Any, Dict, List
 
 from ..scene.em_objects import EMObject
+from .material_library import material_definition
 
 
 def export_emerge_script(
@@ -14,6 +15,7 @@ def export_emerge_script(
     settings: Dict[str, Any],
     objects: List[EMObject],
     units: str = "mm",
+    materials_catalog: Dict[str, Dict[str, Any]] | None = None,
 ) -> str:
     """Return the full EMERGE input script as a string."""
     lines: List[str] = []
@@ -77,19 +79,21 @@ def export_emerge_script(
     # ── Materials ─────────────────────────────────────────────────────────────
     # Collect unique material names from objects
     used_materials: set = {obj.material for obj in objects}
-    _MATERIAL_PARAMS = {
-        "PEC":        ("PEC",         ""),
-        "PMC":        ("PMC",         ""),
-        "PML":        ("PML",         ""),
-        "Air":        ("Dielectric",  "  Epsilon_r = 1.0\n  Mu_r = 1.0\n  SigmaE = 0.0"),
-        "Dielectric": ("Dielectric",  "  Epsilon_r = 4.4\n  Mu_r = 1.0\n  SigmaE = 0.0"),
-        "Custom":     ("Dielectric",  "  Epsilon_r = 1.0\n  Mu_r = 1.0\n  SigmaE = 0.0"),
-    }
     for mat in sorted(used_materials):
-        mtype, mparams = _MATERIAL_PARAMS.get(mat, ("Dielectric", "  Epsilon_r = 1.0"))
-        lines += [f'Material "{mat}"', f'  Type = "{mtype}"']
-        if mparams:
-            lines += mparams.split("\n")
+        mtype_default, mparams_default = material_definition(mat)
+        catalog_entry = (materials_catalog or {}).get(mat)
+        if catalog_entry and mtype_default not in {"PEC", "PMC", "PML"}:
+            lines += [f'Material "{mat}"', f'  Type = "{mtype_default}"']
+            lines += [
+                f"  Epsilon_r = {catalog_entry.get('er', 1.0)}",
+                "  Mu_r = 1.0",
+                f"  Tan_d = {catalog_entry.get('tan_d', 0.0)}",
+                f"  SigmaE = {catalog_entry.get('sigma', 0.0)}",
+            ]
+        else:
+            lines += [f'Material "{mat}"', f'  Type = "{mtype_default}"']
+            if mparams_default:
+                lines += mparams_default.split("\n")
         lines += [f'EndMaterial', ""]
 
     # ── Geometry objects ──────────────────────────────────────────────────────

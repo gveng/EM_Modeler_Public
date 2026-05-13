@@ -20,6 +20,11 @@ class ProjectFile:
         grid_size: float = 200.0,
         grid_spacing: float = 10.0,
         grid_plane: str = "XY",
+        reference_planes: list | None = None,
+        active_plane_name: str | None = None,
+        project_materials: list | None = None,
+        global_material_db_path: str | None = None,
+        camera: dict | None = None,
     ) -> None:
         data = {
             "version":      ProjectFile.VERSION,
@@ -32,6 +37,11 @@ class ProjectFile:
             },
             "emerge_settings": settings,
             "objects":     objects_json,
+            "reference_planes":  reference_planes or [],
+            "active_plane_name": active_plane_name,
+            "project_materials": project_materials or [],
+            "global_material_db_path": global_material_db_path,
+            "camera": camera or {},
         }
         Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
 

@@ -272,8 +272,13 @@ class SketchDialog(QDialog):
         self._origin = tuple(plane_origin)
         self._normal = tuple(plane_normal)
 
+
         # ── main layout ─────────────────────────────────────────────────────
         layout = QVBoxLayout(self)
+
+        # ── canvas ───────────────────────────────────────────────────────────
+        self._canvas = SketchCanvas()
+        layout.addWidget(self._canvas, stretch=1)
 
         # ── toolbar ──────────────────────────────────────────────────────────
         tb = QToolBar()
@@ -292,11 +297,7 @@ class SketchDialog(QDialog):
         act_clear = QAction("Clear", self); act_clear.triggered.connect(self._canvas.clear)
         tb.addAction(act_undo)
         tb.addAction(act_clear)
-        layout.addWidget(tb)
-
-        # ── canvas ───────────────────────────────────────────────────────────
-        self._canvas = SketchCanvas()
-        layout.addWidget(self._canvas, stretch=1)
+        layout.insertWidget(0, tb)
 
         # ── Extrude / Revolve controls ────────────────────────────────────────
         ctrl_widget = QWidget()

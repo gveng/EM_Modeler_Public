@@ -102,8 +102,8 @@ class EMInteractorStyle(vtk.vtkInteractorStyleUser):
         ren.SetWorldPoint(fp[0], fp[1], fp[2], 1.0)
         ren.WorldToDisplay()
         dfp = list(ren.GetDisplayPoint())
-        dfp[0] -= dx
-        dfp[1] -= dy
+        dfp[0] += dx
+        dfp[1] += dy
 
         ren.SetDisplayPoint(*dfp)
         ren.DisplayToWorld()

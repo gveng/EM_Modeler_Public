@@ -55,7 +55,6 @@ from .. import __version__, __release_date__
 
 
 # ������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������
-_PLANES = ["XY", "XZ", "YZ"]
 _UNITS  = ["mm", "um", "cm", "m", "mil", "inch"]
 _DOCS_HELP = Path(__file__).parent.parent.parent.parent / "docs" / "HELP.md"
 _DOCS_README = Path(__file__).parent.parent.parent.parent / "README.md"
@@ -269,16 +268,6 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        # ������ Drawing plane ���������������������������������������������������������������������������������������������������������������������������������
-        tb.addWidget(QLabel(" Plane: "))
-        self._plane_combo = QComboBox()
-        self._plane_combo.addItems(_PLANES)
-        self._plane_combo.setToolTip("Drawing plane (also orients the grid)")
-        self._plane_combo.currentTextChanged.connect(self._on_plane_changed)
-        tb.addWidget(self._plane_combo)
-
-        tb.addSeparator()
-
         # ������ Grid spacing ���������������������������������������������������������������������������������������������������������������������������������
         tb.addWidget(QLabel(" Grid: "))
         self._grid_spacing_spin = QDoubleSpinBox()
@@ -344,6 +333,7 @@ class MainWindow(QMainWindow):
         self._materials.plane_make_active.connect(self._on_plane_make_active)
         self._materials.plane_delete.connect(self._on_plane_delete)
         self._materials.plane_rename.connect(self._on_plane_rename)
+        self._materials.plane_add_requested.connect(self._open_reference_plane_dialog)
         self._materials.objects_hide.connect(self._on_materials_hide)
         self._materials.objects_show.connect(self._on_materials_show)
         self._materials.object_rename.connect(self._on_materials_rename)
@@ -353,7 +343,7 @@ class MainWindow(QMainWindow):
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� actions
     def _start_draw(self, mode: str) -> None:
-        plane    = self._plane_combo.currentText()
+        plane    = self._active_draw_plane_name()
         material = self._draw_material
         self._viewport.start_draw(mode, plane, material)
 
@@ -710,34 +700,19 @@ class MainWindow(QMainWindow):
             origin, normal, make_active=True,
         )
         self._viewport.set_reference_plane(origin, normal)
+        self._viewport.set_grid(
+            self._workspace_spin.value(),
+            self._grid_spacing_spin.value(),
+            "CUSTOM",
+            self._units,
+        )
         self._refresh_materials()
         self._info_bar.set_info(f"Reference plane '{plane.name}' added and made active.")
 
     def _on_plane_make_active(self, plane) -> None:
         scene = self._viewport.scene
         scene.set_active_plane(plane)
-        # Aggiorna la griglia per allinearla al nuovo piano attivo
-        self._viewport.set_reference_plane(plane.origin, plane.normal)
-        # Se il piano e uno dei classici XY/XZ/YZ, aggiorna anche la combo e la griglia nativa
-        plane_map = {
-            (0.0, 0.0, 1.0): "XY",
-            (0.0, 1.0, 0.0): "XZ",
-            (1.0, 0.0, 0.0): "YZ",
-        }
-        # Tolleranza per confrontare i float
-        def _eq(a, b, eps=1e-6):
-            return all(abs(x-y) < eps for x, y in zip(a, b))
-        found = None
-        for nrm, pname in plane_map.items():
-            if _eq(plane.normal, nrm):
-                found = pname
-                break
-        if found:
-            self._plane_combo.setCurrentText(found)
-            # set_grid gia chiamato da _on_plane_changed
-        else:
-            # Custom plane: la griglia rimane, ma si puo migliorare in futuro per supportare piani arbitrari
-            pass
+        self._sync_active_reference_plane_to_viewport()
         self._refresh_materials()
         self._info_bar.set_info(f"Active reference plane: {plane.name}")
 
@@ -751,9 +726,7 @@ class MainWindow(QMainWindow):
         was_active = (scene.active_plane is plane)
         scene.remove_reference_plane(plane)
         if was_active and scene.active_plane is not None:
-            self._viewport.set_reference_plane(
-                scene.active_plane.origin, scene.active_plane.normal
-            )
+            self._sync_active_reference_plane_to_viewport()
         self._refresh_materials()
         self._info_bar.set_info(f"Plane deleted: {plane.name}")
 
@@ -762,22 +735,46 @@ class MainWindow(QMainWindow):
         self._refresh_materials()
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� grid / units / workspace
+    @staticmethod
+    def _axis_plane_from_normal(normal) -> str:
+        """Map a plane normal to the closest axis-aligned drawing mode."""
+        nx, ny, nz = abs(float(normal[0])), abs(float(normal[1])), abs(float(normal[2]))
+        if nz >= nx and nz >= ny:
+            return "XY"
+        if ny >= nx and ny >= nz:
+            return "XZ"
+        return "YZ"
+
+    def _active_draw_plane_name(self) -> str:
+        scene = self._viewport.scene
+        if scene.active_plane is None:
+            return "XY"
+        return self._axis_plane_from_normal(scene.active_plane.normal)
+
+    def _sync_active_reference_plane_to_viewport(self) -> None:
+        """Keep viewport drawing grid/reference aligned with the active tree plane."""
+        scene = self._viewport.scene
+        if scene.active_plane is None:
+            return
+        self._viewport.set_reference_plane(
+            scene.active_plane.origin,
+            scene.active_plane.normal,
+        )
+        self._viewport.set_grid(
+            self._workspace_spin.value(),
+            self._grid_spacing_spin.value(),
+            self._active_draw_plane_name(),
+            self._units,
+        )
+
     def _on_grid_changed(self, value: float) -> None:
-        plane = self._plane_combo.currentText()
         size  = self._workspace_spin.value()
-        self._viewport.set_grid(size, value, plane, self._units)
+        self._viewport.set_grid(size, value, self._active_draw_plane_name(), self._units)
 
     def _on_workspace_changed(self, value: float) -> None:
-        plane   = self._plane_combo.currentText()
         spacing = self._grid_spacing_spin.value()
-        self._viewport.set_grid(value, spacing, plane, self._units)
+        self._viewport.set_grid(value, spacing, self._active_draw_plane_name(), self._units)
         self._info_bar.set_info(f"Workspace size: {value} {self._units}")
-
-    def _on_plane_changed(self, plane: str) -> None:
-        spacing = self._grid_spacing_spin.value()
-        size    = self._workspace_spin.value()
-        self._viewport.set_grid(size, spacing, plane, self._units)
-        self._info_bar.set_info(f"Drawing plane: {plane}")
 
     def _on_units_changed(self, units: str) -> None:
         self._units = units
@@ -826,7 +823,7 @@ class MainWindow(QMainWindow):
             cam.SetPosition(150, -200, 150)
             cam.SetFocalPoint(0, 0, 0)
             cam.SetViewUp(0, 0, 1)
-        self._viewport._renderer.ResetCamera()
+        self._viewport._renderer.ResetCameraClippingRange()
         self._viewport._render()
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� project file
@@ -837,6 +834,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"EM 3D Modeler - {self._project_name}")
         self._project_tree.set_project_name(self._project_name)
         self._viewport.scene.clear()
+        self._sync_active_reference_plane_to_viewport()
         self._body_props.set_object(None)
         self._sync_material_choices()
         self._refresh_materials()
@@ -868,19 +866,27 @@ class MainWindow(QMainWindow):
             )
             self._sync_material_choices()
             grid = data.get("grid", {})
-            self._viewport.set_grid(
-                grid.get("size",    200),
-                grid.get("spacing", 10),
-                grid.get("plane",  "XY"),
-                data.get("units", "mm"),
-            )
             self._units = data.get("units", "mm")
             self._units_combo.setCurrentText(self._units)
             self._grid_spacing_spin.setSuffix(f" {self._units}")
             self._workspace_spin.setSuffix(f" {self._units}")
+            # Restore spinbox values BEFORE calling set_grid so listeners read correct values
+            self._workspace_spin.blockSignals(True)
+            self._grid_spacing_spin.blockSignals(True)
+            self._workspace_spin.setValue(float(grid.get("size", 200)))
+            self._grid_spacing_spin.setValue(float(grid.get("spacing", 10)))
+            self._workspace_spin.blockSignals(False)
+            self._grid_spacing_spin.blockSignals(False)
+            self._viewport.set_grid(
+                self._workspace_spin.value(),
+                self._grid_spacing_spin.value(),
+                self._active_draw_plane_name(),
+                self._units,
+            )
+            self._sync_active_reference_plane_to_viewport()
             self._body_props.set_object(None)
             self._refresh_materials()
-            self._viewport._render()
+            self._viewport.set_camera_state(data.get("camera", {}))
             self._info_bar.set_info(f"Project loaded: {path}")
         except Exception as exc:
             QMessageBox.critical(self, "Load Error", str(exc))
@@ -918,6 +924,7 @@ class MainWindow(QMainWindow):
                 ),
                 project_materials = self._material_store.project_materials_to_json(),
                 global_material_db_path = self._material_store.global_db_path,
+                camera = self._viewport.get_camera_state(),
             )
             self.setWindowTitle(f"EM 3D Modeler - {self._project_name}")
             self._info_bar.set_info(f"Saved: {path}")

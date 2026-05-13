@@ -10,13 +10,12 @@ from typing import Any, Dict, List, Optional
 from PyQt5.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
-    QSlider, QPushButton, QFrame,
+    QSlider, QPushButton, QFrame, QInputDialog, QColorDialog, QCheckBox,
 )
 from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QColor
 
-from ..scene.em_objects import EMObject, MATERIAL_COLORS
-
-_ALL_MATERIALS = list(MATERIAL_COLORS.keys()) + ["Custom"]
+from ..scene.em_objects import EMObject
 
 
 class BodyPropertiesWidget(QWidget):
@@ -24,19 +23,24 @@ class BodyPropertiesWidget(QWidget):
 
     params_changed = pyqtSignal(object, dict)          # (EMObject, new_params)  – single
     bulk_material_changed = pyqtSignal(str, list)      # (material, [EMObject])  – multi
+    bulk_style_changed = pyqtSignal(str, str, list)    # (material, color_hex, [EMObject])
+    material_added = pyqtSignal(str)
+    material_picker_requested = pyqtSignal(str, list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._obj: Optional[EMObject] = None
         self._selection: List[EMObject] = []
         self._blocked = False
+        self._materials: List[str] = ["PEC"]
+        self._color_hex: str = "#bebee6"
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(3)
 
         # ── title
-        self._title = QLabel("Body Properties")
+        self._title = QLabel("Properties")
         self._title.setStyleSheet("font-weight:bold; padding:2px;")
         layout.addWidget(self._title)
 
@@ -61,9 +65,19 @@ class BodyPropertiesWidget(QWidget):
         mat_row = QHBoxLayout()
         mat_row.addWidget(QLabel("Material:"))
         self._mat_combo = QComboBox()
-        self._mat_combo.addItems(_ALL_MATERIALS)
+        self._mat_combo.addItems(self._materials)
         self._mat_combo.currentTextChanged.connect(self._material_changed)
         mat_row.addWidget(self._mat_combo)
+        self._pick_mat_btn = QPushButton("...")
+        self._pick_mat_btn.setToolTip("Open material selector")
+        self._pick_mat_btn.setFixedWidth(30)
+        self._pick_mat_btn.clicked.connect(self._request_material_picker)
+        mat_row.addWidget(self._pick_mat_btn)
+        self._add_mat_btn = QPushButton("+")
+        self._add_mat_btn.setToolTip("Add a new material to this project")
+        self._add_mat_btn.setFixedWidth(28)
+        self._add_mat_btn.clicked.connect(self._on_add_material)
+        mat_row.addWidget(self._add_mat_btn)
         layout.addLayout(mat_row)
 
         # ── Opacity row
@@ -79,6 +93,31 @@ class BodyPropertiesWidget(QWidget):
         op_row.addWidget(self._opacity_label)
         layout.addLayout(op_row)
 
+        # ── Color row (single + multi)
+        color_row = QHBoxLayout()
+        color_row.addWidget(QLabel("Color:"))
+        self._color_preview = QLabel()
+        self._color_preview.setFixedSize(22, 14)
+        self._color_preview.setStyleSheet("border:1px solid #666; background:#bebee6;")
+        color_row.addWidget(self._color_preview)
+        self._color_value = QLabel(self._color_hex)
+        self._color_value.setMinimumWidth(70)
+        color_row.addWidget(self._color_value)
+        self._pick_color_btn = QPushButton("Pick")
+        self._pick_color_btn.setFixedWidth(46)
+        self._pick_color_btn.clicked.connect(self._pick_color)
+        color_row.addWidget(self._pick_color_btn)
+        color_row.addStretch(1)
+        layout.addLayout(color_row)
+
+        self._apply_color_bulk_chk = QCheckBox("Apply color in bulk")
+        self._apply_color_bulk_chk.setChecked(True)
+        self._apply_color_bulk_chk.setToolTip(
+            "When enabled, Apply updates color for all selected objects.\n"
+            "When disabled, existing colors are preserved."
+        )
+        layout.addWidget(self._apply_color_bulk_chk)
+
         # ── Apply-to-all button (visible in multi-select mode)
         self._apply_btn = QPushButton("Apply material to all selected")
         self._apply_btn.clicked.connect(self._apply_bulk)
@@ -90,6 +129,7 @@ class BodyPropertiesWidget(QWidget):
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._table.setAlternatingRowColors(True)
         self._table.itemChanged.connect(self._table_item_changed)
+        self._table.cellDoubleClicked.connect(self._table_cell_double_clicked)
         layout.addWidget(self._table)
 
         self._set_no_selection()
@@ -129,54 +169,122 @@ class BodyPropertiesWidget(QWidget):
             finally:
                 self._blocked = False
 
+    def set_materials(self, materials: List[str]) -> None:
+        """Update material combo values while preserving current text when possible."""
+        unique = []
+        seen = set()
+        for m in materials:
+            ms = str(m).strip()
+            if ms and ms not in seen:
+                seen.add(ms)
+                unique.append(ms)
+        if not unique:
+            unique = ["PEC"]
+
+        current = self._mat_combo.currentText()
+        self._materials = unique
+        self._blocked = True
+        try:
+            self._mat_combo.clear()
+            self._mat_combo.addItems(self._materials)
+            idx = self._mat_combo.findText(current)
+            if idx >= 0:
+                self._mat_combo.setCurrentIndex(idx)
+        finally:
+            self._blocked = False
+
+    def set_selected_material(self, material_name: str) -> None:
+        idx = self._mat_combo.findText(material_name)
+        if idx < 0:
+            self.set_materials(self._materials + [material_name])
+            idx = self._mat_combo.findText(material_name)
+        if idx >= 0:
+            self._mat_combo.setCurrentIndex(idx)
+
     # ─────────────────────────────────────────────────── display modes
     def _set_no_selection(self) -> None:
-        self._title.setText("Body Properties")
+        self._title.setText("Properties")
         self._name_widget.setVisible(False)
         self._name_edit.setText("")
         self._table.setRowCount(0)
         self._table.setVisible(False)
         self._mat_combo.setEnabled(False)
         self._opacity_slider.setEnabled(False)
+        self._pick_color_btn.setEnabled(False)
+        self._apply_color_bulk_chk.setEnabled(False)
+        self._apply_color_bulk_chk.setVisible(False)
         self._apply_btn.setVisible(False)
 
     def _refresh_single(self, obj: EMObject) -> None:
-        self._title.setText(f"{type(obj).__name__}")
+        self._title.setText("Properties")
         self._name_widget.setVisible(True)
         self._name_edit.setText(obj.name)
         self._mat_combo.setEnabled(True)
         self._opacity_slider.setEnabled(True)
+        self._pick_color_btn.setEnabled(True)
+        self._apply_color_bulk_chk.setEnabled(False)
+        self._apply_color_bulk_chk.setVisible(False)
         self._apply_btn.setVisible(False)
 
+        if self._mat_combo.findText(obj.material) < 0:
+            self.set_materials(self._materials + [obj.material])
         idx = self._mat_combo.findText(obj.material)
         self._mat_combo.setCurrentIndex(max(idx, 0))
         self._opacity_slider.setValue(int(obj.opacity * 100))
         self._opacity_label.setText(f"{obj.opacity:.2f}")
+        if hasattr(obj, "_base_color"):
+            r, g, b = obj._base_color()
+            self._set_color_hex(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
 
         params = obj.get_parameters()
         exclude = {"Material", "Opacity"}
         rows = [(k, v) for k, v in params.items() if k not in exclude]
+        # Always expose Color in Properties so user can assign it even when
+        # the object currently uses only material-based coloring.
+        if not any(k == "Color" for k, _ in rows):
+            if hasattr(obj, "_base_color"):
+                r, g, b = obj._base_color()
+                rows.append(("Color", f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"))
         self._table.setRowCount(len(rows))
         self._table.setVisible(bool(rows))
         for row, (k, v) in enumerate(rows):
             key_item = QTableWidgetItem(k)
             key_item.setFlags(Qt.ItemIsEnabled)
             val_item = QTableWidgetItem(str(v))
+            if k == "Color":
+                # For Color parameter, add a color preview button
+                val_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
+                if isinstance(v, str) and v.startswith("#"):
+                    qcolor = QColor(v)
+                    val_item.setBackground(qcolor)
             self._table.setItem(row, 0, key_item)
             self._table.setItem(row, 1, val_item)
 
     def _refresh_multi(self, objects: List[EMObject]) -> None:
-        self._title.setText(f"{len(objects)} objects selected")
+        self._title.setText("Properties")
         self._name_widget.setVisible(False)
         self._table.setRowCount(0)
         self._table.setVisible(False)
         self._mat_combo.setEnabled(True)
         self._opacity_slider.setEnabled(True)
+        self._pick_color_btn.setEnabled(True)
+        self._apply_color_bulk_chk.setEnabled(True)
+        self._apply_color_bulk_chk.setVisible(True)
         self._apply_btn.setVisible(True)
         # Show material of the last selected
+        if self._mat_combo.findText(objects[-1].material) < 0:
+            self.set_materials(self._materials + [objects[-1].material])
         idx = self._mat_combo.findText(objects[-1].material)
         self._mat_combo.setCurrentIndex(max(idx, 0))
         self._opacity_slider.setValue(int(objects[-1].opacity * 100))
+        if hasattr(objects[-1], "_base_color"):
+            r, g, b = objects[-1]._base_color()
+            self._set_color_hex(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
+
+    def _set_color_hex(self, color_hex: str) -> None:
+        self._color_hex = color_hex
+        self._color_value.setText(color_hex)
+        self._color_preview.setStyleSheet(f"border:1px solid #666; background:{color_hex};")
 
     # ─────────────────────────────────────────────────── editing
     def _name_changed(self) -> None:
@@ -199,12 +307,55 @@ class BodyPropertiesWidget(QWidget):
                     params[k.text()] = v.text()
         params["Material"] = self._mat_combo.currentText()
         params["Opacity"]  = self._opacity_slider.value() / 100.0
+        params["Color"] = self._color_hex
         return params
 
     def _table_item_changed(self, item: QTableWidgetItem) -> None:
         if self._blocked or self._obj is None or item.column() != 1:
             return
+        # Skip color cells – they are handled by double-click
+        if self._table.item(item.row(), 0).text() == "Color":
+            return
         self._apply_single()
+
+    def _table_cell_double_clicked(self, row: int, col: int) -> None:
+        """Open color picker for Color parameter cells."""
+        if col != 1:
+            return
+        param_item = self._table.item(row, 0)
+        val_item = self._table.item(row, 1)
+        if param_item is None or param_item.text() != "Color":
+            return
+        
+        current_color = QColor()
+        if val_item is not None and val_item.text().startswith("#"):
+            current_color.setNamedColor(val_item.text())
+        else:
+            current_color.setRgb(190, 190, 230)  # default PEC-like color
+        
+        color = QColorDialog.getColor(current_color, self, "Choose Color")
+        if color.isValid():
+            hex_color = color.name()
+            val_item.setText(hex_color)
+            val_item.setBackground(color)
+            self._set_color_hex(hex_color)
+            self._blocked = True
+            try:
+                self._apply_single()
+            finally:
+                self._blocked = False
+
+    def _pick_color(self) -> None:
+        if not self._selection:
+            return
+        current = QColor()
+        current.setNamedColor(self._color_hex)
+        color = QColorDialog.getColor(current, self, "Choose Color")
+        if not color.isValid():
+            return
+        self._set_color_hex(color.name())
+        if len(self._selection) == 1 and self._obj is not None:
+            self._apply_single()
 
     def _material_changed(self, _text: str) -> None:
         if self._blocked:
@@ -212,6 +363,10 @@ class BodyPropertiesWidget(QWidget):
         if len(self._selection) == 1 and self._obj:
             self._apply_single()
         # For multi: user must click "Apply to all"
+
+    def _request_material_picker(self) -> None:
+        current = self._mat_combo.currentText()
+        self.material_picker_requested.emit(current, list(self._selection))
 
     def _opacity_changed(self, value: int) -> None:
         self._opacity_label.setText(f"{value / 100:.2f}")
@@ -236,8 +391,39 @@ class BodyPropertiesWidget(QWidget):
     def _apply_bulk(self) -> None:
         material = self._mat_combo.currentText()
         opacity  = self._opacity_slider.value() / 100.0
+        apply_color = self._apply_color_bulk_chk.isChecked()
+
+        rr = gg = bb = None
+        color_hex = self._color_hex
+        if apply_color:
+            rr = int(color_hex[1:3], 16) / 255.0
+            gg = int(color_hex[3:5], 16) / 255.0
+            bb = int(color_hex[5:7], 16) / 255.0
+
         for o in self._selection:
             o.material = material
             o.opacity  = opacity
+            if apply_color:
+                o.custom_color = (rr, gg, bb)
             o.refresh_appearance()
-        self.bulk_material_changed.emit(material, list(self._selection))
+
+        if apply_color:
+            self.bulk_style_changed.emit(material, color_hex, list(self._selection))
+        else:
+            self.bulk_material_changed.emit(material, list(self._selection))
+
+    def _on_add_material(self) -> None:
+        name, ok = QInputDialog.getText(
+            self,
+            "Add Material",
+            "Material name:",
+        )
+        name = (name or "").strip()
+        if not ok or not name:
+            return
+        if self._mat_combo.findText(name) < 0:
+            self.set_materials(self._materials + [name])
+        idx = self._mat_combo.findText(name)
+        if idx >= 0:
+            self._mat_combo.setCurrentIndex(idx)
+        self.material_added.emit(name)

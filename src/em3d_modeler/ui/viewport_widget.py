@@ -199,6 +199,34 @@ class Viewport3DWidget(QWidget):
         if self._render_window:
             self._render_window.Render()
 
+    # ──────────────────────────────────────────────────────── camera state
+    def get_camera_state(self) -> dict:
+        """Return serialisable camera state dict."""
+        cam = self._renderer.GetActiveCamera()
+        return {
+            "position":       list(cam.GetPosition()),
+            "focal_point":    list(cam.GetFocalPoint()),
+            "view_up":        list(cam.GetViewUp()),
+            "parallel_scale": cam.GetParallelScale(),
+            "parallel_proj":  bool(cam.GetParallelProjection()),
+            "clipping_range": list(cam.GetClippingRange()),
+        }
+
+    def set_camera_state(self, state: dict) -> None:
+        """Restore camera from a dict saved by get_camera_state."""
+        if not state:
+            return
+        cam = self._renderer.GetActiveCamera()
+        cam.SetPosition(*state["position"])
+        cam.SetFocalPoint(*state["focal_point"])
+        cam.SetViewUp(*state["view_up"])
+        cam.SetParallelScale(state["parallel_scale"])
+        cam.SetParallelProjection(int(state.get("parallel_proj", False)))
+        if "clipping_range" in state:
+            cam.SetClippingRange(*state["clipping_range"])
+        self._renderer.ResetCameraClippingRange()
+        self._render()
+
     # ──────────────────────────────────────────────────────── public reference plane API
     def set_reference_plane(self, origin: tuple, normal: tuple) -> None:
         """Set a custom drawing plane.  Activated immediately. Ricostruisce la griglia su questo piano."""
@@ -374,6 +402,100 @@ class Viewport3DWidget(QWidget):
         """Snap world point to grid."""
         s = self._grid_spacing
         return tuple(round(v / s) * s for v in pt)
+
+    def _project_point_to_draw_plane(self, pt: tuple) -> tuple:
+        """Project a world point onto the current drawing plane."""
+        if self._custom_plane_active:
+            origin = self._custom_plane_origin
+            normal = self._custom_plane_normal
+        else:
+            origin = PLANE_ORIGIN[self._draw_plane]
+            normal = PLANE_NORMAL[self._draw_plane]
+        ox, oy, oz = origin
+        nx, ny, nz = normal
+        px, py, pz = pt
+        denom = nx * nx + ny * ny + nz * nz
+        if denom < 1e-12:
+            return pt
+        t = (nx * (ox - px) + ny * (oy - py) + nz * (oz - pz)) / denom
+        return (px + nx * t, py + ny * t, pz + nz * t)
+
+    @staticmethod
+    def _closest_point_on_segment(point, start, end):
+        """Return the closest point on segment start-end and its distance."""
+        px, py, pz = point
+        ax, ay, az = start
+        bx, by, bz = end
+        dx, dy, dz = bx - ax, by - ay, bz - az
+        denom = dx * dx + dy * dy + dz * dz
+        if denom < 1e-12:
+            closest = (ax, ay, az)
+        else:
+            t = ((px - ax) * dx + (py - ay) * dy + (pz - az) * dz) / denom
+            t = max(0.0, min(1.0, t))
+            closest = (ax + t * dx, ay + t * dy, az + t * dz)
+        dist = math.sqrt((px - closest[0])**2 + (py - closest[1])**2 + (pz - closest[2])**2)
+        return closest, dist
+
+    def _snap_to_visible_geometry(self, sx: int, sy: int, fallback_pt: tuple) -> tuple | None:
+        """Try vertex/edge/face snapping against visible geometry under the cursor."""
+        # Vertex snap has highest priority.
+        point_picker = vtk.vtkPointPicker()
+        point_picker.SetTolerance(0.01)
+        point_picker.Pick(sx, sy, 0, self._renderer)
+        point_actor = point_picker.GetActor()
+        point_id = point_picker.GetPointId()
+        if point_actor is not None and point_id >= 0 and point_picker.GetDataSet() is not None:
+            local = point_picker.GetDataSet().GetPoint(point_id)
+            world = point_actor.GetMatrix().MultiplyPoint([local[0], local[1], local[2], 1.0])
+            return tuple(self._project_point_to_draw_plane((world[0], world[1], world[2])))
+
+        # Edge / face snap: use the picked cell and prefer the nearest edge if close enough.
+        cell_picker = vtk.vtkCellPicker()
+        cell_picker.SetTolerance(0.005)
+        cell_picker.Pick(sx, sy, 0, self._renderer)
+        actor = cell_picker.GetActor()
+        ds = cell_picker.GetDataSet()
+        cell_id = cell_picker.GetCellId()
+        if actor is None or ds is None or cell_id < 0:
+            return None
+
+        pos = cell_picker.GetPickPosition()
+        cell = ds.GetCell(cell_id)
+        if cell is not None and cell.GetNumberOfEdges() > 0:
+            m = actor.GetMatrix()
+            inv = vtk.vtkMatrix4x4()
+            vtk.vtkMatrix4x4.Invert(m, inv)
+            local = inv.MultiplyPoint([pos[0], pos[1], pos[2], 1.0])
+            lp = (local[0], local[1], local[2])
+            best_edge = None
+            best_dist = float("inf")
+            for ei in range(cell.GetNumberOfEdges()):
+                edge = cell.GetEdge(ei)
+                p0 = edge.GetPoints().GetPoint(0)
+                p1 = edge.GetPoints().GetPoint(1)
+                closest_local, dist = self._closest_point_on_segment(lp, p0, p1)
+                if dist < best_dist:
+                    best_dist = dist
+                    best_edge = closest_local
+            edge_threshold = max(self._grid_spacing * 0.05, 0.25)
+            if best_edge is not None and best_dist <= edge_threshold:
+                world = m.MultiplyPoint([best_edge[0], best_edge[1], best_edge[2], 1.0])
+                return tuple(self._project_point_to_draw_plane((world[0], world[1], world[2])))
+
+        return tuple(self._project_point_to_draw_plane(pos))
+
+    def _drawing_snap_point(self, sx: int, sy: int) -> Optional[tuple]:
+        """Return a drawing point on the active plane, snapped to visible geometry if possible."""
+        plane_pt = self._ray_plane_intersect(sx, sy)
+        if plane_pt is None:
+            return None
+
+        geometry_pt = self._snap_to_visible_geometry(sx, sy, plane_pt)
+        if geometry_pt is not None:
+            return geometry_pt
+
+        return self._snap(plane_pt)
 
     def _height_from_cursor(
         self, screen_x: int, screen_y: int, base_z: float
@@ -666,19 +788,23 @@ class Viewport3DWidget(QWidget):
         return actor
 
     def _build_vertex_marker(self, world_pt, ref_actor) -> vtk.vtkActor:
-        # World-space sphere marker (no user matrix needed)
-        size = max(self._grid_spacing * 0.15, 0.5)
-        src = vtk.vtkSphereSource()
-        src.SetCenter(world_pt[0], world_pt[1], world_pt[2])
-        src.SetRadius(size)
-        src.SetPhiResolution(16)
-        src.SetThetaResolution(16)
-        src.Update()
+        # Render as a single screen-space point (fixed pixel size).
+        # No world-space geometry → always the same visual size regardless of zoom.
+        pts = vtk.vtkPoints()
+        pts.InsertNextPoint(world_pt[0], world_pt[1], world_pt[2])
+        verts = vtk.vtkCellArray()
+        verts.InsertNextCell(1)
+        verts.InsertCellPoint(0)
+        poly = vtk.vtkPolyData()
+        poly.SetPoints(pts)
+        poly.SetVerts(verts)
         mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(src.GetOutputPort())
+        mapper.SetInputData(poly)
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        actor.GetProperty().SetColor(1.0, 0.3, 0.0)
+        actor.GetProperty().SetColor(1.0, 0.05, 0.05)   # bright red
+        actor.GetProperty().SetPointSize(2.0)            # fixed screen pixels
+        actor.GetProperty().RenderPointsAsSpheresOn()    # round dot
         actor.PickableOff()
         return actor
 
@@ -698,10 +824,9 @@ class Viewport3DWidget(QWidget):
 
     # ──────────────────────────────────────────────────────── drawing FSM
     def _drawing_click(self, sx: int, sy: int) -> None:
-        pt = self._ray_plane_intersect(sx, sy)
+        pt = self._drawing_snap_point(sx, sy)
         if pt is None:
             return
-        pt = self._snap(pt)
 
         mode = self._draw_mode
         state = self._draw_state
@@ -777,10 +902,9 @@ class Viewport3DWidget(QWidget):
 
     def _fsm_box_preview(self, sx, sy, state):
         if state == 1:
-            pt = self._ray_plane_intersect(sx, sy)
+            pt = self._drawing_snap_point(sx, sy)
             if pt is None:
                 return
-            pt = self._snap(pt)
             p1 = self._draw_pts[0]
             # Show flat base rect (height = 0)
             self._preview_box(p1[0], p1[1], p1[2], pt[0], pt[1], pt[2])
@@ -833,7 +957,7 @@ class Viewport3DWidget(QWidget):
         axis = {"XY": "Z", "XZ": "Y", "YZ": "X"}[self._draw_plane]
         axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
         if state == 1:
-            pt = self._ray_plane_intersect(sx, sy)
+            pt = self._drawing_snap_point(sx, sy)
             if pt is None:
                 return
             r = self._plane_radius(pt, base) or 0.1
@@ -885,7 +1009,7 @@ class Viewport3DWidget(QWidget):
         axis = {"XY": "Z", "XZ": "Y", "YZ": "X"}[self._draw_plane]
         axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
         if state == 1:
-            pt = self._ray_plane_intersect(sx, sy)
+            pt = self._drawing_snap_point(sx, sy)
             if pt is None:
                 return
             r = self._plane_radius(pt, base) or 0.1
@@ -920,7 +1044,7 @@ class Viewport3DWidget(QWidget):
     def _fsm_sphere_preview(self, sx, sy, state):
         ctr = self._draw_pts[0]
         if state == 1:
-            pt = self._ray_plane_intersect(sx, sy)
+            pt = self._drawing_snap_point(sx, sy)
             if pt is None:
                 return
             r = self._plane_radius(pt, ctr) or 0.1
@@ -953,10 +1077,9 @@ class Viewport3DWidget(QWidget):
 
     def _fsm_plate_preview(self, sx, sy, state):
         if state == 1:
-            pt = self._ray_plane_intersect(sx, sy)
+            pt = self._drawing_snap_point(sx, sy)
             if pt is None:
                 return
-            pt = self._snap(pt)
             p1 = self._draw_pts[0]
             self._preview_box(p1[0], p1[1], p1[2], pt[0], pt[1], pt[2])
             self.status_message.emit(f"Plate: second corner [{pt[0]:.1f}, {pt[1]:.1f}]")
@@ -998,7 +1121,7 @@ class Viewport3DWidget(QWidget):
         base = self._draw_pts[0]
         axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
         if state == 1:
-            pt = self._ray_plane_intersect(sx, sy)
+            pt = self._drawing_snap_point(sx, sy)
             if pt is None:
                 return
             r = self._plane_radius(pt, base) or 0.1
@@ -1066,7 +1189,7 @@ class Viewport3DWidget(QWidget):
     def _fsm_torus_preview(self, sx, sy, state):
         ctr = self._draw_pts[0]
         if state == 1:
-            pt = self._ray_plane_intersect(sx, sy)
+            pt = self._drawing_snap_point(sx, sy)
             if pt is None:
                 return
             r = self._plane_radius(pt, ctr) or 0.1
@@ -1112,7 +1235,7 @@ class Viewport3DWidget(QWidget):
     def _fsm_ellipsoid_preview(self, sx, sy, state):
         ctr = self._draw_pts[0]
         if state == 1:
-            pt = self._ray_plane_intersect(sx, sy)
+            pt = self._drawing_snap_point(sx, sy)
             if pt is None:
                 return
             r = self._plane_radius(pt, ctr) or 0.1

@@ -1,12 +1,12 @@
 """Scene manager: owns all EM objects and the VTK renderer."""
 from __future__ import annotations
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import vtk
 
 from .em_objects import (
-    EMObject, BoxObject, CylinderObject, ConeObject, SphereObject
+    EMObject, BoxObject, CylinderObject, ConeObject, SphereObject, MeshObject
 )
 from .grid_actor import build_grid_actor, build_axes_widget
 
@@ -15,6 +15,7 @@ _OBJECT_CLASSES = {
     "CylinderObject": CylinderObject,
     "ConeObject":     ConeObject,
     "SphereObject":   SphereObject,
+    "MeshObject":     MeshObject,
 }
 
 
@@ -150,6 +151,10 @@ class SceneManager:
             o.material = material
             o.refresh_appearance()
 
+    def set_visibility(self, objects: List[EMObject], visible: bool) -> None:
+        for o in objects:
+            o.set_visible(visible)
+
     # ─────────────────────────────────────────────────── reference planes
     def add_reference_plane(self, name: str, origin, normal,
                             make_active: bool = True) -> ReferencePlane:
@@ -176,6 +181,47 @@ class SceneManager:
         if plane in self.reference_planes:
             self.active_plane = plane
 
+    # ─────────────────────────────────────────────────── reference plane serialization
+    _DEFAULT_PLANE_NAMES = ("XY (Z=0)", "XZ (Y=0)", "YZ (X=0)")
+
+    def reference_planes_to_json(self) -> list:
+        """Serialize only user-defined planes (built-in axis presets are recreated on load)."""
+        return [
+            {"name": p.name, "origin": list(p.origin), "normal": list(p.normal)}
+            for p in self.reference_planes
+            if p.name not in self._DEFAULT_PLANE_NAMES
+        ]
+
+    def reference_planes_from_json(self, data: list,
+                                   active_name: Optional[str] = None) -> None:
+        """Restore user-defined planes; keeps built-in axis presets at the top."""
+        # Reset to built-ins
+        self.reference_planes = [
+            ReferencePlane("XY (Z=0)", (0.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+            ReferencePlane("XZ (Y=0)", (0.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+            ReferencePlane("YZ (X=0)", (0.0, 0.0, 0.0), (1.0, 0.0, 0.0)),
+        ]
+        for item in data or []:
+            try:
+                self.reference_planes.append(ReferencePlane(
+                    str(item["name"]),
+                    tuple(item["origin"]),
+                    tuple(item["normal"]),
+                ))
+            except (KeyError, TypeError, ValueError):
+                continue
+        # Restore active plane
+        if active_name:
+            for p in self.reference_planes:
+                if p.name == active_name:
+                    self.active_plane = p
+                    break
+            else:
+                self.active_plane = self.reference_planes[0]
+        else:
+            self.active_plane = self.reference_planes[0]
+        self._rebuild_grid()
+
     # ─────────────────────────────────────────────────── picking
     def pick_at(self, screen_x: int, screen_y: int) -> Optional[EMObject]:
         picker = vtk.vtkCellPicker()
@@ -195,14 +241,92 @@ class SceneManager:
         return result
 
     # ─────────────────────────────────────────────────── serialisation
+    @staticmethod
+    def _polydata_to_json(polydata: Optional[vtk.vtkPolyData]) -> Dict[str, Any]:
+        """Serialize vtkPolyData into JSON-safe points + polygon indices."""
+        if polydata is None:
+            return {"points": [], "polys": []}
+
+        points: List[List[float]] = []
+        vtk_points = polydata.GetPoints()
+        if vtk_points is not None:
+            for i in range(vtk_points.GetNumberOfPoints()):
+                x, y, z = vtk_points.GetPoint(i)
+                points.append([float(x), float(y), float(z)])
+
+        polys: List[List[int]] = []
+        vtk_polys = polydata.GetPolys()
+        if vtk_polys is not None:
+            vtk_polys.InitTraversal()
+            ids = vtk.vtkIdList()
+            while vtk_polys.GetNextCell(ids):
+                if ids.GetNumberOfIds() >= 3:
+                    polys.append([int(ids.GetId(j)) for j in range(ids.GetNumberOfIds())])
+
+        return {"points": points, "polys": polys}
+
+    @staticmethod
+    def _polydata_from_json(data: Any) -> vtk.vtkPolyData:
+        """Deserialize JSON-safe points + polygon indices into vtkPolyData."""
+        poly = vtk.vtkPolyData()
+        if not isinstance(data, dict):
+            return poly
+
+        raw_points = data.get("points", [])
+        raw_polys = data.get("polys", [])
+        if not isinstance(raw_points, list) or not isinstance(raw_polys, list):
+            return poly
+
+        points = vtk.vtkPoints()
+        for p in raw_points:
+            if isinstance(p, (list, tuple)) and len(p) == 3:
+                try:
+                    points.InsertNextPoint(float(p[0]), float(p[1]), float(p[2]))
+                except (TypeError, ValueError):
+                    continue
+
+        polys = vtk.vtkCellArray()
+        n_points = points.GetNumberOfPoints()
+        for cell in raw_polys:
+            if not isinstance(cell, list) or len(cell) < 3:
+                continue
+            valid_ids: List[int] = []
+            bad_cell = False
+            for idx in cell:
+                try:
+                    ii = int(idx)
+                except (TypeError, ValueError):
+                    bad_cell = True
+                    break
+                if ii < 0 or ii >= n_points:
+                    bad_cell = True
+                    break
+                valid_ids.append(ii)
+            if bad_cell or len(valid_ids) < 3:
+                continue
+            polys.InsertNextCell(len(valid_ids))
+            for ii in valid_ids:
+                polys.InsertCellPoint(ii)
+
+        poly.SetPoints(points)
+        poly.SetPolys(polys)
+        return poly
+
     def to_json(self) -> list:
         out = []
         for obj in self.objects:
-            out.append({
+            item = {
                 "type": type(obj).__name__,
                 "name": obj.name,
                 "params": obj.get_parameters(),
-            })
+                "visible": obj.is_visible(),
+            }
+            if isinstance(obj, MeshObject):
+                mesh_poly = None
+                if obj.actor is not None and obj.actor.GetMapper() is not None:
+                    mesh_poly = obj.actor.GetMapper().GetInput()
+                item["mesh"] = self._polydata_to_json(mesh_poly)
+            out.append(item)
         return out
 
     def from_json(self, data: list) -> None:
@@ -212,32 +336,53 @@ class SceneManager:
         self.selected = None
 
         for item in data:
-            cls = _OBJECT_CLASSES.get(item["type"])
+            if not isinstance(item, dict):
+                continue
+            t = item.get("type")
+            cls = _OBJECT_CLASSES.get(t)
             if cls is None:
                 continue
-            p = item["params"]
-            t = item["type"]
+            p = item.get("params", {})
+            if not isinstance(p, dict):
+                p = {}
             try:
                 if t == "BoxObject":
-                    obj = cls(item["name"],
+                    obj = cls(item.get("name", ""),
                               p["X1"], p["Y1"], p["Z1"],
                               p["X2"], p["Y2"], p["Z2"],
                               p.get("Material", "PEC"))
                 elif t in ("CylinderObject", "ConeObject"):
-                    obj = cls(item["name"],
+                    obj = cls(item.get("name", ""),
                               p["CenterX"], p["CenterY"], p["CenterZ"],
                               p["Radius"], p["Height"],
                               p.get("Axis", "Z"), p.get("Material", "PEC"))
                 elif t == "SphereObject":
-                    obj = cls(item["name"],
+                    obj = cls(item.get("name", ""),
                               p["CenterX"], p["CenterY"], p["CenterZ"],
                               p["Radius"], p.get("Material", "PEC"))
+                elif t == "MeshObject":
+                    mesh_poly = self._polydata_from_json(item.get("mesh"))
+                    obj = cls(item.get("name", ""),
+                              mesh_poly,
+                              p.get("Material", "PEC"))
                 else:
                     continue
                 obj.opacity = float(p.get("Opacity", 0.85))
+                # Restore custom color if present
+                if "Color" in p:
+                    col_str = str(p["Color"]).strip()
+                    if col_str.startswith("#") and len(col_str) == 7:
+                        try:
+                            r = int(col_str[1:3], 16) / 255.0
+                            g = int(col_str[3:5], 16) / 255.0
+                            b = int(col_str[5:7], 16) / 255.0
+                            obj.custom_color = (r, g, b)
+                        except ValueError:
+                            pass
                 obj.refresh_appearance()
+                obj.set_visible(bool(item.get("visible", True)))
                 self.add_object(obj)
-            except (KeyError, TypeError):
+            except (KeyError, TypeError, ValueError):
                 pass
 
     def clear(self) -> None:
