@@ -1,95 +1,95 @@
 # EM 3D Modeler Help
 
-Versione: 1.0.0
-Data rilascio: 2026-05-13
+Version: 1.0.0
+Release Date: 2026-05-13
 
-## 1. Panoramica
-EM 3D Modeler e un ambiente CAD/EM 3D per creare geometrie, assegnare materiali, importare STEP, eseguire operazioni booleane e generare script EMERGE.
+## 1. Overview
+EM 3D Modeler is a 3D CAD/EM environment for creating geometries, assigning materials, importing STEP files, performing boolean operations, and generating EMERGE scripts.
 
-## 2. Interfaccia
-- Pannello sinistro: Project Tree e proprieta dell'oggetto selezionato.
-- Centro: viewport 3D e barra informazioni.
-- Pannello destro: Objects/Materials, selezione multipla e azioni rapide.
-- Toolbar: primitive, sketch, booleane, import STEP, griglia, workspace, unita, modalita di selezione.
+## 2. User Interface
+- Left Panel: Project Tree and properties of the selected object.
+- Center: 3D viewport and information bar.
+- Right Panel: Objects/Materials, multi-selection, and quick actions.
+- Toolbar: primitives, sketch, boolean operations, STEP import, grid, workspace, units, selection mode.
 
-## 3. Creazione Geometrie
-- Box, Cylinder, Cone, Sphere: cliccare sull'icona e disegnare nel viewport.
-- Sketch: apre il canvas parametrico per estrusione o rivoluzione.
+## 3. Creating Geometries
+- Box, Cylinder, Cone, Sphere: click the icon and draw in the viewport.
+- Sketch: opens parametric canvas for extrusion or revolution.
 
-Suggerimento:
-- Impostare prima Plane e Grid per un disegno piu preciso.
+Tip:
+- Set Plane and Grid first for more precise drawing.
 
-## 4. Selezione e Modifica
-- Selezione singola: clic su oggetto nel viewport o nel tree.
-- Selezione multipla: usare Ctrl/Shift nel tree materiali.
-- Delete Selected: elimina l'oggetto selezionato.
-- Body Properties: modifica parametri geometrici, materiale, colore e opacita.
+## 4. Selection and Modification
+- Single Selection: click on object in viewport or tree.
+- Multi-Selection: use Ctrl/Shift in the materials tree.
+- Delete Selected: removes the selected object.
+- Body Properties: modify geometric parameters, material, color, and opacity.
 
-## 5. Materiali
-- Il pannello Objects/Materials raggruppa gli oggetti per materiale.
-- E possibile applicare materiali in bulk su piu oggetti selezionati.
-- Database materiali supportati:
+## 5. Materials
+- The Objects/Materials panel groups objects by material.
+- Apply materials in bulk to multiple selected objects.
+- Supported material databases:
   - Built-in
   - Project DB
   - Global DB
-- Menu File:
+- File Menu:
   - Set Global Material DB
   - Reload Global Material DB
 
-## 6. Operazioni Booleane
-- Cut: sottrae i Tool dal Base.
-- Fuse: unisce piu oggetti.
-- Common: mantiene solo l'intersezione.
+## 6. Boolean Operations
+- Cut: subtracts Tool shapes from Base.
+- Fuse: merges multiple objects.
+- Common: keeps only the intersection.
 
-Flusso consigliato:
-1. Selezionare Base + Tool (o piu Tool).
-2. Confermare la finestra di riepilogo.
-3. Il risultato sostituisce gli oggetti originali.
+Recommended workflow:
+1. Select Base + Tool (or multiple Tools).
+2. Confirm the preview window.
+3. The result replaces the original objects.
 
-Nota su STEP complessi:
-- Per mesh importate non-manifold o disgiunte, il sistema usa fallback robusti per evitare crash.
+Note on complex STEP geometry:
+- For non-manifold or disjoint imported meshes, the system uses robust fallbacks to prevent crashes.
 
-## 7. Import STEP
-- File -> Import STEP o bottone Import STEP in toolbar.
-- Sono supportati .step e .stp.
-- Ogni solido importato viene creato come MeshObject separato.
+## 7. STEP Import
+- File -> Import STEP or STEP Import button in toolbar.
+- Supports .step and .stp files.
+- Each imported solid is created as a separate MeshObject.
 
-## 8. Piani di Riferimento
-- View -> Set Reference Plane per creare piani custom.
-- Il piano attivo orienta griglia e strumenti di disegno.
-- Dal tree materiali e possibile rinominare, attivare o rimuovere piani.
+## 8. Reference Planes
+- View -> Set Reference Plane to create custom planes.
+- The active plane orients the grid and drawing tools.
+- From the materials tree, you can rename, activate, or remove planes.
 
-## 9. Salvataggio e Export
-- Save Project / Save Project As: salva il progetto in formato .em3d.
-- Export EMERGE Script: genera uno script .em compatibile con EMERGE.
+## 9. Saving and Export
+- Save Project / Save Project As: saves project in .em3d format.
+- Export EMERGE Script: generates an .em script compatible with EMERGE.
 
-## 10. Vista e Navigazione
-- View menu:
+## 10. View and Navigation
+- View Menu:
   - Reset Camera
   - Top (XY)
   - Front (XZ)
   - Right (YZ)
   - Isometric
 
-## 11. Risoluzione Problemi
-- Boolean fallita:
-  - Verificare che gli oggetti siano validi e con geometria non vuota.
-  - Con STEP complessi, usare selezioni piu piccole e progressive.
-- Import STEP con errori:
-  - Controllare integrita del file CAD.
-  - Provare a riesportare lo STEP dal CAD originale.
-- Materiale non visibile nel progetto:
-  - Ricaricare il Global DB e verificare i nomi duplicati.
+## 11. Troubleshooting
+- Boolean operation failed:
+  - Verify that objects are valid with non-empty geometry.
+  - For complex STEP files, use smaller and progressive selections.
+- STEP import errors:
+  - Check integrity of the CAD file.
+  - Try re-exporting the STEP from the original CAD application.
+- Material not visible in project:
+  - Reload the Global DB and check for duplicate names.
 
-## 12. Comandi Rapidi
+## 12. Quick Commands
 - New Project: Ctrl+N
 - Open Project: Ctrl+O
 - Save Project: Ctrl+S
-- Quit: shortcut di sistema (es. Alt+F4 su Windows)
+- Quit: system shortcut (e.g., Alt+F4 on Windows)
 
 ## 13. About
-Nel menu Help -> About trovi:
-- Nome programma
-- Versione
-- Data rilascio
-- Data corrente
+In the Help -> About menu, you will find:
+- Program name
+- Version
+- Release date
+- Current date
