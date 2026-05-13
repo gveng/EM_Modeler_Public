@@ -24,20 +24,40 @@ import math
 from typing import Optional, Tuple
 
 import vtk
-from PyQt5.QtWidgets import QWidget, QVBoxLayout, QSizePolicy
+from PyQt5.QtWidgets import (
+    QWidget, QVBoxLayout, QSizePolicy, QToolBar, QAction, QInputDialog
+)
 from PyQt5.QtCore    import pyqtSignal, Qt
+from PyQt5.QtGui     import QIcon
 
 try:
     from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 except ImportError:
     from vtk.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
 
+from pathlib import Path
+
 from ..drawing.interactor_style import EMInteractorStyle
+from ..drawing.sketch_engine    import (
+    SketchEngine, plane_basis, uv_to_world, world_to_uv,
+)
 from ..scene.scene_manager      import SceneManager
 from ..scene.em_objects         import (
-    EMObject, BoxObject, CylinderObject, ConeObject, SphereObject
+    EMObject, BoxObject, CylinderObject, ConeObject, SphereObject,
+    PlateObject, PyramidObject, WedgeObject, TorusObject, EllipsoidObject
 )
 from ..scene.grid_actor         import build_axes_widget
+
+
+_ICONS_DIR = Path(__file__).parent.parent.parent.parent / "Icons"
+
+
+def _icon(name: str) -> QIcon:
+    for ext in ("svg", "png"):
+        p = _ICONS_DIR / f"{name}.{ext}"
+        if p.exists():
+            return QIcon(str(p))
+    return QIcon()
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -56,6 +76,10 @@ class Viewport3DWidget(QWidget):
     scene_changed     = pyqtSignal()
     # Status-bar message
     status_message    = pyqtSignal(str)
+    # Sketch-mode signals
+    sketch_extrude_requested = pyqtSignal(list, float, tuple, tuple)
+    sketch_revolve_requested = pyqtSignal(list, float, tuple, tuple, tuple, tuple)
+    sketch_finished          = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -85,6 +109,9 @@ class Viewport3DWidget(QWidget):
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        self._sketch_toolbar = self._build_sketch_toolbar()
+        self._sketch_toolbar.setVisible(False)
+        layout.addWidget(self._sketch_toolbar)
         layout.addWidget(self._vtk_widget)
 
         self._vtk_widget.Initialize()
@@ -115,6 +142,17 @@ class Viewport3DWidget(QWidget):
         # One-shot pick request from external dialogs
         # tuple (kind, callback) where kind ∈ {'point','vertex','face_normal','face_origin_normal'}
         self._pick_request = None
+
+        # ── Sketch state ──────────────────────────────────────────────────────
+        self._sketch_engine: Optional[SketchEngine] = None
+        self._sketch_lines_actor: Optional[vtk.vtkActor]   = None
+        self._sketch_hi_actor:    Optional[vtk.vtkActor]   = None
+        self._sketch_verts_actor: Optional[vtk.vtkActor]   = None
+        self._sketch_preview_actor: Optional[vtk.vtkActor] = None
+        self._sketch_axis_pick_mode: bool = False
+        self._sketch_axis_highlight: Optional[Tuple[Tuple[float, float],
+                                                    Tuple[float, float]]] = None
+        self.setFocusPolicy(Qt.StrongFocus)
 
     # ──────────────────────────────────────────────────────── public API
     def start_draw(self, mode: str, plane: str = "XY",
@@ -446,8 +484,21 @@ class Viewport3DWidget(QWidget):
 
     # ──────────────────────────────────────────────────────── mouse events
     def _on_left_press(self, sx: int, sy: int, ctrl: bool = False) -> None:
+        # Robust Ctrl detection: VTK's GetControlKey() is not always updated
+        # when QVTKRenderWindowInteractor forwards mouse events, so fall back
+        # to Qt's keyboard modifier state.
+        if not ctrl:
+            try:
+                from PyQt5.QtWidgets import QApplication
+                if QApplication.keyboardModifiers() & Qt.ControlModifier:
+                    ctrl = True
+            except Exception:
+                pass
         # One-shot pick takes priority over everything else
         if self._handle_pick_request(sx, sy):
+            return
+        if self._sketch_engine is not None:
+            self._sketch_left_press(sx, sy)
             return
         if self._draw_mode:
             self._drawing_click(sx, sy)
@@ -455,6 +506,9 @@ class Viewport3DWidget(QWidget):
             self._selection_click(sx, sy, ctrl)
 
     def _on_mouse_move(self, sx: int, sy: int) -> None:
+        if self._sketch_engine is not None:
+            self._sketch_mouse_move(sx, sy)
+            return
         if self._draw_mode and self._draw_state > 0:
             self._drawing_preview(sx, sy)
 
@@ -660,6 +714,16 @@ class Viewport3DWidget(QWidget):
             self._fsm_cone_click(pt, sx, sy, state)
         elif mode == "sphere":
             self._fsm_sphere_click(pt, sx, sy, state)
+        elif mode == "plate":
+            self._fsm_plate_click(pt, sx, sy, state)
+        elif mode == "pyramid":
+            self._fsm_pyramid_click(pt, sx, sy, state)
+        elif mode == "wedge":
+            self._fsm_wedge_click(pt, sx, sy, state)
+        elif mode == "torus":
+            self._fsm_torus_click(pt, sx, sy, state)
+        elif mode == "ellipsoid":
+            self._fsm_ellipsoid_click(pt, sx, sy, state)
 
     def _drawing_preview(self, sx: int, sy: int) -> None:
         mode  = self._draw_mode
@@ -672,6 +736,16 @@ class Viewport3DWidget(QWidget):
             self._fsm_cone_preview(sx, sy, state)
         elif mode == "sphere":
             self._fsm_sphere_preview(sx, sy, state)
+        elif mode == "plate":
+            self._fsm_plate_preview(sx, sy, state)
+        elif mode == "pyramid":
+            self._fsm_pyramid_preview(sx, sy, state)
+        elif mode == "wedge":
+            self._fsm_wedge_preview(sx, sy, state)
+        elif mode == "torus":
+            self._fsm_torus_preview(sx, sy, state)
+        elif mode == "ellipsoid":
+            self._fsm_ellipsoid_preview(sx, sy, state)
         self._render()
 
     # ────────────── BOX FSM ──────────────
@@ -853,6 +927,203 @@ class Viewport3DWidget(QWidget):
             self._preview_sphere(ctr[0], ctr[1], ctr[2], r)
             self.status_message.emit(f"Sphere: radius = {r:.2f} {self._units}")
 
+    # ────────────── PLATE FSM (thin box) ──────────────────────────────
+    def _fsm_plate_click(self, pt, sx, sy, state):
+        if state == 0:
+            self._draw_pts = [pt]
+            self._draw_state = 1
+            self.status_message.emit(f"Plate: click opposite corner")
+        elif state == 1:
+            self._draw_pts.append(pt)
+            self._draw_state = 2
+            self.status_message.emit("Plate: move mouse to set thickness, then click")
+        elif state == 2:
+            p1 = self._draw_pts[0]
+            p2 = self._draw_pts[1]
+            axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
+            thick = self._height_from_cursor(sx, sy, p1[axis_idx]) or 0.1
+            p2 = list(p2)
+            p2[axis_idx] = p1[axis_idx] + thick
+            obj = PlateObject(
+                material=self._draw_material,
+                x1=p1[0], y1=p1[1], z1=p1[2],
+                x2=p2[0], y2=p2[1], z2=p2[2],
+            )
+            self._finish_object(obj)
+
+    def _fsm_plate_preview(self, sx, sy, state):
+        if state == 1:
+            pt = self._ray_plane_intersect(sx, sy)
+            if pt is None:
+                return
+            pt = self._snap(pt)
+            p1 = self._draw_pts[0]
+            self._preview_box(p1[0], p1[1], p1[2], pt[0], pt[1], pt[2])
+            self.status_message.emit(f"Plate: second corner [{pt[0]:.1f}, {pt[1]:.1f}]")
+        elif state == 2:
+            p1 = self._draw_pts[0]
+            p2 = list(self._draw_pts[1])
+            axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
+            thick = self._height_from_cursor(sx, sy, p1[axis_idx]) or 0.01
+            p2[axis_idx] = p1[axis_idx] + thick
+            self._preview_box(p1[0], p1[1], p1[2], p2[0], p2[1], p2[2])
+            self.status_message.emit(f"Plate: thickness = {abs(thick):.3f} {self._units}")
+
+    # ────────────── PYRAMID FSM ──────────────────────────────────
+    def _fsm_pyramid_click(self, pt, sx, sy, state):
+        if state == 0:
+            self._draw_pts = [pt]
+            self._draw_state = 1
+            self.status_message.emit(f"Pyramid: base centre at [{pt[0]:.1f}, {pt[1]:.1f}]")
+        elif state == 1:
+            ctr = self._draw_pts[0]
+            r = self._plane_radius(pt, ctr) or 1.0
+            self._draw_pts.append(r)
+            self._draw_state = 2
+            self.status_message.emit(f"Pyramid: base radius = {r:.2f} {self._units}  — move to set height")
+        elif state == 2:
+            base = self._draw_pts[0]
+            r = self._draw_pts[1]
+            axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
+            h = self._height_from_cursor(sx, sy, base[axis_idx]) or 1.0
+            obj = PyramidObject(
+                material=self._draw_material,
+                bx1=base[0]-r, by1=base[1]-r, bz=base[axis_idx],
+                bx2=base[0]+r, by2=base[1]+r,
+                apex_z=base[axis_idx] + abs(h),
+            )
+            self._finish_object(obj)
+
+    def _fsm_pyramid_preview(self, sx, sy, state):
+        base = self._draw_pts[0]
+        axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
+        if state == 1:
+            pt = self._ray_plane_intersect(sx, sy)
+            if pt is None:
+                return
+            r = self._plane_radius(pt, base) or 0.1
+            self.status_message.emit(f"Pyramid: base radius = {r:.2f} {self._units}")
+        elif state == 2:
+            r = self._draw_pts[1]
+            h = self._height_from_cursor(sx, sy, base[axis_idx]) or 0.1
+            self.status_message.emit(f"Pyramid: height = {abs(h):.2f} {self._units}")
+
+    # ────────────── WEDGE FSM ──────────────────────────────────
+    def _fsm_wedge_click(self, pt, sx, sy, state):
+        if state == 0:
+            self._draw_pts = [pt]
+            self._draw_state = 1
+            self.status_message.emit(f"Wedge: first triangle corner")
+        elif state == 1:
+            self._draw_pts.append(pt)
+            self._draw_state = 2
+            self.status_message.emit(f"Wedge: second triangle corner")
+        elif state == 2:
+            self._draw_pts.append(pt)
+            self._draw_state = 3
+            self.status_message.emit(f"Wedge: move mouse to set height, then click")
+        elif state == 3:
+            p1, p2, p3 = self._draw_pts
+            axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
+            h = self._height_from_cursor(sx, sy, p1[axis_idx]) or 1.0
+            obj = WedgeObject(
+                material=self._draw_material,
+                x1=p1[0], y1=p1[1], z1=p1[2],
+                x2=p2[0], y2=p2[1], z2=p2[2],
+                x3=p3[0], y3=p3[1],
+                z_height=abs(h),
+            )
+            self._finish_object(obj)
+
+    def _fsm_wedge_preview(self, sx, sy, state):
+        if state >= 1:
+            self.status_message.emit(f"Wedge: point {state} collected")
+
+    # ────────────── TORUS FSM ──────────────────────────────────
+    def _fsm_torus_click(self, pt, sx, sy, state):
+        if state == 0:
+            self._draw_pts = [pt]
+            self._draw_state = 1
+            self.status_message.emit(f"Torus: centre at [{pt[0]:.1f}, {pt[1]:.1f}]")
+        elif state == 1:
+            ctr = self._draw_pts[0]
+            major_r = self._plane_radius(pt, ctr) or 5.0
+            self._draw_pts.append(major_r)
+            self._draw_state = 2
+            self.status_message.emit(f"Torus: major radius = {major_r:.2f} {self._units}  — click to set minor radius")
+        elif state == 2:
+            ctr = self._draw_pts[0]
+            pt_ref = (ctr[0] + self._draw_pts[1], ctr[1], ctr[2]) if self._draw_plane == "XY" else (ctr[0], ctr[1] + self._draw_pts[1], ctr[2])
+            minor_r = self._plane_radius(pt, pt_ref) or 2.0
+            obj = TorusObject(
+                material=self._draw_material,
+                cx=ctr[0], cy=ctr[1], cz=ctr[2],
+                major_radius=max(self._draw_pts[1], minor_r + 0.1),
+                minor_radius=min(minor_r, self._draw_pts[1] - 0.1),
+            )
+            self._finish_object(obj)
+
+    def _fsm_torus_preview(self, sx, sy, state):
+        ctr = self._draw_pts[0]
+        if state == 1:
+            pt = self._ray_plane_intersect(sx, sy)
+            if pt is None:
+                return
+            r = self._plane_radius(pt, ctr) or 0.1
+            self.status_message.emit(f"Torus: major radius = {r:.2f} {self._units}")
+
+    # ────────────── ELLIPSOID FSM ──────────────────────────────────
+    def _fsm_ellipsoid_click(self, pt, sx, sy, state):
+        if state == 0:
+            self._draw_pts = [pt]
+            self._draw_state = 1
+            self.status_message.emit(f"Ellipsoid: centre at [{pt[0]:.1f}, {pt[1]:.1f}]")
+        elif state == 1:
+            ctr = self._draw_pts[0]
+            plane_r = self._plane_radius(pt, ctr) or 1.0
+            self._draw_pts.append(plane_r)
+            self._draw_state = 2
+            self.status_message.emit(f"Ellipsoid: plane radius = {plane_r:.2f} {self._units}  — move to set height radius")
+        elif state == 2:
+            ctr = self._draw_pts[0]
+            plane_r = self._draw_pts[1]
+            axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
+            h_r = self._height_from_cursor(sx, sy, ctr[axis_idx]) or plane_r
+            if self._draw_plane == "XY":
+                obj = EllipsoidObject(
+                    material=self._draw_material,
+                    cx=ctr[0], cy=ctr[1], cz=ctr[2],
+                    rx=plane_r, ry=plane_r, rz=abs(h_r),
+                )
+            elif self._draw_plane == "XZ":
+                obj = EllipsoidObject(
+                    material=self._draw_material,
+                    cx=ctr[0], cy=ctr[1], cz=ctr[2],
+                    rx=plane_r, ry=abs(h_r), rz=plane_r,
+                )
+            else:  # YZ
+                obj = EllipsoidObject(
+                    material=self._draw_material,
+                    cx=ctr[0], cy=ctr[1], cz=ctr[2],
+                    rx=abs(h_r), ry=plane_r, rz=plane_r,
+                )
+            self._finish_object(obj)
+
+    def _fsm_ellipsoid_preview(self, sx, sy, state):
+        ctr = self._draw_pts[0]
+        if state == 1:
+            pt = self._ray_plane_intersect(sx, sy)
+            if pt is None:
+                return
+            r = self._plane_radius(pt, ctr) or 0.1
+            self._preview_sphere(ctr[0], ctr[1], ctr[2], r)
+            self.status_message.emit(f"Ellipsoid: plane radius = {r:.2f} {self._units}")
+        elif state == 2:
+            r = self._draw_pts[1]
+            axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
+            h_r = self._height_from_cursor(sx, sy, ctr[axis_idx]) or r
+            self.status_message.emit(f"Ellipsoid: height radius = {abs(h_r):.2f} {self._units}")
+
     # ──────────────────────────────────────────────────────── finish / cancel
     def _finish_object(self, obj: EMObject) -> None:
         self._remove_preview()
@@ -883,3 +1154,349 @@ class Viewport3DWidget(QWidget):
         super().resizeEvent(event)
         if self._render_window:
             self._render_window.SetSize(self.width(), self.height())
+
+    def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape and self._sketch_engine is not None:
+            eng = self._sketch_engine
+            if eng.tool is not None or eng.pending or self._sketch_axis_pick_mode:
+                eng.cancel_current()
+                self._sketch_axis_pick_mode = False
+                self._sketch_axis_highlight = None
+                self.status_message.emit("Sketch tool cancelled")
+                self._refresh_sketch_overlay()
+            else:
+                self.exit_sketch(commit=False)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    # ─────────────────────────────────────────────────────── SKETCH MODE
+    def _build_sketch_toolbar(self) -> QToolBar:
+        tb = QToolBar("Sketch", self)
+        tb.setMovable(False)
+
+        def add(label: str, icon: str, slot, tip: str = "") -> QAction:
+            ic = _icon(icon)
+            act = QAction(ic if not ic.isNull() else QIcon(), label, self)
+            if ic.isNull():
+                act.setIconText(label)
+            act.setToolTip(tip or label)
+            act.triggered.connect(slot)
+            tb.addAction(act)
+            return act
+
+        add("Line",      "Sketch_Line",      lambda: self._sketch_set_tool("line"),
+            "Draw a single line segment (2 clicks)")
+        add("Polyline",  "Sketch_Polyline",  lambda: self._sketch_set_tool("polyline"),
+            "Draw a polyline (click to add points; Esc to finish)")
+        add("Arc",       "Sketch_Arc",       lambda: self._sketch_set_tool("arc"),
+            "Draw a 3-point arc: start, end, mid")
+        add("Circle",    "Sketch_Circle",    lambda: self._sketch_set_tool("circle"),
+            "Draw a circle (centre + radius)")
+        add("Rect",      "Sketch_Rect",      lambda: self._sketch_set_tool("rect"),
+            "Draw a rectangle (two opposite corners)")
+        tb.addSeparator()
+        add("Fillet",    "Sketch_Fillet",    self._sketch_apply_fillet,
+            "Round the last polyline corner")
+        add("Chamfer",   "Sketch_Chamfer",   self._sketch_apply_chamfer,
+            "Chamfer the last polyline corner")
+        add("Trim/Del",  "Sketch_Trim",      self._sketch_delete_last,
+            "Delete the last entity")
+        add("Close",     "Sketch_Close",     self._sketch_close_profile,
+            "Close the active polyline")
+        add("Cancel",    "Sketch_Cancel",    self._sketch_cancel_tool,
+            "Cancel the current tool")
+        tb.addSeparator()
+        add("Extrude",   "Part_Extrude",     self._sketch_request_extrude,
+            "Extrude the sketch profile")
+        add("Revolve",   "Part_Revolve",     self._sketch_begin_revolve,
+            "Revolve: pick a sketch line as axis")
+        add("Exit",      "Sketch_Exit",      lambda: self.exit_sketch(commit=False),
+            "Exit sketch mode without committing")
+        return tb
+
+    def start_sketch(self, plane_origin: tuple, plane_normal: tuple) -> None:
+        self._cancel_draw()
+        self.cancel_pick()
+        self._sketch_engine = SketchEngine(plane_origin, plane_normal)
+        # Align the viewport's projection plane with the sketch plane
+        self._custom_plane_active = True
+        self._custom_plane_origin = tuple(plane_origin)
+        self._custom_plane_normal = tuple(plane_normal)
+        self._sketch_toolbar.setVisible(True)
+        self.setCursor(Qt.CrossCursor)
+        self.setFocus()
+        self.status_message.emit(
+            "Sketch mode: pick a tool from the toolbar  |  Esc to exit"
+        )
+        self._refresh_sketch_overlay()
+
+    def exit_sketch(self, commit: bool = False) -> None:
+        if self._sketch_engine is None:
+            return
+        self._remove_sketch_actors()
+        self._sketch_engine = None
+        self._sketch_axis_pick_mode = False
+        self._sketch_axis_highlight = None
+        self._sketch_toolbar.setVisible(False)
+        self.setCursor(Qt.ArrowCursor)
+        self.status_message.emit(
+            "Exited sketch mode" + (" (committed)" if commit else "")
+        )
+        self.sketch_finished.emit()
+        self._render()
+
+    # ── tool slots ────────────────────────────────────────────────────
+    def _sketch_set_tool(self, name: str) -> None:
+        if self._sketch_engine is None:
+            return
+        # Selecting another tool cancels axis-pick
+        self._sketch_axis_pick_mode = False
+        self._sketch_axis_highlight = None
+        self._sketch_engine.set_tool(name)
+        self.status_message.emit(f"Sketch tool: {name}")
+        self._refresh_sketch_overlay()
+
+    def _sketch_cancel_tool(self) -> None:
+        if self._sketch_engine is None:
+            return
+        self._sketch_engine.cancel_current()
+        self._sketch_axis_pick_mode = False
+        self._sketch_axis_highlight = None
+        self.status_message.emit("Sketch tool cancelled")
+        self._refresh_sketch_overlay()
+
+    def _sketch_delete_last(self) -> None:
+        if self._sketch_engine is None:
+            return
+        self._sketch_engine.delete_last()
+        self._refresh_sketch_overlay()
+
+    def _sketch_close_profile(self) -> None:
+        if self._sketch_engine is None:
+            return
+        self._sketch_engine.close_profile()
+        self._refresh_sketch_overlay()
+
+    def _sketch_apply_fillet(self) -> None:
+        if self._sketch_engine is None:
+            return
+        r, ok = QInputDialog.getDouble(
+            self, "Fillet", f"Radius ({self._units}):",
+            self._grid_spacing, 0.001, 1e6, 3,
+        )
+        if not ok:
+            return
+        if not self._sketch_engine.apply_fillet(float(r)):
+            self.status_message.emit("Fillet requires a polyline with ≥3 points")
+            return
+        self._refresh_sketch_overlay()
+
+    def _sketch_apply_chamfer(self) -> None:
+        if self._sketch_engine is None:
+            return
+        d, ok = QInputDialog.getDouble(
+            self, "Chamfer", f"Distance ({self._units}):",
+            self._grid_spacing, 0.001, 1e6, 3,
+        )
+        if not ok:
+            return
+        if not self._sketch_engine.apply_chamfer(float(d)):
+            self.status_message.emit("Chamfer requires a polyline with ≥3 points")
+            return
+        self._refresh_sketch_overlay()
+
+    def _sketch_request_extrude(self) -> None:
+        if self._sketch_engine is None:
+            return
+        profile = self._sketch_engine.build_profile()
+        if len(profile) < 3:
+            self.status_message.emit("Sketch needs at least 3 points to extrude")
+            return
+        depth, ok = QInputDialog.getDouble(
+            self, "Extrude", f"Depth ({self._units}):",
+            10.0, -1e6, 1e6, 3,
+        )
+        if not ok:
+            return
+        origin = self._sketch_engine.plane_origin
+        normal = self._sketch_engine.plane_normal
+        self.sketch_extrude_requested.emit(list(profile), float(depth), tuple(origin), tuple(normal))
+        self.exit_sketch(commit=True)
+
+    def _sketch_begin_revolve(self) -> None:
+        if self._sketch_engine is None:
+            return
+        if not self._sketch_engine.entities:
+            self.status_message.emit("Draw a sketch first, then pick an axis line")
+            return
+        self._sketch_engine.set_tool(None)
+        self._sketch_axis_pick_mode = True
+        self.status_message.emit("Revolve: click a sketch line to use as axis")
+        self._refresh_sketch_overlay()
+
+    # ── click / move dispatch ─────────────────────────────────────────
+    def _sketch_left_press(self, sx: int, sy: int) -> None:
+        uv = self._uv_from_screen(sx, sy)
+        if uv is None:
+            return
+        if self._sketch_axis_pick_mode:
+            tol = max(self._grid_spacing * 0.6, 1e-3)
+            line = self._sketch_engine.find_line_at_uv(uv, tol)
+            if line is None:
+                self.status_message.emit("No line under cursor – click on a sketch line")
+                return
+            self._sketch_axis_highlight = line
+            self._refresh_sketch_overlay()
+            angle, ok = QInputDialog.getDouble(
+                self, "Revolve", "Sweep angle (deg):",
+                360.0, -360.0, 360.0, 2,
+            )
+            if not ok:
+                self._sketch_axis_pick_mode = False
+                self._sketch_axis_highlight = None
+                self._refresh_sketch_overlay()
+                return
+            profile = self._sketch_engine.build_profile()
+            if len(profile) < 2:
+                self.status_message.emit("Sketch needs at least 2 profile points to revolve")
+                self._sketch_axis_pick_mode = False
+                self._sketch_axis_highlight = None
+                self._refresh_sketch_overlay()
+                return
+            p1_world = self._world_from_uv(*line[0])
+            p2_world = self._world_from_uv(*line[1])
+            origin = tuple(self._sketch_engine.plane_origin)
+            normal = tuple(self._sketch_engine.plane_normal)
+            self.sketch_revolve_requested.emit(
+                list(profile), float(angle),
+                tuple(p1_world), tuple(p2_world),
+                origin, normal,
+            )
+            self.exit_sketch(commit=True)
+            return
+
+        if self._sketch_engine.tool is None:
+            return
+        self._sketch_engine.on_click(uv)
+        self._refresh_sketch_overlay()
+
+    def _sketch_mouse_move(self, sx: int, sy: int) -> None:
+        if self._sketch_engine.tool is None and not self._sketch_axis_pick_mode:
+            return
+        uv = self._uv_from_screen(sx, sy)
+        if uv is None:
+            return
+        self._sketch_engine.on_move(uv)
+        self._refresh_sketch_preview()
+
+    # ── coordinate helpers ────────────────────────────────────────────
+    def _uv_from_screen(self, sx: int, sy: int) -> Optional[tuple]:
+        if self._sketch_engine is None:
+            return None
+        world = self._ray_plane_intersect(sx, sy)
+        if world is None:
+            return None
+        world = self._snap(world)
+        return world_to_uv(world, self._sketch_engine.plane_origin,
+                           self._sketch_engine.u_axis,
+                           self._sketch_engine.v_axis)
+
+    def _world_from_uv(self, u: float, v: float) -> tuple:
+        if self._sketch_engine is None:
+            return (0.0, 0.0, 0.0)
+        return uv_to_world((u, v), self._sketch_engine.plane_origin,
+                           self._sketch_engine.u_axis,
+                           self._sketch_engine.v_axis)
+
+    # ── overlay rendering ─────────────────────────────────────────────
+    def _remove_sketch_actors(self) -> None:
+        for attr in ("_sketch_lines_actor", "_sketch_hi_actor",
+                     "_sketch_verts_actor", "_sketch_preview_actor"):
+            actor = getattr(self, attr)
+            if actor is not None:
+                self._renderer.RemoveActor(actor)
+                setattr(self, attr, None)
+
+    def _refresh_sketch_overlay(self) -> None:
+        if self._sketch_engine is None:
+            self._render()
+            return
+        # Remove old line/highlight/vertex actors (preview kept until next move)
+        for attr in ("_sketch_lines_actor", "_sketch_hi_actor",
+                     "_sketch_verts_actor"):
+            actor = getattr(self, attr)
+            if actor is not None:
+                self._renderer.RemoveActor(actor)
+                setattr(self, attr, None)
+
+        normal_poly, hi_poly = self._sketch_engine.to_lines_polydata(
+            highlight=self._sketch_axis_highlight
+        )
+        self._sketch_lines_actor = self._make_line_actor(
+            normal_poly, color=(1.0, 0.5, 0.0), width=2.0
+        )
+        self._renderer.AddActor(self._sketch_lines_actor)
+        if hi_poly.GetNumberOfCells() > 0:
+            self._sketch_hi_actor = self._make_line_actor(
+                hi_poly, color=(1.0, 0.85, 0.0), width=4.0
+            )
+            self._renderer.AddActor(self._sketch_hi_actor)
+        verts_poly = self._sketch_engine.to_vertex_polydata()
+        if verts_poly.GetNumberOfCells() > 0:
+            self._sketch_verts_actor = self._make_vertex_actor(verts_poly)
+            self._renderer.AddActor(self._sketch_verts_actor)
+        self._refresh_sketch_preview()
+
+    def _refresh_sketch_preview(self) -> None:
+        if self._sketch_preview_actor is not None:
+            self._renderer.RemoveActor(self._sketch_preview_actor)
+            self._sketch_preview_actor = None
+        if self._sketch_engine is None:
+            self._render()
+            return
+        prev = self._sketch_engine.to_preview_polydata()
+        if prev.GetNumberOfCells() > 0:
+            self._sketch_preview_actor = self._make_line_actor(
+                prev, color=(1.0, 0.5, 0.0), width=1.5, dashed=True
+            )
+            self._renderer.AddActor(self._sketch_preview_actor)
+        self._render()
+
+    @staticmethod
+    def _make_line_actor(poly: vtk.vtkPolyData, color: tuple,
+                         width: float, dashed: bool = False) -> vtk.vtkActor:
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(poly)
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        prop = actor.GetProperty()
+        prop.SetColor(*color)
+        prop.SetLineWidth(width)
+        prop.SetLighting(False)
+        if dashed:
+            prop.SetLineStipplePattern(0xF0F0)
+            prop.SetLineStippleRepeatFactor(1)
+        actor.PickableOff()
+        return actor
+
+    def _make_vertex_actor(self, poly: vtk.vtkPolyData) -> vtk.vtkActor:
+        size = max(self._grid_spacing * 0.18, 0.4)
+        sphere = vtk.vtkSphereSource()
+        sphere.SetRadius(size)
+        sphere.SetPhiResolution(10)
+        sphere.SetThetaResolution(10)
+        glyph = vtk.vtkGlyph3D()
+        glyph.SetInputData(poly)
+        glyph.SetSourceConnection(sphere.GetOutputPort())
+        glyph.ScalingOff()
+        glyph.Update()
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(glyph.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        prop = actor.GetProperty()
+        prop.SetColor(1.0, 0.5, 0.0)
+        prop.SetLighting(False)
+        actor.PickableOff()
+        return actor
