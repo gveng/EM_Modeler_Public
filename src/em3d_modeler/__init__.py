@@ -1,2 +1,3 @@
 """EM 3D Modeler – 3D design environment with EMERGE integration."""
-__version__ = "0.0.2"
+__version__ = "1.0.0"
+__release_date__ = "2026-05-13"
