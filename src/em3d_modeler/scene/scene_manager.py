@@ -370,7 +370,9 @@ class SceneManager:
                     mesh_poly = self._polydata_from_json(item.get("mesh"))
                     obj = cls(item.get("name", ""),
                               mesh_poly,
-                              p.get("Material", "PEC"))
+                              p.get("Material", "PEC"),
+                              step_source_path=p.get("StepSourcePath"),
+                              step_solid_name=p.get("StepSolidName"))
                 elif t == "PlateObject":
                     obj = cls(item.get("name", ""),
                               p["X1"], p["Y1"], p["Z1"],

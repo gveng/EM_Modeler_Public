@@ -1040,8 +1040,12 @@ class MeshObject(EMObject):
     def __init__(self, name: str = "",
                  polydata: "vtk.vtkPolyData | None" = None,
                  material: str = "PEC",
-                 color: tuple | None = None):
+                 color: tuple | None = None,
+                 step_source_path: str | None = None,
+                 step_solid_name: str | None = None):
         self._polydata = polydata
+        self.step_source_path = step_source_path
+        self.step_solid_name = step_solid_name or (name or "")
         super().__init__(name or _auto_name("Mesh"), material)
         if color is not None:
             self.custom_color = color
@@ -1060,6 +1064,10 @@ class MeshObject(EMObject):
 
     def get_parameters(self) -> Dict[str, Any]:
         p = dict(Material=self.material, Opacity=self.opacity)
+        if self.step_source_path:
+            p["StepSourcePath"] = str(self.step_source_path)
+        if self.step_solid_name:
+            p["StepSolidName"] = str(self.step_solid_name)
         if self.custom_color is not None:
             p["Color"] = f"#{int(self.custom_color[0]*255):02x}{int(self.custom_color[1]*255):02x}{int(self.custom_color[2]*255):02x}"
         return p
@@ -1067,6 +1075,8 @@ class MeshObject(EMObject):
     def set_parameters(self, params: Dict[str, Any]) -> None:
         self.material = params.get("Material", self.material)
         self.opacity  = float(params.get("Opacity", self.opacity))
+        self.step_source_path = params.get("StepSourcePath", self.step_source_path)
+        self.step_solid_name = params.get("StepSolidName", self.step_solid_name)
         if "Color" in params:
             col = str(params["Color"]).strip()
             if col.startswith("#") and len(col) == 7:

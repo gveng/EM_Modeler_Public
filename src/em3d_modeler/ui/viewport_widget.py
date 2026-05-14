@@ -66,6 +66,11 @@ PLANE_ORIGIN = {"XY": (0, 0, 0), "XZ": (0, 0, 0), "YZ": (0, 0, 0)}
 
 
 class Viewport3DWidget(QWidget):
+    def set_grid_visible(self, visible: bool) -> None:
+        """Show or hide the grid actor in the renderer."""
+        if self.scene._grid_actor is not None:
+            self.scene._grid_actor.SetVisibility(visible)
+        self._render()
     """Central 3D viewport widget."""
 
     # Emitted when an object is selected / deselected

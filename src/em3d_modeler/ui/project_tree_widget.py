@@ -76,15 +76,13 @@ class ProjectTreeWidget(QWidget):
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
 
-        lbl = QLabel("EMERGE Settings")
-        lbl.setStyleSheet("font-weight:bold; padding:2px;")
-        layout.addWidget(lbl)
-
         self._tree = QTreeWidget()
         self._tree.setColumnCount(2)
-        self._tree.setHeaderLabels(["Parameter", "Value"])
+        self._tree.setHeaderLabels(["", ""])
+        self._tree.setHeaderHidden(True)
         self._tree.header().setDefaultSectionSize(110)
         self._tree.setAlternatingRowColors(True)
+        self._tree.setIndentation(10)  # Reduce indentation (default is 20)
         self._tree.itemDoubleClicked.connect(self._on_double_click)
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
