@@ -124,17 +124,55 @@ class EMInteractorStyle(vtk.vtkInteractorStyleUser):
     def _on_wheel_bwd(self, _obj, _ev):
         self._zoom(1.0 / 1.15)
 
+    def _world_at_display_depth(self, ren, x: int, y: int, z: float):
+        """Return world point for display coords (x,y) at display depth z."""
+        ren.SetDisplayPoint(float(x), float(y), float(z))
+        ren.DisplayToWorld()
+        wp = ren.GetWorldPoint()
+        w = float(wp[3])
+        if abs(w) < 1e-12:
+            return None
+        return [float(wp[0]) / w, float(wp[1]) / w, float(wp[2]) / w]
+
     def _zoom(self, factor: float) -> None:
         ren = self._ren()
         if ren is None:
             return
+        iren = self.GetInteractor()
+        if iren is None:
+            return
+
+        x, y = iren.GetEventPosition()
         cam = ren.GetActiveCamera()
+
+        # Keep the world point under cursor stable across zoom.
+        fp = cam.GetFocalPoint()
+        ren.SetWorldPoint(fp[0], fp[1], fp[2], 1.0)
+        ren.WorldToDisplay()
+        focal_display_z = float(ren.GetDisplayPoint()[2])
+
+        world_before = self._world_at_display_depth(ren, x, y, focal_display_z)
+
         if cam.GetParallelProjection():
             cam.SetParallelScale(cam.GetParallelScale() / factor)
         else:
             cam.Dolly(factor)
             ren.ResetCameraClippingRange()
-        self.GetInteractor().GetRenderWindow().Render()
+
+        ren.SetWorldPoint(*cam.GetFocalPoint(), 1.0)
+        ren.WorldToDisplay()
+        focal_display_z_after = float(ren.GetDisplayPoint()[2])
+        world_after = self._world_at_display_depth(ren, x, y, focal_display_z_after)
+
+        if world_before is not None and world_after is not None:
+            delta = [world_before[i] - world_after[i] for i in range(3)]
+            pos = cam.GetPosition()
+            fp2 = cam.GetFocalPoint()
+            cam.SetPosition(pos[0] + delta[0], pos[1] + delta[1], pos[2] + delta[2])
+            cam.SetFocalPoint(fp2[0] + delta[0], fp2[1] + delta[1], fp2[2] + delta[2])
+
+        ren.ResetCameraClippingRange()
+        iren.GetRenderWindow().Render()
 
     # ----------------------------------------------------------- left = draw/select
     def _on_left_press(self, _obj, _ev):

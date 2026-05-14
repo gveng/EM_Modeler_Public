@@ -6,7 +6,8 @@ from typing import Any, Dict, List, Optional, Tuple
 import vtk
 
 from .em_objects import (
-    EMObject, BoxObject, CylinderObject, ConeObject, SphereObject, MeshObject
+    EMObject, BoxObject, CylinderObject, ConeObject, SphereObject, MeshObject,
+    PlateObject, PyramidObject, WedgeObject, TorusObject, EllipsoidObject
 )
 from .grid_actor import build_grid_actor, build_axes_widget
 
@@ -16,6 +17,11 @@ _OBJECT_CLASSES = {
     "ConeObject":     ConeObject,
     "SphereObject":   SphereObject,
     "MeshObject":     MeshObject,
+    "PlateObject":    PlateObject,
+    "PyramidObject":  PyramidObject,
+    "WedgeObject":    WedgeObject,
+    "TorusObject":    TorusObject,
+    "EllipsoidObject": EllipsoidObject,
 }
 
 
@@ -364,6 +370,32 @@ class SceneManager:
                     mesh_poly = self._polydata_from_json(item.get("mesh"))
                     obj = cls(item.get("name", ""),
                               mesh_poly,
+                              p.get("Material", "PEC"))
+                elif t == "PlateObject":
+                    obj = cls(item.get("name", ""),
+                              p["X1"], p["Y1"], p["Z1"],
+                              p["X2"], p["Y2"], p["Z2"],
+                              p.get("Material", "PEC"))
+                elif t == "PyramidObject":
+                    obj = cls(item.get("name", ""),
+                              p["BaseX1"], p["BaseY1"], p["BaseZ"],
+                              p["BaseX2"], p["BaseY2"],
+                              p["ApexZ"], p.get("Material", "PEC"))
+                elif t == "WedgeObject":
+                    obj = cls(item.get("name", ""),
+                              p["X1"], p["Y1"], p["Z1"],
+                              p["X2"], p["Y2"], p["Z2"],
+                              p["X3"], p["Y3"], p["ZHeight"],
+                              p.get("Material", "PEC"))
+                elif t == "TorusObject":
+                    obj = cls(item.get("name", ""),
+                              p["CenterX"], p["CenterY"], p["CenterZ"],
+                              p["MajorRadius"], p["MinorRadius"],
+                              p.get("Material", "PEC"))
+                elif t == "EllipsoidObject":
+                    obj = cls(item.get("name", ""),
+                              p["CenterX"], p["CenterY"], p["CenterZ"],
+                              p["RadiusX"], p["RadiusY"], p["RadiusZ"],
                               p.get("Material", "PEC"))
                 else:
                     continue

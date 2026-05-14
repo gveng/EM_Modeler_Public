@@ -33,6 +33,8 @@ class MaterialsWidget(QWidget):
     objects_hide      = pyqtSignal(list)     # List[EMObject]
     objects_show      = pyqtSignal(list)     # List[EMObject]
     object_rename     = pyqtSignal(object, str)  # EMObject, new_name
+    assign_port_requested = pyqtSignal(object)   # EMObject
+    assign_boundary_requested = pyqtSignal(object)  # EMObject
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -248,6 +250,16 @@ class MaterialsWidget(QWidget):
             act_rename = QAction("Rename…", menu)
             act_rename.triggered.connect(lambda: self._rename_object(objs[0]))
             menu.addAction(act_rename)
+
+            menu.addSeparator()
+            act_assign_port = QAction("Assign Port…", menu)
+            act_assign_port.triggered.connect(lambda: self.assign_port_requested.emit(objs[0]))
+            menu.addAction(act_assign_port)
+
+            act_assign_bc = QAction("Assign Boundary Condition…", menu)
+            act_assign_bc.triggered.connect(lambda: self.assign_boundary_requested.emit(objs[0]))
+            menu.addAction(act_assign_bc)
+
             menu.addSeparator()
 
         act_hide = QAction("Hide Selected", menu)

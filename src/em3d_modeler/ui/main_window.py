@@ -38,6 +38,9 @@ from PyQt5.QtWidgets import (
 from PyQt5.QtCore import Qt
 from PyQt5.QtGui  import QIcon, QKeySequence
 
+# Undo/Redo CommandStack
+
+
 from .viewport_widget        import Viewport3DWidget
 from .project_tree_widget    import ProjectTreeWidget
 from .body_properties_widget import BodyPropertiesWidget
@@ -74,12 +77,17 @@ class MainWindow(QMainWindow):
         self._draw_material = "PEC"
         self._material_store = MaterialStore()
 
+
+
+
         self._build_ui()
-        self._build_menus()
         self._build_toolbar()
+        self._build_menus()
         self._connect_signals()
         self._sync_material_choices()
+
         self._new_project()
+
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� UI construction
     def _build_ui(self) -> None:
@@ -121,6 +129,7 @@ class MainWindow(QMainWindow):
 
         self.setCentralWidget(main_splitter)
 
+
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� menus
     def _build_menus(self) -> None:
         mb = self.menuBar()
@@ -145,6 +154,7 @@ class MainWindow(QMainWindow):
         edit_menu = mb.addMenu("&Edit")
         self._act_del = edit_menu.addAction("&Delete Selected", self._delete_selected, QKeySequence.Delete)
         edit_menu.addAction("&Cancel Drawing",    self._viewport.cancel_draw, Qt.Key_Escape)
+
 
         # View
         view_menu = mb.addMenu("&View")
@@ -234,6 +244,8 @@ class MainWindow(QMainWindow):
         act_sketch.setToolTip("Open parametric sketch canvas (extrude or revolve)")
         act_sketch.triggered.connect(self._open_sketch)
         tb.addAction(act_sketch)
+
+
 
         tb.addSeparator()
 
@@ -337,6 +349,8 @@ class MainWindow(QMainWindow):
         self._materials.objects_hide.connect(self._on_materials_hide)
         self._materials.objects_show.connect(self._on_materials_show)
         self._materials.object_rename.connect(self._on_materials_rename)
+        self._materials.assign_port_requested.connect(self._on_assign_port_requested)
+        self._materials.assign_boundary_requested.connect(self._on_assign_boundary_requested)
 
         # EMERGE settings changed
         self._project_tree.settings_changed.connect(self._on_settings_changed)
@@ -574,13 +588,27 @@ class MainWindow(QMainWindow):
     def _on_materials_rename(self, obj, new_name: str) -> None:
         if obj is None or not new_name:
             return
+        old_name = obj.name
         obj.name = new_name
+        self._project_tree.rename_object_references(old_name, new_name)
         self._refresh_materials()
         self._materials.highlight(obj)  # Preserve selection after refresh
         if self._viewport.scene.selected is obj:
             self._body_props.set_object(obj)
         self._viewport._render()
         self._info_bar.set_info(f"Renamed to: {new_name}")
+
+    def _on_assign_port_requested(self, obj) -> None:
+        if obj is None:
+            return
+        self._project_tree.assign_port_to_object(obj.name)
+        self._info_bar.set_info(f"Port assignment updated for {obj.name}")
+
+    def _on_assign_boundary_requested(self, obj) -> None:
+        if obj is None:
+            return
+        self._project_tree.assign_boundary_to_object(obj.name)
+        self._info_bar.set_info(f"Boundary assignment updated for {obj.name}")
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� STEP import
     def _import_step(self) -> None:
@@ -870,24 +898,31 @@ class MainWindow(QMainWindow):
             self._units_combo.setCurrentText(self._units)
             self._grid_spacing_spin.setSuffix(f" {self._units}")
             self._workspace_spin.setSuffix(f" {self._units}")
-            # Restore spinbox values BEFORE calling set_grid so listeners read correct values
+
             self._workspace_spin.blockSignals(True)
             self._grid_spacing_spin.blockSignals(True)
-            self._workspace_spin.setValue(float(grid.get("size", 200)))
-            self._grid_spacing_spin.setValue(float(grid.get("spacing", 10)))
+            self._workspace_spin.setValue(float(grid.get("size", 200.0)))
+            self._grid_spacing_spin.setValue(float(grid.get("spacing", 10.0)))
             self._workspace_spin.blockSignals(False)
             self._grid_spacing_spin.blockSignals(False)
+
+            loaded_plane = str(grid.get("plane", "")).upper().strip()
+            if loaded_plane not in {"XY", "XZ", "YZ"}:
+                loaded_plane = self._active_draw_plane_name()
+
             self._viewport.set_grid(
                 self._workspace_spin.value(),
                 self._grid_spacing_spin.value(),
-                self._active_draw_plane_name(),
+                loaded_plane,
                 self._units,
             )
             self._sync_active_reference_plane_to_viewport()
+            self._viewport.set_camera_state(data.get("camera", {}))
             self._body_props.set_object(None)
             self._refresh_materials()
-            self._viewport.set_camera_state(data.get("camera", {}))
+            self._viewport._render()
             self._info_bar.set_info(f"Project loaded: {path}")
+
         except Exception as exc:
             QMessageBox.critical(self, "Load Error", str(exc))
 
