@@ -24,6 +24,7 @@ class BodyPropertiesWidget(QWidget):
     params_changed = pyqtSignal(object, dict)          # (EMObject, new_params)  – single
     bulk_material_changed = pyqtSignal(str, list)      # (material, [EMObject])  – multi
     bulk_style_changed = pyqtSignal(str, str, list)    # (material, color_hex, [EMObject])
+    model_role_changed = pyqtSignal(object, bool)      # (EMObject, is_model)
     material_added = pyqtSignal(str)
     material_picker_requested = pyqtSignal(str, list)
 
@@ -79,6 +80,15 @@ class BodyPropertiesWidget(QWidget):
         self._add_mat_btn.clicked.connect(self._on_add_material)
         mat_row.addWidget(self._add_mat_btn)
         layout.addLayout(mat_row)
+
+        role_row = QHBoxLayout()
+        role_row.addWidget(QLabel("Simulation role:"))
+        self._model_role_combo = QComboBox()
+        self._model_role_combo.addItems(["MODEL", "NON MODEL"])
+        self._model_role_combo.currentTextChanged.connect(self._model_role_changed)
+        role_row.addWidget(self._model_role_combo)
+        role_row.addStretch(1)
+        layout.addLayout(role_row)
 
         # ── Opacity row
         op_row = QHBoxLayout()
@@ -209,6 +219,7 @@ class BodyPropertiesWidget(QWidget):
         self._table.setRowCount(0)
         self._table.setVisible(False)
         self._mat_combo.setEnabled(False)
+        self._model_role_combo.setEnabled(False)
         self._opacity_slider.setEnabled(False)
         self._pick_color_btn.setEnabled(False)
         self._apply_color_bulk_chk.setEnabled(False)
@@ -220,6 +231,7 @@ class BodyPropertiesWidget(QWidget):
         self._name_widget.setVisible(True)
         self._name_edit.setText(obj.name)
         self._mat_combo.setEnabled(True)
+        self._model_role_combo.setEnabled(True)
         self._opacity_slider.setEnabled(True)
         self._pick_color_btn.setEnabled(True)
         self._apply_color_bulk_chk.setEnabled(False)
@@ -232,6 +244,7 @@ class BodyPropertiesWidget(QWidget):
         self._mat_combo.setCurrentIndex(max(idx, 0))
         self._opacity_slider.setValue(int(obj.opacity * 100))
         self._opacity_label.setText(f"{obj.opacity:.2f}")
+        self._model_role_combo.setCurrentText("MODEL" if bool(getattr(obj, "is_model", True)) else "NON MODEL")
         if hasattr(obj, "_base_color"):
             r, g, b = obj._base_color()
             self._set_color_hex(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
@@ -266,6 +279,7 @@ class BodyPropertiesWidget(QWidget):
         self._table.setRowCount(0)
         self._table.setVisible(False)
         self._mat_combo.setEnabled(True)
+        self._model_role_combo.setEnabled(False)
         self._opacity_slider.setEnabled(True)
         self._pick_color_btn.setEnabled(True)
         self._apply_color_bulk_chk.setEnabled(True)
@@ -363,6 +377,15 @@ class BodyPropertiesWidget(QWidget):
         if len(self._selection) == 1 and self._obj:
             self._apply_single()
         # For multi: user must click "Apply to all"
+
+    def _model_role_changed(self, text: str) -> None:
+        if self._blocked or self._obj is None or len(self._selection) != 1:
+            return
+        is_model = str(text).strip().upper() != "NON MODEL"
+        if bool(getattr(self._obj, "is_model", True)) == is_model:
+            return
+        self._obj.is_model = is_model
+        self.model_role_changed.emit(self._obj, is_model)
 
     def _request_material_picker(self) -> None:
         current = self._mat_combo.currentText()

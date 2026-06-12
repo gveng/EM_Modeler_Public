@@ -181,6 +181,13 @@ class MaterialStore:
         self._project[rec.name] = rec
         return rec
 
+    def delete_project_record(self, name: str) -> bool:
+        key = str(name).strip()
+        if not key or key not in self._project:
+            return False
+        del self._project[key]
+        return True
+
     def append_global_to_project(self, names: Iterable[str]) -> List[str]:
         added: List[str] = []
         for name in names:

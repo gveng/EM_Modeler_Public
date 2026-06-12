@@ -71,6 +71,12 @@ class Viewport3DWidget(QWidget):
         if self.scene._grid_actor is not None:
             self.scene._grid_actor.SetVisibility(visible)
         self._render()
+
+    def is_grid_visible(self) -> bool:
+        if self.scene._grid_actor is None:
+            return True
+        return bool(self.scene._grid_actor.GetVisibility())
+
     """Central 3D viewport widget."""
 
     # Emitted when an object is selected / deselected
@@ -109,6 +115,12 @@ class Viewport3DWidget(QWidget):
         # Scene manager
         self.scene = SceneManager(self._renderer)
 
+        # Triad aligned to active reference plane (in-scene actor)
+        self._plane_triad_visible: bool = True
+        self._plane_triad_size: float = 25.0
+        self._plane_triad_actor: Optional[vtk.vtkAxesActor] = None
+        self._init_plane_triad_actor()
+
         # Default camera
         self._reset_camera()
 
@@ -129,6 +141,7 @@ class Viewport3DWidget(QWidget):
         self._draw_state: int = 0               # step counter within current shape
         self._draw_pts: list = []               # world-coord points collected so far
         self._preview_actor: Optional[vtk.vtkActor] = None
+        self._selection_point_actors: list[vtk.vtkActor] = []
 
         # Custom reference plane (set via ReferencePlaneDialog)
         self._custom_plane_active: bool = False
@@ -143,6 +156,7 @@ class Viewport3DWidget(QWidget):
         # Selection mode: 'object' | 'face' | 'edge' | 'vertex'
         self._selection_mode: str = "object"
         self._sub_pick_actor: Optional[vtk.vtkActor] = None
+        self._last_drawing_snap_kind: str = "grid"
 
         # One-shot pick request from external dialogs
         # tuple (kind, callback) where kind ∈ {'point','vertex','face_normal','face_origin_normal'}
@@ -169,9 +183,14 @@ class Viewport3DWidget(QWidget):
         self._draw_state    = 0
         self._draw_pts      = []
         self.setCursor(Qt.CrossCursor)
-        self.status_message.emit(
-            f"Drawing {mode} on {plane} plane  |  left-click to place points"
-        )
+        if mode == "planar":
+            self.status_message.emit(
+                f"Planar: pick start point (vertex/edge/face) on {plane} plane"
+            )
+        else:
+            self.status_message.emit(
+                f"Drawing {mode} on {plane} plane  |  left-click to place points"
+            )
 
     def cancel_draw(self) -> None:
         self._cancel_draw()
@@ -184,7 +203,24 @@ class Viewport3DWidget(QWidget):
         self._grid_spacing = spacing
         self._units        = units
         self.scene.update_grid(size, spacing, plane)
+        self._update_plane_triad_actor()
         self._render()
+
+    def set_plane_triad_visible(self, visible: bool) -> None:
+        self._plane_triad_visible = bool(visible)
+        self._update_plane_triad_actor()
+        self._render()
+
+    def is_plane_triad_visible(self) -> bool:
+        return bool(self._plane_triad_visible)
+
+    def set_plane_triad_size(self, size: float) -> None:
+        self._plane_triad_size = max(1e-6, float(size))
+        self._update_plane_triad_actor()
+        self._render()
+
+    def get_plane_triad_size(self) -> float:
+        return float(self._plane_triad_size)
 
     def reset_camera(self) -> None:
         self._reset_camera()
@@ -202,7 +238,108 @@ class Viewport3DWidget(QWidget):
     # ──────────────────────────────────────────────────────── render helpers
     def _render(self) -> None:
         if self._render_window:
+            self._update_plane_triad_actor()
             self._render_window.Render()
+
+    def _init_plane_triad_actor(self) -> None:
+        actor = vtk.vtkAxesActor()
+        actor.SetAxisLabels(1)
+        actor.SetTotalLength(self._plane_triad_size, self._plane_triad_size, self._plane_triad_size)
+        actor.PickableOff()
+        self._renderer.AddActor(actor)
+        self._plane_triad_actor = actor
+        self._update_plane_triad_text_size()
+
+    def _update_plane_triad_text_size(self) -> None:
+        if self._plane_triad_actor is None:
+            return
+
+        # Keep axis caption text proportional to triad size (1:10 ratio).
+        font_size = max(1, int(round(self._plane_triad_size / 10.0)))
+        for caption in (
+            self._plane_triad_actor.GetXAxisCaptionActor2D(),
+            self._plane_triad_actor.GetYAxisCaptionActor2D(),
+            self._plane_triad_actor.GetZAxisCaptionActor2D(),
+        ):
+            text_actor = caption.GetTextActor()
+            text_actor.SetTextScaleModeToNone()
+            text_actor.GetTextProperty().SetFontSize(font_size)
+
+    def _active_draw_origin_normal(self) -> Tuple[Tuple[float, float, float], Tuple[float, float, float]]:
+        if self._custom_plane_active:
+            return tuple(self._custom_plane_origin), tuple(self._custom_plane_normal)
+        return tuple(PLANE_ORIGIN[self._draw_plane]), tuple(PLANE_NORMAL[self._draw_plane])
+
+    def _plane_basis_from_normal(self, normal: tuple) -> Tuple[tuple, tuple, tuple]:
+        nx, ny, nz = [float(v) for v in normal]
+        mag = math.sqrt(nx * nx + ny * ny + nz * nz)
+        if mag < 1e-12:
+            n = (0.0, 0.0, 1.0)
+        else:
+            n = (nx / mag, ny / mag, nz / mag)
+
+        ref = (0.0, 0.0, 1.0) if abs(n[2]) < 0.99 else (0.0, 1.0, 0.0)
+        x = (
+            ref[1] * n[2] - ref[2] * n[1],
+            ref[2] * n[0] - ref[0] * n[2],
+            ref[0] * n[1] - ref[1] * n[0],
+        )
+        xm = math.sqrt(x[0] * x[0] + x[1] * x[1] + x[2] * x[2])
+        if xm < 1e-12:
+            x = (1.0, 0.0, 0.0)
+        else:
+            x = (x[0] / xm, x[1] / xm, x[2] / xm)
+
+        y = (
+            n[1] * x[2] - n[2] * x[1],
+            n[2] * x[0] - n[0] * x[2],
+            n[0] * x[1] - n[1] * x[0],
+        )
+        ym = math.sqrt(y[0] * y[0] + y[1] * y[1] + y[2] * y[2])
+        if ym < 1e-12:
+            y = (0.0, 1.0, 0.0)
+        else:
+            y = (y[0] / ym, y[1] / ym, y[2] / ym)
+        return x, y, n
+
+    def _update_plane_triad_actor(self) -> None:
+        if self._plane_triad_actor is None:
+            return
+
+        self._update_plane_triad_text_size()
+
+        self._plane_triad_actor.SetVisibility(1 if self._plane_triad_visible else 0)
+        if not self._plane_triad_visible:
+            return
+
+        origin, normal = self._active_draw_origin_normal()
+        x_axis, y_axis, z_axis = self._plane_basis_from_normal(normal)
+
+        m = vtk.vtkMatrix4x4()
+        m.Identity()
+        m.SetElement(0, 0, x_axis[0]); m.SetElement(1, 0, x_axis[1]); m.SetElement(2, 0, x_axis[2])
+        m.SetElement(0, 1, y_axis[0]); m.SetElement(1, 1, y_axis[1]); m.SetElement(2, 1, y_axis[2])
+        m.SetElement(0, 2, z_axis[0]); m.SetElement(1, 2, z_axis[1]); m.SetElement(2, 2, z_axis[2])
+        m.SetElement(0, 3, float(origin[0]))
+        m.SetElement(1, 3, float(origin[1]))
+        m.SetElement(2, 3, float(origin[2]))
+
+        tfm = vtk.vtkTransform()
+        tfm.SetMatrix(m)
+        self._plane_triad_actor.SetUserTransform(tfm)
+
+        cam = self._renderer.GetActiveCamera()
+        cam_pos = cam.GetPosition()
+        dist = math.sqrt(
+            (cam_pos[0] - origin[0]) ** 2 +
+            (cam_pos[1] - origin[1]) ** 2 +
+            (cam_pos[2] - origin[2]) ** 2
+        )
+        desired = dist * 0.08
+        min_len = max(self._plane_triad_size * 0.5, 1e-6)
+        max_len = max(self._plane_triad_size * 1.5, min_len)
+        triad_len = max(min_len, min(max_len, desired))
+        self._plane_triad_actor.SetTotalLength(triad_len, triad_len, triad_len)
 
     # ──────────────────────────────────────────────────────── camera state
     def get_camera_state(self) -> dict:
@@ -241,6 +378,7 @@ class Viewport3DWidget(QWidget):
         # Ricostruisci la griglia su questo piano
         self.scene._grid_plane = "CUSTOM"
         self.scene._rebuild_grid()
+        self._update_plane_triad_actor()
         self.status_message.emit(
             f"Reference plane set: origin {origin}  normal {normal}"
         )
@@ -251,6 +389,7 @@ class Viewport3DWidget(QWidget):
         # Ricostruisci la griglia sul piano selezionato
         self.scene._grid_plane = self._draw_plane if hasattr(self, '_draw_plane') else "XY"
         self.scene._rebuild_grid()
+        self._update_plane_triad_actor()
         self.status_message.emit("Reference plane reset to axis-aligned plane.")
 
     # ─────────────────────────────────────────────────── selection mode
@@ -442,20 +581,32 @@ class Viewport3DWidget(QWidget):
         dist = math.sqrt((px - closest[0])**2 + (py - closest[1])**2 + (pz - closest[2])**2)
         return closest, dist
 
-    def _snap_to_visible_geometry(self, sx: int, sy: int, fallback_pt: tuple) -> tuple | None:
-        """Try vertex/edge/face snapping against visible geometry under the cursor."""
-        # Vertex snap has highest priority.
-        point_picker = vtk.vtkPointPicker()
-        point_picker.SetTolerance(0.01)
-        point_picker.Pick(sx, sy, 0, self._renderer)
-        point_actor = point_picker.GetActor()
-        point_id = point_picker.GetPointId()
-        if point_actor is not None and point_id >= 0 and point_picker.GetDataSet() is not None:
-            local = point_picker.GetDataSet().GetPoint(point_id)
-            world = point_actor.GetMatrix().MultiplyPoint([local[0], local[1], local[2], 1.0])
-            return tuple(self._project_point_to_draw_plane((world[0], world[1], world[2])))
+    def _snap_to_visible_geometry(self, sx: int, sy: int, fallback_pt: tuple, snap_mode: str = "all") -> tuple | None:
+        """Try snapping against visible geometry using the requested filter.
 
-        # Edge / face snap: use the picked cell and prefer the nearest edge if close enough.
+        snap_mode: 'all' | 'vertex' | 'edge' | 'face'
+        """
+        mode = str(snap_mode or "all").strip().lower()
+        if mode == "object":
+            mode = "all"
+        if mode not in {"all", "vertex", "edge", "face"}:
+            mode = "all"
+
+        # Vertex-only or ALL: vertex snap has highest priority.
+        if mode in {"all", "vertex"}:
+            point_picker = vtk.vtkPointPicker()
+            point_picker.SetTolerance(0.01)
+            point_picker.Pick(sx, sy, 0, self._renderer)
+            point_actor = point_picker.GetActor()
+            point_id = point_picker.GetPointId()
+            if point_actor is not None and point_id >= 0 and point_picker.GetDataSet() is not None:
+                local = point_picker.GetDataSet().GetPoint(point_id)
+                world = point_actor.GetMatrix().MultiplyPoint([local[0], local[1], local[2], 1.0])
+                return (tuple(self._project_point_to_draw_plane((world[0], world[1], world[2]))), "vertex")
+            if mode == "vertex":
+                return None
+
+        # Edge / face snap: use the picked cell and evaluate based on filter.
         cell_picker = vtk.vtkCellPicker()
         cell_picker.SetTolerance(0.005)
         cell_picker.Pick(sx, sy, 0, self._renderer)
@@ -467,7 +618,8 @@ class Viewport3DWidget(QWidget):
 
         pos = cell_picker.GetPickPosition()
         cell = ds.GetCell(cell_id)
-        if cell is not None and cell.GetNumberOfEdges() > 0:
+
+        if mode in {"all", "edge"} and cell is not None and cell.GetNumberOfEdges() > 0:
             m = actor.GetMatrix()
             inv = vtk.vtkMatrix4x4()
             vtk.vtkMatrix4x4.Invert(m, inv)
@@ -486,21 +638,40 @@ class Viewport3DWidget(QWidget):
             edge_threshold = max(self._grid_spacing * 0.05, 0.25)
             if best_edge is not None and best_dist <= edge_threshold:
                 world = m.MultiplyPoint([best_edge[0], best_edge[1], best_edge[2], 1.0])
-                return tuple(self._project_point_to_draw_plane((world[0], world[1], world[2])))
+                return (tuple(self._project_point_to_draw_plane((world[0], world[1], world[2]))), "edge")
+            if mode == "edge":
+                return None
 
-        return tuple(self._project_point_to_draw_plane(pos))
+        if mode in {"all", "face"}:
+            return (tuple(self._project_point_to_draw_plane(pos)), "surface")
+
+        return None
 
     def _drawing_snap_point(self, sx: int, sy: int) -> Optional[tuple]:
-        """Return a drawing point on the active plane, snapped to visible geometry if possible."""
+        """Return a drawing point on the active plane using Select filter for snap."""
         plane_pt = self._ray_plane_intersect(sx, sy)
         if plane_pt is None:
             return None
 
-        geometry_pt = self._snap_to_visible_geometry(sx, sy, plane_pt)
+        snap_mode = self._selection_mode if self._selection_mode != "object" else "all"
+        geometry_pt = self._snap_to_visible_geometry(sx, sy, plane_pt, snap_mode=snap_mode)
         if geometry_pt is not None:
-            return geometry_pt
+            pt, kind = geometry_pt
+            self._last_drawing_snap_kind = str(kind)
+            return pt
 
+        self._last_drawing_snap_kind = "grid"
         return self._snap(plane_pt)
+
+    def _drawing_snap_status_suffix(self) -> str:
+        kind = str(getattr(self, "_last_drawing_snap_kind", "grid")).strip().lower()
+        labels = {
+            "vertex": "Vertex",
+            "edge": "Edge",
+            "surface": "Surface",
+            "grid": "Grid",
+        }
+        return f" | snap: {labels.get(kind, kind.title() or 'Grid')}"
 
     def _height_from_cursor(
         self, screen_x: int, screen_y: int, base_z: float
@@ -539,6 +710,33 @@ class Viewport3DWidget(QWidget):
         if self._preview_actor:
             self._renderer.RemoveActor(self._preview_actor)
             self._preview_actor = None
+
+    def _clear_selection_point_markers(self) -> None:
+        for a in self._selection_point_actors:
+            self._renderer.RemoveActor(a)
+        self._selection_point_actors = []
+
+    def _add_selection_point_marker(self, world_pt: tuple) -> None:
+        pts = vtk.vtkPoints()
+        pts.InsertNextPoint(world_pt[0], world_pt[1], world_pt[2])
+        verts = vtk.vtkCellArray()
+        verts.InsertNextCell(1)
+        verts.InsertCellPoint(0)
+        poly = vtk.vtkPolyData()
+        poly.SetPoints(pts)
+        poly.SetVerts(verts)
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(poly)
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(1.0, 0.05, 0.05)
+        actor.GetProperty().SetPointSize(7.0)
+        actor.GetProperty().RenderPointsAsSpheresOn()
+        actor.PickableOff()
+
+        self._renderer.AddActor(actor)
+        self._selection_point_actors.append(actor)
 
     def _set_preview(self, actor: vtk.vtkActor) -> None:
         self._remove_preview()
@@ -854,6 +1052,8 @@ class Viewport3DWidget(QWidget):
             self._fsm_torus_click(pt, sx, sy, state)
         elif mode == "ellipsoid":
             self._fsm_ellipsoid_click(pt, sx, sy, state)
+        elif mode == "planar":
+            self._fsm_planar_click(pt, sx, sy, state)
 
     def _drawing_preview(self, sx: int, sy: int) -> None:
         mode  = self._draw_mode
@@ -876,6 +1076,8 @@ class Viewport3DWidget(QWidget):
             self._fsm_torus_preview(sx, sy, state)
         elif mode == "ellipsoid":
             self._fsm_ellipsoid_preview(sx, sy, state)
+        elif mode == "planar":
+            self._fsm_planar_preview(sx, sy, state)
         self._render()
 
     # ────────────── BOX FSM ──────────────
@@ -914,7 +1116,7 @@ class Viewport3DWidget(QWidget):
             # Show flat base rect (height = 0)
             self._preview_box(p1[0], p1[1], p1[2], pt[0], pt[1], pt[2])
             coord_str = f"[{pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f}]"
-            self.status_message.emit(f"Box: second corner {coord_str}")
+            self.status_message.emit(f"Box: second corner {coord_str}{self._drawing_snap_status_suffix()}")
         elif state == 2:
             p1 = self._draw_pts[0]
             p2 = list(self._draw_pts[1])
@@ -922,7 +1124,7 @@ class Viewport3DWidget(QWidget):
             h = self._height_from_cursor(sx, sy, p1[axis_idx]) or 0.1
             p2[axis_idx] = p1[axis_idx] + h
             self._preview_box(p1[0], p1[1], p1[2], p2[0], p2[1], p2[2])
-            self.status_message.emit(f"Box: height = {h:.2f} {self._units}")
+            self.status_message.emit(f"Box: height = {h:.2f} {self._units}{self._drawing_snap_status_suffix()}")
 
     # ────────────── CYLINDER FSM ──────────────
     def _fsm_cylinder_click(self, pt, sx, sy, state):
@@ -968,13 +1170,13 @@ class Viewport3DWidget(QWidget):
             r = self._plane_radius(pt, base) or 0.1
             # Show thin disk at the base (h≈0 so no offset needed)
             self._preview_cylinder(base[0], base[1], base[2], r, max(r * 0.05, 0.05), axis)
-            self.status_message.emit(f"Cylinder: radius = {r:.2f} {self._units}")
+            self.status_message.emit(f"Cylinder: radius = {r:.2f} {self._units}{self._drawing_snap_status_suffix()}")
         elif state == 2:
             r = self._draw_pts[1]
             h = self._height_from_cursor(sx, sy, base[axis_idx]) or 0.1
             geom = self._geom_center_from_base(base, h, axis)
             self._preview_cylinder(geom[0], geom[1], geom[2], r, abs(h), axis)
-            self.status_message.emit(f"Cylinder: height = {h:.2f} {self._units}")
+            self.status_message.emit(f"Cylinder: height = {h:.2f} {self._units}{self._drawing_snap_status_suffix()}")
 
     # ────────────── CONE FSM ──────────────
     def _fsm_cone_click(self, pt, sx, sy, state):
@@ -1019,13 +1221,13 @@ class Viewport3DWidget(QWidget):
                 return
             r = self._plane_radius(pt, base) or 0.1
             self._preview_cone(base[0], base[1], base[2], r, max(r * 0.5, 0.1), axis)
-            self.status_message.emit(f"Cone: radius = {r:.2f} {self._units}")
+            self.status_message.emit(f"Cone: radius = {r:.2f} {self._units}{self._drawing_snap_status_suffix()}")
         elif state == 2:
             r = self._draw_pts[1]
             h = self._height_from_cursor(sx, sy, base[axis_idx]) or 0.1
             geom = self._geom_center_from_base(base, h, axis)
             self._preview_cone(geom[0], geom[1], geom[2], r, abs(h), axis)
-            self.status_message.emit(f"Cone: height = {h:.2f} {self._units}")
+            self.status_message.emit(f"Cone: height = {h:.2f} {self._units}{self._drawing_snap_status_suffix()}")
 
     # ────────────── SPHERE FSM ──────────────
     def _fsm_sphere_click(self, pt, sx, sy, state):
@@ -1054,7 +1256,7 @@ class Viewport3DWidget(QWidget):
                 return
             r = self._plane_radius(pt, ctr) or 0.1
             self._preview_sphere(ctr[0], ctr[1], ctr[2], r)
-            self.status_message.emit(f"Sphere: radius = {r:.2f} {self._units}")
+            self.status_message.emit(f"Sphere: radius = {r:.2f} {self._units}{self._drawing_snap_status_suffix()}")
 
     # ────────────── PLATE FSM (thin box) ──────────────────────────────
     def _fsm_plate_click(self, pt, sx, sy, state):
@@ -1087,7 +1289,7 @@ class Viewport3DWidget(QWidget):
                 return
             p1 = self._draw_pts[0]
             self._preview_box(p1[0], p1[1], p1[2], pt[0], pt[1], pt[2])
-            self.status_message.emit(f"Plate: second corner [{pt[0]:.1f}, {pt[1]:.1f}]")
+            self.status_message.emit(f"Plate: second corner [{pt[0]:.1f}, {pt[1]:.1f}]{self._drawing_snap_status_suffix()}")
         elif state == 2:
             p1 = self._draw_pts[0]
             p2 = list(self._draw_pts[1])
@@ -1095,7 +1297,7 @@ class Viewport3DWidget(QWidget):
             thick = self._height_from_cursor(sx, sy, p1[axis_idx]) or 0.01
             p2[axis_idx] = p1[axis_idx] + thick
             self._preview_box(p1[0], p1[1], p1[2], p2[0], p2[1], p2[2])
-            self.status_message.emit(f"Plate: thickness = {abs(thick):.3f} {self._units}")
+            self.status_message.emit(f"Plate: thickness = {abs(thick):.3f} {self._units}{self._drawing_snap_status_suffix()}")
 
     # ────────────── PYRAMID FSM ──────────────────────────────────
     def _fsm_pyramid_click(self, pt, sx, sy, state):
@@ -1130,11 +1332,11 @@ class Viewport3DWidget(QWidget):
             if pt is None:
                 return
             r = self._plane_radius(pt, base) or 0.1
-            self.status_message.emit(f"Pyramid: base radius = {r:.2f} {self._units}")
+            self.status_message.emit(f"Pyramid: base radius = {r:.2f} {self._units}{self._drawing_snap_status_suffix()}")
         elif state == 2:
             r = self._draw_pts[1]
             h = self._height_from_cursor(sx, sy, base[axis_idx]) or 0.1
-            self.status_message.emit(f"Pyramid: height = {abs(h):.2f} {self._units}")
+            self.status_message.emit(f"Pyramid: height = {abs(h):.2f} {self._units}{self._drawing_snap_status_suffix()}")
 
     # ────────────── WEDGE FSM ──────────────────────────────────
     def _fsm_wedge_click(self, pt, sx, sy, state):
@@ -1198,7 +1400,7 @@ class Viewport3DWidget(QWidget):
             if pt is None:
                 return
             r = self._plane_radius(pt, ctr) or 0.1
-            self.status_message.emit(f"Torus: major radius = {r:.2f} {self._units}")
+            self.status_message.emit(f"Torus: major radius = {r:.2f} {self._units}{self._drawing_snap_status_suffix()}")
 
     # ────────────── ELLIPSOID FSM ──────────────────────────────────
     def _fsm_ellipsoid_click(self, pt, sx, sy, state):
@@ -1245,16 +1447,61 @@ class Viewport3DWidget(QWidget):
                 return
             r = self._plane_radius(pt, ctr) or 0.1
             self._preview_sphere(ctr[0], ctr[1], ctr[2], r)
-            self.status_message.emit(f"Ellipsoid: plane radius = {r:.2f} {self._units}")
+            self.status_message.emit(f"Ellipsoid: plane radius = {r:.2f} {self._units}{self._drawing_snap_status_suffix()}")
         elif state == 2:
             r = self._draw_pts[1]
             axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
             h_r = self._height_from_cursor(sx, sy, ctr[axis_idx]) or r
-            self.status_message.emit(f"Ellipsoid: height radius = {abs(h_r):.2f} {self._units}")
+            self.status_message.emit(f"Ellipsoid: height radius = {abs(h_r):.2f} {self._units}{self._drawing_snap_status_suffix()}")
+
+    # ────────────── PLANAR FSM (2-point planar structure) ─────────────────────
+    def _fsm_planar_click(self, pt, sx, sy, state):
+        if state == 0:
+            self._draw_pts = [pt]
+            self._draw_state = 1
+            self._clear_selection_point_markers()
+            self._add_selection_point_marker(pt)
+            self.status_message.emit(
+                "Planar: drag on plane and pick second point (vertex/edge/face snap)"
+            )
+        elif state == 1:
+            self._draw_pts.append(pt)
+            self._add_selection_point_marker(pt)
+
+            p1 = self._draw_pts[0]
+            p2 = list(self._draw_pts[1])
+            thickness = max(self._grid_spacing * 0.01, 1e-6)
+            axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
+            p2[axis_idx] = p1[axis_idx] + thickness
+
+            obj = PlateObject(
+                material=self._draw_material,
+                x1=p1[0], y1=p1[1], z1=p1[2],
+                x2=p2[0], y2=p2[1], z2=p2[2],
+            )
+            self._finish_object(obj)
+
+    def _fsm_planar_preview(self, sx, sy, state):
+        if state != 1:
+            return
+        pt = self._drawing_snap_point(sx, sy)
+        if pt is None:
+            return
+
+        p1 = self._draw_pts[0]
+        p2 = list(pt)
+        thickness = max(self._grid_spacing * 0.01, 1e-6)
+        axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
+        p2[axis_idx] = p1[axis_idx] + thickness
+        self._preview_box(p1[0], p1[1], p1[2], p2[0], p2[1], p2[2])
+        self.status_message.emit(
+            f"Planar: second point [{pt[0]:.2f}, {pt[1]:.2f}, {pt[2]:.2f}]{self._drawing_snap_status_suffix()}"
+        )
 
     # ──────────────────────────────────────────────────────── finish / cancel
     def _finish_object(self, obj: EMObject) -> None:
         self._remove_preview()
+        self._clear_selection_point_markers()
         self.scene.add_object(obj)
         self.scene.select(obj)
         self.object_selected.emit(obj)
@@ -1271,6 +1518,7 @@ class Viewport3DWidget(QWidget):
 
     def _cancel_draw(self) -> None:
         self._remove_preview()
+        self._clear_selection_point_markers()
         self._draw_mode  = None
         self._draw_state = 0
         self._draw_pts   = []

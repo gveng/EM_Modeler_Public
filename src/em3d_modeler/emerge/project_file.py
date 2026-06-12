@@ -25,6 +25,7 @@ class ProjectFile:
         project_materials: list | None = None,
         global_material_db_path: str | None = None,
         camera: dict | None = None,
+        display_settings: dict | None = None,
     ) -> None:
         data = {
             "version":      ProjectFile.VERSION,
@@ -42,6 +43,7 @@ class ProjectFile:
             "project_materials": project_materials or [],
             "global_material_db_path": global_material_db_path,
             "camera": camera or {},
+            "display_settings": display_settings or {},
         }
         Path(path).write_text(json.dumps(data, indent=2), encoding="utf-8")
 

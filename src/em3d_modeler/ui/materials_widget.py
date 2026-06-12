@@ -19,6 +19,8 @@ from ..scene.em_objects import EMObject
 _ROLE_OBJ_ID      = Qt.UserRole       # int(id(EMObject))
 _ROLE_PLANE_ID    = Qt.UserRole + 1   # int(id(ReferencePlane))
 _ROLE_PLANES_ROOT = Qt.UserRole + 2   # True on the "Reference Planes" root node
+_ROLE_PLANE_TRIAD = Qt.UserRole + 3   # bool on the "Plane XYZ Triad" row
+_ROLE_GRID_VISIBLE = Qt.UserRole + 4  # bool on the "Grid" row
 
 
 class MaterialsWidget(QWidget):
@@ -30,9 +32,13 @@ class MaterialsWidget(QWidget):
     plane_delete      = pyqtSignal(object)   # ReferencePlane
     plane_rename      = pyqtSignal(object, str)  # ReferencePlane, new_name
     plane_add_requested = pyqtSignal()       # user wants to add a new reference plane
+    plane_triad_visibility_changed = pyqtSignal(bool)  # show/hide plane XYZ triad
+    grid_visibility_changed = pyqtSignal(bool)  # show/hide grid
     objects_hide      = pyqtSignal(list)     # List[EMObject]
     objects_show      = pyqtSignal(list)     # List[EMObject]
+    objects_model_role_changed = pyqtSignal(list, bool)  # List[EMObject], is_model
     object_rename     = pyqtSignal(object, str)  # EMObject, new_name
+    objects_bulk_rename = pyqtSignal(list, str, int)  # List[EMObject], base_name, start_index
     assign_port_requested = pyqtSignal(object)   # EMObject
     assign_boundary_requested = pyqtSignal(object)  # EMObject
 
@@ -65,7 +71,9 @@ class MaterialsWidget(QWidget):
     # ─────────────────────────────────────────────────── public API
     def refresh(self, by_material: Dict[str, List[EMObject]],
                 planes: Optional[List] = None,
-                active_plane=None) -> None:
+                active_plane=None,
+                plane_triad_visible: bool = True,
+                grid_visible: bool = True) -> None:
         """Rebuild the tree.
 
         Parameters
@@ -95,6 +103,19 @@ class MaterialsWidget(QWidget):
             self._tree.addTopLevelItem(planes_root)
             # Always keep expanded (user can manually close)
             planes_root.setExpanded(True)
+
+            triad_marker = "\u2611" if plane_triad_visible else "\u2610"
+            triad_item = QTreeWidgetItem([f"{triad_marker} Plane XYZ Triad"])
+            triad_item.setData(0, _ROLE_PLANE_TRIAD, bool(plane_triad_visible))
+            triad_item.setToolTip(0, "Show/Hide the XYZ triad attached to the active reference plane.")
+            planes_root.addChild(triad_item)
+
+            grid_marker = "\u2611" if grid_visible else "\u2610"
+            grid_item = QTreeWidgetItem([f"{grid_marker} Grid"])
+            grid_item.setData(0, _ROLE_GRID_VISIBLE, bool(grid_visible))
+            grid_item.setToolTip(0, "Show/Hide reference-plane grid.")
+            planes_root.addChild(grid_item)
+
             for p in planes:
                 is_active = (active_plane is p)
                 marker = "\u2605 " if is_active else "   "
@@ -121,7 +142,11 @@ class MaterialsWidget(QWidget):
             # Always keep expanded (user can manually close)
             mat_item.setExpanded(True)
             for obj in objects:
-                label = obj.name if obj.is_visible() else f"{obj.name}  [hidden]"
+                label = obj.name
+                if not bool(getattr(obj, "is_model", True)):
+                    label += "  [NON MODEL]"
+                if not obj.is_visible():
+                    label += "  [hidden]"
                 child = QTreeWidgetItem([label])
                 child.setData(0, _ROLE_OBJ_ID, id(obj))
                 mat_item.addChild(child)
@@ -152,6 +177,16 @@ class MaterialsWidget(QWidget):
 
     # ─────────────────────────────────────────────────── events
     def _on_item_click(self, item: QTreeWidgetItem, _col: int) -> None:
+        triad_flag = item.data(0, _ROLE_PLANE_TRIAD)
+        if triad_flag is not None:
+            self.plane_triad_visibility_changed.emit(not bool(triad_flag))
+            return
+
+        grid_flag = item.data(0, _ROLE_GRID_VISIBLE)
+        if grid_flag is not None:
+            self.grid_visibility_changed.emit(not bool(grid_flag))
+            return
+
         obj_id = item.data(0, _ROLE_OBJ_ID)
         if obj_id is None:
             return
@@ -181,6 +216,30 @@ class MaterialsWidget(QWidget):
         obj_id = item.data(0, _ROLE_OBJ_ID)
         if obj_id is not None:
             self._show_object_context_menu(item, pos)
+            return
+
+        triad_flag = item.data(0, _ROLE_PLANE_TRIAD)
+        if triad_flag is not None:
+            menu = QMenu(self._tree)
+            if bool(triad_flag):
+                act_toggle = QAction("Hide Plane XYZ Triad", menu)
+            else:
+                act_toggle = QAction("Show Plane XYZ Triad", menu)
+            act_toggle.triggered.connect(lambda: self.plane_triad_visibility_changed.emit(not bool(triad_flag)))
+            menu.addAction(act_toggle)
+            menu.exec_(self._tree.viewport().mapToGlobal(pos))
+            return
+
+        grid_flag = item.data(0, _ROLE_GRID_VISIBLE)
+        if grid_flag is not None:
+            menu = QMenu(self._tree)
+            if bool(grid_flag):
+                act_toggle = QAction("Hide Grid", menu)
+            else:
+                act_toggle = QAction("Show Grid", menu)
+            act_toggle.triggered.connect(lambda: self.grid_visibility_changed.emit(not bool(grid_flag)))
+            menu.addAction(act_toggle)
+            menu.exec_(self._tree.viewport().mapToGlobal(pos))
             return
 
         # ── Reference Planes root header ──────────────────────────────────
@@ -262,6 +321,22 @@ class MaterialsWidget(QWidget):
 
             menu.addSeparator()
 
+        if len(objs) >= 2:
+            act_bulk_rename = QAction(f"Bulk Rename {len(objs)} objects…", menu)
+            act_bulk_rename.triggered.connect(lambda: self._bulk_rename_dialog(list(objs)))
+            menu.addAction(act_bulk_rename)
+            menu.addSeparator()
+
+        act_set_model = QAction("Set as MODEL", menu)
+        act_set_model.triggered.connect(lambda: self.objects_model_role_changed.emit(list(objs), True))
+        menu.addAction(act_set_model)
+
+        act_set_non_model = QAction("Set as NON MODEL", menu)
+        act_set_non_model.triggered.connect(lambda: self.objects_model_role_changed.emit(list(objs), False))
+        menu.addAction(act_set_non_model)
+
+        menu.addSeparator()
+
         act_hide = QAction("Hide Selected", menu)
         act_hide.triggered.connect(lambda: self.objects_hide.emit(list(objs)))
         menu.addAction(act_hide)
@@ -271,6 +346,38 @@ class MaterialsWidget(QWidget):
         menu.addAction(act_show)
 
         menu.exec_(self._tree.viewport().mapToGlobal(pos))
+
+    def _bulk_rename_dialog(self, objs: list) -> None:
+        from PyQt5.QtWidgets import (
+            QDialog, QFormLayout, QLineEdit, QSpinBox,
+            QDialogButtonBox, QLabel,
+        )
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Bulk Rename ({len(objs)} objects)")
+        form = QFormLayout(dlg)
+
+        le_name = QLineEdit()
+        le_name.setPlaceholderText("e.g. Part")
+        form.addRow("Base name", le_name)
+
+        sb_start = QSpinBox()
+        sb_start.setRange(0, 999999)
+        sb_start.setValue(1)
+        form.addRow("Start index", sb_start)
+
+        note = QLabel(f"Objects will be renamed: <b>&lt;name&gt;_1</b>, <b>&lt;name&gt;_2</b>, …")
+        note.setWordWrap(True)
+        form.addRow("", note)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        form.addRow(btns)
+
+        if dlg.exec_() == QDialog.Accepted:
+            base = le_name.text().strip()
+            if base:
+                self.objects_bulk_rename.emit(list(objs), base, int(sb_start.value()))
 
     def _rename_object(self, obj: EMObject) -> None:
         new_name, ok = QInputDialog.getText(

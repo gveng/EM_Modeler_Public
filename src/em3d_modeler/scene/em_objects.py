@@ -13,6 +13,8 @@ MATERIAL_COLORS: Dict[str, tuple] = {
     "Custom":    (0.80, 0.70, 0.60),
 }
 
+SELECTION_COLOR: tuple = (0.62, 0.34, 0.85)
+
 _OBJECT_COUNTER: Dict[str, int] = {}
 
 
@@ -21,12 +23,19 @@ def _auto_name(prefix: str) -> str:
     return f"{prefix}_{_OBJECT_COUNTER[prefix]}"
 
 
+def set_selection_color(color: tuple) -> None:
+    global SELECTION_COLOR
+    if isinstance(color, tuple) and len(color) == 3:
+        SELECTION_COLOR = tuple(float(v) for v in color)
+
+
 class EMObject:
     """Base class for all EM scene objects."""
 
     def __init__(self, name: str, material: str = "PEC"):
         self.name = name
         self.material = material
+        self.is_model: bool = True
         self.opacity: float = 0.85
         self.custom_color: tuple | None = None  # Optional (R, G, B) override; if set, overrides material color
         self._selected: bool = False
@@ -93,9 +102,13 @@ class EMObject:
                 prop.EdgeVisibilityOn()
                 prop.SetEdgeColor(r * 0.6, g * 0.6, b * 0.6)
             elif sel:
-                prop.SetColor(1.0, 0.78, 0.0)
+                prop.SetColor(*SELECTION_COLOR)
                 prop.SetLineWidth(2.5)
-                prop.SetEdgeColor(0.8, 0.4, 0.0)
+                prop.SetEdgeColor(
+                    max(SELECTION_COLOR[0] * 0.65, 0.0),
+                    max(SELECTION_COLOR[1] * 0.65, 0.0),
+                    max(SELECTION_COLOR[2] * 0.65, 0.0),
+                )
             else:
                 self._apply_appearance(self._actor)
 
@@ -1042,10 +1055,19 @@ class MeshObject(EMObject):
                  material: str = "PEC",
                  color: tuple | None = None,
                  step_source_path: str | None = None,
-                 step_solid_name: str | None = None):
+                 step_solid_name: str | None = None,
+                 boolean_op: str | None = None,
+                 boolean_source_names: List[str] | None = None,
+                 boolean_sources_data: List[Dict[str, Any]] | None = None):
         self._polydata = polydata
         self.step_source_path = step_source_path
         self.step_solid_name = step_solid_name or (name or "")
+        self.step_geometry_modified = False
+        self.step_export_offset = (0.0, 0.0, 0.0)
+        self.source_objects: List[EMObject] = []
+        self.boolean_op = str(boolean_op or "").strip().lower() or None
+        self.boolean_source_names = [str(x) for x in (boolean_source_names or []) if str(x)]
+        self.boolean_sources_data = [x for x in (boolean_sources_data or []) if isinstance(x, dict)]
         super().__init__(name or _auto_name("Mesh"), material)
         if color is not None:
             self.custom_color = color
@@ -1068,6 +1090,17 @@ class MeshObject(EMObject):
             p["StepSourcePath"] = str(self.step_source_path)
         if self.step_solid_name:
             p["StepSolidName"] = str(self.step_solid_name)
+        if self.step_geometry_modified:
+            p["StepGeometryModified"] = True
+        ox, oy, oz = self.step_export_offset
+        if abs(float(ox)) > 1e-12 or abs(float(oy)) > 1e-12 or abs(float(oz)) > 1e-12:
+            p["StepExportOffset"] = [float(ox), float(oy), float(oz)]
+        if self.boolean_op:
+            p["BooleanOperation"] = str(self.boolean_op)
+        if self.boolean_source_names:
+            p["BooleanSourceNames"] = list(self.boolean_source_names)
+        if self.boolean_sources_data:
+            p["BooleanSourcesData"] = list(self.boolean_sources_data)
         if self.custom_color is not None:
             p["Color"] = f"#{int(self.custom_color[0]*255):02x}{int(self.custom_color[1]*255):02x}{int(self.custom_color[2]*255):02x}"
         return p
@@ -1077,6 +1110,20 @@ class MeshObject(EMObject):
         self.opacity  = float(params.get("Opacity", self.opacity))
         self.step_source_path = params.get("StepSourcePath", self.step_source_path)
         self.step_solid_name = params.get("StepSolidName", self.step_solid_name)
+        self.step_geometry_modified = bool(params.get("StepGeometryModified", self.step_geometry_modified))
+        off = params.get("StepExportOffset", self.step_export_offset)
+        if isinstance(off, (list, tuple)) and len(off) == 3:
+            try:
+                self.step_export_offset = (float(off[0]), float(off[1]), float(off[2]))
+            except Exception:
+                pass
+        self.boolean_op = str(params.get("BooleanOperation", self.boolean_op or "")).strip().lower() or None
+        names = params.get("BooleanSourceNames", self.boolean_source_names)
+        if isinstance(names, list):
+            self.boolean_source_names = [str(x) for x in names if str(x)]
+        src_data = params.get("BooleanSourcesData", self.boolean_sources_data)
+        if isinstance(src_data, list):
+            self.boolean_sources_data = [x for x in src_data if isinstance(x, dict)]
         if "Color" in params:
             col = str(params["Color"]).strip()
             if col.startswith("#") and len(col) == 7:

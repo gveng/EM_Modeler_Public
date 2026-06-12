@@ -47,6 +47,15 @@ class EMInteractorStyle(vtk.vtkInteractorStyleUser):
             return iren.GetRenderWindow().GetRenderers().GetFirstRenderer()
         return None
 
+    def _stabilize_clipping(self, ren) -> None:
+        """Keep near clip conservative so close zoom does not hide geometry."""
+        ren.ResetCameraClippingRange()
+        cam = ren.GetActiveCamera()
+        near_far = cam.GetClippingRange()
+        near = max(float(near_far[0]) * 0.1, 1e-9)
+        far = max(float(near_far[1]), near * 1.01)
+        cam.SetClippingRange(near, far)
+
     # ----------------------------------------------------------- middle = rotate
     def _on_mid_press(self, _obj, _ev):
         iren = self.GetInteractor()
@@ -92,7 +101,7 @@ class EMInteractorStyle(vtk.vtkInteractorStyleUser):
         cam.Azimuth(-360.0 * dx / max(w, 1))
         cam.Elevation(-360.0 * dy / max(h, 1))   # negated: screen-Y grows downward
         cam.OrthogonalizeViewUp()
-        ren.ResetCameraClippingRange()
+        self._stabilize_clipping(ren)
 
     def _pan(self, dx: int, dy: int, ren) -> None:
         cam = ren.GetActiveCamera()
@@ -157,7 +166,7 @@ class EMInteractorStyle(vtk.vtkInteractorStyleUser):
             cam.SetParallelScale(cam.GetParallelScale() / factor)
         else:
             cam.Dolly(factor)
-            ren.ResetCameraClippingRange()
+            self._stabilize_clipping(ren)
 
         ren.SetWorldPoint(*cam.GetFocalPoint(), 1.0)
         ren.WorldToDisplay()
@@ -171,7 +180,7 @@ class EMInteractorStyle(vtk.vtkInteractorStyleUser):
             cam.SetPosition(pos[0] + delta[0], pos[1] + delta[1], pos[2] + delta[2])
             cam.SetFocalPoint(fp2[0] + delta[0], fp2[1] + delta[1], fp2[2] + delta[2])
 
-        ren.ResetCameraClippingRange()
+        self._stabilize_clipping(ren)
         iren.GetRenderWindow().Render()
 
     # ----------------------------------------------------------- left = draw/select

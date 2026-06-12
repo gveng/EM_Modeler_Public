@@ -326,6 +326,7 @@ class SceneManager:
                 "name": obj.name,
                 "params": obj.get_parameters(),
                 "visible": obj.is_visible(),
+                "is_model": bool(getattr(obj, "is_model", True)),
             }
             if isinstance(obj, MeshObject):
                 mesh_poly = None
@@ -340,6 +341,8 @@ class SceneManager:
         for obj in list(self.objects):
             self.remove_object(obj)
         self.selected = None
+
+        pending_boolean_sources: List[Tuple[MeshObject, List[str]]] = []
 
         for item in data:
             if not isinstance(item, dict):
@@ -367,12 +370,24 @@ class SceneManager:
                               p["CenterX"], p["CenterY"], p["CenterZ"],
                               p["Radius"], p.get("Material", "PEC"))
                 elif t == "MeshObject":
-                    mesh_poly = self._polydata_from_json(item.get("mesh"))
+                    mesh_blob = item.get("mesh")
+                    mesh_poly = self._polydata_from_json(mesh_blob)
                     obj = cls(item.get("name", ""),
                               mesh_poly,
                               p.get("Material", "PEC"),
                               step_source_path=p.get("StepSourcePath"),
-                              step_solid_name=p.get("StepSolidName"))
+                              step_solid_name=p.get("StepSolidName"),
+                              boolean_op=p.get("BooleanOperation"),
+                              boolean_source_names=p.get("BooleanSourceNames"),
+                              boolean_sources_data=p.get("BooleanSourcesData"))
+                    if hasattr(obj, "set_parameters"):
+                        obj.set_parameters(p)
+                    if (
+                        "StepGeometryModified" not in p
+                        and mesh_blob is not None
+                        and str(p.get("StepSourcePath", "") or "").strip()
+                    ):
+                        obj.step_geometry_modified = True
                 elif t == "PlateObject":
                     obj = cls(item.get("name", ""),
                               p["X1"], p["Y1"], p["Z1"],
@@ -415,9 +430,18 @@ class SceneManager:
                             pass
                 obj.refresh_appearance()
                 obj.set_visible(bool(item.get("visible", True)))
+                obj.is_model = bool(item.get("is_model", True))
                 self.add_object(obj)
+
+                if isinstance(obj, MeshObject) and obj.boolean_source_names:
+                    pending_boolean_sources.append((obj, list(obj.boolean_source_names)))
             except (KeyError, TypeError, ValueError):
                 pass
+
+        if pending_boolean_sources:
+            by_name = {o.name: o for o in self.objects}
+            for mesh_obj, names in pending_boolean_sources:
+                mesh_obj.source_objects = [by_name[n] for n in names if n in by_name]
 
     def clear(self) -> None:
         for obj in list(self.objects):

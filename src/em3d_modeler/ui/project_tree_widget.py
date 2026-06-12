@@ -28,7 +28,7 @@ from PyQt5.QtWidgets import (
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox,
     QMenu, QAction, QMessageBox,
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtCore import Qt, pyqtSignal, QLocale
 
 
 # ──────────────────────────────────────────────────────────────────── constants
@@ -38,7 +38,8 @@ _PORT_TYPES = ["WaveguidePort", "LumpedPort", "PlaneWave"]
 
 _PORT_TYPE_DEFAULT_PARAMS = {
     "WaveguidePort": {"Mode": "TE10", "Impedance_Ohm": 50.0, "Excitation": 1.0},
-    "LumpedPort": {"Resistance_Ohm": 50.0, "Voltage_V": 1.0},
+    "LumpedPort": {"Resistance_Ohm": 50.0, "Voltage_V": 1.0,
+                   "Direction_X": 0.0, "Direction_Y": 0.0, "Direction_Z": 0.0},
     "PlaneWave": {"Theta_Deg": 0.0, "Phi_Deg": 0.0, "Polarization": "Ex"},
 }
 
@@ -52,14 +53,69 @@ _OBJECT_BC_DEFAULT_PARAMS = {
     "Radiation": {"Order": 1},
 }
 
+_LOG_VERBOSITY_LEVELS = ["Debug", "Info", "Warning", "Error"]
+_SIMULATION_TYPES = ["Sweep", "Eigenmode", "Parametric"]
+
+
+def _default_simulation_item() -> Dict[str, Any]:
+    return {
+        "name": "Simulation_1",
+        "type": "Sweep",
+        "enabled": True,
+        "Fmin_GHz": 0.1,
+        "Fmax_GHz": 10.0,
+        "Fstep_GHz": 0.1,
+        "EigenmodeCount": 5,
+        "ParamName": "",
+        "ParamValues": "",
+        "LogVerbosity": "Info",
+    }
+
 _DEFAULT_SETTINGS: Dict[str, Any] = {
     "boundaries": {k: "PML" for k in _BOUNDARY_KEYS},
     "ports":      [],
     "object_boundaries": [],
-    "simulation": {"Fmin_GHz": 0.0, "Fmax_GHz": 10.0, "Fstep_GHz": 0.1},
+    "simulation": {"Fmin_GHz": 0.1, "Fmax_GHz": 10.0, "Fstep_GHz": 0.1, "LogVerbosity": "Info"},
+    "simulations": [_default_simulation_item()],
     "mesh":       {"MaxCellSize": 1.0, "MinCellSize": 0.05,
                    "LinesPerWavelength": 10},
 }
+
+_NUMERIC_LOCALE = QLocale.c()
+
+
+def set_numeric_locale(locale: QLocale) -> None:
+    global _NUMERIC_LOCALE
+    _NUMERIC_LOCALE = QLocale(locale)
+
+
+def _parse_locale_float(text: str) -> float:
+    s = str(text).strip()
+    val, ok = _NUMERIC_LOCALE.toDouble(s)  # val is float, ok is bool
+    if ok:
+        return float(val)
+
+    normalized = s.replace(" ", "").replace("\u00a0", "")
+    if "," in normalized and "." in normalized:
+        if normalized.rfind(",") > normalized.rfind("."):
+            normalized = normalized.replace(".", "").replace(",", ".")
+        else:
+            normalized = normalized.replace(",", "")
+    else:
+        normalized = normalized.replace(",", ".")
+    return float(normalized)
+
+
+def _parse_locale_int(text: str) -> int:
+    s = str(text).strip()
+    val, ok = _NUMERIC_LOCALE.toInt(s)  # FIX: val is int, ok is bool!
+    if ok:
+        return int(val)
+    return int(round(_parse_locale_float(s)))
+
+
+def _format_locale_number(value: float) -> str:
+    return _NUMERIC_LOCALE.toString(float(value), 'g', 12)
 
 
 class ProjectTreeWidget(QWidget):
@@ -79,8 +135,16 @@ class ProjectTreeWidget(QWidget):
         self._tree = QTreeWidget()
         self._tree.setColumnCount(2)
         self._tree.setHeaderLabels(["", ""])
-        self._tree.setHeaderHidden(True)
-        self._tree.header().setDefaultSectionSize(110)
+        
+        from PyQt5.QtWidgets import QHeaderView
+        header = self._tree.header()
+        header.setDefaultSectionSize(180)
+        header.setSectionResizeMode(0, QHeaderView.Interactive)
+        header.setSectionResizeMode(1, QHeaderView.Interactive)
+        header.setStretchLastSection(False)
+        self._tree.setHeaderHidden(False)
+        header.setVisible(False)
+        
         self._tree.setAlternatingRowColors(True)
         self._tree.setIndentation(10)  # Reduce indentation (default is 20)
         self._tree.itemDoubleClicked.connect(self._on_double_click)
@@ -99,6 +163,32 @@ class ProjectTreeWidget(QWidget):
     def get_settings(self) -> Dict[str, Any]:
         return _deep_copy(self._settings)
 
+    def get_log_verbosity(self) -> str:
+        sims = self._settings.get("simulations", [])
+        if isinstance(sims, list):
+            for sim in sims:
+                if not isinstance(sim, dict):
+                    continue
+                if bool(sim.get("enabled", True)):
+                    value = str(sim.get("LogVerbosity", "Info")).strip()
+                    return value if value in _LOG_VERBOSITY_LEVELS else "Info"
+        value = str(self._settings.get("simulation", {}).get("LogVerbosity", "Info")).strip()
+        return value if value in _LOG_VERBOSITY_LEVELS else "Info"
+
+    def set_log_verbosity(self, verbosity: str) -> None:
+        value = str(verbosity).strip().title()
+        if value not in _LOG_VERBOSITY_LEVELS:
+            value = "Info"
+        self._settings.setdefault("simulation", {})["LogVerbosity"] = value
+        sims = self._settings.get("simulations", [])
+        if isinstance(sims, list):
+            for sim in sims:
+                if isinstance(sim, dict):
+                    sim["LogVerbosity"] = value
+        self._sync_legacy_simulation_from_list()
+        self._populate()
+        self.settings_changed.emit()
+
     def load_settings(self, settings: Dict[str, Any]) -> None:
         loaded = _deep_copy(settings or {})
         merged = _deep_copy(_DEFAULT_SETTINGS)
@@ -114,8 +204,51 @@ class ProjectTreeWidget(QWidget):
         if not isinstance(merged.get("object_boundaries"), list):
             merged["object_boundaries"] = []
 
+        if not isinstance(merged.get("simulations"), list):
+            merged["simulations"] = []
+
+        # Backward compatibility: lift legacy single simulation dict into the new list model.
+        if not merged["simulations"]:
+            legacy_sim = merged.get("simulation", {})
+            if not isinstance(legacy_sim, dict):
+                legacy_sim = {}
+            sim = _default_simulation_item()
+            sim["name"] = "Simulation_1"
+            sim["type"] = "Sweep"
+            sim["enabled"] = True
+            sim["Fmin_GHz"] = float(legacy_sim.get("Fmin_GHz", sim["Fmin_GHz"]))
+            sim["Fmax_GHz"] = float(legacy_sim.get("Fmax_GHz", sim["Fmax_GHz"]))
+            sim["Fstep_GHz"] = float(legacy_sim.get("Fstep_GHz", sim["Fstep_GHz"]))
+            lv = str(legacy_sim.get("LogVerbosity", "Info")).strip().title()
+            sim["LogVerbosity"] = lv if lv in _LOG_VERBOSITY_LEVELS else "Info"
+            merged["simulations"] = [sim]
+
         self._settings = merged
+        self._sync_legacy_simulation_from_list()
         self._populate()
+
+    def _sync_legacy_simulation_from_list(self) -> None:
+        sims = self._settings.get("simulations", [])
+        if not isinstance(sims, list) or not sims:
+            return
+        chosen = None
+        for sim in sims:
+            if isinstance(sim, dict) and bool(sim.get("enabled", True)):
+                chosen = sim
+                break
+        if chosen is None and isinstance(sims[0], dict):
+            chosen = sims[0]
+        if not isinstance(chosen, dict):
+            return
+        self._settings.setdefault("simulation", {})
+        self._settings["simulation"].update(
+            {
+                "Fmin_GHz": float(chosen.get("Fmin_GHz", 0.1)),
+                "Fmax_GHz": float(chosen.get("Fmax_GHz", 10.0)),
+                "Fstep_GHz": float(chosen.get("Fstep_GHz", 0.1)),
+                "LogVerbosity": str(chosen.get("LogVerbosity", "Info")).strip().title(),
+            }
+        )
 
     # ─────────────────────────────────────────────────── build tree
     def _populate(self) -> None:
@@ -140,10 +273,8 @@ class ProjectTreeWidget(QWidget):
         # Ports
         self._refresh_ports()
 
-        # Simulation
-        sim = self._settings["simulation"]
-        for k, v in sim.items():
-            self._make_leaf(self._s_node, k, str(v), editable=True)
+        # Simulation list
+        self._refresh_simulations()
 
         # Mesh
         mesh = self._settings["mesh"]
@@ -186,6 +317,45 @@ class ProjectTreeWidget(QWidget):
         hint.setData(0, Qt.UserRole, "__add_port__")
         self._p_node.addChild(hint)
 
+    def _refresh_simulations(self) -> None:
+        self._s_node.takeChildren()
+        sims = self._settings.get("simulations", [])
+        if not isinstance(sims, list):
+            sims = []
+
+        for i, sim in enumerate(sims):
+            if not isinstance(sim, dict):
+                continue
+            name = str(sim.get("name", f"Simulation_{i+1}")).strip() or f"Simulation_{i+1}"
+            sim_type = str(sim.get("type", "Sweep")).strip().title()
+            enabled = bool(sim.get("enabled", True))
+            status = "On" if enabled else "Off"
+
+            if sim_type == "Eigenmode":
+                summary = f"modes={int(sim.get('EigenmodeCount', 5))}"
+            elif sim_type == "Parametric":
+                pname = str(sim.get("ParamName", "")).strip()
+                pvals = str(sim.get("ParamValues", "")).strip()
+                summary = f"{pname}={pvals}" if pname and pvals else (pname or pvals or "parametric")
+            else:
+                fmin = sim.get("Fmin_GHz", 0.1)
+                fmax = sim.get("Fmax_GHz", 10.0)
+                fstep = sim.get("Fstep_GHz", 0.1)
+                summary = f"{fmin:g}..{fmax:g} GHz step {fstep:g}"
+
+            label = f"{name} [{sim_type}] | {summary}"
+            row = QTreeWidgetItem([label, status])
+            row.setData(0, Qt.UserRole, ("__sim_idx__", i))
+            font = row.font(0)
+            font.setPointSize(max(8, font.pointSize() - 1))
+            row.setFont(0, font)
+            row.setFont(1, font)
+            self._s_node.addChild(row)
+
+        hint = QTreeWidgetItem(["Add Simulation... (double-click)", ""])
+        hint.setData(0, Qt.UserRole, "__add_sim__")
+        self._s_node.addChild(hint)
+
     def _refresh_object_boundaries(self) -> None:
         self._b_obj_node.takeChildren()
         for i, bc in enumerate(self._settings.get("object_boundaries", [])):
@@ -212,6 +382,9 @@ class ProjectTreeWidget(QWidget):
         if role == "__add_port__":
             self._add_port_dialog()
             return
+        if role == "__add_sim__":
+            self._add_simulation_dialog()
+            return
 
         if isinstance(role, tuple) and len(role) == 2:
             tag, idx = role
@@ -220,6 +393,9 @@ class ProjectTreeWidget(QWidget):
                 return
             if tag == "__bc_idx__":
                 self._edit_object_boundary_dialog(int(idx))
+                return
+            if tag == "__sim_idx__":
+                self._edit_simulation_dialog(int(idx))
                 return
 
         key = item.text(0)
@@ -230,8 +406,7 @@ class ProjectTreeWidget(QWidget):
             self._edit_boundary(item, key)
         # Simulation numeric
         elif parent is self._s_node:
-            self._edit_numeric(item, key, val,
-                               self._settings["simulation"])
+            return
         # Mesh numeric
         elif parent is self._m_node:
             self._edit_numeric(item, key, val,
@@ -265,6 +440,22 @@ class ProjectTreeWidget(QWidget):
 
             act_remove = QAction("Remove Assignment", menu)
             act_remove.triggered.connect(lambda: self._remove_object_boundary_assignment(int(idx)))
+            menu.addAction(act_remove)
+        elif tag == "__sim_idx__":
+            act_edit = QAction("Edit Simulation…", menu)
+            act_edit.triggered.connect(lambda: self._edit_simulation_dialog(int(idx)))
+            menu.addAction(act_edit)
+
+            sims = self._settings.get("simulations", [])
+            enabled = False
+            if isinstance(sims, list) and 0 <= int(idx) < len(sims) and isinstance(sims[int(idx)], dict):
+                enabled = bool(sims[int(idx)].get("enabled", True))
+            act_toggle = QAction("Disable" if enabled else "Enable", menu)
+            act_toggle.triggered.connect(lambda: self._toggle_simulation_enabled(int(idx)))
+            menu.addAction(act_toggle)
+
+            act_remove = QAction("Remove Simulation", menu)
+            act_remove.triggered.connect(lambda: self._remove_simulation(int(idx)))
             menu.addAction(act_remove)
         else:
             return
@@ -309,6 +500,156 @@ class ProjectTreeWidget(QWidget):
         self._refresh_object_boundaries()
         self.settings_changed.emit()
 
+    def _add_simulation_dialog(self) -> None:
+        sims = self._settings.setdefault("simulations", [])
+        if not isinstance(sims, list):
+            self._settings["simulations"] = []
+            sims = self._settings["simulations"]
+        sim = _default_simulation_item()
+        sim["name"] = f"Simulation_{len(sims) + 1}"
+        created = self._simulation_dialog_data(sim, title="Add Simulation")
+        if created is None:
+            return
+        sims.append(created)
+        self._sync_legacy_simulation_from_list()
+        self._refresh_simulations()
+        self.settings_changed.emit()
+
+    def _edit_simulation_dialog(self, index: int) -> None:
+        sims = self._settings.get("simulations", [])
+        if not isinstance(sims, list) or not (0 <= index < len(sims)):
+            return
+        current = _deep_copy(sims[index]) if isinstance(sims[index], dict) else _default_simulation_item()
+        updated = self._simulation_dialog_data(current, title="Edit Simulation")
+        if updated is None:
+            return
+        sims[index] = updated
+        self._sync_legacy_simulation_from_list()
+        self._refresh_simulations()
+        self.settings_changed.emit()
+
+    def _toggle_simulation_enabled(self, index: int) -> None:
+        sims = self._settings.get("simulations", [])
+        if not isinstance(sims, list) or not (0 <= index < len(sims)):
+            return
+        sim = sims[index]
+        if not isinstance(sim, dict):
+            return
+        sim["enabled"] = not bool(sim.get("enabled", True))
+        self._sync_legacy_simulation_from_list()
+        self._refresh_simulations()
+        self.settings_changed.emit()
+
+    def _remove_simulation(self, index: int) -> None:
+        sims = self._settings.get("simulations", [])
+        if not isinstance(sims, list) or not (0 <= index < len(sims)):
+            return
+        sim = sims[index] if isinstance(sims[index], dict) else {}
+        name = str(sim.get("name", f"Simulation_{index+1}"))
+        reply = QMessageBox.question(
+            self,
+            "Remove Simulation",
+            f"Remove simulation '{name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        sims.pop(index)
+        if not sims:
+            sims.append(_default_simulation_item())
+        self._sync_legacy_simulation_from_list()
+        self._refresh_simulations()
+        self.settings_changed.emit()
+
+    def _simulation_dialog_data(self, initial: dict, title: str) -> dict | None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        form = QFormLayout(dlg)
+
+        le_name = QLineEdit(str(initial.get("name", "Simulation_1")))
+        cb_type = QComboBox(dlg)
+        cb_type.addItems(_SIMULATION_TYPES)
+        current_type = str(initial.get("type", "Sweep")).strip().title()
+        if current_type not in _SIMULATION_TYPES:
+            current_type = "Sweep"
+        cb_type.setCurrentText(current_type)
+
+        cb_enabled = QComboBox(dlg)
+        cb_enabled.addItems(["Enabled", "Disabled"])
+        cb_enabled.setCurrentText("Enabled" if bool(initial.get("enabled", True)) else "Disabled")
+
+        le_fmin = QLineEdit(_format_locale_number(float(initial.get("Fmin_GHz", 0.1))))
+        le_fmax = QLineEdit(_format_locale_number(float(initial.get("Fmax_GHz", 10.0))))
+        le_fstep = QLineEdit(_format_locale_number(float(initial.get("Fstep_GHz", 0.1))))
+        le_modes = QLineEdit(str(int(initial.get("EigenmodeCount", 5))))
+        le_param_name = QLineEdit(str(initial.get("ParamName", "")))
+        le_param_values = QLineEdit(str(initial.get("ParamValues", "")))
+
+        cb_log = QComboBox(dlg)
+        cb_log.addItems(_LOG_VERBOSITY_LEVELS)
+        current_log = str(initial.get("LogVerbosity", "Info")).strip().title()
+        cb_log.setCurrentText(current_log if current_log in _LOG_VERBOSITY_LEVELS else "Info")
+
+        form.addRow("Name", le_name)
+        form.addRow("Type", cb_type)
+        form.addRow("State", cb_enabled)
+        form.addRow("Fmin [GHz]", le_fmin)
+        form.addRow("Fmax [GHz]", le_fmax)
+        form.addRow("Fstep [GHz]", le_fstep)
+        form.addRow("Eigenmode count", le_modes)
+        form.addRow("Parametric name", le_param_name)
+        form.addRow("Parametric values (CSV)", le_param_values)
+        form.addRow("Log verbosity", cb_log)
+
+        def _update_visibility(sim_type: str) -> None:
+            is_sweep = sim_type == "Sweep"
+            is_eigen = sim_type == "Eigenmode"
+            is_param = sim_type == "Parametric"
+            for w in (le_fmin, le_fmax, le_fstep):
+                w.setVisible(is_sweep or is_param)
+            le_modes.setVisible(is_eigen)
+            le_param_name.setVisible(is_param)
+            le_param_values.setVisible(is_param)
+
+        _update_visibility(current_type)
+        cb_type.currentTextChanged.connect(_update_visibility)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        form.addRow(btns)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+
+        try:
+            sim_type = cb_type.currentText().strip().title()
+            if sim_type not in _SIMULATION_TYPES:
+                sim_type = "Sweep"
+            fmin = _parse_locale_float(le_fmin.text())
+            fmax = _parse_locale_float(le_fmax.text())
+            fstep = _parse_locale_float(le_fstep.text())
+            modes = max(1, _parse_locale_int(le_modes.text()))
+            name = le_name.text().strip() or "Simulation"
+            log_v = cb_log.currentText().strip().title()
+            if log_v not in _LOG_VERBOSITY_LEVELS:
+                log_v = "Info"
+            return {
+                "name": name,
+                "type": sim_type,
+                "enabled": cb_enabled.currentText() == "Enabled",
+                "Fmin_GHz": float(fmin),
+                "Fmax_GHz": float(fmax),
+                "Fstep_GHz": float(fstep),
+                "EigenmodeCount": int(modes),
+                "ParamName": le_param_name.text().strip(),
+                "ParamValues": le_param_values.text().strip(),
+                "LogVerbosity": log_v,
+            }
+        except Exception:
+            return None
+
     def _edit_boundary(self, item: QTreeWidgetItem, key: str) -> None:
         dlg = QDialog(self)
         dlg.setWindowTitle(f"Edit boundary – {key}")
@@ -335,12 +676,31 @@ class ProjectTreeWidget(QWidget):
         )
         if ok and new_val.strip():
             try:
-                parsed = float(new_val.strip())
+                parsed = _parse_locale_float(new_val.strip())
                 target_dict[key] = parsed
-                item.setText(1, str(parsed))
+                item.setText(1, _format_locale_number(parsed))
                 self.settings_changed.emit()
             except ValueError:
                 pass
+
+    def _edit_choice(self, item: QTreeWidgetItem, key: str, options: list[str], current_val: str, target_dict: dict) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Edit – {key}")
+        form = QFormLayout(dlg)
+        combo = QComboBox(dlg)
+        combo.addItems(options)
+        combo.setCurrentText(current_val if current_val in options else options[0])
+        form.addRow(key, combo)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        form.addRow(btns)
+        if dlg.exec_() == QDialog.Accepted:
+            new_val = combo.currentText().strip().title()
+            if new_val in options:
+                target_dict[key] = new_val
+                item.setText(1, new_val)
+                self.settings_changed.emit()
 
     def _add_port_dialog(self) -> None:
         port = self._port_dialog_data(
@@ -368,14 +728,36 @@ class ProjectTreeWidget(QWidget):
         self.settings_changed.emit()
 
     def assign_port_to_object(self, obj_name: str) -> None:
+        ports = self._settings.get("ports", [])
+        existing_idx = next((i for i, p in enumerate(ports) if str(p.get("object", "")).strip() == obj_name), None)
+
+        if existing_idx is not None:
+            initial = _deep_copy(ports[existing_idx])
+            title = f"Assign Port - {obj_name} (edit existing)"
+        else:
+            port_type = "WaveguidePort"
+            initial = {
+                "name": f"Port_{obj_name}",
+                "type": port_type,
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0,
+                "params": _deep_copy(_PORT_TYPE_DEFAULT_PARAMS.get(port_type, {})),
+            }
+            title = f"Assign Port - {obj_name}"
+
         port = self._port_dialog_data(
-            initial={"name": f"Port_{obj_name}", "type": "WaveguidePort", "x": 0.0, "y": 0.0, "z": 0.0},
+            initial=initial,
             fixed_object=obj_name,
-            title=f"Assign Port - {obj_name}",
+            title=title,
         )
         if port is None:
             return
-        self._settings["ports"].append(port)
+
+        if existing_idx is not None:
+            ports[existing_idx] = port
+        else:
+            ports.append(port)
         self._refresh_ports()
         self.settings_changed.emit()
 
@@ -388,6 +770,14 @@ class ProjectTreeWidget(QWidget):
         if current_type not in _PORT_TYPES:
             current_type = "WaveguidePort"
 
+        current_params = initial.get("params", {}) if isinstance(initial.get("params", {}), dict) else {}
+        if current_type == "LumpedPort":
+            # Backward compatibility: map old waveguide keys if present.
+            if "Resistance_Ohm" not in current_params and "Impedance_Ohm" in current_params:
+                current_params["Resistance_Ohm"] = current_params.get("Impedance_Ohm")
+            if "Voltage_V" not in current_params and "Excitation" in current_params:
+                current_params["Voltage_V"] = current_params.get("Excitation")
+
         le_name = QLineEdit(str(initial.get("name", "Port")))
         le_type = QComboBox()
         le_type.addItems(_PORT_TYPES)
@@ -399,22 +789,68 @@ class ProjectTreeWidget(QWidget):
         le_y = QLineEdit(str(initial.get("y", 0.0)))
         le_z = QLineEdit(str(initial.get("z", 0.0)))
 
+        from PyQt5.QtWidgets import QLabel as _QLabel
+        lbl_x = _QLabel("X")
+        lbl_y = _QLabel("Y")
+        lbl_z = _QLabel("Z")
+
         params_container = QWidget(dlg)
         params_form = QFormLayout(params_container)
+        params_form.setContentsMargins(0, 0, 0, 0)
         param_edits: Dict[str, QLineEdit] = {}
+
+        def _normalize_params_for_type(port_type: str) -> None:
+            """Normalize param keys when switching port types (e.g., WaveguidePort → LumpedPort)."""
+            if port_type == "LumpedPort":
+                # Map WaveguidePort keys to LumpedPort if needed
+                if "Impedance_Ohm" in current_params and "Resistance_Ohm" not in current_params:
+                    current_params["Resistance_Ohm"] = current_params["Impedance_Ohm"]
+                if "Excitation" in current_params and "Voltage_V" not in current_params:
+                    current_params["Voltage_V"] = current_params["Excitation"]
+                # Ensure core LumpedPort params exist with correct defaults
+                if "Resistance_Ohm" not in current_params:
+                    current_params["Resistance_Ohm"] = _PORT_TYPE_DEFAULT_PARAMS["LumpedPort"]["Resistance_Ohm"]
+                if "Voltage_V" not in current_params:
+                    current_params["Voltage_V"] = _PORT_TYPE_DEFAULT_PARAMS["LumpedPort"]["Voltage_V"]
+            elif port_type == "WaveguidePort":
+                # Map LumpedPort keys to WaveguidePort if needed
+                if "Resistance_Ohm" in current_params and "Impedance_Ohm" not in current_params:
+                    current_params["Impedance_Ohm"] = current_params["Resistance_Ohm"]
+                if "Voltage_V" in current_params and "Excitation" not in current_params:
+                    current_params["Excitation"] = current_params["Voltage_V"]
+                # Ensure core WaveguidePort params exist with correct defaults
+                if "Impedance_Ohm" not in current_params:
+                    current_params["Impedance_Ohm"] = _PORT_TYPE_DEFAULT_PARAMS["WaveguidePort"]["Impedance_Ohm"]
+                if "Excitation" not in current_params:
+                    current_params["Excitation"] = _PORT_TYPE_DEFAULT_PARAMS["WaveguidePort"]["Excitation"]
 
         def _rebuild_param_fields(port_type: str) -> None:
             while params_form.rowCount() > 0:
                 params_form.removeRow(0)
             param_edits.clear()
 
+            # Normalize parameters for the selected type
+            _normalize_params_for_type(port_type)
+
             defaults = _PORT_TYPE_DEFAULT_PARAMS.get(port_type, {})
-            current_params = initial.get("params", {}) if isinstance(initial.get("params", {}), dict) else {}
             for key, default_val in defaults.items():
                 value = current_params.get(key, default_val)
                 edit = QLineEdit(str(value))
+                if key in ("Resistance_Ohm",):
+                    edit.setToolTip("Port impedance in Ohm (typically 50)")
+                elif key.startswith("Direction_"):
+                    axis = key[-1]  # X, Y or Z
+                    edit.setToolTip(
+                        f"{axis} component of the excitation field direction vector.\n"
+                        "Leave all Direction fields at 0 to auto-compute from plate geometry."
+                    )
                 params_form.addRow(key, edit)
                 param_edits[key] = edit
+
+            # Show/hide position fields: not meaningful for LumpedPort
+            is_lumped = (port_type == "LumpedPort")
+            for w in (lbl_x, le_x, lbl_y, le_y, lbl_z, le_z):
+                w.setVisible(not is_lumped)
 
         _rebuild_param_fields(current_type)
         le_type.currentTextChanged.connect(_rebuild_param_fields)
@@ -422,10 +858,10 @@ class ProjectTreeWidget(QWidget):
         form.addRow("Name", le_name)
         form.addRow("Type", le_type)
         form.addRow("Object", le_obj)
-        form.addRow("X",    le_x)
-        form.addRow("Y",    le_y)
-        form.addRow("Z",    le_z)
-        form.addRow("Type Parameters", params_container)
+        form.addRow(lbl_x, le_x)
+        form.addRow(lbl_y, le_y)
+        form.addRow(lbl_z, le_z)
+        form.addRow("Parameters", params_container)
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
@@ -439,18 +875,25 @@ class ProjectTreeWidget(QWidget):
                     raw = edit.text().strip()
                     default_val = defaults.get(key)
                     if isinstance(default_val, int) and not isinstance(default_val, bool):
-                        parsed_params[key] = int(raw)
+                        val = _parse_locale_int(raw) if raw else None
+                        parsed_params[key] = val if val is not None else default_val
                     elif isinstance(default_val, float):
-                        parsed_params[key] = float(raw)
+                        val = _parse_locale_float(raw) if raw else None
+                        parsed_params[key] = val if val is not None else default_val
                     else:
-                        parsed_params[key] = raw
+                        parsed_params[key] = raw if raw else ""
+
+                if port_type == "LumpedPort":
+                    # Defensive defaults to avoid accidental impedance reset.
+                    parsed_params.setdefault("Resistance_Ohm", float(_PORT_TYPE_DEFAULT_PARAMS["LumpedPort"]["Resistance_Ohm"]))
+                    parsed_params.setdefault("Voltage_V", float(_PORT_TYPE_DEFAULT_PARAMS["LumpedPort"]["Voltage_V"]))
 
                 port = {
                     "name": le_name.text().strip() or "Port",
                     "type": port_type,
-                    "x": float(le_x.text()),
-                    "y": float(le_y.text()),
-                    "z": float(le_z.text()),
+                    "x": _parse_locale_float(le_x.text()),
+                    "y": _parse_locale_float(le_y.text()),
+                    "z": _parse_locale_float(le_z.text()),
                     "params": parsed_params,
                 }
                 obj_txt = le_obj.text().strip()
@@ -542,9 +985,9 @@ class ProjectTreeWidget(QWidget):
                     raw = edit.text().strip()
                     default_val = defaults.get(key)
                     if isinstance(default_val, int) and not isinstance(default_val, bool):
-                        parsed_params[key] = int(raw)
+                        parsed_params[key] = _parse_locale_int(raw)
                     elif isinstance(default_val, float):
-                        parsed_params[key] = float(raw)
+                        parsed_params[key] = _parse_locale_float(raw)
                     else:
                         parsed_params[key] = raw
 
