@@ -97,6 +97,18 @@ def export_emerge_script(
         lines += [f'EndMaterial', ""]
 
     # ── Geometry objects ──────────────────────────────────────────────────────
+    used_reference_planes = {}
+    for obj in objects:
+        ref_block = obj.creation_plane_reference_block()
+        if ref_block:
+            block_name = ref_block.split('"')[1]
+            used_reference_planes[block_name] = ref_block
+
+    if used_reference_planes:
+        lines.append("# ── Relative reference frames ──────────────────────────────")
+        for ref_block in used_reference_planes.values():
+            lines.append(ref_block)
+
     lines.append("# ── Geometry ──────────────────────────────────────────────")
     for obj in objects:
         lines.append(obj.to_emerge_script())

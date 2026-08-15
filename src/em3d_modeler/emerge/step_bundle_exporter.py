@@ -593,13 +593,24 @@ def export_objects_to_step_bundle(
     progress_callback: Callable[[int, int, str], None] | None = None,
     log_callback: Callable[[str, str], None] | None = None,
     debug_boolean_sources_only: bool = False,
+    material_priorities: Dict[str, int] | None = None,
 ) -> Dict[str, Any]:
     """Export one STEP file per object (excluding PlateObject).
 
     Returns a dict with:
       - entries: list of dicts with keys object_name, step_file, material, priority
       - skipped: list of object names skipped by design
+    
+    Args:
+        objects: List of objects to export
+        bundle_dir: Directory to export STEP files to
+        progress_callback: Optional callback for progress updates
+        log_callback: Optional callback for log messages
+        debug_boolean_sources_only: If True, export only boolean source objects
+        material_priorities: Optional dict mapping material names to priority values
     """
+    if material_priorities is None:
+        material_priorities = {}
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
     entries: List[Dict[str, Any]] = []
@@ -715,13 +726,17 @@ def export_objects_to_step_bundle(
         if progress_callback is not None:
             progress_callback(done, total, export_name)
 
+        # Calculate priority from material_priorities dict or use default (base + index)
+        material_priority = material_priorities.get(material, 0) if material_priorities else 0
+        priority_value = 5000 + idx + (material_priority * 100)
+
         entries.append(
             {
                 "object_name": export_name,
                 "object_type": obj_type,
                 "step_file": filename,
                 "material": material,
-                "priority": 5000 + idx,
+                "priority": priority_value,
                 "export_mode": export_mode,
                 "solid_count": solid_count,
                 "poly_points": int(poly.GetNumberOfPoints()),

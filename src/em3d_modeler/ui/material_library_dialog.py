@@ -4,7 +4,7 @@ from pathlib import Path
 from typing import Callable, Optional
 import uuid
 
-from PyQt5.QtWidgets import (
+from PySide6.QtWidgets import (
     QAbstractItemView,
     QColorDialog,
     QComboBox,

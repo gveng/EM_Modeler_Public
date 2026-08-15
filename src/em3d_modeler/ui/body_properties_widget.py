@@ -7,13 +7,13 @@ Multi-selection   → shows object count, common material combo, opacity slider,
 from __future__ import annotations
 from typing import Any, Dict, List, Optional
 
-from PyQt5.QtWidgets import (
+from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
     QSlider, QPushButton, QFrame, QInputDialog, QColorDialog, QCheckBox,
 )
-from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui import QColor
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor
 
 from ..scene.em_objects import EMObject
 
@@ -21,12 +21,12 @@ from ..scene.em_objects import EMObject
 class BodyPropertiesWidget(QWidget):
     """Bottom-left panel: body name, material, opacity and geometry parameters."""
 
-    params_changed = pyqtSignal(object, dict)          # (EMObject, new_params)  – single
-    bulk_material_changed = pyqtSignal(str, list)      # (material, [EMObject])  – multi
-    bulk_style_changed = pyqtSignal(str, str, list)    # (material, color_hex, [EMObject])
-    model_role_changed = pyqtSignal(object, bool)      # (EMObject, is_model)
-    material_added = pyqtSignal(str)
-    material_picker_requested = pyqtSignal(str, list)
+    params_changed = Signal(object, dict)          # (EMObject, new_params)  – single
+    bulk_material_changed = Signal(str, list)      # (material, [EMObject])  – multi
+    bulk_style_changed = Signal(str, str, list)    # (material, color_hex, [EMObject])
+    model_role_changed = Signal(object, bool)      # (EMObject, is_model)
+    material_added = Signal(str)
+    material_picker_requested = Signal(str, list)
 
     def __init__(self, parent=None):
         super().__init__(parent)

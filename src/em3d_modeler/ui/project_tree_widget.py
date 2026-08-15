@@ -15,20 +15,19 @@ Structure
   │   ├── Fmax  [GHz]
   │   └── Fstep [GHz]
   └── Mesh
-      ├── MaxCellSize
-      ├── MinCellSize
-      └── LinesPerWavelength
+      └── Assigned To Objects (resolution 1/λ)
 """
 from __future__ import annotations
 from typing import Any, Dict
 
-from PyQt5.QtWidgets import (
+from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTreeWidget, QTreeWidgetItem, QPushButton, QInputDialog, QComboBox,
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox,
-    QMenu, QAction, QMessageBox,
+    QMenu, QMessageBox, QSpinBox, QDoubleSpinBox, QCheckBox,
 )
-from PyQt5.QtCore import Qt, pyqtSignal, QLocale
+from PySide6.QtCore import Qt, Signal, QLocale
+from PySide6.QtGui import QColor, QBrush, QAction
 
 
 # ──────────────────────────────────────────────────────────────────── constants
@@ -55,6 +54,7 @@ _OBJECT_BC_DEFAULT_PARAMS = {
 
 _LOG_VERBOSITY_LEVELS = ["Debug", "Info", "Warning", "Error"]
 _SIMULATION_TYPES = ["Sweep", "Eigenmode", "Parametric"]
+_OUTPUT_PLOT_TYPES = ["plot_sp", "plot_vswr", "smith", "plot", "plot_ff", "plot_ff_polar"]
 
 
 def _default_simulation_item() -> Dict[str, Any]:
@@ -68,7 +68,17 @@ def _default_simulation_item() -> Dict[str, Any]:
         "EigenmodeCount": 5,
         "ParamName": "",
         "ParamValues": "",
+        "sparam_fitting": {"enabled": False, "points": 1001},
         "LogVerbosity": "Info",
+    }
+
+
+def _default_output_item(simulation_name: str, idx: int) -> Dict[str, Any]:
+    return {
+        "name": f"Output_{idx}",
+        "simulation": simulation_name,
+        "plot_type": "plot_sp",
+        "enabled": True,
     }
 
 _DEFAULT_SETTINGS: Dict[str, Any] = {
@@ -77,8 +87,9 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
     "object_boundaries": [],
     "simulation": {"Fmin_GHz": 0.1, "Fmax_GHz": 10.0, "Fstep_GHz": 0.1, "LogVerbosity": "Info"},
     "simulations": [_default_simulation_item()],
-    "mesh":       {"MaxCellSize": 1.0, "MinCellSize": 0.05,
-                   "LinesPerWavelength": 10},
+    "outputs": [],
+    "mesh":       {"default_fraction": 0.3, "object_resolutions": {}},
+    "material_priorities": {},  # Maps material_name -> priority_value
 }
 
 _NUMERIC_LOCALE = QLocale.c()
@@ -121,12 +132,14 @@ def _format_locale_number(value: float) -> str:
 class ProjectTreeWidget(QWidget):
     """Left-top widget: EMERGE simulation settings tree."""
 
-    settings_changed = pyqtSignal()
+    settings_changed = Signal()
+    output_plot_requested = Signal(dict)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._project_name = "Untitled"
         self._settings: Dict[str, Any] = _deep_copy(_DEFAULT_SETTINGS)
+        self._scene_object_names: set[str] = set()
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
@@ -136,7 +149,7 @@ class ProjectTreeWidget(QWidget):
         self._tree.setColumnCount(2)
         self._tree.setHeaderLabels(["", ""])
         
-        from PyQt5.QtWidgets import QHeaderView
+        from PySide6.QtWidgets import QHeaderView
         header = self._tree.header()
         header.setDefaultSectionSize(180)
         header.setSectionResizeMode(0, QHeaderView.Interactive)
@@ -162,6 +175,16 @@ class ProjectTreeWidget(QWidget):
 
     def get_settings(self) -> Dict[str, Any]:
         return _deep_copy(self._settings)
+
+    def set_scene_object_names(self, object_names: list[str]) -> None:
+        names: set[str] = set()
+        for name in object_names or []:
+            s = str(name).strip()
+            if s:
+                names.add(s)
+        self._scene_object_names = names
+        self._refresh_ports()
+        self._refresh_object_mesh_assignments()
 
     def get_log_verbosity(self) -> str:
         sims = self._settings.get("simulations", [])
@@ -206,6 +229,32 @@ class ProjectTreeWidget(QWidget):
 
         if not isinstance(merged.get("simulations"), list):
             merged["simulations"] = []
+        if not isinstance(merged.get("outputs"), list):
+            merged["outputs"] = []
+
+        mesh_cfg = merged.get("mesh")
+        if not isinstance(mesh_cfg, dict):
+            mesh_cfg = {}
+            merged["mesh"] = mesh_cfg
+
+        try:
+            mesh_cfg["default_fraction"] = max(0.01, min(1.0, float(mesh_cfg.get("default_fraction", 0.3))))
+        except Exception:
+            mesh_cfg["default_fraction"] = 0.3
+
+        obj_res = mesh_cfg.get("object_resolutions")
+        if not isinstance(obj_res, dict):
+            obj_res = {}
+        normalized_obj_res: Dict[str, float] = {}
+        for k, v in obj_res.items():
+            name = str(k).strip()
+            if not name:
+                continue
+            try:
+                normalized_obj_res[name] = max(0.01, min(1.0, float(v)))
+            except Exception:
+                continue
+        mesh_cfg["object_resolutions"] = normalized_obj_res
 
         # Backward compatibility: lift legacy single simulation dict into the new list model.
         if not merged["simulations"]:
@@ -223,9 +272,44 @@ class ProjectTreeWidget(QWidget):
             sim["LogVerbosity"] = lv if lv in _LOG_VERBOSITY_LEVELS else "Info"
             merged["simulations"] = [sim]
 
+        valid_sim_names = {
+            str(item.get("name", "")).strip()
+            for item in merged["simulations"]
+            if isinstance(item, dict)
+        }
+        valid_sim_names = {name for name in valid_sim_names if name}
+        normalized_outputs = []
+        for idx, output in enumerate(merged.get("outputs", []), start=1):
+            if not isinstance(output, dict):
+                continue
+            name = str(output.get("name", f"Output_{idx}")).strip() or f"Output_{idx}"
+            simulation = str(output.get("simulation", "")).strip()
+            if not simulation and valid_sim_names:
+                simulation = sorted(valid_sim_names, key=lambda s: s.lower())[0]
+            plot_type = str(output.get("plot_type", "plot_sp")).strip()
+            if plot_type not in _OUTPUT_PLOT_TYPES:
+                plot_type = "plot_sp"
+            normalized_outputs.append(
+                {
+                    "name": name,
+                    "simulation": simulation,
+                    "plot_type": plot_type,
+                    "enabled": bool(output.get("enabled", True)),
+                    "params": dict(output.get("params", {})) if isinstance(output.get("params", {}), dict) else {},
+                }
+            )
+        merged["outputs"] = normalized_outputs
+
         self._settings = merged
         self._sync_legacy_simulation_from_list()
         self._populate()
+
+    def reset_settings(self) -> None:
+        """Reset all simulation settings to defaults."""
+        self._settings = _deep_copy(_DEFAULT_SETTINGS)
+        self._sync_legacy_simulation_from_list()
+        self._populate()
+        self.settings_changed.emit()
 
     def _sync_legacy_simulation_from_list(self) -> None:
         sims = self._settings.get("simulations", [])
@@ -260,6 +344,7 @@ class ProjectTreeWidget(QWidget):
         self._b_node   = self._make_section(root, "Boundaries")
         self._p_node   = self._make_section(root, "Ports")
         self._s_node   = self._make_section(root, "Simulation")
+        self._o_node   = self._make_section(root, "Outputs")
         self._m_node   = self._make_section(root, "Mesh")
 
         # Boundaries
@@ -276,10 +361,12 @@ class ProjectTreeWidget(QWidget):
         # Simulation list
         self._refresh_simulations()
 
+        # Outputs list
+        self._refresh_outputs()
+
         # Mesh
-        mesh = self._settings["mesh"]
-        for k, v in mesh.items():
-            self._make_leaf(self._m_node, k, str(v), editable=True)
+        self._m_obj_node = self._make_section(self._m_node, "Assigned To Objects")
+        self._refresh_object_mesh_assignments()
 
         self._tree.expandAll()
 
@@ -304,12 +391,19 @@ class ProjectTreeWidget(QWidget):
         self._p_node.takeChildren()
         for i, port in enumerate(self._settings["ports"]):
             obj_name = str(port.get("object", "")).strip()
+            missing_obj = bool(obj_name and obj_name not in self._scene_object_names)
             if obj_name:
                 txt = f"Port {i+1}: {port.get('type', '?')} -> {obj_name}"
             else:
                 txt = (f"Port {i+1}: {port.get('type','?')} "
                        f"@ [{port.get('x',0)},{port.get('y',0)},{port.get('z',0)}]")
+            if missing_obj:
+                txt += "  [MISSING OBJECT]"
             row = QTreeWidgetItem([txt, ""])
+            if missing_obj:
+                warn_brush = QBrush(QColor(220, 40, 40))
+                row.setForeground(0, warn_brush)
+                row.setForeground(1, warn_brush)
             row.setData(0, Qt.UserRole, ("__port_idx__", i))
             self._p_node.addChild(row)
         # Add-port hint
@@ -356,6 +450,73 @@ class ProjectTreeWidget(QWidget):
         hint.setData(0, Qt.UserRole, "__add_sim__")
         self._s_node.addChild(hint)
 
+    def _simulation_names(self) -> list[str]:
+        sims = self._settings.get("simulations", [])
+        names: list[str] = []
+        if isinstance(sims, list):
+            for i, sim in enumerate(sims):
+                if not isinstance(sim, dict):
+                    continue
+                name = str(sim.get("name", f"Simulation_{i+1}")).strip() or f"Simulation_{i+1}"
+                names.append(name)
+        return names
+
+    def _refresh_outputs(self) -> None:
+        node = getattr(self, "_o_node", None)
+        if node is None:
+            return
+        node.takeChildren()
+
+        sim_names = self._simulation_names()
+        outputs = self._settings.get("outputs", [])
+        if not isinstance(outputs, list):
+            outputs = []
+
+        grouped: Dict[str, list[tuple[int, dict]]] = {name: [] for name in sim_names}
+        unknown_key = "__unknown__"
+        grouped[unknown_key] = []
+        for idx, output in enumerate(outputs):
+            if not isinstance(output, dict):
+                continue
+            sim_name = str(output.get("simulation", "")).strip()
+            key = sim_name if sim_name in grouped else unknown_key
+            grouped.setdefault(key, []).append((idx, output))
+
+        for sim_name in sim_names:
+            sim_node = self._make_section(node, sim_name)
+            sim_node.setData(0, Qt.UserRole, ("__out_sim__", sim_name))
+            rows = grouped.get(sim_name, [])
+            if not rows:
+                hint = QTreeWidgetItem(["[double-click to add plot]", ""])
+                hint.setData(0, Qt.UserRole, ("__add_out__", sim_name))
+                sim_node.addChild(hint)
+                continue
+            for out_idx, output in rows:
+                name = str(output.get("name", f"Output_{out_idx+1}")).strip() or f"Output_{out_idx+1}"
+                plot_type = str(output.get("plot_type", "plot_sp")).strip()
+                enabled = bool(output.get("enabled", True))
+                row = QTreeWidgetItem([f"{name} [{plot_type}]", "On" if enabled else "Off"])
+                row.setData(0, Qt.UserRole, ("__out_idx__", out_idx))
+                sim_node.addChild(row)
+
+        unknown_rows = grouped.get(unknown_key, [])
+        if unknown_rows:
+            unknown_node = self._make_section(node, "Unmapped Outputs")
+            for out_idx, output in unknown_rows:
+                name = str(output.get("name", f"Output_{out_idx+1}")).strip() or f"Output_{out_idx+1}"
+                plot_type = str(output.get("plot_type", "plot_sp")).strip()
+                sim_name = str(output.get("simulation", "?")).strip() or "?"
+                row = QTreeWidgetItem([f"{name} [{plot_type}] -> {sim_name}", "Off"])
+                row.setData(0, Qt.UserRole, ("__out_idx__", out_idx))
+                warn_brush = QBrush(QColor(220, 40, 40))
+                row.setForeground(0, warn_brush)
+                row.setForeground(1, warn_brush)
+                unknown_node.addChild(row)
+
+        add_hint = QTreeWidgetItem(["Add Output Plot... (double-click)", ""])
+        add_hint.setData(0, Qt.UserRole, "__add_out_global__")
+        node.addChild(add_hint)
+
     def _refresh_object_boundaries(self) -> None:
         self._b_obj_node.takeChildren()
         for i, bc in enumerate(self._settings.get("object_boundaries", [])):
@@ -369,6 +530,46 @@ class ProjectTreeWidget(QWidget):
         hint = QTreeWidgetItem(["[assign from Object/Materials right-click]", ""])
         hint.setData(0, Qt.UserRole, "__bc_hint__")
         self._b_obj_node.addChild(hint)
+
+    def _refresh_object_mesh_assignments(self) -> None:
+        node = getattr(self, "_m_obj_node", None)
+        if node is None:
+            return
+        node.takeChildren()
+
+        mesh_cfg = self._settings.get("mesh", {})
+        if not isinstance(mesh_cfg, dict):
+            mesh_cfg = {}
+
+        default_fraction = 0.3
+        try:
+            default_fraction = float(mesh_cfg.get("default_fraction", 0.3))
+        except Exception:
+            default_fraction = 0.3
+        default_row = QTreeWidgetItem(["Default resolution (1/λ)", _format_locale_number(default_fraction)])
+        default_row.setData(0, Qt.UserRole, ("__mesh_default__", 0))
+        node.addChild(default_row)
+
+        obj_res = mesh_cfg.get("object_resolutions", {})
+        if not isinstance(obj_res, dict):
+            obj_res = {}
+
+        for obj_name in sorted(obj_res.keys(), key=lambda s: str(s).lower()):
+            try:
+                val = float(obj_res[obj_name])
+            except Exception:
+                continue
+            row = QTreeWidgetItem([str(obj_name), _format_locale_number(val)])
+            row.setData(0, Qt.UserRole, ("__mesh_obj__", str(obj_name)))
+            if self._scene_object_names and str(obj_name) not in self._scene_object_names:
+                warn_brush = QBrush(QColor(220, 40, 40))
+                row.setForeground(0, warn_brush)
+                row.setForeground(1, warn_brush)
+            node.addChild(row)
+
+        hint = QTreeWidgetItem(["[assign from Object/Materials right-click]", ""])
+        hint.setData(0, Qt.UserRole, "__mesh_hint__")
+        node.addChild(hint)
 
     # ─────────────────────────────────────────────────── editing
     def _on_double_click(self, item: QTreeWidgetItem, col: int) -> None:
@@ -385,6 +586,9 @@ class ProjectTreeWidget(QWidget):
         if role == "__add_sim__":
             self._add_simulation_dialog()
             return
+        if role == "__add_out_global__":
+            self._add_output_dialog(None)
+            return
 
         if isinstance(role, tuple) and len(role) == 2:
             tag, idx = role
@@ -397,6 +601,15 @@ class ProjectTreeWidget(QWidget):
             if tag == "__sim_idx__":
                 self._edit_simulation_dialog(int(idx))
                 return
+            if tag == "__out_idx__":
+                self._run_output_plot(int(idx))
+                return
+            if tag == "__add_out__":
+                self._add_output_dialog(str(idx))
+                return
+            if tag == "__mesh_default__":
+                self._edit_default_mesh_resolution()
+                return
 
         key = item.text(0)
         val = item.text(1)
@@ -407,10 +620,9 @@ class ProjectTreeWidget(QWidget):
         # Simulation numeric
         elif parent is self._s_node:
             return
-        # Mesh numeric
+        # Mesh values are assigned from Object/Materials context menu.
         elif parent is self._m_node:
-            self._edit_numeric(item, key, val,
-                               self._settings["mesh"])
+            return
 
     def _on_context_menu(self, pos) -> None:
         item = self._tree.itemAt(pos)
@@ -457,6 +669,38 @@ class ProjectTreeWidget(QWidget):
             act_remove = QAction("Remove Simulation", menu)
             act_remove.triggered.connect(lambda: self._remove_simulation(int(idx)))
             menu.addAction(act_remove)
+        elif tag == "__mesh_obj__":
+            act_remove = QAction("Remove Mesh Assignment", menu)
+            act_remove.triggered.connect(lambda: self._remove_object_mesh_assignment(str(idx)))
+            menu.addAction(act_remove)
+        elif tag == "__mesh_default__":
+            act_edit = QAction("Edit Default Mesh Resolution…", menu)
+            act_edit.triggered.connect(self._edit_default_mesh_resolution)
+            menu.addAction(act_edit)
+        elif tag == "__out_idx__":
+            act_plot = QAction("Generate Plot", menu)
+            act_plot.triggered.connect(lambda: self._run_output_plot(int(idx)))
+            menu.addAction(act_plot)
+
+            act_edit = QAction("Edit Output…", menu)
+            act_edit.triggered.connect(lambda: self._edit_output_dialog(int(idx)))
+            menu.addAction(act_edit)
+
+            outputs = self._settings.get("outputs", [])
+            enabled = False
+            if isinstance(outputs, list) and 0 <= int(idx) < len(outputs) and isinstance(outputs[int(idx)], dict):
+                enabled = bool(outputs[int(idx)].get("enabled", True))
+            act_toggle = QAction("Disable" if enabled else "Enable", menu)
+            act_toggle.triggered.connect(lambda: self._toggle_output_enabled(int(idx)))
+            menu.addAction(act_toggle)
+
+            act_remove = QAction("Remove Output", menu)
+            act_remove.triggered.connect(lambda: self._remove_output(int(idx)))
+            menu.addAction(act_remove)
+        elif tag == "__out_sim__":
+            act_add = QAction("Add Output Plot…", menu)
+            act_add.triggered.connect(lambda: self._add_output_dialog(str(idx)))
+            menu.addAction(act_add)
         else:
             return
 
@@ -500,6 +744,58 @@ class ProjectTreeWidget(QWidget):
         self._refresh_object_boundaries()
         self.settings_changed.emit()
 
+    def _remove_object_mesh_assignment(self, obj_name: str) -> None:
+        mesh_cfg = self._settings.get("mesh", {})
+        if not isinstance(mesh_cfg, dict):
+            return
+        obj_res = mesh_cfg.get("object_resolutions", {})
+        if not isinstance(obj_res, dict):
+            return
+        name = str(obj_name).strip()
+        if not name or name not in obj_res:
+            return
+        reply = QMessageBox.question(
+            self,
+            "Remove Mesh Assignment",
+            f"Remove mesh assignment for '{name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        obj_res.pop(name, None)
+        self._refresh_object_mesh_assignments()
+        self.settings_changed.emit()
+
+    def _edit_default_mesh_resolution(self) -> None:
+        mesh_cfg = self._settings.get("mesh", {})
+        if not isinstance(mesh_cfg, dict):
+            mesh_cfg = {}
+            self._settings["mesh"] = mesh_cfg
+
+        current = 0.3
+        try:
+            current = float(mesh_cfg.get("default_fraction", 0.3))
+        except Exception:
+            current = 0.3
+        current = max(0.01, min(1.0, current))
+
+        value, ok = QInputDialog.getDouble(
+            self,
+            "Default Mesh Resolution",
+            "Default resolution (1/λ):",
+            current,
+            0.01,
+            1.0,
+            4,
+        )
+        if not ok:
+            return
+
+        mesh_cfg["default_fraction"] = float(value)
+        self._refresh_object_mesh_assignments()
+        self.settings_changed.emit()
+
     def _add_simulation_dialog(self) -> None:
         sims = self._settings.setdefault("simulations", [])
         if not isinstance(sims, list):
@@ -513,6 +809,7 @@ class ProjectTreeWidget(QWidget):
         sims.append(created)
         self._sync_legacy_simulation_from_list()
         self._refresh_simulations()
+        self._refresh_outputs()
         self.settings_changed.emit()
 
     def _edit_simulation_dialog(self, index: int) -> None:
@@ -520,12 +817,21 @@ class ProjectTreeWidget(QWidget):
         if not isinstance(sims, list) or not (0 <= index < len(sims)):
             return
         current = _deep_copy(sims[index]) if isinstance(sims[index], dict) else _default_simulation_item()
+        old_name = str(current.get("name", "")).strip()
         updated = self._simulation_dialog_data(current, title="Edit Simulation")
         if updated is None:
             return
         sims[index] = updated
+        new_name = str(updated.get("name", "")).strip()
+        if old_name and new_name and old_name != new_name:
+            outputs = self._settings.get("outputs", [])
+            if isinstance(outputs, list):
+                for output in outputs:
+                    if isinstance(output, dict) and str(output.get("simulation", "")).strip() == old_name:
+                        output["simulation"] = new_name
         self._sync_legacy_simulation_from_list()
         self._refresh_simulations()
+        self._refresh_outputs()
         self.settings_changed.emit()
 
     def _toggle_simulation_enabled(self, index: int) -> None:
@@ -538,6 +844,7 @@ class ProjectTreeWidget(QWidget):
         sim["enabled"] = not bool(sim.get("enabled", True))
         self._sync_legacy_simulation_from_list()
         self._refresh_simulations()
+        self._refresh_outputs()
         self.settings_changed.emit()
 
     def _remove_simulation(self, index: int) -> None:
@@ -558,9 +865,209 @@ class ProjectTreeWidget(QWidget):
         sims.pop(index)
         if not sims:
             sims.append(_default_simulation_item())
+        valid_sim_names = {
+            str(item.get("name", "")).strip()
+            for item in sims
+            if isinstance(item, dict)
+        }
+        outputs = self._settings.get("outputs", [])
+        if isinstance(outputs, list):
+            self._settings["outputs"] = [
+                output for output in outputs
+                if isinstance(output, dict)
+                and str(output.get("simulation", "")).strip() in valid_sim_names
+            ]
         self._sync_legacy_simulation_from_list()
         self._refresh_simulations()
+        self._refresh_outputs()
         self.settings_changed.emit()
+
+    def _add_output_dialog(self, simulation_name: str | None) -> None:
+        sim_names = self._simulation_names()
+        if not sim_names:
+            QMessageBox.information(self, "Add Output", "No simulations defined. Add a simulation first.")
+            return
+        outputs = self._settings.setdefault("outputs", [])
+        if not isinstance(outputs, list):
+            self._settings["outputs"] = []
+            outputs = self._settings["outputs"]
+        sim_ref = str(simulation_name or "").strip()
+        if sim_ref not in sim_names:
+            sim_ref = sim_names[0]
+        initial = _default_output_item(sim_ref, len(outputs) + 1)
+        created = self._output_dialog_data(initial, title="Add Output Plot")
+        if created is None:
+            return
+        outputs.append(created)
+        self._refresh_outputs()
+        self.settings_changed.emit()
+
+    def _edit_output_dialog(self, index: int) -> None:
+        outputs = self._settings.get("outputs", [])
+        if not isinstance(outputs, list) or not (0 <= index < len(outputs)):
+            return
+        current = _deep_copy(outputs[index]) if isinstance(outputs[index], dict) else _default_output_item("", index + 1)
+        updated = self._output_dialog_data(current, title="Edit Output Plot")
+        if updated is None:
+            return
+        outputs[index] = updated
+        self._refresh_outputs()
+        self.settings_changed.emit()
+
+    def _toggle_output_enabled(self, index: int) -> None:
+        outputs = self._settings.get("outputs", [])
+        if not isinstance(outputs, list) or not (0 <= index < len(outputs)):
+            return
+        output = outputs[index]
+        if not isinstance(output, dict):
+            return
+        output["enabled"] = not bool(output.get("enabled", True))
+        self._refresh_outputs()
+        self.settings_changed.emit()
+
+    def _remove_output(self, index: int) -> None:
+        outputs = self._settings.get("outputs", [])
+        if not isinstance(outputs, list) or not (0 <= index < len(outputs)):
+            return
+        output = outputs[index] if isinstance(outputs[index], dict) else {}
+        name = str(output.get("name", f"Output_{index + 1}"))
+        reply = QMessageBox.question(
+            self,
+            "Remove Output",
+            f"Remove output '{name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        outputs.pop(index)
+        self._refresh_outputs()
+        self.settings_changed.emit()
+
+    def _run_output_plot(self, index: int) -> None:
+        outputs = self._settings.get("outputs", [])
+        if not isinstance(outputs, list) or not (0 <= index < len(outputs)):
+            return
+        output = outputs[index]
+        if not isinstance(output, dict):
+            return
+        if not bool(output.get("enabled", True)):
+            QMessageBox.information(self, "Output", "This output is disabled. Enable it first.")
+            return
+        payload = {
+            "name": str(output.get("name", f"Output_{index + 1}")).strip() or f"Output_{index + 1}",
+            "simulation": str(output.get("simulation", "")).strip(),
+            "plot_type": str(output.get("plot_type", "plot_sp")).strip() or "plot_sp",
+            "enabled": bool(output.get("enabled", True)),
+            "params": dict(output.get("params", {})) if isinstance(output.get("params", {}), dict) else {},
+        }
+        self.output_plot_requested.emit(payload)
+
+    def _output_dialog_data(self, initial: dict, title: str) -> dict | None:
+        sim_names = self._simulation_names()
+        if not sim_names:
+            QMessageBox.information(self, "Output", "No simulations available.")
+            return None
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(title)
+        form = QFormLayout(dlg)
+
+        le_name = QLineEdit(str(initial.get("name", "Output")))
+
+        cb_sim = QComboBox(dlg)
+        cb_sim.addItems(sim_names)
+        current_sim = str(initial.get("simulation", "")).strip()
+        cb_sim.setCurrentText(current_sim if current_sim in sim_names else sim_names[0])
+
+        cb_type = QComboBox(dlg)
+        cb_type.addItems(_OUTPUT_PLOT_TYPES)
+        current_type = str(initial.get("plot_type", "plot_sp")).strip()
+        cb_type.setCurrentText(current_type if current_type in _OUTPUT_PLOT_TYPES else "plot_sp")
+
+        cb_enabled = QComboBox(dlg)
+        cb_enabled.addItems(["Enabled", "Disabled"])
+        cb_enabled.setCurrentText("Enabled" if bool(initial.get("enabled", True)) else "Disabled")
+
+        params = initial.get("params", {}) if isinstance(initial.get("params", {}), dict) else {}
+        port_i = QSpinBox(dlg)
+        port_i.setRange(1, 64)
+        port_i.setValue(max(1, int(params.get("port_i", 1))))
+        port_j = QSpinBox(dlg)
+        port_j.setRange(1, 64)
+        port_j.setValue(max(1, int(params.get("port_j", 1))))
+        ff_component = QComboBox(dlg)
+        ff_component.addItems(["E", "E_theta", "E_phi", "Gain", "Directivity"])
+        ff_component.setCurrentText(str(params.get("far_field_component", "E")))
+        ff_db = QCheckBox("Plot far-field data in dB", dlg)
+        ff_db.setChecked(bool(params.get("far_field_db", False)))
+        ff_points = QSpinBox(dlg)
+        ff_points.setRange(8, 10001)
+        ff_points.setSingleStep(1)
+        ff_points.setValue(max(8, int(params.get("far_field_points", 361))))
+        ff_phi = QDoubleSpinBox(dlg)
+        ff_phi.setRange(-360.0, 360.0)
+        ff_phi.setDecimals(3)
+        ff_phi.setSuffix(" deg")
+        ff_phi.setValue(float(params.get("far_field_phi_deg", params.get("far_field_theta_deg", 0.0))))
+        ff_frequency = QDoubleSpinBox(dlg)
+        ff_frequency.setRange(0.000001, 1.0e9)
+        ff_frequency.setDecimals(6)
+        ff_frequency.setSuffix(" GHz")
+        ff_frequency.setValue(float(params.get("far_field_frequency_ghz", 0.0)))
+
+        form.addRow("Name", le_name)
+        form.addRow("Simulation", cb_sim)
+        form.addRow("Plot type", cb_type)
+        form.addRow("State", cb_enabled)
+        form.addRow("Smith/S-parameter port i", port_i)
+        form.addRow("Smith/S-parameter port j", port_j)
+        form.addRow("Far-field component", ff_component)
+        form.addRow("Far-field scale", ff_db)
+        ff_points_row = form.rowCount()
+        form.addRow("Far-field angular samples", ff_points)
+        ff_phi_row = form.rowCount()
+        form.addRow("Far-field phi cut", ff_phi)
+        ff_frequency_row = form.rowCount()
+        form.addRow("Far-field frequency", ff_frequency)
+
+        smith_rows = (4, 5)
+        farfield_rows = (6, 7, ff_points_row, ff_phi_row, ff_frequency_row)
+
+        def update_parameter_visibility(plot_type: str) -> None:
+            is_smith = plot_type == "smith"
+            is_farfield = plot_type in {"plot_ff", "plot_ff_polar"}
+            for row in smith_rows:
+                form.setRowVisible(row, is_smith)
+            for row in farfield_rows:
+                form.setRowVisible(row, is_farfield)
+
+        update_parameter_visibility(cb_type.currentText().strip())
+        cb_type.currentTextChanged.connect(update_parameter_visibility)
+
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        form.addRow(btns)
+
+        if dlg.exec_() != QDialog.Accepted:
+            return None
+
+        return {
+            "name": le_name.text().strip() or "Output",
+            "simulation": cb_sim.currentText().strip(),
+            "plot_type": cb_type.currentText().strip(),
+            "enabled": cb_enabled.currentText() == "Enabled",
+            "params": {
+                "port_i": int(port_i.value()),
+                "port_j": int(port_j.value()),
+                "far_field_component": ff_component.currentText().strip(),
+                "far_field_db": bool(ff_db.isChecked()),
+                "far_field_points": int(ff_points.value()),
+                "far_field_phi_deg": float(ff_phi.value()),
+                "far_field_frequency_ghz": float(ff_frequency.value()),
+            },
+        }
 
     def _simulation_dialog_data(self, initial: dict, title: str) -> dict | None:
         dlg = QDialog(self)
@@ -585,6 +1092,13 @@ class ProjectTreeWidget(QWidget):
         le_modes = QLineEdit(str(int(initial.get("EigenmodeCount", 5))))
         le_param_name = QLineEdit(str(initial.get("ParamName", "")))
         le_param_values = QLineEdit(str(initial.get("ParamValues", "")))
+        fit_config = initial.get("sparam_fitting", {}) if isinstance(initial.get("sparam_fitting", {}), dict) else {}
+        fit_check = QCheckBox("Enable S-parameter line fitting", dlg)
+        fit_check.setChecked(bool(fit_config.get("enabled", False)))
+        fit_points = QSpinBox(dlg)
+        fit_points.setRange(8, 100001)
+        fit_points.setSingleStep(1)
+        fit_points.setValue(max(8, int(fit_config.get("points", 1001))))
 
         cb_log = QComboBox(dlg)
         cb_log.addItems(_LOG_VERBOSITY_LEVELS)
@@ -600,6 +1114,8 @@ class ProjectTreeWidget(QWidget):
         form.addRow("Eigenmode count", le_modes)
         form.addRow("Parametric name", le_param_name)
         form.addRow("Parametric values (CSV)", le_param_values)
+        form.addRow("S-parameter fitting", fit_check)
+        form.addRow("Fitting points", fit_points)
         form.addRow("Log verbosity", cb_log)
 
         def _update_visibility(sim_type: str) -> None:
@@ -611,9 +1127,13 @@ class ProjectTreeWidget(QWidget):
             le_modes.setVisible(is_eigen)
             le_param_name.setVisible(is_param)
             le_param_values.setVisible(is_param)
+            fit_check.setVisible(is_sweep or is_param)
+            fit_points.setVisible(is_sweep or is_param)
+            fit_points.setEnabled(fit_check.isChecked() and (is_sweep or is_param))
 
         _update_visibility(current_type)
         cb_type.currentTextChanged.connect(_update_visibility)
+        fit_check.toggled.connect(lambda checked: fit_points.setEnabled(bool(checked)))
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(dlg.accept)
@@ -645,6 +1165,10 @@ class ProjectTreeWidget(QWidget):
                 "EigenmodeCount": int(modes),
                 "ParamName": le_param_name.text().strip(),
                 "ParamValues": le_param_values.text().strip(),
+                "sparam_fitting": {
+                    "enabled": bool(fit_check.isChecked()),
+                    "points": int(fit_points.value()),
+                },
                 "LogVerbosity": log_v,
             }
         except Exception:
@@ -789,7 +1313,7 @@ class ProjectTreeWidget(QWidget):
         le_y = QLineEdit(str(initial.get("y", 0.0)))
         le_z = QLineEdit(str(initial.get("z", 0.0)))
 
-        from PyQt5.QtWidgets import QLabel as _QLabel
+        from PySide6.QtWidgets import QLabel as _QLabel
         lbl_x = _QLabel("X")
         lbl_y = _QLabel("Y")
         lbl_z = _QLabel("Z")
@@ -1014,9 +1538,16 @@ class ProjectTreeWidget(QWidget):
             if str(bc.get("object", "")) == old_name:
                 bc["object"] = new_name
                 changed = True
+        mesh_cfg = self._settings.get("mesh", {})
+        if isinstance(mesh_cfg, dict):
+            obj_res = mesh_cfg.get("object_resolutions", {})
+            if isinstance(obj_res, dict) and old_name in obj_res:
+                obj_res[new_name] = obj_res.pop(old_name)
+                changed = True
         if changed:
             self._refresh_ports()
             self._refresh_object_boundaries()
+            self._refresh_object_mesh_assignments()
             self.settings_changed.emit()
 
 

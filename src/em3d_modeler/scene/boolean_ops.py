@@ -106,17 +106,37 @@ def _postprocess(poly: vtk.vtkPolyData) -> vtk.vtkPolyData:
     if poly is None or poly.GetNumberOfPoints() == 0:
         raise RuntimeError("Boolean produced an empty result")
 
+    # First pass: aggressive cleaning to remove degenerate triangles and duplicate points
     clean = vtk.vtkCleanPolyData()
     clean.SetInputData(poly)
+    clean.ToleranceIsAbsoluteOff()
+    clean.SetTolerance(1e-6)
+    clean.ConvertLinesToPointsOff()
+    clean.ConvertPolysToLinesOff()
     clean.Update()
 
+    # Second pass: remove degenerate cells
+    cleaned_data = clean.GetOutput()
+    
+    # Recompute normals with smooth shading to eliminate faceting artifacts
     normals = vtk.vtkPolyDataNormals()
-    normals.SetInputData(clean.GetOutput())
+    normals.SetInputData(cleaned_data)
     normals.ConsistencyOn()
     normals.AutoOrientNormalsOn()
-    normals.SplittingOff()
+    normals.SplittingOff()  # Don't split normals at edges - keeps smooth shading
     normals.Update()
-    return normals.GetOutput()
+    
+    result = normals.GetOutput()
+    
+    # Remove any scalars from the boolean result so it renders as a uniform solid,
+    # not with a heatmap/gradient coloring. This ensures boolean results visualize
+    # like raw primitives, using only the base material color.
+    if result.GetCellData().GetNumberOfArrays() > 0:
+        result.GetCellData().RemoveArray(0)
+    if result.GetPointData().GetNumberOfArrays() > 0:
+        result.GetPointData().RemoveArray(0)
+    
+    return result
 
 
 def _boolean_polydata(op: str, pa: vtk.vtkPolyData, pb: vtk.vtkPolyData) -> vtk.vtkPolyData:

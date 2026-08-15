@@ -20,15 +20,16 @@ Mouse controls (always active, even during drawing)
 """
 from __future__ import annotations
 
+from collections import deque
 import math
 from typing import Optional, Tuple
 
 import vtk
-from PyQt5.QtWidgets import (
-    QWidget, QVBoxLayout, QSizePolicy, QToolBar, QAction, QInputDialog
+from PySide6.QtWidgets import (
+    QWidget, QVBoxLayout, QSizePolicy, QToolBar, QInputDialog
 )
-from PyQt5.QtCore    import pyqtSignal, Qt
-from PyQt5.QtGui     import QIcon
+from PySide6.QtCore    import Signal, Qt
+from PySide6.QtGui     import QIcon, QAction
 
 try:
     from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
@@ -66,6 +67,16 @@ PLANE_ORIGIN = {"XY": (0, 0, 0), "XZ": (0, 0, 0), "YZ": (0, 0, 0)}
 
 
 class Viewport3DWidget(QWidget):
+    @staticmethod
+    def _axis_plane_from_normal(normal) -> str:
+        """Map a plane normal to the closest axis-aligned drawing mode."""
+        nx, ny, nz = abs(float(normal[0])), abs(float(normal[1])), abs(float(normal[2]))
+        if nz >= nx and nz >= ny:
+            return "XY"
+        if ny >= nx and ny >= nz:
+            return "XZ"
+        return "YZ"
+
     def set_grid_visible(self, visible: bool) -> None:
         """Show or hide the grid actor in the renderer."""
         if self.scene._grid_actor is not None:
@@ -80,17 +91,20 @@ class Viewport3DWidget(QWidget):
     """Central 3D viewport widget."""
 
     # Emitted when an object is selected / deselected
-    object_selected   = pyqtSignal(object)        # EMObject | None
+    object_selected   = Signal(object)        # EMObject | None
     # Emitted when the multi-selection changes
-    selection_changed = pyqtSignal(list)           # List[EMObject]
+    selection_changed = Signal(list)           # List[EMObject]
     # Emitted when the scene changes (add/remove objects)
-    scene_changed     = pyqtSignal()
+    scene_changed     = Signal()
     # Status-bar message
-    status_message    = pyqtSignal(str)
+    status_message    = Signal(str)
+    # Coordinates for sub-element pick display (X,Y,Z,units)
+    picked_coords     = Signal(float, float, float, str)
+    clear_coords_requested = Signal()
     # Sketch-mode signals
-    sketch_extrude_requested = pyqtSignal(list, float, tuple, tuple)
-    sketch_revolve_requested = pyqtSignal(list, float, tuple, tuple, tuple, tuple)
-    sketch_finished          = pyqtSignal()
+    sketch_extrude_requested = Signal(list, float, tuple, tuple)
+    sketch_revolve_requested = Signal(list, float, tuple, tuple, tuple, tuple)
+    sketch_finished          = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -278,6 +292,16 @@ class Viewport3DWidget(QWidget):
         else:
             n = (nx / mag, ny / mag, nz / mag)
 
+        # Keep the displayed world-axis directions stable when switching
+        # between the built-in planes.  A generic cross-product basis can
+        # legitimately choose -X or -Y, which makes the triad appear to flip.
+        if abs(n[2]) > 1.0 - 1e-9:
+            return (1.0, 0.0, 0.0), (0.0, 1.0, 0.0), n
+        if abs(n[1]) > 1.0 - 1e-9:
+            return (1.0, 0.0, 0.0), (0.0, 0.0, 1.0), n
+        if abs(n[0]) > 1.0 - 1e-9:
+            return (0.0, 1.0, 0.0), (0.0, 0.0, 1.0), n
+
         ref = (0.0, 0.0, 1.0) if abs(n[2]) < 0.99 else (0.0, 1.0, 0.0)
         x = (
             ref[1] * n[2] - ref[2] * n[1],
@@ -314,6 +338,36 @@ class Viewport3DWidget(QWidget):
 
         origin, normal = self._active_draw_origin_normal()
         x_axis, y_axis, z_axis = self._plane_basis_from_normal(normal)
+
+        # vtkAxesActor assigns red/green/blue to its local X/Y/Z axes.  The
+        # plane triad is transformed into world coordinates, so those local
+        # colors must be remapped to keep world X/Y/Z consistently red/green/blue.
+        world_colors = (
+            (1.0, 0.0, 0.0),
+            (0.0, 1.0, 0.0),
+            (0.0, 0.0, 1.0),
+        )
+        local_axes = (x_axis, y_axis, z_axis)
+        local_labels = ("X", "Y", "Z")
+        for axis_index, axis_vector in enumerate(local_axes):
+            world_axis_index = max(range(3), key=lambda i: abs(axis_vector[i]))
+            color = world_colors[world_axis_index]
+            if axis_index == 0:
+                shaft = self._plane_triad_actor.GetXAxisShaftProperty()
+                tip = self._plane_triad_actor.GetXAxisTipProperty()
+                caption = self._plane_triad_actor.GetXAxisCaptionActor2D()
+            elif axis_index == 1:
+                shaft = self._plane_triad_actor.GetYAxisShaftProperty()
+                tip = self._plane_triad_actor.GetYAxisTipProperty()
+                caption = self._plane_triad_actor.GetYAxisCaptionActor2D()
+            else:
+                shaft = self._plane_triad_actor.GetZAxisShaftProperty()
+                tip = self._plane_triad_actor.GetZAxisTipProperty()
+                caption = self._plane_triad_actor.GetZAxisCaptionActor2D()
+            shaft.SetColor(*color)
+            tip.SetColor(*color)
+            caption.GetTextActor().SetInput(local_labels[world_axis_index])
+            caption.GetTextActor().GetTextProperty().SetColor(*color)
 
         m = vtk.vtkMatrix4x4()
         m.Identity()
@@ -375,7 +429,8 @@ class Viewport3DWidget(QWidget):
         self._custom_plane_active = True
         self._custom_plane_origin = tuple(origin)
         self._custom_plane_normal = tuple(normal)
-        # Ricostruisci la griglia su questo piano
+        self._draw_plane = self._axis_plane_from_normal(normal)
+        # Ricostruisce la griglia su questo piano
         self.scene._grid_plane = "CUSTOM"
         self.scene._rebuild_grid()
         self._update_plane_triad_actor()
@@ -399,6 +454,8 @@ class Viewport3DWidget(QWidget):
             return
         self._selection_mode = mode
         self._clear_sub_pick_marker()
+        if mode == "object":
+            self.clear_coords_requested.emit()
         self._render()
 
     def _clear_sub_pick_marker(self) -> None:
@@ -444,7 +501,8 @@ class Viewport3DWidget(QWidget):
         kind, callback = self._pick_request
 
         picker = vtk.vtkCellPicker()
-        picker.SetTolerance(0.005)
+        mode = "vertex" if kind == "vertex" else "face"
+        picker.SetTolerance(self._pick_tolerance_for_mode(mode))
         picker.Pick(sx, sy, 0, self._renderer)
         actor = picker.GetActor()
         if actor is None:
@@ -484,7 +542,7 @@ class Viewport3DWidget(QWidget):
                 callback(tuple(pos))
             elif kind == "vertex":
                 pp = vtk.vtkPointPicker()
-                pp.SetTolerance(0.01)
+                pp.SetTolerance(self._pick_tolerance_for_mode("vertex"))
                 pp.Pick(sx, sy, 0, self._renderer)
                 pid = pp.GetPointId()
                 if pid >= 0 and pp.GetDataSet() is not None:
@@ -595,7 +653,7 @@ class Viewport3DWidget(QWidget):
         # Vertex-only or ALL: vertex snap has highest priority.
         if mode in {"all", "vertex"}:
             point_picker = vtk.vtkPointPicker()
-            point_picker.SetTolerance(0.01)
+            point_picker.SetTolerance(self._pick_tolerance_for_mode("vertex"))
             point_picker.Pick(sx, sy, 0, self._renderer)
             point_actor = point_picker.GetActor()
             point_id = point_picker.GetPointId()
@@ -608,7 +666,7 @@ class Viewport3DWidget(QWidget):
 
         # Edge / face snap: use the picked cell and evaluate based on filter.
         cell_picker = vtk.vtkCellPicker()
-        cell_picker.SetTolerance(0.005)
+        cell_picker.SetTolerance(self._pick_tolerance_for_mode(mode if mode in {"edge", "face"} else "face"))
         cell_picker.Pick(sx, sy, 0, self._renderer)
         actor = cell_picker.GetActor()
         ds = cell_picker.GetDataSet()
@@ -617,28 +675,15 @@ class Viewport3DWidget(QWidget):
             return None
 
         pos = cell_picker.GetPickPosition()
-        cell = ds.GetCell(cell_id)
-
-        if mode in {"all", "edge"} and cell is not None and cell.GetNumberOfEdges() > 0:
-            m = actor.GetMatrix()
-            inv = vtk.vtkMatrix4x4()
-            vtk.vtkMatrix4x4.Invert(m, inv)
-            local = inv.MultiplyPoint([pos[0], pos[1], pos[2], 1.0])
-            lp = (local[0], local[1], local[2])
-            best_edge = None
-            best_dist = float("inf")
-            for ei in range(cell.GetNumberOfEdges()):
-                edge = cell.GetEdge(ei)
-                p0 = edge.GetPoints().GetPoint(0)
-                p1 = edge.GetPoints().GetPoint(1)
-                closest_local, dist = self._closest_point_on_segment(lp, p0, p1)
-                if dist < best_dist:
-                    best_dist = dist
-                    best_edge = closest_local
-            edge_threshold = max(self._grid_spacing * 0.05, 0.25)
-            if best_edge is not None and best_dist <= edge_threshold:
-                world = m.MultiplyPoint([best_edge[0], best_edge[1], best_edge[2], 1.0])
-                return (tuple(self._project_point_to_draw_plane((world[0], world[1], world[2]))), "edge")
+        if mode in {"all", "edge"}:
+            edge_pick = self._pick_edge_segment_local(ds, cell_id, actor, pos)
+            if edge_pick is not None:
+                _, _, closest_local = edge_pick
+                m = actor.GetMatrix()
+                world4 = m.MultiplyPoint([closest_local[0], closest_local[1], closest_local[2], 1.0])
+                w = world4[3] if abs(world4[3]) > 1e-12 else 1.0
+                world = (world4[0] / w, world4[1] / w, world4[2] / w)
+                return (tuple(self._project_point_to_draw_plane(world)), "edge")
             if mode == "edge":
                 return None
 
@@ -673,6 +718,20 @@ class Viewport3DWidget(QWidget):
         }
         return f" | snap: {labels.get(kind, kind.title() or 'Grid')}"
 
+    def _active_drawing_plane(self) -> str:
+        """Return the logical plane used for active sketching, including custom planes."""
+        if self._custom_plane_active:
+            return self._axis_plane_from_normal(self._custom_plane_normal)
+        return self._draw_plane
+
+    def _active_plane_axis(self) -> str:
+        plane = self._active_drawing_plane()
+        return {"XY": "Z", "XZ": "Y", "YZ": "X"}[plane]
+
+    def _active_plane_axis_index(self) -> int:
+        plane = self._active_drawing_plane()
+        return {"XY": 2, "XZ": 1, "YZ": 0}[plane]
+
     def _height_from_cursor(
         self, screen_x: int, screen_y: int, base_z: float
     ) -> float:
@@ -680,15 +739,15 @@ class Viewport3DWidget(QWidget):
         picker = vtk.vtkWorldPointPicker()
         picker.Pick(screen_x, screen_y, 0, self._renderer)
         p = picker.GetPickPosition()
-        # Height axis: Z for XY plane, Y for XZ plane, X for YZ plane
-        axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
+        axis_idx = self._active_plane_axis_index()
         return p[axis_idx] - base_z
 
     def _plane_radius(self, pt: tuple, center: tuple) -> float:
         """2D distance on the drawing plane (plane-aware)."""
-        if self._draw_plane == "XY":
+        plane = self._active_drawing_plane()
+        if plane == "XY":
             return math.sqrt((pt[0] - center[0])**2 + (pt[1] - center[1])**2)
-        elif self._draw_plane == "XZ":
+        elif plane == "XZ":
             return math.sqrt((pt[0] - center[0])**2 + (pt[2] - center[2])**2)
         else:  # YZ
             return math.sqrt((pt[1] - center[1])**2 + (pt[2] - center[2])**2)
@@ -716,7 +775,11 @@ class Viewport3DWidget(QWidget):
             self._renderer.RemoveActor(a)
         self._selection_point_actors = []
 
-    def _add_selection_point_marker(self, world_pt: tuple) -> None:
+    def _add_selection_point_marker(
+        self,
+        world_pt: tuple,
+        color: tuple[float, float, float] = (1.0, 0.05, 0.05),
+    ) -> None:
         pts = vtk.vtkPoints()
         pts.InsertNextPoint(world_pt[0], world_pt[1], world_pt[2])
         verts = vtk.vtkCellArray()
@@ -730,7 +793,7 @@ class Viewport3DWidget(QWidget):
         mapper.SetInputData(poly)
         actor = vtk.vtkActor()
         actor.SetMapper(mapper)
-        actor.GetProperty().SetColor(1.0, 0.05, 0.05)
+        actor.GetProperty().SetColor(color[0], color[1], color[2])
         actor.GetProperty().SetPointSize(7.0)
         actor.GetProperty().RenderPointsAsSpheresOn()
         actor.PickableOff()
@@ -814,7 +877,7 @@ class Viewport3DWidget(QWidget):
         # to Qt's keyboard modifier state.
         if not ctrl:
             try:
-                from PyQt5.QtWidgets import QApplication
+                from PySide6.QtWidgets import QApplication
                 if QApplication.keyboardModifiers() & Qt.ControlModifier:
                     ctrl = True
             except Exception:
@@ -842,6 +905,7 @@ class Viewport3DWidget(QWidget):
         # Object-level selection (default)
         if self._selection_mode == "object":
             self._clear_sub_pick_marker()
+            self.clear_coords_requested.emit()
             obj = self.scene.pick_at(sx, sy)
             if ctrl and obj:
                 self.scene.select_add(obj)
@@ -858,11 +922,12 @@ class Viewport3DWidget(QWidget):
     def _sub_element_pick(self, sx: int, sy: int) -> None:
         """Pick a single face / edge / vertex on the topmost actor."""
         picker = vtk.vtkCellPicker()
-        picker.SetTolerance(0.005)
+        picker.SetTolerance(self._pick_tolerance_for_mode(self._selection_mode))
         picker.Pick(sx, sy, 0, self._renderer)
         actor = picker.GetActor()
         if actor is None:
             self._clear_sub_pick_marker()
+            self.clear_coords_requested.emit()
             self.status_message.emit("No object under cursor.")
             self._render()
             return
@@ -871,6 +936,7 @@ class Viewport3DWidget(QWidget):
         pos     = picker.GetPickPosition()
         ds      = picker.GetDataSet()
         if ds is None or cell_id < 0:
+            self.clear_coords_requested.emit()
             self.status_message.emit("Pick failed.")
             return
 
@@ -885,25 +951,41 @@ class Viewport3DWidget(QWidget):
         mode = self._selection_mode
 
         if mode == "face":
-            marker = self._build_face_marker(ds, cell_id, actor)
+            marker = self._build_face_region_marker(ds, cell_id, actor)
+            self.picked_coords.emit(float(pos[0]), float(pos[1]), float(pos[2]), self._units)
             self.status_message.emit(
-                f"Face picked  cell={cell_id}  on {owner.name if owner else '?'}"
+                f"Face picked  cell={cell_id}  on {owner.name if owner else '?'}  "
+                f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})"
             )
         elif mode == "edge":
-            marker = self._build_edge_marker(ds, cell_id, actor, pos)
+            edge_pick = self._pick_edge_segment_local(ds, cell_id, actor, pos)
+            marker = None
+            edge_world = pos
+            if edge_pick is not None:
+                p0, p1, closest_local = edge_pick
+                marker = self._build_edge_segment_marker(p0, p1, actor)
+                w = actor.GetMatrix().MultiplyPoint([closest_local[0], closest_local[1], closest_local[2], 1.0])
+                ww = w[3] if abs(w[3]) > 1e-12 else 1.0
+                edge_world = (w[0] / ww, w[1] / ww, w[2] / ww)
+            self.picked_coords.emit(float(edge_world[0]), float(edge_world[1]), float(edge_world[2]), self._units)
             self.status_message.emit(
-                f"Edge picked  on {owner.name if owner else '?'}"
+                f"Edge picked  on {owner.name if owner else '?'}  "
+                f"({edge_world[0]:.2f}, {edge_world[1]:.2f}, {edge_world[2]:.2f})"
             )
         else:  # vertex
             point_picker = vtk.vtkPointPicker()
-            point_picker.SetTolerance(0.01)
+            point_picker.SetTolerance(self._pick_tolerance_for_mode("vertex"))
             point_picker.Pick(sx, sy, 0, self._renderer)
             pid = point_picker.GetPointId()
             if pid >= 0 and point_picker.GetDataSet() is not None:
-                vp = point_picker.GetDataSet().GetPoint(pid)
+                vp_local = point_picker.GetDataSet().GetPoint(pid)
+                vp4 = actor.GetMatrix().MultiplyPoint([vp_local[0], vp_local[1], vp_local[2], 1.0])
+                w = vp4[3] if abs(vp4[3]) > 1e-12 else 1.0
+                vp = (vp4[0] / w, vp4[1] / w, vp4[2] / w)
             else:
                 vp = pos
             marker = self._build_vertex_marker(vp, actor)
+            self.picked_coords.emit(float(vp[0]), float(vp[1]), float(vp[2]), self._units)
             self.status_message.emit(
                 f"Vertex picked  ({vp[0]:.2f}, {vp[1]:.2f}, {vp[2]:.2f})"
             )
@@ -943,35 +1025,116 @@ class Viewport3DWidget(QWidget):
         actor.PickableOff()
         return actor
 
-    def _build_edge_marker(self, dataset, cell_id: int, ref_actor, pos) -> Optional[vtk.vtkActor]:
-        cell = dataset.GetCell(cell_id)
-        if cell is None or cell.GetNumberOfEdges() == 0:
-            return None
+    def _build_face_region_marker(self, dataset, cell_id: int, ref_actor) -> Optional[vtk.vtkActor]:
+        poly = vtk.vtkPolyData.SafeDownCast(dataset)
+        if poly is None:
+            return self._build_face_marker(dataset, cell_id, ref_actor)
 
-        # Find the edge of this cell closest to pos (in dataset-local coords)
-        # Convert pos (world) to dataset-local using inverse user-matrix
+        region_ids = self._coplanar_region_cell_ids(poly, cell_id)
+        if not region_ids:
+            return self._build_face_marker(dataset, cell_id, ref_actor)
+
+        ids = vtk.vtkIdTypeArray()
+        for cid in sorted(region_ids):
+            ids.InsertNextValue(int(cid))
+
+        sel_node = vtk.vtkSelectionNode()
+        sel_node.SetFieldType(vtk.vtkSelectionNode.CELL)
+        sel_node.SetContentType(vtk.vtkSelectionNode.INDICES)
+        sel_node.SetSelectionList(ids)
+        sel = vtk.vtkSelection()
+        sel.AddNode(sel_node)
+
+        extract = vtk.vtkExtractSelection()
+        extract.SetInputData(0, poly)
+        extract.SetInputData(1, sel)
+        extract.Update()
+
+        surf = vtk.vtkDataSetSurfaceFilter()
+        surf.SetInputConnection(extract.GetOutputPort())
+        surf.Update()
+
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(surf.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.SetUserMatrix(ref_actor.GetMatrix())
+        actor.GetProperty().SetColor(1.0, 0.6, 0.0)
+        actor.GetProperty().SetOpacity(0.85)
+        actor.GetProperty().EdgeVisibilityOn()
+        actor.GetProperty().SetEdgeColor(1.0, 0.9, 0.0)
+        actor.GetProperty().SetLineWidth(2.0)
+        actor.PickableOff()
+        return actor
+
+    def _pick_edge_segment_local(self, dataset, cell_id: int, ref_actor, pos):
+        """Return (p0, p1, closest_local) for the best edge candidate in local coords."""
         m = ref_actor.GetMatrix()
         inv = vtk.vtkMatrix4x4()
         vtk.vtkMatrix4x4.Invert(m, inv)
         local = inv.MultiplyPoint([pos[0], pos[1], pos[2], 1.0])
         lp = (local[0], local[1], local[2])
 
+        poly = vtk.vtkPolyData.SafeDownCast(dataset)
         best_edge = None
-        best_d    = float("inf")
+        best_dist = float("inf")
+
+        # Prefer geometric feature edges (creases/boundaries) over triangle edges.
+        if poly is not None:
+            feat = vtk.vtkFeatureEdges()
+            feat.SetInputData(poly)
+            feat.BoundaryEdgesOn()
+            feat.FeatureEdgesOn()
+            feat.NonManifoldEdgesOn()
+            feat.ManifoldEdgesOff()
+            feat.SetFeatureAngle(35.0)
+            feat.Update()
+
+            edge_poly = feat.GetOutput()
+            if edge_poly is not None and edge_poly.GetNumberOfCells() > 0:
+                for cid in range(edge_poly.GetNumberOfCells()):
+                    ec = edge_poly.GetCell(cid)
+                    if ec is None:
+                        continue
+                    npts = ec.GetNumberOfPoints()
+                    if npts < 2:
+                        continue
+                    for i in range(npts - 1):
+                        p0 = ec.GetPoints().GetPoint(i)
+                        p1 = ec.GetPoints().GetPoint(i + 1)
+                        closest_local, d = self._closest_point_on_segment(lp, p0, p1)
+                        if d < best_dist:
+                            best_dist = d
+                            best_edge = (p0, p1, closest_local)
+
+        if best_edge is not None:
+            return best_edge
+
+        # Fallback: closest edge on picked triangle/cell.
+        cell = dataset.GetCell(cell_id)
+        if cell is None or cell.GetNumberOfEdges() == 0:
+            return None
+
         for ei in range(cell.GetNumberOfEdges()):
             e = cell.GetEdge(ei)
             p0 = e.GetPoints().GetPoint(0)
             p1 = e.GetPoints().GetPoint(1)
-            d = self._point_segment_distance(lp, p0, p1)
-            if d < best_d:
-                best_d    = d
-                best_edge = (p0, p1)
+            closest_local, d = self._closest_point_on_segment(lp, p0, p1)
+            if d < best_dist:
+                best_dist = d
+                best_edge = (p0, p1, closest_local)
         if best_edge is None:
             return None
 
+        return best_edge
+
+    def _build_edge_segment_marker(self, p0, p1, ref_actor) -> Optional[vtk.vtkActor]:
+        if p0 is None or p1 is None:
+            return None
+
         pts = vtk.vtkPoints()
-        pts.InsertNextPoint(*best_edge[0])
-        pts.InsertNextPoint(*best_edge[1])
+        pts.InsertNextPoint(*p0)
+        pts.InsertNextPoint(*p1)
         line = vtk.vtkCellArray()
         seg = vtk.vtkLine()
         seg.GetPointIds().SetId(0, 0)
@@ -989,6 +1152,111 @@ class Viewport3DWidget(QWidget):
         actor.GetProperty().SetLineWidth(4.0)
         actor.PickableOff()
         return actor
+
+    def _pick_tolerance_for_mode(self, mode: str) -> float:
+        """Return vtk picker tolerance as screen fraction from pixel target."""
+        rw = self._render_window
+        width, height = rw.GetSize() if rw is not None else (1280, 720)
+        diag = max(float(math.hypot(max(width, 1), max(height, 1))), 1.0)
+        px = 7.0
+        if mode == "vertex":
+            px = 11.0
+        elif mode == "edge":
+            px = 10.0
+        elif mode == "face":
+            px = 8.0
+        tol = px / diag
+        return max(0.0015, min(0.02, tol))
+
+    @staticmethod
+    def _cell_normal_local(poly, cell_id: int):
+        cell = poly.GetCell(cell_id)
+        if cell is None or cell.GetNumberOfPoints() < 3:
+            return None, None
+        p0 = cell.GetPoints().GetPoint(0)
+        p1 = cell.GetPoints().GetPoint(1)
+        p2 = cell.GetPoints().GetPoint(2)
+        e1 = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
+        e2 = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
+        nx = e1[1] * e2[2] - e1[2] * e2[1]
+        ny = e1[2] * e2[0] - e1[0] * e2[2]
+        nz = e1[0] * e2[1] - e1[1] * e2[0]
+        mag = math.sqrt(nx * nx + ny * ny + nz * nz)
+        if mag < 1e-12:
+            return None, None
+        centroid = [0.0, 0.0, 0.0]
+        n = cell.GetNumberOfPoints()
+        for i in range(n):
+            p = cell.GetPoints().GetPoint(i)
+            centroid[0] += p[0]
+            centroid[1] += p[1]
+            centroid[2] += p[2]
+        centroid = (centroid[0] / n, centroid[1] / n, centroid[2] / n)
+        return (nx / mag, ny / mag, nz / mag), centroid
+
+    def _coplanar_region_cell_ids(self, poly, seed_cell_id: int) -> set[int]:
+        if poly is None or seed_cell_id < 0 or seed_cell_id >= poly.GetNumberOfCells():
+            return set()
+
+        seed_normal, seed_centroid = self._cell_normal_local(poly, seed_cell_id)
+        if seed_normal is None or seed_centroid is None:
+            return {seed_cell_id}
+
+        bounds = [0.0] * 6
+        poly.GetBounds(bounds)
+        dx = bounds[1] - bounds[0]
+        dy = bounds[3] - bounds[2]
+        dz = bounds[5] - bounds[4]
+        diag = math.sqrt(max(dx, 0.0) ** 2 + max(dy, 0.0) ** 2 + max(dz, 0.0) ** 2)
+        dist_tol = max(diag * 1e-4, 1e-5)
+        cos_tol = math.cos(math.radians(10.0))
+        plane_d = (
+            seed_normal[0] * seed_centroid[0]
+            + seed_normal[1] * seed_centroid[1]
+            + seed_normal[2] * seed_centroid[2]
+        )
+
+        visited = set([seed_cell_id])
+        q = deque([seed_cell_id])
+        neigh_ids = vtk.vtkIdList()
+
+        while q:
+            cid = q.popleft()
+            cell = poly.GetCell(cid)
+            if cell is None:
+                continue
+
+            for ei in range(cell.GetNumberOfEdges()):
+                edge = cell.GetEdge(ei)
+                if edge is None:
+                    continue
+                poly.GetCellNeighbors(cid, edge.GetPointIds(), neigh_ids)
+                for ni in range(neigh_ids.GetNumberOfIds()):
+                    nid = int(neigh_ids.GetId(ni))
+                    if nid in visited:
+                        continue
+                    nrm, ctr = self._cell_normal_local(poly, nid)
+                    if nrm is None or ctr is None:
+                        continue
+                    dot = abs(
+                        nrm[0] * seed_normal[0]
+                        + nrm[1] * seed_normal[1]
+                        + nrm[2] * seed_normal[2]
+                    )
+                    if dot < cos_tol:
+                        continue
+                    plane_dist = abs(
+                        seed_normal[0] * ctr[0]
+                        + seed_normal[1] * ctr[1]
+                        + seed_normal[2] * ctr[2]
+                        - plane_d
+                    )
+                    if plane_dist > dist_tol:
+                        continue
+                    visited.add(nid)
+                    q.append(nid)
+
+        return visited
 
     def _build_vertex_marker(self, world_pt, ref_actor) -> vtk.vtkActor:
         # Render as a single screen-space point (fixed pixel size).
@@ -1010,20 +1278,6 @@ class Viewport3DWidget(QWidget):
         actor.GetProperty().RenderPointsAsSpheresOn()    # round dot
         actor.PickableOff()
         return actor
-
-    @staticmethod
-    def _point_segment_distance(p, a, b) -> float:
-        ax, ay, az = a
-        bx, by, bz = b
-        px, py, pz = p
-        dx, dy, dz = bx - ax, by - ay, bz - az
-        denom = dx*dx + dy*dy + dz*dz
-        if denom < 1e-12:
-            return math.sqrt((px-ax)**2 + (py-ay)**2 + (pz-az)**2)
-        t = ((px-ax)*dx + (py-ay)*dy + (pz-az)*dz) / denom
-        t = max(0.0, min(1.0, t))
-        cx, cy, cz = ax + t*dx, ay + t*dy, az + t*dz
-        return math.sqrt((px-cx)**2 + (py-cy)**2 + (pz-cz)**2)
 
     # ──────────────────────────────────────────────────────── drawing FSM
     def _drawing_click(self, sx: int, sy: int) -> None:
@@ -1128,6 +1382,9 @@ class Viewport3DWidget(QWidget):
 
     # ────────────── CYLINDER FSM ──────────────
     def _fsm_cylinder_click(self, pt, sx, sy, state):
+        plane = self._active_drawing_plane()
+        axis = {"XY": "Z", "XZ": "Y", "YZ": "X"}[plane]
+        axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[plane]
         if state == 0:
             self._draw_pts = [pt]   # base centre
             self._draw_state = 1
@@ -1147,8 +1404,6 @@ class Viewport3DWidget(QWidget):
         elif state == 2:
             base  = self._draw_pts[0]
             r     = self._draw_pts[1]
-            axis  = {"XY": "Z", "XZ": "Y", "YZ": "X"}[self._draw_plane]
-            axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
             h = self._height_from_cursor(sx, sy, base[axis_idx]) or 1.0
             geom = self._geom_center_from_base(base, h, axis)
             obj = CylinderObject(
@@ -1161,8 +1416,9 @@ class Viewport3DWidget(QWidget):
 
     def _fsm_cylinder_preview(self, sx, sy, state):
         base = self._draw_pts[0]
-        axis = {"XY": "Z", "XZ": "Y", "YZ": "X"}[self._draw_plane]
-        axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
+        plane = self._active_drawing_plane()
+        axis = {"XY": "Z", "XZ": "Y", "YZ": "X"}[plane]
+        axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[plane]
         if state == 1:
             pt = self._drawing_snap_point(sx, sy)
             if pt is None:
@@ -1180,6 +1436,9 @@ class Viewport3DWidget(QWidget):
 
     # ────────────── CONE FSM ──────────────
     def _fsm_cone_click(self, pt, sx, sy, state):
+        plane = self._active_drawing_plane()
+        axis = {"XY": "Z", "XZ": "Y", "YZ": "X"}[plane]
+        axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[plane]
         if state == 0:
             self._draw_pts = [pt]   # base centre
             self._draw_state = 1
@@ -1199,8 +1458,6 @@ class Viewport3DWidget(QWidget):
         elif state == 2:
             base  = self._draw_pts[0]
             r     = self._draw_pts[1]
-            axis  = {"XY": "Z", "XZ": "Y", "YZ": "X"}[self._draw_plane]
-            axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
             h = self._height_from_cursor(sx, sy, base[axis_idx]) or 1.0
             geom = self._geom_center_from_base(base, h, axis)
             obj = ConeObject(
@@ -1213,8 +1470,9 @@ class Viewport3DWidget(QWidget):
 
     def _fsm_cone_preview(self, sx, sy, state):
         base = self._draw_pts[0]
-        axis = {"XY": "Z", "XZ": "Y", "YZ": "X"}[self._draw_plane]
-        axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
+        plane = self._active_drawing_plane()
+        axis = {"XY": "Z", "XZ": "Y", "YZ": "X"}[plane]
+        axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[plane]
         if state == 1:
             pt = self._drawing_snap_point(sx, sy)
             if pt is None:
@@ -1502,6 +1760,10 @@ class Viewport3DWidget(QWidget):
     def _finish_object(self, obj: EMObject) -> None:
         self._remove_preview()
         self._clear_selection_point_markers()
+        plane_name = self._active_drawing_plane()
+        origin = self._custom_plane_origin if self._custom_plane_active else PLANE_ORIGIN.get(plane_name, (0.0, 0.0, 0.0))
+        normal = self._custom_plane_normal if self._custom_plane_active else PLANE_NORMAL.get(plane_name, (0.0, 0.0, 1.0))
+        obj.set_creation_plane(plane_name, origin, normal)
         self.scene.add_object(obj)
         self.scene.select(obj)
         self.object_selected.emit(obj)
@@ -1517,8 +1779,13 @@ class Viewport3DWidget(QWidget):
         self._render()
 
     def _cancel_draw(self) -> None:
+        was_planar = (self._draw_mode == "planar")
         self._remove_preview()
         self._clear_selection_point_markers()
+        if was_planar:
+            self._clear_sub_pick_marker()
+            self._planar_side_edge = None
+            self.clear_coords_requested.emit()
         self._draw_mode  = None
         self._draw_state = 0
         self._draw_pts   = []

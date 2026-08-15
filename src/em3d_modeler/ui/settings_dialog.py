@@ -2,9 +2,9 @@ from __future__ import annotations
 
 from typing import Dict, Tuple
 
-from PyQt5.QtCore import Qt, QLocale
-from PyQt5.QtGui import QColor
-from PyQt5.QtWidgets import (
+from PySide6.QtCore import Qt, QLocale
+from PySide6.QtGui import QColor
+from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,

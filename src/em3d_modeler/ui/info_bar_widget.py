@@ -1,7 +1,7 @@
 """Info / error bar at the bottom of the viewport column."""
-from PyQt5.QtWidgets import QWidget, QHBoxLayout, QLabel, QStatusBar
-from PyQt5.QtCore    import Qt
-from PyQt5.QtGui     import QColor, QPalette
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QStatusBar
+from PySide6.QtCore    import Qt
+from PySide6.QtGui     import QColor, QPalette
 
 
 class InfoBarWidget(QWidget):

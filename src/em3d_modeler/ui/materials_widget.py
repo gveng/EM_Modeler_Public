@@ -6,12 +6,12 @@ Clicking an item selects the corresponding 3D object.
 from __future__ import annotations
 from typing import Dict, List, Optional
 
-from PyQt5.QtWidgets import (
+from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem,
-    QMenu, QAction, QInputDialog,
+    QMenu, QInputDialog,
 )
-from PyQt5.QtCore import Qt, pyqtSignal
-from PyQt5.QtGui  import QBrush, QColor
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui  import QBrush, QColor, QAction
 
 from ..scene.em_objects import EMObject
 
@@ -21,26 +21,30 @@ _ROLE_PLANE_ID    = Qt.UserRole + 1   # int(id(ReferencePlane))
 _ROLE_PLANES_ROOT = Qt.UserRole + 2   # True on the "Reference Planes" root node
 _ROLE_PLANE_TRIAD = Qt.UserRole + 3   # bool on the "Plane XYZ Triad" row
 _ROLE_GRID_VISIBLE = Qt.UserRole + 4  # bool on the "Grid" row
+_ROLE_MATERIAL     = Qt.UserRole + 5  # str(material_name) on material header row
 
 
 class MaterialsWidget(QWidget):
     """Right-column panel: scene objects grouped by material."""
 
-    object_selected   = pyqtSignal(object)   # EMObject  (single click – backward compat)
-    selection_changed = pyqtSignal(list)     # List[EMObject]  (multi-select)
-    plane_make_active = pyqtSignal(object)   # ReferencePlane
-    plane_delete      = pyqtSignal(object)   # ReferencePlane
-    plane_rename      = pyqtSignal(object, str)  # ReferencePlane, new_name
-    plane_add_requested = pyqtSignal()       # user wants to add a new reference plane
-    plane_triad_visibility_changed = pyqtSignal(bool)  # show/hide plane XYZ triad
-    grid_visibility_changed = pyqtSignal(bool)  # show/hide grid
-    objects_hide      = pyqtSignal(list)     # List[EMObject]
-    objects_show      = pyqtSignal(list)     # List[EMObject]
-    objects_model_role_changed = pyqtSignal(list, bool)  # List[EMObject], is_model
-    object_rename     = pyqtSignal(object, str)  # EMObject, new_name
-    objects_bulk_rename = pyqtSignal(list, str, int)  # List[EMObject], base_name, start_index
-    assign_port_requested = pyqtSignal(object)   # EMObject
-    assign_boundary_requested = pyqtSignal(object)  # EMObject
+    object_selected   = Signal(object)   # EMObject  (single click – backward compat)
+    selection_changed = Signal(list)     # List[EMObject]  (multi-select)
+    plane_make_active = Signal(object)   # ReferencePlane
+    plane_view_normal = Signal(object)   # ReferencePlane
+    plane_delete      = Signal(object)   # ReferencePlane
+    plane_rename      = Signal(object, str)  # ReferencePlane, new_name
+    plane_add_requested = Signal()       # user wants to add a new reference plane
+    plane_triad_visibility_changed = Signal(bool)  # show/hide plane XYZ triad
+    grid_visibility_changed = Signal(bool)  # show/hide grid
+    objects_hide      = Signal(list)     # List[EMObject]
+    objects_show      = Signal(list)     # List[EMObject]
+    objects_model_role_changed = Signal(list, bool)  # List[EMObject], is_model
+    object_rename     = Signal(object, str)  # EMObject, new_name
+    objects_bulk_rename = Signal(list, str, int)  # List[EMObject], base_name, start_index
+    assign_port_requested = Signal(object)   # EMObject
+    assign_boundary_requested = Signal(object)  # EMObject
+    assign_mesh_resolution_requested = Signal(list)  # List[EMObject]
+    material_priority_changed = Signal(str, int)  # material_name, delta (1 for higher, -1 for lower)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -73,7 +77,8 @@ class MaterialsWidget(QWidget):
                 planes: Optional[List] = None,
                 active_plane=None,
                 plane_triad_visible: bool = True,
-                grid_visible: bool = True) -> None:
+                grid_visible: bool = True,
+                material_priorities: Optional[Dict[str, int]] = None) -> None:
         """Rebuild the tree.
 
         Parameters
@@ -132,9 +137,17 @@ class MaterialsWidget(QWidget):
                 planes_root.addChild(child)
                 self._plane_map[id(p)] = p
 
-        # ── Materials sections ─────────────────────────────────────────────
-        for material, objects in by_material.items():
-            mat_item = QTreeWidgetItem([f"[{material}]"])
+        # ── Materials sections (sorted by priority desc, then name) ───────
+        priorities = material_priorities or {}
+        ordered_materials = sorted(
+            by_material.items(),
+            key=lambda kv: (-int(priorities.get(str(kv[0]), 0)), str(kv[0]).lower()),
+        )
+        for material, objects in ordered_materials:
+            prio = int(priorities.get(str(material), 0))
+            prio_tag = f"  (P={prio:+d})" if prio != 0 else ""
+            mat_item = QTreeWidgetItem([f"[{material}]{prio_tag}"])
+            mat_item.setData(0, _ROLE_MATERIAL, str(material))
             font = mat_item.font(0)
             font.setBold(True)
             mat_item.setFont(0, font)
@@ -241,7 +254,18 @@ class MaterialsWidget(QWidget):
             menu.addAction(act_toggle)
             menu.exec_(self._tree.viewport().mapToGlobal(pos))
             return
-
+        # ── Material header row ───────────────────────────────────────────
+        material_name = item.data(0, _ROLE_MATERIAL)
+        if material_name is not None:
+            menu = QMenu(self._tree)
+            act_higher = QAction("⬆ Set Higher Priority", menu)
+            act_higher.triggered.connect(lambda: self.material_priority_changed.emit(material_name, 1))
+            menu.addAction(act_higher)
+            act_lower = QAction("⬇ Set Lower Priority", menu)
+            act_lower.triggered.connect(lambda: self.material_priority_changed.emit(material_name, -1))
+            menu.addAction(act_lower)
+            menu.exec_(self._tree.viewport().mapToGlobal(pos))
+            return
         # ── Reference Planes root header ──────────────────────────────────
         if item.data(0, _ROLE_PLANES_ROOT):
             menu = QMenu(self._tree)
@@ -266,6 +290,10 @@ class MaterialsWidget(QWidget):
         act_active = QAction("\u2605 Make Active", menu)
         act_active.triggered.connect(lambda: self.plane_make_active.emit(plane))
         menu.addAction(act_active)
+
+        act_view_normal = QAction("View Normal to Plane", menu)
+        act_view_normal.triggered.connect(lambda: self.plane_view_normal.emit(plane))
+        menu.addAction(act_view_normal)
 
         act_rename = QAction("Rename\u2026", menu)
         act_rename.triggered.connect(lambda: self._rename_plane(plane))
@@ -327,6 +355,12 @@ class MaterialsWidget(QWidget):
             menu.addAction(act_bulk_rename)
             menu.addSeparator()
 
+        act_assign_mesh = QAction("Assign Mesh Resolution (1/λ)…", menu)
+        act_assign_mesh.triggered.connect(lambda: self.assign_mesh_resolution_requested.emit(list(objs)))
+        menu.addAction(act_assign_mesh)
+
+        menu.addSeparator()
+
         act_set_model = QAction("Set as MODEL", menu)
         act_set_model.triggered.connect(lambda: self.objects_model_role_changed.emit(list(objs), True))
         menu.addAction(act_set_model)
@@ -348,7 +382,7 @@ class MaterialsWidget(QWidget):
         menu.exec_(self._tree.viewport().mapToGlobal(pos))
 
     def _bulk_rename_dialog(self, objs: list) -> None:
-        from PyQt5.QtWidgets import (
+        from PySide6.QtWidgets import (
             QDialog, QFormLayout, QLineEdit, QSpinBox,
             QDialogButtonBox, QLabel,
         )

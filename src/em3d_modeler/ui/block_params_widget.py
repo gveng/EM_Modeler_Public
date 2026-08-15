@@ -2,12 +2,12 @@
 from __future__ import annotations
 from typing import Any, Dict, Optional
 
-from PyQt5.QtWidgets import (
+from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QTableWidget,
     QTableWidgetItem, QHeaderView, QComboBox,
     QSlider, QHBoxLayout,
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PySide6.QtCore import Qt, Signal
 
 from ..scene.em_objects import EMObject, MATERIAL_COLORS
 
@@ -17,7 +17,7 @@ _ALL_MATERIALS = list(MATERIAL_COLORS.keys()) + ["Custom"]
 class BlockParamsWidget(QWidget):
     """Bottom-left panel: editable parameters for the selected 3D object."""
 
-    params_changed = pyqtSignal(object, dict)   # (EMObject, new_params)
+    params_changed = Signal(object, dict)   # (EMObject, new_params)
 
     def __init__(self, parent=None):
         super().__init__(parent)

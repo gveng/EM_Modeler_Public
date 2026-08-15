@@ -42,6 +42,9 @@ class EMObject:
         # Optional role-highlight color (e.g. boolean base/tool); overrides
         # both base material color and the regular yellow selection color.
         self._role_color: tuple | None = None
+        self.creation_plane: str = "XY"
+        self.creation_plane_origin: tuple[float, float, float] = (0.0, 0.0, 0.0)
+        self.creation_plane_normal: tuple[float, float, float] = (0.0, 0.0, 1.0)
         self._actor: vtk.vtkActor | None = None
         self._build()
 
@@ -128,6 +131,54 @@ class EMObject:
             if self._selected or self._role_color is not None:
                 self.set_selected(self._selected)
 
+    def set_creation_plane(self, plane: str, origin: tuple | None = None, normal: tuple | None = None) -> None:
+        self.creation_plane = str(plane or "XY").upper()
+        self.creation_plane_origin = tuple(origin if origin is not None else (0.0, 0.0, 0.0))
+        self.creation_plane_normal = tuple(normal if normal is not None else (0.0, 0.0, 1.0))
+
+    def creation_plane_reference_block(self) -> str:
+        if self.creation_plane == "XY" and self.creation_plane_normal == (0.0, 0.0, 1.0):
+            return ""
+        ox, oy, oz = self.creation_plane_origin
+        nx, ny, nz = self.creation_plane_normal
+        name = f"Ref_{self.creation_plane}_{self.name}"
+        return (
+            f'ReferencePlane "{name}"\n'
+            f"  Origin = [{ox}, {oy}, {oz}]\n"
+            f"  Normal = [{nx}, {ny}, {nz}]\n"
+            "EndReferencePlane\n"
+        )
+
+    def creation_plane_reference_tag(self) -> str:
+        if self.creation_plane == "XY" and self.creation_plane_normal == (0.0, 0.0, 1.0):
+            return ""
+        return f'  ReferencePlane = "Ref_{self.creation_plane}_{self.name}"\n'
+
+    def to_json_state(self) -> Dict[str, Any]:
+        return {
+            "creation_plane": self.creation_plane,
+            "creation_plane_origin": list(self.creation_plane_origin),
+            "creation_plane_normal": list(self.creation_plane_normal),
+        }
+
+    def from_json_state(self, data: Dict[str, Any]) -> None:
+        if not isinstance(data, dict):
+            return
+        plane = str(data.get("creation_plane", self.creation_plane or "XY")).strip().upper() or "XY"
+        origin = data.get("creation_plane_origin", self.creation_plane_origin)
+        normal = data.get("creation_plane_normal", self.creation_plane_normal)
+        try:
+            origin_tuple = tuple(float(v) for v in origin)
+        except Exception:
+            origin_tuple = self.creation_plane_origin
+        try:
+            normal_tuple = tuple(float(v) for v in normal)
+            if len(normal_tuple) != 3:
+                raise ValueError
+        except Exception:
+            normal_tuple = self.creation_plane_normal
+        self.set_creation_plane(plane, origin_tuple, normal_tuple)
+
 
 # ═══════════════════════════════════════════════════════════════════════════════
 class BoxObject(EMObject):
@@ -192,14 +243,16 @@ class BoxObject(EMObject):
         xmin, xmax = sorted([self.x1, self.x2])
         ymin, ymax = sorted([self.y1, self.y2])
         zmin, zmax = sorted([self.z1, self.z2])
-        return (
-            f'Block "{self.name}"\n'
-            f'  Material = "{self.material}"\n'
-            f"  XRange = [{xmin}, {xmax}]\n"
-            f"  YRange = [{ymin}, {ymax}]\n"
-            f"  ZRange = [{zmin}, {zmax}]\n"
-            "EndBlock\n"
-        )
+        lines = [
+            f'Block "{self.name}"',
+            f'  Material = "{self.material}"',
+            self.creation_plane_reference_tag(),
+            f"  XRange = [{xmin}, {xmax}]",
+            f"  YRange = [{ymin}, {ymax}]",
+            f"  ZRange = [{zmin}, {zmax}]",
+            "EndBlock",
+        ]
+        return "\n".join(part for part in lines if part)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -259,15 +312,17 @@ class CylinderObject(EMObject):
         self.refresh_appearance()
 
     def to_emerge_script(self) -> str:
-        return (
-            f'Cylinder "{self.name}"\n'
-            f'  Material = "{self.material}"\n'
-            f"  Center = [{self.cx}, {self.cy}, {self.cz}]\n"
-            f"  Radius = {abs(self.radius)}\n"
-            f"  Height = {abs(self.height)}\n"
-            f'  Axis = "{self.axis}"\n'
-            "EndCylinder\n"
-        )
+        lines = [
+            f'Cylinder "{self.name}"',
+            f'  Material = "{self.material}"',
+            self.creation_plane_reference_tag(),
+            f"  Center = [{self.cx}, {self.cy}, {self.cz}]",
+            f"  Radius = {abs(self.radius)}",
+            f"  Height = {abs(self.height)}",
+            f'  Axis = "{self.axis}"',
+            "EndCylinder",
+        ]
+        return "\n".join(part for part in lines if part)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -340,15 +395,17 @@ class ConeObject(EMObject):
         self.refresh_appearance()
 
     def to_emerge_script(self) -> str:
-        return (
-            f'Cone "{self.name}"\n'
-            f'  Material = "{self.material}"\n'
-            f"  Center = [{self.cx}, {self.cy}, {self.cz}]\n"
-            f"  Radius = {abs(self.radius)}\n"
-            f"  Height = {abs(self.height)}\n"
-            f'  Axis = "{self.axis}"\n'
-            "EndCone\n"
-        )
+        lines = [
+            f'Cone "{self.name}"',
+            f'  Material = "{self.material}"',
+            self.creation_plane_reference_tag(),
+            f"  Center = [{self.cx}, {self.cy}, {self.cz}]",
+            f"  Radius = {abs(self.radius)}",
+            f"  Height = {abs(self.height)}",
+            f'  Axis = "{self.axis}"',
+            "EndCone",
+        ]
+        return "\n".join(part for part in lines if part)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -407,13 +464,15 @@ class SphereObject(EMObject):
         self.refresh_appearance()
 
     def to_emerge_script(self) -> str:
-        return (
-            f'Sphere "{self.name}"\n'
-            f'  Material = "{self.material}"\n'
-            f"  Center = [{self.cx}, {self.cy}, {self.cz}]\n"
-            f"  Radius = {abs(self.radius)}\n"
-            "EndSphere\n"
-        )
+        lines = [
+            f'Sphere "{self.name}"',
+            f'  Material = "{self.material}"',
+            self.creation_plane_reference_tag(),
+            f"  Center = [{self.cx}, {self.cy}, {self.cz}]",
+            f"  Radius = {abs(self.radius)}",
+            "EndSphere",
+        ]
+        return "\n".join(part for part in lines if part)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -479,14 +538,16 @@ class PlateObject(EMObject):
         xmin, xmax = sorted([self.x1, self.x2])
         ymin, ymax = sorted([self.y1, self.y2])
         zmin, zmax = sorted([self.z1, self.z2])
-        return (
-            f'Block "{self.name}"\n'
-            f'  Material = "{self.material}"\n'
-            f"  XRange = [{xmin}, {xmax}]\n"
-            f"  YRange = [{ymin}, {ymax}]\n"
-            f"  ZRange = [{zmin}, {zmax}]\n"
-            "EndBlock\n"
-        )
+        lines = [
+            f'Block "{self.name}"',
+            f'  Material = "{self.material}"',
+            self.creation_plane_reference_tag(),
+            f"  XRange = [{xmin}, {xmax}]",
+            f"  YRange = [{ymin}, {ymax}]",
+            f"  ZRange = [{zmin}, {zmax}]",
+            "EndBlock",
+        ]
+        return "\n".join(part for part in lines if part)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -551,12 +612,14 @@ class PyramidObject(EMObject):
     def to_emerge_script(self) -> str:
         xmin, xmax = sorted([self.bx1, self.bx2])
         ymin, ymax = sorted([self.by1, self.by2])
-        return (
-            f'# Pyramid "{self.name}" — rectangular base + apex\n'
-            f'# Material = "{self.material}"\n'
-            f"# Base: X=[{xmin}, {xmax}], Y=[{ymin}, {ymax}], Z={self.bz}\n"
-            f"# Apex Z: {self.apex_z}\n"
-        )
+        lines = [
+            f'# Pyramid "{self.name}" — rectangular base + apex',
+            f'# Material = "{self.material}"',
+            self.creation_plane_reference_tag(),
+            f"# Base: X=[{xmin}, {xmax}], Y=[{ymin}, {ymax}], Z={self.bz}",
+            f"# Apex Z: {self.apex_z}",
+        ]
+        return "\n".join(part for part in lines if part)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -625,12 +688,14 @@ class WedgeObject(EMObject):
         self.refresh_appearance()
 
     def to_emerge_script(self) -> str:
-        return (
-            f'# Wedge "{self.name}" — triangular prism\n'
-            f'# Material = "{self.material}"\n'
-            f"# Base triangle: ({self.x1},{self.y1}) ({self.x2},{self.y2}) ({self.x3},{self.y3})\n"
-            f"# Height: {self.z_height}\n"
-        )
+        lines = [
+            f'# Wedge "{self.name}" — triangular prism',
+            f'# Material = "{self.material}"',
+            self.creation_plane_reference_tag(),
+            f"# Base triangle: ({self.x1},{self.y1}) ({self.x2},{self.y2}) ({self.x3},{self.y3})",
+            f"# Height: {self.z_height}",
+        ]
+        return "\n".join(part for part in lines if part)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -679,12 +744,14 @@ class TorusObject(EMObject):
         self.refresh_appearance()
 
     def to_emerge_script(self) -> str:
-        return (
-            f'# Torus "{self.name}" — donut shape\n'
-            f'# Material = "{self.material}"\n'
-            f"# Center: [{self.cx}, {self.cy}, {self.cz}]\n"
-            f"# Major Radius: {self.major_radius}, Minor Radius: {self.minor_radius}\n"
-        )
+        lines = [
+            f'# Torus "{self.name}" — donut shape',
+            f'# Material = "{self.material}"',
+            self.creation_plane_reference_tag(),
+            f"# Center: [{self.cx}, {self.cy}, {self.cz}]",
+            f"# Major Radius: {self.major_radius}, Minor Radius: {self.minor_radius}",
+        ]
+        return "\n".join(part for part in lines if part)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -738,12 +805,14 @@ class EllipsoidObject(EMObject):
         self.refresh_appearance()
 
     def to_emerge_script(self) -> str:
-        return (
-            f'# Ellipsoid "{self.name}" — scaled sphere\n'
-            f'# Material = "{self.material}"\n'
-            f"# Center: [{self.cx}, {self.cy}, {self.cz}]\n"
-            f"# Radii: RX={self.rx}, RY={self.ry}, RZ={self.rz}\n"
-        )
+        lines = [
+            f'# Ellipsoid "{self.name}" — scaled sphere',
+            f'# Material = "{self.material}"',
+            self.creation_plane_reference_tag(),
+            f"# Center: [{self.cx}, {self.cy}, {self.cz}]",
+            f"# Radii: RX={self.rx}, RY={self.ry}, RZ={self.rz}",
+        ]
+        return "\n".join(part for part in lines if part)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -859,10 +928,12 @@ class ExtrudedObject(EMObject):
         self._rebuild()
 
     def to_emerge_script(self) -> str:
-        return (
-            f'# ExtrudedObject "{self.name}" — export via EMERGE extrude command\n'
-            f'# Depth = {self._depth}, Material = "{self.material}"\n'
-        )
+        lines = [
+            f'# ExtrudedObject "{self.name}" — export via EMERGE extrude command',
+            f'# Depth = {self._depth}, Material = "{self.material}"',
+            self.creation_plane_reference_tag(),
+        ]
+        return "\n".join(part for part in lines if part)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1040,10 +1111,12 @@ class RevolvedObject(EMObject):
         self.refresh_appearance()
 
     def to_emerge_script(self) -> str:
-        return (
-            f'# RevolvedObject "{self.name}" — export via EMERGE revolve command\n'
-            f'# Angle = {self._angle}, Material = "{self.material}"\n'
-        )
+        lines = [
+            f'# RevolvedObject "{self.name}" — export via EMERGE revolve command',
+            f'# Angle = {self._angle}, Material = "{self.material}"',
+            self.creation_plane_reference_tag(),
+        ]
+        return "\n".join(part for part in lines if part)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -1080,6 +1153,9 @@ class MeshObject(EMObject):
             self._polydata = vtk.vtkPolyData()
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputData(self._polydata)
+        # Disable scalar visibility to ensure uniform material color rendering,
+        # not gradient/heatmap coloring. This is especially important for boolean results.
+        mapper.ScalarVisibilityOff()
         self._actor = vtk.vtkActor()
         self._actor.SetMapper(mapper)
         self._apply_appearance(self._actor)
@@ -1137,5 +1213,9 @@ class MeshObject(EMObject):
         self.refresh_appearance()
 
     def to_emerge_script(self) -> str:
-        return f'# MeshObject "{self.name}" — Material = "{self.material}"\n'
+        lines = [
+            f'# MeshObject "{self.name}" — Material = "{self.material}"',
+            self.creation_plane_reference_tag(),
+        ]
+        return "\n".join(part for part in lines if part)
 

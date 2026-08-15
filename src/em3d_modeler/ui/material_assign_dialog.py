@@ -4,8 +4,8 @@ from __future__ import annotations
 from typing import Dict, List, Optional
 import uuid
 
-from PyQt5.QtCore import Qt
-from PyQt5.QtWidgets import (
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (
     QDialog, QHBoxLayout, QVBoxLayout, QListWidget, QListWidgetItem,
     QLabel, QPushButton, QLineEdit, QMessageBox, QFrame,
     QInputDialog, QAbstractItemView,

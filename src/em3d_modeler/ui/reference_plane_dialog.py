@@ -12,12 +12,12 @@ from typing import Optional, Tuple
 
 import math
 
-from PyQt5.QtWidgets import (
+from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QRadioButton,
     QDoubleSpinBox, QLabel, QPushButton, QButtonGroup, QFormLayout,
     QSizePolicy, QDialogButtonBox, QComboBox, QLineEdit,
 )
-from PyQt5.QtCore import Qt, pyqtSignal
+from PySide6.QtCore import Qt, Signal
 
 
 Vec3 = Tuple[float, float, float]
@@ -32,7 +32,7 @@ class ReferencePlaneDialog(QDialog):
         Emitted when the user confirms a plane.
     """
 
-    plane_defined = pyqtSignal(tuple, tuple, str)
+    plane_defined = Signal(tuple, tuple, str)
 
     def __init__(self, parent=None,
                  current_origin: Vec3 = (0, 0, 0),

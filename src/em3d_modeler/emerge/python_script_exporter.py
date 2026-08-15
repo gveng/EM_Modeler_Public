@@ -1,9 +1,56 @@
 """Generate runnable Python script for EMERGE simulation."""
 from __future__ import annotations
-
 from typing import Any, Dict, List
 import json
 import locale
+import re
+
+
+def _detect_emerge_version() -> str:
+    """Best-effort resolution of the installed EMERGE version."""
+    candidates: List[str] = []
+
+    try:
+        import importlib.metadata as importlib_metadata
+    except Exception:
+        importlib_metadata = None
+
+    if importlib_metadata is not None:
+        for pkg in ("emerge", "emerge_iron"):
+            try:
+                value = str(importlib_metadata.version(pkg))
+                if value and value not in candidates:
+                    candidates.append(value)
+            except Exception:
+                pass
+
+    try:
+        import pkg_resources  # type: ignore
+        try:
+            value = str(pkg_resources.get_distribution("emerge").version)
+            if value and value not in candidates:
+                candidates.append(value)
+        except Exception:
+            pass
+    except Exception:
+        pass
+
+    try:
+        import emerge as em
+        for attr in ("__version__", "version"):
+            value = getattr(em, attr, None)
+            if value is not None:
+                value = str(value)
+                if value and value not in candidates:
+                    candidates.append(value)
+    except Exception:
+        pass
+
+    for value in candidates:
+        match = re.search(r"(\d+\.\d+\.\d+)", value)
+        if match:
+            return match.group(1)
+    return "unknown"
 
 
 def _q(value: Any) -> str:
@@ -122,6 +169,7 @@ def _normalize_simulation_configs(settings: Dict[str, Any]) -> List[Dict[str, An
                     "EigenmodeCount": max(1, _to_int(item.get("EigenmodeCount", 5), 5)),
                     "ParamName": str(item.get("ParamName", "")).strip(),
                     "ParamValues": str(item.get("ParamValues", "")).strip(),
+                    "sparam_fitting": dict(item.get("sparam_fitting", {})) if isinstance(item.get("sparam_fitting", {}), dict) else {"enabled": False, "points": 1001},
                     "LogVerbosity": str(item.get("LogVerbosity", "Info")).strip().title(),
                 }
             )
@@ -141,6 +189,7 @@ def _normalize_simulation_configs(settings: Dict[str, Any]) -> List[Dict[str, An
                 "EigenmodeCount": 5,
                 "ParamName": "",
                 "ParamValues": "",
+                "sparam_fitting": dict(legacy.get("sparam_fitting", {})) if isinstance(legacy.get("sparam_fitting", {}), dict) else {"enabled": False, "points": 1001},
                 "LogVerbosity": str(legacy.get("LogVerbosity", "Info")).strip().title(),
             }
         ]
@@ -165,137 +214,143 @@ def export_emerge_python_script(
     mesh_resolution_fraction: float = 0.3,
     plot_sparams_after_sim: bool = True,
     export_sparams_after_sim: bool = True,
+    simulation_override: Dict[str, Any] | None = None,
 ) -> str:
     simulations = _normalize_simulation_configs(settings)
-    first_sim = simulations[0] if simulations else {
-        "Fmin_GHz": 0.1,
-        "Fmax_GHz": 10.0,
-        "Fstep_GHz": 0.1,
-    }
-    sim = settings.get("simulation", {})
-    if not isinstance(sim, dict):
-        sim = {}
-    fmin = _to_float(first_sim.get("Fmin_GHz", sim.get("Fmin_GHz", 0.1)), 0.1)
-    fmax = _to_float(first_sim.get("Fmax_GHz", sim.get("Fmax_GHz", 10.0)), 10.0)
-    fstep = _to_float(first_sim.get("Fstep_GHz", sim.get("Fstep_GHz", 0.1)), 0.1)
+    sim = dict(simulation_override) if isinstance(simulation_override, dict) else None
+    if sim is None:
+        enabled = [s for s in simulations if bool(s.get("enabled", True))]
+        sim = dict(enabled[0]) if enabled else {
+            "name": "Simulation_1",
+            "type": "Sweep",
+            "enabled": True,
+            "Fmin_GHz": 0.1,
+            "Fmax_GHz": 10.0,
+            "Fstep_GHz": 0.1,
+            "EigenmodeCount": 5,
+            "ParamName": "",
+            "ParamValues": "",
+            "LogVerbosity": "Info",
+        }
 
-    fit_cfg = sim.get("sparam_fitting", {})
-    if not isinstance(fit_cfg, dict):
-        fit_cfg = {}
-    fit_enabled = _to_bool(
-        fit_cfg.get(
-            "enabled",
-            sim.get(
-                "SParamFittingEnabled",
-                sim.get("SParameterFittingEnabled", sim.get("EnableSParamFitting", False)),
-            ),
-        )
-    )
-    fit_npoints = max(
-        2,
-        _to_int(
-            fit_cfg.get("npoints", sim.get("SParamFitNPoints", sim.get("SParameterFitNPoints", 201))),
-            201,
-        ),
-    )
-    fit_poly_order = max(
-        1,
-        _to_int(
-            fit_cfg.get("poly_order", sim.get("SParamFitPolyOrder", sim.get("SParameterFitPolyOrder", 3))),
-            3,
-        ),
-    )
+    sim_name = str(sim.get("name", "Simulation_1")).strip() or "Simulation_1"
+    sim_type = str(sim.get("type", "Sweep")).strip().lower() or "sweep"
+    fmin = _to_float(sim.get("Fmin_GHz", 0.1), 0.1)
+    fmax = _to_float(sim.get("Fmax_GHz", 10.0), 10.0)
+    fstep = _to_float(sim.get("Fstep_GHz", 0.1), 0.1)
+    if fstep <= 0.0:
+        fstep = 0.1
+    if fmin <= 0.0:
+        fmin = 1e-6
+    if fmax <= fmin:
+        fmax = fmin + max(fstep, 1e-6)
+    npoints = int(max(2, round((fmax - fmin) / max(fstep, 1e-9)) + 1))
+    fit_cfg = sim.get("sparam_fitting", {}) if isinstance(sim.get("sparam_fitting", {}), dict) else {}
+    fit_enabled = _to_bool(fit_cfg.get("enabled", False))
+    fit_points = max(8, _to_int(fit_cfg.get("points", 1001), 1001))
 
-    # Use mesh_resolution_fraction parameter from UI settings.
+    mode_count = max(1, _to_int(sim.get("EigenmodeCount", 5), 5))
+    param_name = str(sim.get("ParamName", "")).strip()
+    param_values = str(sim.get("ParamValues", "")).strip()
+
     mesh_resolution = max(0.01, min(1.0, float(mesh_resolution_fraction)))
     eff_pardiso_threads = max(1, int(pardiso_threads if parallel_enabled else 1))
     eff_acc_threads = max(1, int(acc_threads if parallel_enabled else 1))
-
     used_materials = sorted({str(e.get("material", "PEC")) for e in step_entries})
-    simulation_configs = [s for s in simulations if bool(s.get("enabled", True))]
-    has_sweep_like = any(str(s.get("type", "")).strip().title() in {"Sweep", "Parametric"} for s in simulation_configs)
+    detected_emerge_version = _detect_emerge_version()
+    farfield_outputs = []
+    raw_outputs = settings.get("outputs", []) if isinstance(settings, dict) else []
+    for output in raw_outputs if isinstance(raw_outputs, list) else []:
+        if not isinstance(output, dict) or not bool(output.get("enabled", True)):
+            continue
+        plot_type = str(output.get("plot_type", "")).strip()
+        if plot_type not in {"plot_ff", "plot_ff_polar"}:
+            continue
+        params = output.get("params", {}) if isinstance(output.get("params", {}), dict) else {}
+        farfield_outputs.append({
+            "name": str(output.get("name", "FarField")).strip() or "FarField",
+            "plot_type": plot_type,
+            "component": str(params.get("far_field_component", "E")).strip() or "E",
+            "db": bool(params.get("far_field_db", False)),
+            "points": max(8, _to_int(params.get("far_field_points", 361), 361)),
+            "phi_deg": _to_float(params.get("far_field_phi_deg", params.get("far_field_theta_deg", 0.0)), 0.0),
+            "frequency_ghz": _to_float(params.get("far_field_frequency_ghz", fmax), fmax),
+        })
 
     lines: List[str] = [
         "# Auto-generated EMERGE Python script from EM 3D Modeler",
-        "# This script is intended to be run with: python -u <script.py>",
+        "# Single simulation job script.",
         "",
-        "import datetime",
-        "import emerge_iron",
+        "import os",
+        "import sys",
+        "import traceback",
+        "",
+        "try:",
+        "    import emerge_iron  # optional compatibility bootstrap",
+        "except Exception:",
+        "    pass",
+        "",
+        "try:",
+        "    import importlib.metadata as _importlib_metadata",
+        "except Exception:",
+        "    _importlib_metadata = None",
+        "",
+        f"TARGET_EMERGE_VERSION = {_q(detected_emerge_version)}",
+        "try:",
+        "    if _importlib_metadata is not None:",
+        "        try:",
+        "            TARGET_EMERGE_VERSION = str(_importlib_metadata.version('emerge'))",
+        "        except Exception:",
+        "            pass",
+        "    if TARGET_EMERGE_VERSION == 'unknown':",
+        "        try:",
+        "            import emerge as em",
+        "            TARGET_EMERGE_VERSION = str(getattr(em, '__version__', getattr(em, 'version', 'unknown')))",
+        "        except Exception:",
+        "            pass",
+        "except Exception:",
+        "    pass",
+        "",
+        "import emerge as em",
+        "",
+        "# Ensure Unicode output does not crash on Windows cp1252 consoles.",
+        "try:",
+        "    sys.stdout.reconfigure(encoding='utf-8', errors='replace')",
+        "except Exception:",
+        "    pass",
+        "try:",
+        "    sys.stderr.reconfigure(encoding='utf-8', errors='replace')",
+        "except Exception:",
+        "    pass",
         "",
         "from emerge_config import config",
         f"config.set_pardiso_threads({eff_pardiso_threads})",
         f"config.set_acc_threads({eff_acc_threads})",
         "",
-        "import math",
-        "import numpy as np",
-        "import emerge as em",
-        "import locale",
-        "import os",
-        "import tempfile",
-        "import shutil",
-        "import traceback",
+        f"JOB_NAME = {_q(sim_name)}",
+        f"JOB_TYPE = {_q(sim_type)}",
+        f"PROJECT_NAME = {_q(project_name)}",
+        "SCRIPT_DIR = os.path.dirname(os.path.abspath(__file__))",
+        "RESULTS_DIR = SCRIPT_DIR",
+        "os.chdir(SCRIPT_DIR)",
+        "print(f'[job] Results directory: {RESULTS_DIR}')",
         "",
-        "try:",
-        "    locale.setlocale(locale.LC_ALL, '')",
-        "except Exception as _locale_exc:",
-        "    print(f'WARNING: locale setup skipped ({_locale_exc})')",
-        "",
-        "#######################################################################################################################################",
-        "# DEFINE PROJECT NAME",
-        "#######################################################################################################################################",
-        "#from Plot_Results import ProjectName",
-        f"ProjectName = {_q(project_name)}",
-        "",
-        "",
-        "# Change current path to script file folder",
-        "abspath = os.path.abspath(__file__)",
-        "dname = os.path.dirname(abspath)",
-        "os.chdir(dname)",
-        "",
-        "currDir = os.getcwd()",
-        "print(currDir)",
-        "## prepare simulation folder, if dir exits remove and create new one to be empty",
-        "Sim_Path = os.path.join(currDir, ProjectName)",
-        "if os.path.exists(Sim_Path):",
-        "    shutil.rmtree(Sim_Path)",
-        "os.mkdir(Sim_Path)",
-        "",
-        "m = 1.0",
-        "cm = 0.01",
         "mm = 0.001",
-        "um = 0.000001",
-        "",
-        "PROJECT_NAME = ProjectName",
-        f"MODEL_UNITS = {_q(units)}",
         f"FMIN_GHZ = {fmin}",
         f"FMAX_GHZ = {fmax}",
         f"FSTEP_GHZ = {fstep}",
-        f"SHOW_MODEL = {bool(show_model)}",
-        f"SHOW_MESH = {bool(show_mesh)}",
-        f"RUN_SWEEP = {bool(run_sweep)}",
+        f"NPOINTS = {npoints}",
+        f"MESH_RESOLUTION = {mesh_resolution:.6f}",
+        f"EIGENMODE_COUNT = {mode_count}",
+        f"PARAM_NAME = {_q(param_name)}",
+        f"PARAM_VALUES = {_q(param_values)}",
         f"PLOT_SPARAMS_AFTER_SIM = {bool(plot_sparams_after_sim)}",
         f"EXPORT_SPARAMS_AFTER_SIM = {bool(export_sparams_after_sim)}",
-        f"SIM_SOLVER = {_q(solver)}",
-        f"PARALLEL_ENABLED = {bool(parallel_enabled)}",
-        f"SIMULATION_CONFIGS = {repr(simulation_configs)}",
-        "TOUCHSTONE_Z0 = 50",
-        "TOUCHSTONE_FORMAT = 'RI'",
-        "TOUCHSTONE_FUNIT = 'HZ'",
+        f"SPARAM_FIT_ENABLED = {fit_enabled}",
+        f"SPARAM_FIT_POINTS = {fit_points}",
+        f"FARFIELD_OUTPUTS = {repr(farfield_outputs)}",
+        "print(f\"[job] {JOB_NAME} | type={JOB_TYPE} | range={FMIN_GHZ}..{FMAX_GHZ} GHz step {FSTEP_GHZ}\")",
         "",
-        "if FSTEP_GHZ <= 0:",
-        "    print(f'WARNING: invalid FSTEP_GHZ={FSTEP_GHZ}; using 0.1 GHz')",
-        "    FSTEP_GHZ = 0.1",
-        "MIN_NONZERO_FMIN_GHZ = 1e-6",
-        "if FMIN_GHZ <= 0:",
-        "    _old_fmin = FMIN_GHZ",
-        "    FMIN_GHZ = MIN_NONZERO_FMIN_GHZ",
-        "    print(f'WARNING: FMIN_GHZ={_old_fmin} leads to DC singularity for conductive materials; using {FMIN_GHZ} GHz')",
-        "if FMAX_GHZ <= FMIN_GHZ:",
-        "    _old_fmax = FMAX_GHZ",
-        "    FMAX_GHZ = FMIN_GHZ + max(FSTEP_GHZ, 1e-6)",
-        "    print(f'WARNING: invalid frequency range ({FMIN_GHZ}..{_old_fmax}) GHz; using FMAX_GHZ={FMAX_GHZ} GHz')",
-        "",
-        "npoints = int(max(2, round((FMAX_GHZ - FMIN_GHZ) / max(FSTEP_GHZ, 1e-9)) + 1))",
         "try:",
         "    simulationObj = em.Simulation(PROJECT_NAME, save_file=True, write_log=True)",
         "except TypeError:",
@@ -308,14 +363,142 @@ def export_emerge_python_script(
         "        simulationObj.write_log = True",
         "    except Exception:",
         "        pass",
-        "TARGET_EMERGE_VERSION = \"2.5.5\"",
-        "STRICT_VERSION_CHECK = False",
-        "try:",
-        "    simulationObj.check_version(TARGET_EMERGE_VERSION)",
-        "except Exception as _version_exc:",
-        "    if STRICT_VERSION_CHECK:",
-        "        raise",
-        "    print(f'WARNING: version check skipped ({_version_exc})')",
+        "",
+        "def _safe_token(v: str) -> str:",
+        "    t = ''.join(ch if (ch.isalnum() or ch in ('-', '_')) else '_' for ch in str(v))",
+        "    t = t.strip('_')",
+        "    return t or 'simulation'",
+        "",
+        "def _try_methods(target, method_names, args_variants, kwargs_variants):",
+        "    if target is None:",
+        "        return (False, None, None)",
+        "    for _name in method_names:",
+        "        _fn = getattr(target, _name, None)",
+        "        if not callable(_fn):",
+        "            continue",
+        "        for _args in args_variants:",
+        "            try:",
+        "                _ret = _fn(*_args)",
+        "                return (True, _name, _ret)",
+        "            except TypeError:",
+        "                pass",
+        "            except Exception:",
+        "                pass",
+        "        for _kwargs in kwargs_variants:",
+        "            try:",
+        "                _ret = _fn(**_kwargs)",
+        "                return (True, _name, _ret)",
+        "            except TypeError:",
+        "                pass",
+        "            except Exception:",
+        "                pass",
+        "    return (False, None, None)",
+        "",
+        "def _postprocess_sparams(sim_obj, sim_result):",
+        "    if JOB_TYPE not in ('sweep', 'parametric'):",
+        "        return",
+        "    out_base = os.path.join(SCRIPT_DIR, f\"{_safe_token(PROJECT_NAME)}_{_safe_token(JOB_NAME)}\")",
+        "",
+        "    if EXPORT_SPARAMS_AFTER_SIM:",
+        "        exported = False",
+        "        # Resolve MWData: run_sweep() returns it directly; also available via sim_obj.data.mw",
+        "        _mwdata_candidates = []",
+        "        if sim_result is not None and hasattr(sim_result, 'scalar'):",
+        "            _mwdata_candidates.append(sim_result)",
+        "        try:",
+        "            _d = sim_obj.data",
+        "            if hasattr(_d, 'mw') and hasattr(_d.mw, 'scalar'):",
+        "                _mwdata_candidates.append(_d.mw)",
+        "        except Exception:",
+        "            pass",
+        "        for _mwd in _mwdata_candidates:",
+        "            try:",
+        "                _spgrid = _mwd.scalar.grid",
+        "                if _spgrid is not None and hasattr(_spgrid, 'export_touchstone'):",
+        "                    _spgrid.export_touchstone(out_base, Z0ref=50, format='RI', funit='GHz')",
+        "                    import glob as _glob",
+        "                    _written = _glob.glob(out_base + '.s*p')",
+        "                    _out = _written[0] if _written else out_base",
+        "                    print(f'[job] S-parameters exported: {_out}')",
+        "                    exported = True",
+        "                    break",
+        "            except Exception as _ex:",
+        "                print(f'[job][warn] export_touchstone failed: {_ex}')",
+        "        if not exported:",
+        "            print('[job][warn] Could not export S-parameters: no compatible EMERGE API found.')",
+        "",
+        "    if PLOT_SPARAMS_AFTER_SIM:",
+        "        _mwdata_plot = []",
+        "        if sim_result is not None and hasattr(sim_result, 'scalar'):",
+        "            _mwdata_plot.append(sim_result)",
+        "        try:",
+        "            _dp = sim_obj.data",
+        "            if hasattr(_dp, 'mw') and hasattr(_dp.mw, 'scalar'):",
+        "                _mwdata_plot.append(_dp.mw)",
+        "        except Exception:",
+        "            pass",
+        "        for _mwd in _mwdata_plot:",
+        "            try:",
+        "                from emerge.plot import plot_sp as _plot_sp",
+        "                _sg = _mwd.scalar.grid",
+        "                _nports = len(getattr(_sg, 'ports', [])) or 1",
+        "                if SPARAM_FIT_ENABLED and hasattr(_sg, 'dense_f') and hasattr(_sg, 'model_S'):",
+        "                    _freqs = _sg.dense_f(SPARAM_FIT_POINTS)",
+        "                    _curves = [_sg.model_S(i, j, _freqs) for i in range(1, _nports + 1) for j in range(1, _nports + 1)]",
+        "                else:",
+        "                    _freqs = _sg.freq if hasattr(_sg, 'freq') else _mwd.scalar.grid.freq",
+        "                    _curves = [_sg.S(i, j) for i in range(1, _nports + 1) for j in range(1, _nports + 1)]",
+        "                _labels = [f'S{i}{j}' for i in range(1, _nports+1) for j in range(1, _nports+1)]",
+        "                _plot_sp(_freqs, _curves, labels=_labels)",
+        "                print('[job] S-parameters plotted')",
+        "                break",
+        "            except Exception as _pex:",
+        "                print(f'[job][warn] plot_sp failed: {_pex}')",
+        "                break",
+        "",
+        "def _postprocess_farfields(sim_obj):",
+        "    if not FARFIELD_OUTPUTS:",
+        "        return",
+        "    import numpy as _np",
+        "    try:",
+        "        from emerge.plot import plot_ff as _plot_ff, plot_ff_polar as _plot_ff_polar",
+        "        _field_dataset = sim_obj.data.mw.field",
+        "        _surfaces = globals().get('_farfield_surfaces', [])",
+        "        if not _surfaces:",
+        "            raise RuntimeError('No integration surface was generated for far-field calculation.')",
+        "        _faces = _surfaces[0]",
+        "        if len(_surfaces) > 1:",
+        "            try:",
+        "                from emerge._emerge.geo.operations import GeoSurface as _GeoSurface",
+        "                _faces = _GeoSurface.merged(_surfaces)",
+        "            except Exception:",
+        "                pass",
+        "        for _cfg in FARFIELD_OUTPUTS:",
+        "            _frequency_ghz = float(_cfg.get('frequency_ghz', FMAX_GHZ))",
+        "            _field = _field_dataset.find(freq=_frequency_ghz * 1e9)",
+        "            if _field is None:",
+        "                raise RuntimeError(f'No saved microwave field found at {_frequency_ghz} GHz.')",
+        "            _n = int(_cfg.get('points', 361))",
+        "            _theta = _np.linspace(0.0, 2.0 * _np.pi, _n)",
+        "            _phi = _np.full_like(_theta, _np.deg2rad(float(_cfg.get('phi_deg', 0.0))))",
+        "            _e, _h, _ptot = _field.farfield(_theta, _phi, _faces)",
+        "            _component = str(_cfg.get('component', 'E')).lower()",
+        "            if _component in ('e_theta', 'etheta'):",
+        "                _values = _e[0]",
+        "            elif _component in ('e_phi', 'ephi'):",
+        "                _values = _e[1]",
+        "            else:",
+        "                _values = _np.sqrt(_np.sum(_np.abs(_e) ** 2, axis=0))",
+        "            _values = _np.abs(_values)",
+        "            _base = os.path.join(SCRIPT_DIR, _safe_token(_cfg.get('name', 'FarField')))",
+        "            _np.savetxt(_base + '.farfield.txt', _np.column_stack((_theta, _values)), header='theta_rad value')",
+        "            if _cfg.get('plot_type') == 'plot_ff_polar':",
+        "                _plot_ff_polar(_theta, _values, dB=bool(_cfg.get('db', False)), labels=[str(_cfg.get('name', 'FarField'))])",
+        "            else:",
+        "                _plot_ff(_theta, _values, dB=bool(_cfg.get('db', False)), labels=[str(_cfg.get('name', 'FarField'))])",
+        "            print(f'[job] Far-field generated: {_base}.farfield.txt')",
+        "    except Exception as _ff_exc:",
+        "        print(f'[job][warn] Far-field generation failed: {_ff_exc}')",
         "",
     ]
 
@@ -323,6 +506,7 @@ def export_emerge_python_script(
 
     lines += [
         "# One STEP file per object, exported in this bundle directory.",
+        "_farfield_surfaces = []",
         "",
     ]
 
@@ -334,12 +518,16 @@ def export_emerge_python_script(
             priority = int(entry.get("priority", 5000))
 
             lines += [
-                f"stepObjectGroup = em.geo.step.STEPItems(name={_q(obj_name)}, filename=os.path.join(currDir, {_q(step_file)}), unit=mm)",
+                f"stepObjectGroup = em.geo.step.STEPItems(name={_q(obj_name)}, filename=os.path.join(SCRIPT_DIR, {_q(step_file)}), unit=mm)",
                 "for geoObj in stepObjectGroup.objects:",
                 f"    geoObj.prio_set({priority})",
                 f"    _mat = materials.get({_q(material)})",
                 "    if _mat is not None:",
                 "        geoObj.set_material(_mat)",
+                "try:",
+                "    _farfield_surfaces.append(stepObjectGroup.as_surface())",
+                "except Exception as _surface_exc:",
+                "    print(f'[job][warn] Could not register far-field surface: {_surface_exc}')",
                 "",
             ]
     else:
@@ -348,7 +536,6 @@ def export_emerge_python_script(
             "",
         ]
 
-    bounds = settings.get("boundaries", {})
     ports = lumped_ports or []
 
     if ports:
@@ -377,27 +564,32 @@ def export_emerge_python_script(
                 f"port[{idx}]['portR'] = {z0}",
                 f"port[{idx}]['portDirection'] = ({direction[0]}, {direction[1]}, {direction[2]})",
                 f"port[{idx}]['portExcitationAmplitude'] = {power}",
-                (
-                    f"port[{idx}]['object'] = em.geo.Plate(name={_q(name)}, "
-                    f"origin=({_q(origin[0])}, {_q(origin[1])}, {_q(origin[2])}), "
-                    f"u=({_q(u[0])}, {_q(u[1])}, {_q(u[2])}), "
-                    f"v=({_q(v[0])}, {_q(v[1])}, {_q(v[2])}))"
-                ),
+                f"_port_{idx}_origin = ({_q(origin[0])}, {_q(origin[1])}, {_q(origin[2])})",
+                f"_port_{idx}_u = ({_q(u[0])}, {_q(u[1])}, {_q(u[2])})",
+                f"_port_{idx}_v = ({_q(v[0])}, {_q(v[1])}, {_q(v[2])})",
+                f"port[{idx}]['object'] = em.geo.Plate(",
+                f"    name={_q(name)},",
+                f"    origin=_port_{idx}_origin,",
+                f"    u=_port_{idx}_u,",
+                f"    v=_port_{idx}_v,",
+                ")",
                 "",
             ]
 
     lines += [
-        "# Boundary settings from project tree",
-        f"BOUNDARIES = {_q(bounds)}",
-        "",
-        "# Port settings from project tree (kept for reference/log)",
-        f"PORTS = {_q(settings.get('ports', []))}",
-        "",
         "simulationObj.commit_geometry()",
-        "if SHOW_MODEL:",
-        "    simulationObj.view()",
-        "simulationObj.mw.set_frequency_range(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, npoints)",
-        f"simulationObj.mw.set_resolution({mesh_resolution:.6f})",
+    ]
+    if show_model:
+        lines += [
+            "simulationObj.view()",
+        ]
+    lines += [
+        "simulationObj.mw.set_frequency_range(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, NPOINTS)",
+        "simulationObj.mw.set_resolution(MESH_RESOLUTION)",
+        "try:",
+        "    simulationObj.data.mw.field.save_fields = True",
+        "except Exception as _field_cfg_exc:",
+        "    print(f'[job][warn] Could not enable microwave field saving: {_field_cfg_exc}')",
         "",
     ]
 
@@ -407,314 +599,91 @@ def export_emerge_python_script(
         ]
         for p in ports:
             idx = int(p.get("index", 1))
-            lines.append(
-                f"simulationObj.mw.bc.LumpedPort(port[{idx}]['object'], {idx}, width=port[{idx}]['w'], height=port[{idx}]['h'], direction=port[{idx}]['portDirection'], Z0=port[{idx}]['portR'], power=port[{idx}]['portExcitationAmplitude'])"
-            )
+            lines += [
+                f"simulationObj.mw.bc.LumpedPort(",
+                f"    port[{idx}]['object'],",
+                f"    {idx},",
+                f"    width=port[{idx}]['w'],",
+                f"    height=port[{idx}]['h'],",
+                f"    direction=port[{idx}]['portDirection'],",
+                f"    Z0=port[{idx}]['portR'],",
+                f"    power=port[{idx}]['portExcitationAmplitude'],",
+                ")",
+            ]
         lines += [
         "",
         ]
 
     lines += [
         "simulationObj.generate_mesh()",
-        "if SHOW_MESH:",
-        "    simulationObj.view(plot_mesh=True)",
         "",
     ]
+    if show_mesh:
+        lines += [
+            "simulationObj.view(plot_mesh=True)",
+            "",
+        ]
 
     lines += [
         "simulationResult = None",
-        "_last_sweep_executed = False",
-        "if not SIMULATION_CONFIGS:",
-        "    print('[sim] No enabled simulations configured. Geometry/mesh prepared, no simulation run executed.')",
-        "for _sim_cfg in SIMULATION_CONFIGS:",
-        "    _sim_name = str(_sim_cfg.get('name', 'Simulation'))",
-        "    _sim_type = str(_sim_cfg.get('type', 'Sweep')).strip().lower()",
-        "    _fmin_ghz = float(_sim_cfg.get('Fmin_GHz', FMIN_GHZ))",
-        "    _fmax_ghz = float(_sim_cfg.get('Fmax_GHz', FMAX_GHZ))",
-        "    _fstep_ghz = float(_sim_cfg.get('Fstep_GHz', FSTEP_GHZ))",
-        "    _mode_count = int(max(1, _sim_cfg.get('EigenmodeCount', 5)))",
-        "    _param_name = str(_sim_cfg.get('ParamName', '')).strip()",
-        "    _param_values = str(_sim_cfg.get('ParamValues', '')).strip()",
-        "",
-        "    if _fstep_ghz <= 0:",
-        "        _fstep_ghz = 0.1",
-        "    if _fmin_ghz <= 0:",
-        "        _fmin_ghz = 1e-6",
-        "    if _fmax_ghz <= _fmin_ghz:",
-        "        _fmax_ghz = _fmin_ghz + max(_fstep_ghz, 1e-6)",
-        "",
-        "    _npoints = int(max(2, round((_fmax_ghz - _fmin_ghz) / max(_fstep_ghz, 1e-9)) + 1))",
-        "    print(f\"[sim] Running '{_sim_name}' type={_sim_type}\")",
-        "",
-        "    if _sim_type == 'sweep':",
-        "        if not RUN_SWEEP:",
-        "            print(f\"[sim] Skipped sweep '{_sim_name}' because RUN_SWEEP is disabled.\")",
+        "if JOB_TYPE == 'sweep':",
+        "    simulationResult = simulationObj.mw.run_sweep()",
+        "    print(f\"[job] Sweep completed: {JOB_NAME}\")",
+        "elif JOB_TYPE == 'eigenmode':",
+        "    _done = False",
+        "    for _method in ('run_eigenmode', 'eigenmode', 'solve_eigenmode'):",
+        "        _fn = getattr(simulationObj.mw, _method, None)",
+        "        if not callable(_fn):",
         "            continue",
         "        try:",
-        "            simulationObj.mw.set_frequency_range(_fmin_ghz * 1e9, _fmax_ghz * 1e9, _npoints)",
-        "            simulationResult = simulationObj.mw.run_sweep()",
-        "            _last_sweep_executed = True",
-        "            print(f\"[sim] Sweep completed: {_sim_name}\")",
-        "            if PLOT_SPARAMS_AFTER_SIM or EXPORT_SPARAMS_AFTER_SIM:",
-        "                try:",
-        "                    from datetime import datetime as _dt",
-        "                    if PLOT_SPARAMS_AFTER_SIM:",
-        "                        from emerge.plot import plot_sp",
-        "                    _result_time_code = _dt.now().strftime('%Y%m%d-%H%M%S')",
-        "                    _safe_name = ''.join(c if c.isalnum() or c in ('-', '_') else '_' for c in _sim_name) or 'Simulation'",
-        "                    _run_tag = f'{_safe_name}_{_result_time_code}'",
-        "                    m_post = em.Simulation(PROJECT_NAME, load_file=True)",
-        "                    data = m_post.data.mw",
-        "                    _freq = data.scalar.grid.freq",
-        "                    _s_terms = [data.scalar.grid.S(1,1)]",
-        "                    _labels = ['S11']",
+        "            simulationResult = _fn(EIGENMODE_COUNT)",
+        "            print(f\"[job] Eigenmode completed ({_method}) count={EIGENMODE_COUNT}\")",
+        "            _done = True",
+        "            break",
+        "        except TypeError:",
+        "            try:",
+        "                simulationResult = _fn()",
+        "                print(f\"[job] Eigenmode completed ({_method})\")",
+        "                _done = True",
+        "                break",
+        "            except Exception:",
+        "                pass",
+        "    if not _done:",
+        "        raise RuntimeError('No compatible eigenmode API found in EMERGE.')",
+        "elif JOB_TYPE == 'parametric':",
+        "    values = [v.strip() for v in PARAM_VALUES.split(',') if v.strip()]",
+        "    if not values:",
+        "        values = ['default']",
+        "    for _value in values:",
+        "        if PARAM_NAME:",
+        "            _applied = False",
+        "            _num = None",
+        "            try:",
+        "                _num = float(_value)",
+        "            except Exception:",
+        "                _num = None",
+        "            for _target in (simulationObj, getattr(simulationObj, 'mw', None), getattr(simulationObj, 'settings', None)):",
+        "                if _target is None:",
+        "                    continue",
+        "                if hasattr(_target, PARAM_NAME):",
         "                    try:",
-        "                        _s_terms.append(data.scalar.grid.S(2,1))",
-        "                        _labels.append('S21')",
-        "                    except Exception:",
-        "                        pass",
-        "                    if PLOT_SPARAMS_AFTER_SIM:",
-        "                        plot_sp(_freq, _s_terms, labels=_labels)",
-        "                        print(f'[sim] S-parameter plot completed: {_run_tag}')",
-        "                    if EXPORT_SPARAMS_AFTER_SIM:",
-        f"                        _touchstone_name = f'{{_run_tag}}.s{port_count}p'",
-        "                        data.scalar.grid.export_touchstone(",
-        "                            _touchstone_name,",
-        "                            Z0ref=TOUCHSTONE_Z0,",
-        "                            format=TOUCHSTONE_FORMAT,",
-        "                            custom_comments=['EM 3D Modeler', 'EMERGE auto-export', f'Simulation: {_sim_name}'],",
-        "                            funit=TOUCHSTONE_FUNIT,",
-        "                        )",
-        "                        print(f'[sim] S-parameter export completed: {_touchstone_name}')",
-        "                except Exception:",
-        "                    print(f'[warn] S-parameter post-processing failed for {_sim_name}; continuing.')",
-        "                    traceback.print_exc()",
-        "        except Exception:",
-        "            print(f\"[sim] Sweep failed: {_sim_name}\")",
-        "            traceback.print_exc()",
-        "            raise",
-        "",
-        "    elif _sim_type == 'eigenmode':",
-        "        _done = False",
-        "        for _meth in ('run_eigenmode', 'eigenmode', 'solve_eigenmode'):",
-        "            _fn = getattr(simulationObj.mw, _meth, None)",
-        "            if callable(_fn):",
-        "                try:",
-        "                    simulationResult = _fn(_mode_count)",
-        "                    _done = True",
-        "                    print(f\"[sim] Eigenmode completed via {_meth}: {_sim_name}\")",
-        "                    break",
-        "                except TypeError:",
-        "                    try:",
-        "                        simulationResult = _fn()",
-        "                        _done = True",
-        "                        print(f\"[sim] Eigenmode completed via {_meth}(): {_sim_name}\")",
+        "                        setattr(_target, PARAM_NAME, _num if _num is not None else _value)",
+        "                        _applied = True",
         "                        break",
         "                    except Exception:",
         "                        pass",
-        "                except Exception:",
-        "                    pass",
-        "        if not _done:",
-        "            print(f\"[sim][warn] Eigenmode API not available; skipped '{_sim_name}'.\")",
+        "            if not _applied:",
+        "                print(f\"[job][warn] Parameter not applied directly: {PARAM_NAME}\")",
+        "        simulationResult = simulationObj.mw.run_sweep()",
+        "        print(f\"[job] Parametric sweep value={_value} completed\")",
+        "else:",
+        "    raise ValueError(f\"Unsupported job type: {JOB_TYPE}\")",
         "",
-        "    elif _sim_type == 'parametric':",
-        "        _vals = []",
-        "        if _param_values:",
-        "            for _tok in _param_values.split(','):",
-        "                _tok = _tok.strip()",
-        "                if _tok:",
-        "                    _vals.append(_tok)",
-        "        if not _vals:",
-        "            _vals = ['default']",
-        "",
-        "        for _v in _vals:",
-        "            print(f\"[sim] Parametric '{_sim_name}': {_param_name}={_v}\")",
-        "            _applied = False",
-        "            if _param_name:",
-        "                _numeric_v = None",
-        "                try:",
-        "                    _numeric_v = float(_v)",
-        "                except Exception:",
-        "                    _numeric_v = None",
-        "                for _target in (simulationObj, getattr(simulationObj, 'mw', None), getattr(simulationObj, 'settings', None)):",
-        "                    if _target is None:",
-        "                        continue",
-        "                    if hasattr(_target, _param_name):",
-        "                        try:",
-        "                            setattr(_target, _param_name, _numeric_v if _numeric_v is not None else _v)",
-        "                            _applied = True",
-        "                            break",
-        "                        except Exception:",
-        "                            pass",
-        "                if not _applied:",
-        "                    print(f\"[sim][warn] Param '{_param_name}' could not be applied directly; running with unchanged model.\")",
-        "            if not RUN_SWEEP:",
-        "                print(f\"[sim] Skipped parametric sweep '{_sim_name}' because RUN_SWEEP is disabled.\")",
-        "                continue",
-        "            try:",
-        "                simulationObj.mw.set_frequency_range(_fmin_ghz * 1e9, _fmax_ghz * 1e9, _npoints)",
-        "                simulationResult = simulationObj.mw.run_sweep()",
-        "                _last_sweep_executed = True",
-        "            except Exception:",
-        "                print(f\"[sim] Parametric sweep failed: {_sim_name} value={_v}\")",
-        "                traceback.print_exc()",
-        "                raise",
-        "    else:",
-        "        print(f\"[sim][warn] Unknown simulation type '{_sim_type}' for '{_sim_name}'.\")",
+        "_postprocess_sparams(simulationObj, simulationResult)",
+        "_postprocess_farfields(simulationObj)",
         "",
         "simulationObj.save()",
-        "print('Project saved.')",
+        "print(f\"[job] Saved project for {JOB_NAME}\")",
     ]
-
-    lines += [
-        "",
-        "if (PLOT_SPARAMS_AFTER_SIM or EXPORT_SPARAMS_AFTER_SIM) and not _last_sweep_executed:",
-        "    print('S-parameter post-processing skipped because no sweep simulation was executed.')",
-    ]
-
-    if fit_enabled and bool(run_sweep) and has_sweep_like:
-        lines += [
-            "",
-            "# Optional post-processing: fit S-parameters on N points and store NPZ output.",
-            f"SPARAM_FIT_NPOINTS = {fit_npoints}",
-            f"SPARAM_FIT_POLY_ORDER = {fit_poly_order}",
-            "try:",
-            "    print(f'[fit] S-parameter fitting enabled (N={SPARAM_FIT_NPOINTS}, order={SPARAM_FIT_POLY_ORDER}).')",
-            "",
-            "    def _call_if_needed(value):",
-            "        if callable(value):",
-            "            try:",
-            "                return value()",
-            "            except Exception:",
-            "                return None",
-            "        return value",
-            "",
-            "    def _first_attr(obj, names):",
-            "        if obj is None:",
-            "            return None",
-            "        for name in names:",
-            "            try:",
-            "                if isinstance(obj, dict) and name in obj:",
-            "                    v = _call_if_needed(obj[name])",
-            "                    if v is not None:",
-            "                        return v",
-            "                if hasattr(obj, name):",
-            "                    v = _call_if_needed(getattr(obj, name))",
-            "                    if v is not None:",
-            "                        return v",
-            "                getter = f'get_{name}'",
-            "                if hasattr(obj, getter):",
-            "                    v = _call_if_needed(getattr(obj, getter))",
-            "                    if v is not None:",
-            "                        return v",
-            "            except Exception:",
-            "                continue",
-            "        return None",
-            "",
-            "    def _as_1d_freq(raw):",
-            "        if raw is None:",
-            "            return None",
-            "        try:",
-            "            arr = np.asarray(raw, dtype=float).reshape(-1)",
-            "            if arr.size < 2:",
-            "                return None",
-            "            return arr",
-            "        except Exception:",
-            "            return None",
-            "",
-            "    def _as_s_array(raw):",
-            "        if raw is None:",
-            "            return None",
-            "        try:",
-            "            arr = np.asarray(raw)",
-            "            if arr.size == 0:",
-            "                return None",
-            "            if np.isrealobj(arr):",
-            "                arr = arr.astype(np.float64) + 0.0j",
-            "            else:",
-            "                arr = arr.astype(np.complex128)",
-            "            return arr",
-            "        except Exception:",
-            "            return None",
-            "",
-            "    result_obj = locals().get('simulationResult', None)",
-            "    if result_obj is None:",
-            "        result_obj = _first_attr(simulationObj, ['result', 'results', 'simulationResult'])",
-            "    mw_obj = _first_attr(simulationObj, ['mw'])",
-            "    if result_obj is None and mw_obj is not None:",
-            "        result_obj = _first_attr(mw_obj, ['result', 'results', 'simulationResult'])",
-            "",
-            "    freq = _as_1d_freq(_first_attr(result_obj, ['freq_hz', 'frequency_hz', 'freq', 'frequency', 'frequencies', 'f']))",
-            "    if freq is None and mw_obj is not None:",
-            "        freq = _as_1d_freq(_first_attr(mw_obj, ['freq_hz', 'frequency_hz', 'freq', 'frequency', 'frequencies', 'f']))",
-            "    if freq is None:",
-            "        freq = np.linspace(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, npoints)",
-            "        print('[fit][info] Frequency vector not found in result object. Using sweep range grid.')",
-            "",
-            "    s_raw = _first_attr(result_obj, ['s_matrix', 'S_matrix', 'sparameters', 'SParameters', 'sparams', 's_parameter', 's', 'S'])",
-            "    if s_raw is None and isinstance(result_obj, dict):",
-            "        nested = _first_attr(result_obj, ['data', 'results', 'output'])",
-            "        s_raw = _first_attr(nested, ['s_matrix', 'S_matrix', 'sparameters', 'SParameters', 'sparams', 's_parameter', 's', 'S'])",
-            "    if s_raw is None and mw_obj is not None:",
-            "        s_raw = _first_attr(mw_obj, ['s_matrix', 'S_matrix', 'sparameters', 'SParameters', 'sparams', 's_parameter', 's', 'S'])",
-            "",
-            "    s_arr = _as_s_array(s_raw)",
-            "    if s_arr is None:",
-            "        print('[fit][warn] Could not locate S-parameter matrix in simulation result. Skipping fit.')",
-            "    else:",
-            "        if s_arr.ndim == 1:",
-            "            s_arr = s_arr[:, np.newaxis, np.newaxis]",
-            "        elif s_arr.ndim == 2:",
-            "            if s_arr.shape[0] == freq.size:",
-            "                s_arr = s_arr[:, :, np.newaxis]",
-            "            elif s_arr.shape[1] == freq.size:",
-            "                s_arr = s_arr.T[:, :, np.newaxis]",
-            "        elif s_arr.shape[0] != freq.size:",
-            "            matched_axis = None",
-            "            for ax in range(s_arr.ndim):",
-            "                if s_arr.shape[ax] == freq.size:",
-            "                    matched_axis = ax",
-            "                    break",
-            "            if matched_axis is not None:",
-            "                s_arr = np.moveaxis(s_arr, matched_axis, 0)",
-            "",
-            "        if s_arr.shape[0] != freq.size:",
-            "            print(f'[fit][warn] Frequency size ({freq.size}) does not match S data axis ({s_arr.shape[0]}). Skipping fit.')",
-            "        else:",
-            "            fit_n = int(max(2, SPARAM_FIT_NPOINTS))",
-            "            fit_order = int(max(1, min(SPARAM_FIT_POLY_ORDER, freq.size - 1)))",
-            "            fit_freq = np.linspace(float(np.min(freq)), float(np.max(freq)), fit_n)",
-            "            s_fit = np.empty((fit_n,) + s_arr.shape[1:], dtype=np.complex128)",
-            "            coeff_shape = (fit_order + 1,) + s_arr.shape[1:]",
-            "            coeff_re = np.empty(coeff_shape, dtype=np.float64)",
-            "            coeff_im = np.empty(coeff_shape, dtype=np.float64)",
-            "",
-            "            for idx in np.ndindex(s_arr.shape[1:]):",
-            "                trace = s_arr[(slice(None),) + idx]",
-            "                cre = np.polyfit(freq, np.real(trace), fit_order)",
-            "                cim = np.polyfit(freq, np.imag(trace), fit_order)",
-            "                coeff_re[(slice(None),) + idx] = cre",
-            "                coeff_im[(slice(None),) + idx] = cim",
-            "                s_fit[(slice(None),) + idx] = np.polyval(cre, fit_freq) + 1j * np.polyval(cim, fit_freq)",
-            "",
-            "            fit_dir = os.path.join(currDir, PROJECT_NAME)",
-            "            os.makedirs(fit_dir, exist_ok=True)",
-            "            out_npz = os.path.join(fit_dir, f'{PROJECT_NAME}_sparam_fit.npz')",
-            "            np.savez(",
-            "                out_npz,",
-            "                freq_hz=np.asarray(freq, dtype=np.float64),",
-            "                s_matrix=np.asarray(s_arr, dtype=np.complex128),",
-            "                freq_fit_hz=np.asarray(fit_freq, dtype=np.float64),",
-            "                s_matrix_fit=np.asarray(s_fit, dtype=np.complex128),",
-            "                coeff_real=np.asarray(coeff_re, dtype=np.float64),",
-            "                coeff_imag=np.asarray(coeff_im, dtype=np.float64),",
-            "                fit_order=np.asarray([fit_order], dtype=np.int32),",
-            "            )",
-            "            print(f'[fit] Saved fitted S-parameters to: {out_npz}')",
-            "            print(f'[fit] Raw shape={tuple(s_arr.shape)}, fitted shape={tuple(s_fit.shape)}')",
-            "except Exception:",
-            "    print('[fit][warn] S-parameter fitting failed. Continuing without fitted output.')",
-            "    traceback.print_exc()",
-        ]
 
     return "\n".join(lines) + "\n"

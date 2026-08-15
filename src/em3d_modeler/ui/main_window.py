@@ -14,6 +14,7 @@ Layout
 from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
+import os
 import traceback
 import sys
 import vtk
@@ -27,21 +28,21 @@ def _icon(name: str) -> "QIcon":
     for ext in ("svg", "png"):
         p = _ICONS_DIR / f"{name}.{ext}"
         if p.exists():
-            from PyQt5.QtGui import QIcon
+            from PySide6.QtGui import QIcon
             return QIcon(str(p))
-    from PyQt5.QtGui import QIcon
+    from PySide6.QtGui import QIcon
     return QIcon()
 
-from PyQt5.QtWidgets import (
-    QMainWindow, QWidget, QSplitter, QAction,
+from PySide6.QtWidgets import (
+    QMainWindow, QWidget, QSplitter,
     QFileDialog, QMessageBox, QComboBox,
     QLabel, QDoubleSpinBox, QDialog, QInputDialog,
     QVBoxLayout, QTextBrowser, QPlainTextEdit,
     QPushButton, QHBoxLayout, QGroupBox, QCheckBox,
-    QProgressDialog, QApplication,
+    QProgressDialog, QApplication, QTabWidget,
 )
-from PyQt5.QtCore import Qt, QProcess, QLocale, QSettings
-from PyQt5.QtGui  import QIcon, QKeySequence
+from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize
+from PySide6.QtGui  import QIcon, QKeySequence, QAction
 
 # Undo/Redo CommandStack
 
@@ -108,6 +109,7 @@ class MainWindow(QMainWindow):
         self._sim_step_bundle_ready = False
         self._sim_step_bundle_cache: dict = {"entries": [], "skipped": []}
         self._sim_cached_script = ""
+        self._sim_cached_script_bundle: dict = {"master": "", "scripts": []}
         self._sim_log_verbosity = "INFO"
         self._ui_locale = QLocale.c()
 
@@ -159,7 +161,7 @@ class MainWindow(QMainWindow):
 
         # ������ centre column: viewport (top) + info bar (bottom) ���������������������������������������������������
         centre_widget = QWidget()
-        centre_layout = __import__("PyQt5.QtWidgets", fromlist=["QVBoxLayout"]).QVBoxLayout(centre_widget)
+        centre_layout = QVBoxLayout(centre_widget)
         centre_layout.setContentsMargins(0, 0, 0, 0)
         centre_layout.setSpacing(0)
         centre_layout.addWidget(self._viewport, stretch=1)
@@ -280,6 +282,7 @@ class MainWindow(QMainWindow):
             self,
             "About EM 3D Modeler",
             "EM 3D Modeler\n"
+            "Author: Gabriele Vittori\n"
             f"Version: {__version__}\n"
             f"Release Date: {__release_date__}\n"
             f"Date: {today}",
@@ -290,7 +293,7 @@ class MainWindow(QMainWindow):
         tb = self.addToolBar("Main")
         tb.setObjectName("main_toolbar")
         tb.setMovable(False)
-        tb.setIconSize(__import__("PyQt5.QtCore", fromlist=["QSize"]).QSize(22, 22))
+        tb.setIconSize(QSize(22, 22))
 
         # ������ Primitive shapes ������������������������������������������������������������������������������������������������������������������������
         _DRAW_ICONS = [
@@ -397,6 +400,8 @@ class MainWindow(QMainWindow):
         self._viewport.selection_changed.connect(self._on_selection_changed)
         self._viewport.scene_changed.connect(self._on_scene_changed)
         self._viewport.status_message.connect(self._info_bar.set_info)
+        self._viewport.picked_coords.connect(self._info_bar.set_coords)
+        self._viewport.clear_coords_requested.connect(self._info_bar.clear_coords)
 
         # Body props ��� viewport render
         self._body_props.params_changed.connect(self._on_params_changed)
@@ -410,6 +415,7 @@ class MainWindow(QMainWindow):
         self._materials.object_selected.connect(self._on_material_tree_select)
         self._materials.selection_changed.connect(self._on_material_tree_multi_select)
         self._materials.plane_make_active.connect(self._on_plane_make_active)
+        self._materials.plane_view_normal.connect(self._on_plane_view_normal)
         self._materials.plane_delete.connect(self._on_plane_delete)
         self._materials.plane_rename.connect(self._on_plane_rename)
         self._materials.plane_add_requested.connect(self._open_reference_plane_dialog)
@@ -422,9 +428,12 @@ class MainWindow(QMainWindow):
         self._materials.objects_bulk_rename.connect(self._on_materials_bulk_rename)
         self._materials.assign_port_requested.connect(self._on_assign_port_requested)
         self._materials.assign_boundary_requested.connect(self._on_assign_boundary_requested)
+        self._materials.assign_mesh_resolution_requested.connect(self._on_assign_mesh_resolution_requested)
+        self._materials.material_priority_changed.connect(self._on_material_priority_changed)
 
         # EMERGE settings changed
         self._project_tree.settings_changed.connect(self._on_settings_changed)
+        self._project_tree.output_plot_requested.connect(self._on_output_plot_requested)
 
     def _reset_simulation_cache(self) -> None:
         self._sim_steps_dirty = True
@@ -432,6 +441,7 @@ class MainWindow(QMainWindow):
         self._sim_step_bundle_ready = False
         self._sim_step_bundle_cache = {"entries": [], "skipped": []}
         self._sim_cached_script = ""
+        self._sim_cached_script_bundle = {"master": "", "scripts": []}
 
     def _mark_simulation_dirty(self, *, steps: bool = False, script: bool = True) -> None:
         if steps:
@@ -442,7 +452,12 @@ class MainWindow(QMainWindow):
 
     def _on_scene_changed(self) -> None:
         self._refresh_materials()
+        self._sync_port_reference_state()
         self._mark_simulation_dirty(steps=True, script=True)
+
+    def _sync_port_reference_state(self) -> None:
+        object_names = [str(o.name) for o in self._viewport.scene.objects if getattr(o, "name", None)]
+        self._project_tree.set_scene_object_names(object_names)
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� actions
     def _start_draw(self, mode: str) -> None:
@@ -457,6 +472,7 @@ class MainWindow(QMainWindow):
             self._viewport.scene.select(None)
             self._body_props.set_object(None)
             self._refresh_materials()
+            self._sync_port_reference_state()
             self._viewport._render()
             self._info_bar.set_info(f"Deleted: {obj.name}")
 
@@ -488,12 +504,12 @@ class MainWindow(QMainWindow):
             off = getattr(obj, "step_export_offset", (0.0, 0.0, 0.0))
             try:
                 obj.step_export_offset = (
-                    float(off[0]) + float(dx),
-                    float(off[1]) + float(dy),
-                    float(off[2]) + float(dz),
+                    float(off[0]) * factor,
+                    float(off[1]) * factor,
+                    float(off[2]) * factor,
                 )
             except Exception:
-                obj.step_export_offset = (float(dx), float(dy), float(dz))
+                obj.step_export_offset = (0.0, 0.0, 0.0)
         return True
 
     def _scale_by_attributes(self, obj, factor: float) -> bool:
@@ -1275,6 +1291,81 @@ class MainWindow(QMainWindow):
         self._project_tree.assign_boundary_to_object(obj.name)
         self._info_bar.set_info(f"Boundary assignment updated for {obj.name}")
 
+    def _on_assign_mesh_resolution_requested(self, objects: list) -> None:
+        if not objects:
+            return
+        settings = self._project_tree.get_settings()
+        mesh_cfg = settings.get("mesh")
+        if not isinstance(mesh_cfg, dict):
+            mesh_cfg = {}
+            settings["mesh"] = mesh_cfg
+
+        current_default = mesh_cfg.get("default_fraction", 0.3)
+        try:
+            current_default = float(current_default)
+        except Exception:
+            current_default = 0.3
+        current_default = max(0.01, min(1.0, current_default))
+
+        value, ok = QInputDialog.getDouble(
+            self,
+            "Assign Mesh Resolution",
+            "Resolution fraction (1/λ):",
+            current_default,
+            0.01,
+            1.0,
+            4,
+        )
+        if not ok:
+            return
+
+        mesh_assign = mesh_cfg.get("object_resolutions")
+        if not isinstance(mesh_assign, dict):
+            mesh_assign = {}
+            mesh_cfg["object_resolutions"] = mesh_assign
+
+        names: list[str] = []
+        seen: set[str] = set()
+        for obj in objects:
+            name = str(getattr(obj, "name", "")).strip()
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            names.append(name)
+
+        for name in names:
+            mesh_assign[name] = float(value)
+        mesh_cfg["default_fraction"] = float(value)
+
+        self._project_tree.load_settings(settings)
+        self._project_tree.settings_changed.emit()
+        self._mark_simulation_dirty(steps=False, script=True)
+        if len(names) == 1:
+            self._info_bar.set_info(f"Mesh 1/λ set to {value:.4g} for {names[0]}")
+        else:
+            self._info_bar.set_info(f"Mesh 1/λ set to {value:.4g} for {len(names)} objects")
+
+    def _on_material_priority_changed(self, material_name: str, delta: int) -> None:
+        """Handle material priority change: delta is 1 for higher, -1 for lower."""
+        if not material_name:
+            return
+        # Get current priorities from project settings
+        settings = self._project_tree.get_settings()
+        priorities = settings.get("material_priorities")
+        if not isinstance(priorities, dict):
+            priorities = {}
+            settings["material_priorities"] = priorities
+        # Update priority
+        current_priority = priorities.get(material_name, 0)
+        new_priority = current_priority + delta
+        priorities[material_name] = new_priority
+        # Apply the full settings payload back to the widget.
+        self._project_tree.load_settings(settings)
+        self._project_tree.settings_changed.emit()
+        self._refresh_materials()
+        self._reset_simulation_cache()
+        self._info_bar.set_info(f"Material '{material_name}' priority set to {new_priority}")
+
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� STEP import
     def _import_step(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
@@ -1332,10 +1423,12 @@ class MainWindow(QMainWindow):
 
             script_box = QGroupBox("Python Script to run with EMERGE")
             script_layout = QVBoxLayout(script_box)
+            self._sim_script_tabs = QTabWidget(script_box)
             self._sim_script_view = QPlainTextEdit(script_box)
             self._sim_script_view.setReadOnly(True)
             self._sim_script_view.setLineWrapMode(QPlainTextEdit.NoWrap)
-            script_layout.addWidget(self._sim_script_view)
+            self._sim_script_tabs.addTab(self._sim_script_view, "Master")
+            script_layout.addWidget(self._sim_script_tabs)
 
             log_box = QGroupBox("Verbose execution log")
             log_layout = QVBoxLayout(log_box)
@@ -1495,21 +1588,22 @@ class MainWindow(QMainWindow):
             u[tangent_axes[0]] = maxs[tangent_axes[0]] - mins[tangent_axes[0]]
             v[tangent_axes[1]] = maxs[tangent_axes[1]] - mins[tangent_axes[1]]
 
-            direction = [0.0, 0.0, 0.0]
-            direction[normal_axis] = 1.0
-
             params = port.get("params", {}) if isinstance(port.get("params", {}), dict) else {}
+            configured_direction = [
+                float(params.get("Direction_X", 0.0)),
+                float(params.get("Direction_Y", 0.0)),
+                float(params.get("Direction_Z", 0.0)),
+            ]
+            direction_magnitude = sum(value * value for value in configured_direction) ** 0.5
+            if direction_magnitude > 1e-9:
+                # An explicit port direction is part of the user's excitation
+                # definition and must be preserved in the generated script.
+                direction = [value / direction_magnitude for value in configured_direction]
+            else:
+                direction = [0.0, 0.0, 0.0]
+                direction[normal_axis] = 1.0
             z0 = float(params.get("Resistance_Ohm", 50.0))
             power = float(params.get("Voltage_V", 1.0))
-
-            # Use user-specified direction if set (any non-zero component)
-            dx = float(params.get("Direction_X", 0.0))
-            dy = float(params.get("Direction_Y", 0.0))
-            dz = float(params.get("Direction_Z", 0.0))
-            import math as _math
-            _mag = _math.sqrt(dx*dx + dy*dy + dz*dz)
-            if _mag > 1e-9:
-                direction = [dx/_mag, dy/_mag, dz/_mag]
 
             entries.append(
                 {
@@ -1528,25 +1622,190 @@ class MainWindow(QMainWindow):
             )
         return entries
 
-    def _build_simulation_script(self, step_entries: list[dict], show_model: bool, show_mesh: bool, run_sweep: bool) -> str:
-        return export_emerge_python_script(
-            project_name=self._project_name,
-            settings=self._project_tree.get_settings(),
-            step_entries=step_entries,
-            units=self._units,
-            materials_catalog=self._material_store.material_export_catalog(),
-            show_model=show_model,
-            show_mesh=show_mesh,
-            run_sweep=run_sweep,
-            lumped_ports=self._collect_plate_lumped_ports(),
-            solver=self._sim_solver,
-            parallel_enabled=self._sim_parallel_enabled,
-            pardiso_threads=self._sim_pardiso_threads,
-            acc_threads=self._sim_acc_threads,
-            mesh_resolution_fraction=self._mesh_resolution,
-            plot_sparams_after_sim=self._sim_plot_sparams_after_sim,
-            export_sparams_after_sim=self._sim_export_sparams_after_sim,
+    def _enabled_simulations(self, settings: dict) -> list[dict]:
+        sims = settings.get("simulations", [])
+        out: list[dict] = []
+        if isinstance(sims, list):
+            for idx, item in enumerate(sims, start=1):
+                if not isinstance(item, dict):
+                    continue
+                if not bool(item.get("enabled", True)):
+                    continue
+                name = str(item.get("name", f"Simulation_{idx}")).strip() or f"Simulation_{idx}"
+                out.append({
+                    "name": name,
+                    "type": str(item.get("type", "Sweep")).strip() or "Sweep",
+                    "enabled": True,
+                    "Fmin_GHz": item.get("Fmin_GHz", 0.1),
+                    "Fmax_GHz": item.get("Fmax_GHz", 10.0),
+                    "Fstep_GHz": item.get("Fstep_GHz", 0.1),
+                    "EigenmodeCount": item.get("EigenmodeCount", 5),
+                    "ParamName": item.get("ParamName", ""),
+                    "ParamValues": item.get("ParamValues", ""),
+                    "sparam_fitting": dict(item.get("sparam_fitting", {})) if isinstance(item.get("sparam_fitting", {}), dict) else {"enabled": False, "points": 1001},
+                    "LogVerbosity": item.get("LogVerbosity", "Info"),
+                })
+
+        if out:
+            return out
+
+        legacy = settings.get("simulation", {})
+        if not isinstance(legacy, dict):
+            legacy = {}
+        return [{
+            "name": "Simulation_1",
+            "type": "Sweep",
+            "enabled": True,
+            "Fmin_GHz": legacy.get("Fmin_GHz", 0.1),
+            "Fmax_GHz": legacy.get("Fmax_GHz", 10.0),
+            "Fstep_GHz": legacy.get("Fstep_GHz", 0.1),
+            "EigenmodeCount": legacy.get("EigenmodeCount", 5),
+            "ParamName": legacy.get("ParamName", ""),
+            "ParamValues": legacy.get("ParamValues", ""),
+            "sparam_fitting": dict(legacy.get("sparam_fitting", {})) if isinstance(legacy.get("sparam_fitting", {}), dict) else {"enabled": False, "points": 1001},
+            "LogVerbosity": legacy.get("LogVerbosity", "Info"),
+        }]
+
+    def _safe_script_token(self, value: str) -> str:
+        token = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in str(value))
+        token = token.strip("_")
+        return token or "Simulation"
+
+    def _build_master_simulation_script(
+        self,
+        jobs: list[dict],
+    ) -> str:
+        job_lines = []
+        for job in jobs:
+            job_lines.append(
+                "        {"
+                f"'name': {repr(str(job.get('name', 'Simulation')))}, "
+                f"'type': {repr(str(job.get('type', 'Sweep')).strip().lower())}, "
+                f"'filename': {repr(str(job.get('filename', 'simulation_emerge_run.py')))}"
+                "},"
+            )
+        jobs_literal = "\n".join(job_lines) if job_lines else ""
+        return (
+            "# Auto-generated EMERGE master script\n"
+            "import os\n"
+            "import sys\n"
+            "import subprocess\n\n"
+            "STOP_ON_ERROR = True\n\n"
+            "def _run_children() -> int:\n"
+            "    script_dir = os.path.dirname(os.path.abspath(__file__))\n"
+            "    jobs = [\n"
+            f"{jobs_literal}\n"
+            "    ]\n"
+            "    for job in jobs:\n"
+            "        child = str(job.get('filename', ''))\n"
+            "        child_path = os.path.join(script_dir, child)\n"
+            "        env = os.environ.copy()\n"
+            "        env.setdefault('PYTHONIOENCODING', 'utf-8')\n"
+            "        env.setdefault('PYTHONUTF8', '1')\n"
+            "        print(f\"[master] Running job '{job.get('name')}' from {child_path}\")\n"
+            "        result = subprocess.run([sys.executable, '-u', child_path], cwd=script_dir, env=env)\n"
+            "        if result.returncode != 0:\n"
+            "            print(f\"[master] Job failed ({result.returncode}): {job.get('name')}\")\n"
+            "            if STOP_ON_ERROR:\n"
+            "                return int(result.returncode)\n"
+            "    print('[master] All simulations completed successfully.')\n"
+            "    return 0\n\n"
+            "if __name__ == '__main__':\n"
+            "    raise SystemExit(_run_children())\n"
         )
+
+    def _build_simulation_script_bundle(self, step_entries: list[dict], show_model: bool, show_mesh: bool, run_sweep: bool) -> dict:
+        settings = self._project_tree.get_settings()
+        mesh_cfg = settings.get("mesh", {}) if isinstance(settings, dict) else {}
+        mesh_fraction = self._mesh_resolution
+        if isinstance(mesh_cfg, dict):
+            try:
+                mesh_fraction = max(0.01, min(1.0, float(mesh_cfg.get("default_fraction", mesh_fraction))))
+            except Exception:
+                pass
+
+        enabled_sims = self._enabled_simulations(settings)
+        if not bool(run_sweep):
+            enabled_sims = [
+                s for s in enabled_sims
+                if str(s.get("type", "Sweep")).strip().lower() not in {"sweep", "parametric"}
+            ]
+        scripts: list[dict] = []
+        for idx, sim_cfg in enumerate(enabled_sims, start=1):
+            sim_name = str(sim_cfg.get("name", f"Simulation_{idx}")).strip() or f"Simulation_{idx}"
+            child_settings = dict(settings)
+            child_settings["simulations"] = [dict(sim_cfg)]
+            child_settings["simulation"] = {
+                "Fmin_GHz": sim_cfg.get("Fmin_GHz", 0.1),
+                "Fmax_GHz": sim_cfg.get("Fmax_GHz", 10.0),
+                "Fstep_GHz": sim_cfg.get("Fstep_GHz", 0.1),
+                "LogVerbosity": sim_cfg.get("LogVerbosity", "Info"),
+            }
+            safe_project = self._safe_script_token(self._project_name)
+            safe_sim = self._safe_script_token(sim_name)
+            filename = f"{safe_project}_{idx:02d}_{safe_sim}_emerge_run.py"
+            script_text = export_emerge_python_script(
+                project_name=self._project_name,
+                settings=child_settings,
+                step_entries=step_entries,
+                units=self._units,
+                materials_catalog=self._material_store.material_export_catalog(),
+                show_model=show_model,
+                show_mesh=show_mesh,
+                run_sweep=run_sweep,
+                lumped_ports=self._collect_plate_lumped_ports(),
+                solver=self._sim_solver,
+                parallel_enabled=self._sim_parallel_enabled,
+                pardiso_threads=self._sim_pardiso_threads,
+                acc_threads=self._sim_acc_threads,
+                mesh_resolution_fraction=mesh_fraction,
+                plot_sparams_after_sim=self._sim_plot_sparams_after_sim,
+                export_sparams_after_sim=self._sim_export_sparams_after_sim,
+                simulation_override=sim_cfg,
+            )
+            scripts.append(
+                {
+                    "name": sim_name,
+                    "job_name": sim_name,
+                    "type": str(sim_cfg.get("type", "Sweep")).strip().lower(),
+                    "index": idx,
+                    "filename": filename,
+                    "content": script_text,
+                }
+            )
+
+        master_script = self._build_master_simulation_script(
+            scripts,
+        )
+        return {"master": master_script, "scripts": scripts}
+
+    def _update_simulation_script_tabs(self, script_bundle: dict) -> None:
+        tabs = getattr(self, "_sim_script_tabs", None)
+        if tabs is None:
+            return
+
+        while tabs.count() > 0:
+            w = tabs.widget(0)
+            tabs.removeTab(0)
+            if w is not None:
+                w.deleteLater()
+
+        master_editor = QPlainTextEdit(tabs)
+        master_editor.setReadOnly(True)
+        master_editor.setLineWrapMode(QPlainTextEdit.NoWrap)
+        master_editor.setPlainText(str(script_bundle.get("master", "")))
+        tabs.addTab(master_editor, "Master")
+        self._sim_script_view = master_editor
+
+        for item in script_bundle.get("scripts", []):
+            editor = QPlainTextEdit(tabs)
+            editor.setReadOnly(True)
+            editor.setLineWrapMode(QPlainTextEdit.NoWrap)
+            editor.setPlainText(str(item.get("content", "")))
+            job_name = str(item.get("job_name", item.get("name", "Simulation"))).strip() or "Simulation"
+            idx = int(item.get("index", 0))
+            tab_name = f"{idx:02d} {job_name}" if idx > 0 else job_name
+            tabs.addTab(editor, tab_name)
 
     def _simulation_model_objects(self) -> list:
         return [obj for obj in self._viewport.scene.objects if bool(getattr(obj, "is_model", True))]
@@ -1597,6 +1856,7 @@ class MainWindow(QMainWindow):
                         progress_callback=_progress_cb,
                         log_callback=_step_cb,
                         debug_boolean_sources_only=bool(getattr(self, "_sim_chk_boolean_debug", None) and self._sim_chk_boolean_debug.isChecked()),
+                        material_priorities=self._project_tree.get_settings().get("material_priorities", {}),
                     )
                 except Exception as exc:
                     self._append_step_export_log(f"[error] STEP export failed: {exc}", level="ERROR")
@@ -1641,26 +1901,29 @@ class MainWindow(QMainWindow):
             else:
                 bundle = self._sim_step_bundle_cache
 
-            need_script = force_script or self._sim_script_dirty or (not self._sim_cached_script)
+            need_script = force_script or self._sim_script_dirty or (not self._sim_cached_script_bundle.get("master", ""))
 
             if need_script:
                 show_model = bool(getattr(self, "_sim_chk_show_model", None) and self._sim_chk_show_model.isChecked())
                 show_mesh = bool(getattr(self, "_sim_chk_show_mesh", None) and self._sim_chk_show_mesh.isChecked())
                 run_sweep = bool(getattr(self, "_sim_chk_run_sweep", None) and self._sim_chk_run_sweep.isChecked())
 
-                script = self._build_simulation_script(
+                script_bundle = self._build_simulation_script_bundle(
                     bundle.get("entries", []),
                     show_model=show_model,
                     show_mesh=show_mesh,
                     run_sweep=run_sweep,
                 )
+                self._sim_cached_script_bundle = script_bundle
+                script = str(script_bundle.get("master", ""))
                 self._sim_cached_script = script
                 self._sim_script_dirty = False
-                self._append_sim_log("[info] Script generated.")
+                self._append_sim_log(f"[info] Script bundle generated ({len(script_bundle.get('scripts', []))} simulation scripts + master).")
             else:
-                script = self._sim_cached_script
+                script_bundle = self._sim_cached_script_bundle
+                script = str(script_bundle.get("master", ""))
 
-            self._sim_script_view.setPlainText(script)
+            self._update_simulation_script_tabs(script_bundle)
             if need_step_export:
                 self._append_step_export_log("[info] STEP export finished.", level="INFO")
             return script
@@ -1676,8 +1939,27 @@ class MainWindow(QMainWindow):
 
     def _simulation_project_dir(self) -> Path:
         if self._project_path:
-            return Path(self._project_path).resolve().parent
-        return Path(__file__).parent.parent.parent.parent
+            project_path = Path(self._project_path).expanduser().resolve()
+            if project_path.exists():
+                if project_path.is_file():
+                    return project_path.parent
+                if project_path.is_dir():
+                    return project_path
+
+            if project_path.suffix.lower() == ".em3d":
+
+                # Recover a stale relative/launcher path by resolving the
+                # project file by name inside the workspace.
+                workspace_root = Path(__file__).resolve().parents[3]
+                matches = list(workspace_root.rglob(project_path.name))
+                for match in matches:
+                    if match.is_file() and match.suffix.lower() == ".em3d":
+                        self._project_path = str(match.resolve())
+                        return match.resolve().parent
+
+        # main_window.py lives in <workspace>/src/em3d_modeler/ui.  Resolve
+        # first so the result never depends on the launcher's current folder.
+        return Path(__file__).resolve().parents[3]
 
     def _simulation_bundle_dir(self) -> Path:
         safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in self._project_name)
@@ -1709,15 +1991,16 @@ class MainWindow(QMainWindow):
         out_dir = self._simulation_bundle_dir()
         safe_name = "".join(c if c.isalnum() or c in ("-", "_") else "_" for c in self._project_name)
         safe_name = safe_name or "project"
-        return out_dir / f"{safe_name}_emerge_run.py"
+        return out_dir / f"{safe_name}_master_emerge_run.py"
 
     def _on_sim_save_script(self) -> None:
-        script = self._sim_script_view.toPlainText().strip()
-        if not script:
+        script_bundle = self._sim_cached_script_bundle
+        if not str(script_bundle.get("master", "")).strip():
             try:
-                script = self._generate_simulation_assets(show_progress=True)
-                if not script:
+                master_script = self._generate_simulation_assets(show_progress=True)
+                if not master_script:
                     return
+                script_bundle = self._sim_cached_script_bundle
             except Exception as exc:
                 self._append_sim_log(f"[error] Failed to generate script: {exc}")
                 return
@@ -1731,21 +2014,33 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        Path(path).write_text(script, encoding="utf-8")
-        self._append_sim_log(f"[info] Script saved: {path}")
+        master_path = Path(path)
+        target_dir = master_path.parent
+        master_path.write_text(str(script_bundle.get("master", "")), encoding="utf-8")
+        self._append_sim_log(f"[info] Master script saved: {master_path}")
+        for item in script_bundle.get("scripts", []):
+            child_name = str(item.get("filename", "simulation_emerge_run.py"))
+            child_path = target_dir / child_name
+            child_path.write_text(str(item.get("content", "")), encoding="utf-8")
+            self._append_sim_log(f"[info] Child script saved: {child_path}")
 
     def _on_sim_run(self) -> None:
         try:
-            script = self._generate_simulation_assets(show_progress=True, force_script=False)
+            master_script = self._generate_simulation_assets(show_progress=True, force_script=False)
         except Exception as exc:
             self._append_sim_log(f"[error] Failed to prepare simulation assets: {exc}")
             return
-        if not script:
+        if not master_script:
             return
 
+        bundle = self._sim_cached_script_bundle
         script_path = self._simulation_script_path()
-        script_path.write_text(script, encoding="utf-8")
-        self._append_sim_log(f"[info] Running script: {script_path}")
+        script_path.write_text(str(bundle.get("master", "")), encoding="utf-8")
+        for item in bundle.get("scripts", []):
+            child_name = str(item.get("filename", "simulation_emerge_run.py"))
+            child_path = script_path.parent / child_name
+            child_path.write_text(str(item.get("content", "")), encoding="utf-8")
+        self._append_sim_log(f"[info] Running master script: {script_path}")
 
         proc = getattr(self, "_sim_process", None)
         if proc is not None and proc.state() != QProcess.NotRunning:
@@ -1881,6 +2176,40 @@ class MainWindow(QMainWindow):
         self._sync_active_reference_plane_to_viewport()
         self._refresh_materials()
         self._info_bar.set_info(f"Active reference plane: {plane.name}")
+
+    def _on_plane_view_normal(self, plane) -> None:
+        """Look at the selected reference plane along its positive normal."""
+        import math
+
+        normal = tuple(float(value) for value in plane.normal)
+        length = math.sqrt(sum(value * value for value in normal))
+        if length < 1e-12:
+            return
+        normal = tuple(value / length for value in normal)
+        origin = tuple(float(value) for value in plane.origin)
+
+        camera = self._viewport._renderer.GetActiveCamera()
+        current_position = camera.GetPosition()
+        distance = math.sqrt(sum(
+            (current_position[index] - origin[index]) ** 2
+            for index in range(3)
+        ))
+        distance = max(distance, float(self._workspace_size), 1.0)
+        camera.SetPosition(*(
+            origin[index] + normal[index] * distance
+            for index in range(3)
+        ))
+        camera.SetFocalPoint(*origin)
+
+        # Prefer world Z as the vertical direction, unless it is parallel to
+        # the view direction; then use world Y to keep the view upright.
+        view_up = (0.0, 0.0, 1.0)
+        if abs(sum(view_up[index] * normal[index] for index in range(3))) > 0.95:
+            view_up = (0.0, 1.0, 0.0)
+        camera.SetViewUp(*view_up)
+        self._viewport._renderer.ResetCameraClippingRange()
+        self._viewport._render()
+        self._info_bar.set_info(f"View normal to plane: {plane.name}")
 
     def _on_plane_delete(self, plane) -> None:
         scene = self._viewport.scene
@@ -2193,18 +2522,365 @@ class MainWindow(QMainWindow):
     def _refresh_materials(self) -> None:
         scene = self._viewport.scene
         by_mat = scene.by_material()
+        settings = self._project_tree.get_settings()
+        material_priorities = settings.get("material_priorities", {})
+        if not isinstance(material_priorities, dict):
+            material_priorities = {}
         self._materials.refresh(
             by_mat,
             planes=scene.reference_planes,
             active_plane=scene.active_plane,
             plane_triad_visible=self._viewport.is_plane_triad_visible(),
             grid_visible=self._viewport.is_grid_visible(),
+            material_priorities=material_priorities,
         )
 
     def _on_settings_changed(self) -> None:
         self._sync_log_verbosity_from_settings()
+        self._sync_port_reference_state()
         self._info_bar.set_info("EMERGE settings updated.")
         self._mark_simulation_dirty(steps=False, script=True)
+
+    def _simdata_file_in_dir(self, results_dir: Path) -> Path | None:
+        if not results_dir.exists() or not results_dir.is_dir():
+            return None
+        for name in ("simdata.emerge", "simdata.EMERGE"):
+            p = results_dir / name
+            if p.exists() and p.is_file():
+                return p
+        return None
+
+    def _candidate_results_dirs_for_sim(self, simulation_name: str) -> list[Path]:
+        bundle_dir = self._simulation_bundle_dir()
+        safe_project = self._safe_script_token(self._project_name)
+        safe_sim = self._safe_script_token(simulation_name)
+
+        sim_index = None
+        settings = self._project_tree.get_settings()
+        sims = settings.get("simulations", []) if isinstance(settings, dict) else []
+        if isinstance(sims, list):
+            for idx, sim in enumerate(sims, start=1):
+                if not isinstance(sim, dict):
+                    continue
+                name = str(sim.get("name", f"Simulation_{idx}")).strip() or f"Simulation_{idx}"
+                if name == simulation_name:
+                    sim_index = idx
+                    break
+
+        candidates: list[Path] = []
+        if sim_index is not None:
+            candidates.append(bundle_dir / f"{safe_project}_{sim_index:02d}_{safe_sim}.EMResults")
+        candidates.append(bundle_dir / f"{safe_project}.EMResults")
+
+        try:
+            all_res = sorted(bundle_dir.glob("*.EMResults"), key=lambda p: p.stat().st_mtime, reverse=True)
+        except Exception:
+            all_res = []
+
+        sim_token = safe_sim.lower()
+        for p in all_res:
+            stem = p.stem.lower()
+            if sim_token and sim_token in stem and p not in candidates:
+                candidates.append(p)
+        for p in all_res:
+            if p not in candidates:
+                candidates.append(p)
+
+        # Existing results may have been generated before the project path was
+        # corrected. Recover only matching EMERGE result folders in the
+        # workspace so the plot command can still open the latest run.
+        if not any(self._simdata_file_in_dir(path) for path in candidates):
+            workspace_root = Path(__file__).resolve().parents[3]
+            for simdata in workspace_root.rglob("simdata.emerge"):
+                result_dir = simdata.parent
+                if result_dir not in candidates and safe_project.lower() in result_dir.parent.name.lower():
+                    candidates.append(result_dir)
+        return candidates
+
+    def _resolve_emerge_simulation_ctor(self):
+        # EMERGE API differs across versions/distributions.
+        # Some builds require importing emerge_iron before emerge symbols are exposed.
+        import importlib
+        import pkgutil
+
+        for bootstrap in ("emerge_iron",):
+            try:
+                importlib.import_module(bootstrap)
+            except Exception:
+                pass
+
+        self._import_installed_emerge()
+
+        tried: list[str] = []
+
+        def _try(mod_name: str, attr_name: str):
+            tried.append(f"{mod_name}.{attr_name}")
+            try:
+                mod = importlib.import_module(mod_name)
+                ctor = getattr(mod, attr_name, None)
+                if callable(ctor):
+                    return ctor
+            except Exception:
+                return None
+            return None
+
+        for mod_name, attr_name in (
+            ("emerge", "Simulation"),
+            ("emerge.core", "Simulation"),
+            ("emerge.ext", "Simulation"),
+            ("emerge._emerge.simmodel", "Simulation"),
+            ("emerge", "SimulationBeta"),
+        ):
+            ctor = _try(mod_name, attr_name)
+            if ctor is not None:
+                return ctor
+
+        # Dynamic fallback: search emerge submodules for a callable Simulation symbol.
+        em = None
+        em_file = "<unknown>"
+        em_attrs = []
+        try:
+            em = importlib.import_module("emerge")
+            em_file = str(getattr(em, "__file__", "<unknown>"))
+            em_attrs = [a for a in dir(em) if "sim" in a.lower()][:20]
+        except Exception:
+            em = None
+
+        if em is not None:
+            # Check already imported child modules first.
+            for attr_name in dir(em):
+                try:
+                    obj = getattr(em, attr_name, None)
+                    ctor = getattr(obj, "Simulation", None)
+                    if callable(ctor):
+                        return ctor
+                except Exception:
+                    continue
+
+            # Then scan package modules.
+            em_path = getattr(em, "__path__", None)
+            if em_path is not None:
+                try:
+                    for mod_info in pkgutil.walk_packages(em_path, em.__name__ + "."):
+                        mod_name = mod_info.name
+                        lname = mod_name.lower()
+                        if not ("sim" in lname or "core" in lname or "ext" in lname):
+                            continue
+                        tried.append(f"{mod_name}.Simulation")
+                        try:
+                            mod = importlib.import_module(mod_name)
+                            ctor = getattr(mod, "Simulation", None)
+                            if callable(ctor):
+                                return ctor
+                        except Exception:
+                            continue
+                except Exception:
+                    pass
+
+        raise RuntimeError(
+            "Unable to resolve EMERGE Simulation class. "
+            f"Tried: {', '.join(tried)}. "
+            f"emerge module: {em_file}; sim-like attrs: {em_attrs}"
+        )
+
+    @staticmethod
+    def _import_installed_emerge():
+        """Import site-packages EMERGE, not the local ``emerge`` helper package."""
+        import importlib
+        import sys
+        from pathlib import Path
+
+        local_emerge = Path(__file__).resolve().parents[1] / "emerge"
+        local_root = str(local_emerge.parent).lower()
+        current = sys.modules.get("emerge")
+        current_file = str(getattr(current, "__file__", "")).lower()
+        if current is not None and current_file.startswith(str(local_emerge).lower()):
+            for name in list(sys.modules):
+                if name == "emerge" or name.startswith("emerge."):
+                    del sys.modules[name]
+
+        old_path = list(sys.path)
+        sys.path[:] = [
+            entry for entry in sys.path
+            if str(Path(entry or ".").resolve()).lower() != local_root
+        ]
+        try:
+            module = importlib.import_module("emerge")
+            module_file = str(getattr(module, "__file__", "")).lower()
+            if module_file.startswith(str(local_emerge).lower()):
+                raise RuntimeError(f"Local EMERGE helper package was imported: {module_file}")
+            return module
+        finally:
+            sys.path[:] = old_path
+
+    def _load_sim_grid_from_results(self, simulation_name: str):
+        sim_ctor = self._resolve_emerge_simulation_ctor()
+
+        candidates = self._candidate_results_dirs_for_sim(simulation_name)
+        last_err = None
+        for results_dir in candidates:
+            simdata = self._simdata_file_in_dir(results_dir)
+            if simdata is None:
+                continue
+            results_dir = results_dir.resolve()
+            model_name = str(results_dir.parent / results_dir.stem)
+            cwd_prev = os.getcwd()
+            try:
+                os.chdir(str(results_dir.parent))
+                try:
+                    sim = sim_ctor(model_name, load_file=True)
+                except TypeError:
+                    sim = sim_ctor(model_name)
+                    load_fn = getattr(sim, "load", None)
+                    if callable(load_fn):
+                        try:
+                            load_fn()
+                        except TypeError:
+                            load_fn(str(results_dir))
+                mw_data = getattr(getattr(sim, "data", None), "mw", None)
+                if mw_data is None:
+                    raise RuntimeError("Loaded simulation has no microwave data.")
+                scalar = getattr(mw_data, "scalar", None)
+                grid = getattr(scalar, "grid", None)
+                if grid is None:
+                    raise RuntimeError("Loaded simulation has no scalar.grid data.")
+                return sim, grid, simdata
+            except Exception as exc:
+                last_err = exc
+            finally:
+                os.chdir(cwd_prev)
+
+        if last_err is not None:
+            raise RuntimeError(f"Failed to load results for '{simulation_name}': {last_err}") from last_err
+        raise RuntimeError(
+            f"No simdata.emerge found for simulation '{simulation_name}' in {self._simulation_bundle_dir()}"
+        )
+
+    def _grid_port_numbers(self, grid) -> list[int]:
+        port_map = getattr(grid, "_portmap", None)
+        if isinstance(port_map, dict) and port_map:
+            out: list[int] = []
+            for k in port_map.keys():
+                try:
+                    out.append(int(k))
+                except Exception:
+                    pass
+            if out:
+                return sorted(set(out))
+        try:
+            smat = grid.Smat
+            n_ports = int(smat.shape[1]) if len(getattr(smat, "shape", ())) >= 3 else 1
+            return list(range(1, max(1, n_ports) + 1))
+        except Exception:
+            return [1]
+
+    def _plot_loaded_far_field(
+        self,
+        simulation,
+        plot_type: str,
+        plot_params: dict,
+        output_name: str,
+        simdata_path: Path,
+    ) -> None:
+        """Plot far-field data generated and saved by the EMERGE job."""
+        import numpy as np
+
+        result_dir = simdata_path.parent.parent
+        data_path = result_dir / f"{self._safe_script_token(output_name)}.farfield.txt"
+        if not data_path.exists():
+            field_dataset = getattr(getattr(getattr(simulation, "data", None), "mw", None), "field", None)
+            raise RuntimeError(
+                "Far-field data file was not found in the simulation folder: "
+                f"{data_path}. Saved microwave field dataset available: {field_dataset is not None}. "
+                "Regenerate the simulation with a Far Field output enabled."
+            )
+
+        values = np.loadtxt(data_path, comments="#", ndmin=2)
+        if values.shape[1] < 2:
+            raise RuntimeError(f"Invalid far-field data file: {data_path}")
+        theta = values[:, 0]
+        field_values = values[:, 1]
+        labels = [str(output_name)]
+        use_db = bool(plot_params.get("far_field_db", False))
+
+        import importlib
+        emerge_plot = importlib.import_module("emerge.plot")
+        if plot_type == "plot_ff_polar":
+            emerge_plot.plot_ff_polar(theta, field_values, dB=use_db, labels=labels)
+        else:
+            emerge_plot.plot_ff(theta, field_values, dB=use_db, labels=labels)
+
+        self._info_bar.set_info(f"Far-field plotted: {output_name} from {data_path}")
+        self._append_sim_log(f"[info] Far-field plotted: {output_name} from {data_path}")
+
+    def _on_output_plot_requested(self, payload: dict) -> None:
+        name = str(payload.get("name", "Output")).strip() or "Output"
+        sim_name = str(payload.get("simulation", "")).strip()
+        plot_type = str(payload.get("plot_type", "plot_sp")).strip() or "plot_sp"
+        plot_params = payload.get("params", {}) if isinstance(payload.get("params", {}), dict) else {}
+        if not sim_name:
+            QMessageBox.warning(self, "Output", "Output has no simulation assigned.")
+            return
+
+        try:
+            loaded_sim, grid, simdata_path = self._load_sim_grid_from_results(sim_name)
+        except Exception as exc:
+            QMessageBox.warning(self, "Output", str(exc))
+            self._append_sim_log(f"[warn] Output '{name}' failed: {exc}")
+            return
+
+        try:
+            import importlib
+            self._import_installed_emerge()
+            emerge_plot = importlib.import_module("emerge.plot")
+            plot_sp = emerge_plot.plot_sp
+            plot_vswr = emerge_plot.plot_vswr
+            smith = emerge_plot.smith
+            plot = emerge_plot.plot
+            plot_ff = emerge_plot.plot_ff
+            plot_ff_polar = emerge_plot.plot_ff_polar
+        except Exception as exc:
+            QMessageBox.warning(self, "Output", f"Unable to import emerge.plot: {exc}")
+            return
+
+        freq = getattr(grid, "freq", None)
+        if freq is None:
+            QMessageBox.warning(self, "Output", "Loaded simdata has no frequency axis.")
+            return
+        ports = self._grid_port_numbers(grid)
+
+        try:
+            if plot_type == "plot_sp":
+                curves = [grid.S(i, j) for i in ports for j in ports]
+                labels = [f"S{i}{j}" for i in ports for j in ports]
+                plot_sp(freq, curves, labels=labels)
+            elif plot_type == "plot_vswr":
+                curves = [grid.S(i, i) for i in ports]
+                labels = [f"VSWR{i}{i}" for i in ports]
+                plot_vswr(freq, curves, labels=labels)
+            elif plot_type == "smith":
+                port_i = max(1, int(plot_params.get("port_i", 1)))
+                port_j = max(1, int(plot_params.get("port_j", port_i)))
+                curves = [grid.S(port_i, port_j)]
+                smith(curves, f=freq, labels=[f"S{port_i}{port_j}"])
+            elif plot_type == "plot":
+                import numpy as np
+                curves = [20.0 * np.log10(np.maximum(np.abs(grid.S(i, i)), 1e-12)) for i in ports]
+                labels = [f"|S{i}{i}| dB" for i in ports]
+                plot(freq, curves, labels=labels, xlabel="Frequency (Hz)", ylabel="Magnitude (dB)")
+            elif plot_type in {"plot_ff", "plot_ff_polar"}:
+                self._plot_loaded_far_field(loaded_sim, plot_type, plot_params, name, simdata_path)
+                return
+            else:
+                QMessageBox.warning(self, "Output", f"Unsupported plot type: {plot_type}")
+                return
+        except Exception as exc:
+            QMessageBox.warning(self, "Output", f"Failed to generate plot '{name}': {exc}")
+            self._append_sim_log(f"[warn] Output '{name}' plot error: {exc}")
+            return
+
+        self._info_bar.set_info(f"Output plotted: {name} ({plot_type}) from {simdata_path}")
+        self._append_sim_log(f"[info] Output plotted: {name} ({plot_type}) from {simdata_path}")
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� camera views
     def _set_view(self, view: str) -> None:
@@ -2248,11 +2924,13 @@ class MainWindow(QMainWindow):
         self._reset_simulation_cache()
         self.setWindowTitle(f"EM 3D Modeler - {self._project_name}")
         self._project_tree.set_project_name(self._project_name)
+        self._project_tree.reset_settings()
         self._sync_log_verbosity_from_settings()
         self._viewport.scene.clear()
         self._sync_active_reference_plane_to_viewport()
         self._body_props.set_object(None)
         self._sync_material_choices()
+        self._sync_port_reference_state()
         self._refresh_materials()
         self._viewport._render()
         self._info_bar.set_info("New project created.")
@@ -2267,7 +2945,7 @@ class MainWindow(QMainWindow):
             data = ProjectFile.load(path)
             loaded_name = str(data.get("project_name", "")).strip()
             self._project_name = loaded_name if loaded_name and loaded_name != "Untitled" else Path(path).stem
-            self._project_path = path
+            self._project_path = str(Path(path).expanduser().resolve())
             self._reset_simulation_cache()
             self.setWindowTitle(f"EM 3D Modeler - {self._project_name}")
             self._project_tree.set_project_name(self._project_name)
@@ -2313,8 +2991,17 @@ class MainWindow(QMainWindow):
                 self._units,
             )
             self._sync_active_reference_plane_to_viewport()
+            default_plane = self._viewport.scene.active_plane.name if self._viewport.scene.active_plane is not None else loaded_plane
+            plane_name = str(default_plane).split()[0].upper() if default_plane else loaded_plane
+            if plane_name not in {"XY", "XZ", "YZ"}:
+                plane_name = loaded_plane
+            normal_map = {"XY": (0.0, 0.0, 1.0), "XZ": (0.0, 1.0, 0.0), "YZ": (1.0, 0.0, 0.0)}
+            for obj in self._viewport.scene.objects:
+                if obj.creation_plane == "XY" and obj.creation_plane_normal == (0.0, 0.0, 1.0):
+                    obj.set_creation_plane(plane_name, (0.0, 0.0, 0.0), normal_map.get(plane_name, (0.0, 0.0, 1.0)))
             self._viewport.set_camera_state(data.get("camera", {}))
             self._body_props.set_object(None)
+            self._sync_port_reference_state()
             self._refresh_materials()
             self._viewport._render()
             self._info_bar.set_info(f"Project loaded: {path}")
@@ -2334,7 +3021,7 @@ class MainWindow(QMainWindow):
             "EM3D Project (*.em3d);;All Files (*)"
         )
         if path:
-            self._project_path = path
+            self._project_path = str(Path(path).expanduser().resolve())
             self._project_name = Path(path).stem
             self.setWindowTitle(f"EM 3D Modeler - {self._project_name}")
             self._project_tree.set_project_name(self._project_name)

@@ -45,6 +45,151 @@ def _build_occ_box_shape(obj: Any) -> Any | None:
     return None
 
 
+def _translate_shape_local(shape: Any, dx: float, dy: float, dz: float) -> Any:
+    for pkg in ("OCP", "OCC.Core"):
+        try:
+            if pkg == "OCP":
+                from OCP.gp import gp_Trsf, gp_Vec
+                from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+                tr = gp_Trsf()
+                tr.SetTranslation(gp_Vec(dx, dy, dz))
+                return BRepBuilderAPI_Transform(shape, tr, True).Shape()
+
+            from OCC.Core.gp import gp_Trsf, gp_Vec
+            from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Transform
+            tr = gp_Trsf()
+            tr.SetTranslation(gp_Vec(dx, dy, dz))
+            return BRepBuilderAPI_Transform(shape, tr, True).Shape()
+        except ImportError:
+            continue
+        except Exception:
+            return shape
+    return shape
+
+
+def _build_occ_cylinder_shape(obj: Any) -> Any | None:
+    try:
+        radius = abs(float(getattr(obj, "radius")))
+        height = abs(float(getattr(obj, "height")))
+        center = (
+            float(getattr(obj, "cx")),
+            float(getattr(obj, "cy")),
+            float(getattr(obj, "cz")),
+        )
+        axis = str(getattr(obj, "axis", "Z")).upper()
+    except Exception:
+        return None
+    if radius <= 0.0 or height <= 0.0:
+        return None
+
+    direction = {
+        "X": (1.0, 0.0, 0.0),
+        "Y": (0.0, 1.0, 0.0),
+        "Z": (0.0, 0.0, 1.0),
+    }.get(axis)
+    if direction is None:
+        return None
+    base = tuple(center[index] - 0.5 * height * direction[index] for index in range(3))
+
+    for pkg in ("OCP", "OCC.Core"):
+        try:
+            if pkg == "OCP":
+                from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+                from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+                axis_frame = gp_Ax2(
+                    gp_Pnt(*base),
+                    gp_Dir(*direction),
+                )
+                return BRepPrimAPI_MakeCylinder(axis_frame, radius, height).Shape()
+
+            from OCC.Core.gp import gp_Ax2, gp_Dir, gp_Pnt
+            from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeCylinder
+            axis_frame = gp_Ax2(
+                gp_Pnt(*base),
+                gp_Dir(*direction),
+            )
+            return BRepPrimAPI_MakeCylinder(axis_frame, radius, height).Shape()
+        except ImportError:
+            continue
+        except Exception:
+            return None
+    return None
+
+
+def _build_occ_cone_shape(obj: Any) -> Any | None:
+    try:
+        radius = abs(float(getattr(obj, "radius")))
+        height = abs(float(getattr(obj, "height")))
+        center = (
+            float(getattr(obj, "cx")),
+            float(getattr(obj, "cy")),
+            float(getattr(obj, "cz")),
+        )
+        axis = str(getattr(obj, "axis", "Z")).upper()
+    except Exception:
+        return None
+    if radius <= 0.0 or height <= 0.0:
+        return None
+
+    direction = {
+        "X": (1.0, 0.0, 0.0),
+        "Y": (0.0, 1.0, 0.0),
+        "Z": (0.0, 0.0, 1.0),
+    }.get(axis)
+    if direction is None:
+        return None
+    base = tuple(center[index] - 0.5 * height * direction[index] for index in range(3))
+
+    for pkg in ("OCP", "OCC.Core"):
+        try:
+            if pkg == "OCP":
+                from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
+                from OCP.BRepPrimAPI import BRepPrimAPI_MakeCone
+                axis_frame = gp_Ax2(
+                    gp_Pnt(*base),
+                    gp_Dir(*direction),
+                )
+                return BRepPrimAPI_MakeCone(axis_frame, radius, 0.0, height).Shape()
+
+            from OCC.Core.gp import gp_Ax2, gp_Dir, gp_Pnt
+            from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeCone
+            axis_frame = gp_Ax2(
+                gp_Pnt(*base),
+                gp_Dir(*direction),
+            )
+            return BRepPrimAPI_MakeCone(axis_frame, radius, 0.0, height).Shape()
+        except ImportError:
+            continue
+        except Exception:
+            return None
+    return None
+
+
+def _build_occ_sphere_shape(obj: Any) -> Any | None:
+    try:
+        radius = abs(float(getattr(obj, "radius")))
+    except Exception:
+        return None
+    if radius <= 0.0:
+        return None
+
+    for pkg in ("OCP", "OCC.Core"):
+        try:
+            if pkg == "OCP":
+                from OCP.BRepPrimAPI import BRepPrimAPI_MakeSphere
+                shape = BRepPrimAPI_MakeSphere(radius).Shape()
+                return _apply_actor_transform(shape, obj)
+
+            from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeSphere
+            shape = BRepPrimAPI_MakeSphere(radius).Shape()
+            return _apply_actor_transform(shape, obj)
+        except ImportError:
+            continue
+        except Exception:
+            return None
+    return None
+
+
 def _iter_solids(shape: Any) -> List[Any]:
     for pkg in ("OCP", "OCC.Core"):
         try:
@@ -473,13 +618,28 @@ def build_occ_shape_for_export(obj: Any, cache: Dict[str, Any] | None = None, de
         cache[oid] = boolean_shape
         return boolean_shape
 
-    # Support direct OCC export for primitive boxes (e.g. AirBox) without mesh roundtrip.
-    if type(obj).__name__ == "BoxObject":
+    # Support direct OCC export for primitive solids without mesh roundtrip.
+    obj_type = type(obj).__name__
+    if obj_type == "BoxObject":
         box_shape = _build_occ_box_shape(obj)
         if box_shape is not None:
-            transformed_box = _apply_actor_transform(box_shape, obj)
-            cache[oid] = transformed_box
-            return transformed_box
+            cache[oid] = box_shape
+            return box_shape
+    elif obj_type == "CylinderObject":
+        cyl_shape = _build_occ_cylinder_shape(obj)
+        if cyl_shape is not None:
+            cache[oid] = cyl_shape
+            return cyl_shape
+    elif obj_type == "ConeObject":
+        cone_shape = _build_occ_cone_shape(obj)
+        if cone_shape is not None:
+            cache[oid] = cone_shape
+            return cone_shape
+    elif obj_type == "SphereObject":
+        sphere_shape = _build_occ_sphere_shape(obj)
+        if sphere_shape is not None:
+            cache[oid] = sphere_shape
+            return sphere_shape
 
     if not _is_mesh_object(obj):
         return None

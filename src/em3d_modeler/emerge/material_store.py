@@ -28,6 +28,7 @@ class MaterialRecord:
     color: str = DEFAULT_COLOR
     opacity: float = 0.85
     source: str = "project"  # builtin | project | global
+    priority: int = 0  # priority level for material (higher = higher priority)
 
     def to_dict(self) -> Dict[str, Any]:
         return {
@@ -40,6 +41,7 @@ class MaterialRecord:
             "color": self.color,
             "opacity": self.opacity,
             "source": self.source,
+            "priority": self.priority,
         }
 
     @staticmethod
@@ -54,6 +56,7 @@ class MaterialRecord:
             color=str(data.get("color") or DEFAULT_COLOR),
             opacity=float(data.get("opacity", 0.85)),
             source=str(data.get("source") or source_fallback),
+            priority=int(data.get("priority", 0)),
         )
 
 

@@ -1,5 +1,5 @@
 numpy
 scipy
 matplotlib
-PyQt5
+PySide6
 vtk

@@ -7,11 +7,11 @@ def main():
     # Must set this before importing VTK / Qt to avoid OpenGL conflicts on Windows
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
 
-    from PyQt5.QtWidgets import QApplication
-    from PyQt5.QtCore    import Qt, QLocale
-    QApplication.setAttribute(Qt.AA_EnableHighDpiScaling, True)
-    QApplication.setAttribute(Qt.AA_UseHighDpiPixmaps,    True)
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtCore    import QLocale
 
+    # Qt 6 enables high-DPI scaling by default; explicitly setting the old
+    # AA_* attributes triggers deprecation warnings on modern PySide6.
     app = QApplication(sys.argv)
     QLocale.setDefault(QLocale.c())
     try:
@@ -24,7 +24,7 @@ def main():
     from em3d_modeler.ui.main_window import MainWindow
     win = MainWindow()
     win.show()
-    sys.exit(app.exec_())
+    sys.exit(app.exec())
 
 
 if __name__ == "__main__":

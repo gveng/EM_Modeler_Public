@@ -327,6 +327,7 @@ class SceneManager:
                 "params": obj.get_parameters(),
                 "visible": obj.is_visible(),
                 "is_model": bool(getattr(obj, "is_model", True)),
+                **obj.to_json_state(),
             }
             if isinstance(obj, MeshObject):
                 mesh_poly = None
@@ -417,6 +418,7 @@ class SceneManager:
                 else:
                     continue
                 obj.opacity = float(p.get("Opacity", 0.85))
+                obj.from_json_state(item)
                 # Restore custom color if present
                 if "Color" in p:
                     col_str = str(p["Color"]).strip()

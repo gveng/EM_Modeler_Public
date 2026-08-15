@@ -17,14 +17,14 @@ from __future__ import annotations
 import math
 from typing import List, Optional, Tuple
 
-from PyQt5.QtWidgets import (
-    QDialog, QVBoxLayout, QHBoxLayout, QToolBar, QAction,
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QToolBar,
     QSplitter, QGroupBox, QFormLayout, QDoubleSpinBox,
     QLabel, QPushButton, QWidget, QSizePolicy,
     QDialogButtonBox, QComboBox, QColorDialog,
 )
-from PyQt5.QtCore import Qt, QPointF, QRectF, QSizeF, pyqtSignal
-from PyQt5.QtGui  import QPainter, QPen, QBrush, QColor, QMouseEvent
+from PySide6.QtCore import Qt, QPointF, QRectF, QSizeF, Signal
+from PySide6.QtGui  import QPainter, QPen, QBrush, QColor, QMouseEvent, QAction
 
 Point2D = Tuple[float, float]
 
@@ -33,7 +33,7 @@ Point2D = Tuple[float, float]
 class SketchCanvas(QWidget):
     """Simple 2-D drawing canvas inside the sketch dialog."""
 
-    sketch_changed = pyqtSignal()
+    sketch_changed = Signal()
 
     # Each element: ("line"|"rect"|"circle"|"polyline", data)
     # line    : [(x1,y1),(x2,y2)]
@@ -258,8 +258,8 @@ class SketchDialog(QDialog):
     revolve_requested(profile_pts, angle, axis_pt1, axis_pt2)
     """
 
-    extrude_requested = pyqtSignal(list, float, tuple, tuple)
-    revolve_requested = pyqtSignal(list, float, tuple, tuple)
+    extrude_requested = Signal(list, float, tuple, tuple)
+    revolve_requested = Signal(list, float, tuple, tuple)
 
     def __init__(self, parent=None,
                  plane_origin=(0.0, 0.0, 0.0),
