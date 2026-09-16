@@ -25,9 +25,10 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QPushButton, QInputDialog, QComboBox,
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox,
     QMenu, QMessageBox, QSpinBox, QDoubleSpinBox, QCheckBox,
+    QStyle,
 )
 from PySide6.QtCore import Qt, Signal, QLocale
-from PySide6.QtGui import QColor, QBrush, QAction
+from PySide6.QtGui import QColor, QBrush, QAction, QIcon
 
 
 # ──────────────────────────────────────────────────────────────────── constants
@@ -55,6 +56,19 @@ _OBJECT_BC_DEFAULT_PARAMS = {
 _LOG_VERBOSITY_LEVELS = ["Trace", "Debug", "Info", "Warning", "Error"]
 _SIMULATION_TYPES = ["Sweep", "Eigenmode", "Parametric"]
 _OUTPUT_PLOT_TYPES = ["plot_sp", "plot_vswr", "smith", "plot", "plot_ff", "plot_ff_polar", "plot_ff_3d"]
+
+_SECTION_STYLES = {
+    "Boundaries": (QStyle.SP_MessageBoxWarning, QColor("#d98c3f"), QColor("#3a2d20")),
+    "Assigned To Objects": (QStyle.SP_FileLinkIcon, QColor("#4aa3a2"), QColor("#1e3030")),
+    "Ports": (QStyle.SP_DriveNetIcon, QColor("#5b9bd5"), QColor("#1d2a3a")),
+    "Simulation": (QStyle.SP_MediaPlay, QColor("#74b86b"), QColor("#213323")),
+    "Outputs": (QStyle.SP_FileDialogContentsView, QColor("#b084cc"), QColor("#30243a")),
+    "Mesh": (QStyle.SP_DialogApplyButton, QColor("#7f9db9"), QColor("#25303a")),
+}
+
+_SECTION_THEME_ICONS = {
+    "Outputs": ("office-chart-line", "view-statistics", "x-office-chart"),
+}
 
 
 def _default_simulation_item() -> Dict[str, Any]:
@@ -376,6 +390,18 @@ class ProjectTreeWidget(QWidget):
         font = item.font(0)
         font.setBold(True)
         item.setFont(0, font)
+        style = _SECTION_STYLES.get(label)
+        if style is not None:
+            icon, foreground, background = style
+            themed_icon = QIcon()
+            for icon_name in _SECTION_THEME_ICONS.get(label, ()):
+                themed_icon = QIcon.fromTheme(icon_name)
+                if not themed_icon.isNull():
+                    break
+            item.setIcon(0, themed_icon if not themed_icon.isNull() else self.style().standardIcon(icon))
+            for column in range(2):
+                item.setForeground(column, QBrush(foreground))
+                item.setBackground(column, QBrush(background))
         parent.addChild(item)
         return item
 
