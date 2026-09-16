@@ -2896,28 +2896,12 @@ class MainWindow(QMainWindow):
                 else:
                     if plot_ff_polar is None:
                         raise RuntimeError("EMERGE does not expose plot_ff_polar in this installation.")
-                    plot_ff_polar(theta_arr, values_arr, dB=True, labels=[name], title=f"{name} - {plane} plane", zero_location="N", clockwise=False)
+                    plot_ff_polar(theta_arr, values_arr, dB=True, dBfloor=-80, labels=[name], title=f"{name} - {plane} plane", zero_location="N", clockwise=False)
             elif plot_type == "plot_ff_3d":
-                if theta_arr is None or phi_arr is None:
-                    raise RuntimeError("3D polar plot requires theta/phi far-field data.")
-                import matplotlib.pyplot as plt
-                from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
-                theta_grid, phi_grid = np.meshgrid(np.asarray(theta_arr), np.asarray(phi_arr), indexing="ij")
-                amp = np.abs(np.asarray(values_arr))
-                if amp.shape != theta_grid.shape:
-                    amp = np.resize(amp, theta_grid.shape)
-                r = np.clip(20.0 * np.log10(np.maximum(amp, 1e-12)), -120, 120)
-                x = r * np.sin(theta_grid) * np.cos(phi_grid)
-                y = r * np.sin(theta_grid) * np.sin(phi_grid)
-                z = r * np.cos(theta_grid)
-                fig = plt.figure()
-                ax = fig.add_subplot(111, projection="3d")
-                ax.plot_surface(x, y, z, cmap="viridis", alpha=0.9)
-                ax.set_title(f"{name} - 3D polar ({plane} plane)")
-                ax.set_xlabel("X")
-                ax.set_ylabel("Y")
-                ax.set_zlabel("Magnitude (dB)")
-                plt.show()
+                raise RuntimeError(
+                    "EMERGE 3.0.0a16 provides farfield_3d() extraction but no official 3D plot command. "
+                    "Use plot_ff_polar for an EMERGE-rendered polar plot."
+                )
             self._info_bar.set_info(f"Output plotted: {name} ({plot_type}) from {simdata_path}")
             self._append_sim_log(f"[info] Output plotted: {name} ({plot_type}) from {simdata_path}")
             return
