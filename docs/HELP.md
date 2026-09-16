@@ -9,7 +9,7 @@ The SVG snapshots in this guide are schematic views of the application windows. 
 
 ## 1. Main Window
 
-![Main window snapshot](snapshots/main-window.svg)
+![Main window snapshot](snapshots/main-window.png)
 
 The main window has three working areas:
 
@@ -137,7 +137,7 @@ The active plane controls the drawing grid and the orientation of new sketches.
 
 ## 8. Settings
 
-![Settings snapshot](snapshots/settings-dialog.svg)
+![Settings snapshot](snapshots/settings-dialog.png)
 
 ### Display tab
 
