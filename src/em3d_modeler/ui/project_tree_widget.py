@@ -1088,16 +1088,24 @@ class ProjectTreeWidget(QWidget):
         form.addRow("Far-field plane", cb_plane)
         form.addRow("Polar view", cb_polar_view)
         form.addRow("Far-field frequency", farfield_frequency)
+        s_parameter_rows = (4,)
         smith_rows = (5, 6)
-        farfield_rows = (7, 8)
+        farfield_rows = (7, 9)
+        polar_view_rows = (8,)
 
         def update_parameter_visibility(plot_type: str) -> None:
+            is_s_parameter = plot_type in {"plot_sp", "plot_vswr", "smith", "plot"}
+            for row in s_parameter_rows:
+                form.setRowVisible(row, is_s_parameter)
             is_smith = plot_type == "smith"
             for row in smith_rows:
                 form.setRowVisible(row, is_smith)
             is_farfield = plot_type in {"plot_ff", "plot_ff_polar", "plot_ff_3d"}
             for row in farfield_rows:
                 form.setRowVisible(row, is_farfield)
+            is_3d_polar = plot_type == "plot_ff_3d"
+            for row in polar_view_rows:
+                form.setRowVisible(row, is_3d_polar)
 
         update_parameter_visibility(cb_type.currentText().strip())
         cb_type.currentTextChanged.connect(update_parameter_visibility)
