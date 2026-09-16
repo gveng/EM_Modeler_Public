@@ -2849,14 +2849,17 @@ class MainWindow(QMainWindow):
                         farfield = field_entry.farfield_2d(ref_direction, plane_normal, faces)
                         theta = farfield.ang
                     electric_field = getattr(farfield, "E", None)
-                    ff_data = getattr(electric_field, "norm", None)
-                    if ff_data is None:
-                        field_values = np.asarray(getattr(electric_field, "F", electric_field))
-                        ff_data = (
-                            np.linalg.norm(field_values, axis=0)
-                            if field_values.ndim > 1
-                            else np.abs(field_values)
+                    field_values = getattr(electric_field, "F", None)
+                    if field_values is None:
+                        raise RuntimeError(
+                            "EMERGE returned a far-field component without numeric E-field data."
                         )
+                    field_values = np.asarray(field_values)
+                    ff_data = (
+                        np.sqrt(np.sum(np.abs(field_values) ** 2, axis=0))
+                        if field_values.ndim > 1
+                        else np.abs(field_values)
+                    )
             if ff_data is None:
                 raise RuntimeError(
                     "This result does not contain saved E/H fields for far-field plotting. "
