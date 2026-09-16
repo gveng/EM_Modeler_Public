@@ -2837,8 +2837,20 @@ class MainWindow(QMainWindow):
                         faces = faces + geometry.boundary()
                     if plot_type == "plot_ff_3d":
                         farfield = field_entry.farfield_3d(faces)
-                        theta = farfield.theta
-                        phi = farfield.phi
+                        display = loaded_sim.display
+                        display.populate()
+                        display.add_farfield3d(
+                            farfield,
+                            component="normE",
+                            quantity="abs",
+                            dB=True,
+                            dBfloor=-40,
+                            opacity=0.75,
+                        )
+                        display.show()
+                        self._info_bar.set_info(f"Output plotted: {name} ({plot_type}) from {simdata_path}")
+                        self._append_sim_log(f"[info] Output plotted: {name} ({plot_type}) from {simdata_path}")
+                        return
                     else:
                         plane_axes = {
                             "XY": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
@@ -2848,18 +2860,7 @@ class MainWindow(QMainWindow):
                         ref_direction, plane_normal = plane_axes.get(plane, plane_axes["XY"])
                         farfield = field_entry.farfield_2d(ref_direction, plane_normal, faces)
                         theta = farfield.ang
-                    electric_field = getattr(farfield, "E", None)
-                    field_values = getattr(electric_field, "F", None)
-                    if field_values is None:
-                        raise RuntimeError(
-                            "EMERGE returned a far-field component without numeric E-field data."
-                        )
-                    field_values = np.asarray(field_values)
-                    ff_data = (
-                        np.sqrt(np.sum(np.abs(field_values) ** 2, axis=0))
-                        if field_values.ndim > 1
-                        else np.abs(field_values)
-                    )
+                    ff_data = farfield.gain.norm
             if ff_data is None:
                 raise RuntimeError(
                     "This result does not contain saved E/H fields for far-field plotting. "
@@ -2897,11 +2898,6 @@ class MainWindow(QMainWindow):
                     if plot_ff_polar is None:
                         raise RuntimeError("EMERGE does not expose plot_ff_polar in this installation.")
                     plot_ff_polar(theta_arr, values_arr, dB=True, dBfloor=-80, labels=[name], title=f"{name} - {plane} plane", zero_location="N", clockwise=False)
-            elif plot_type == "plot_ff_3d":
-                raise RuntimeError(
-                    "EMERGE 3.0.0a16 provides farfield_3d() extraction but no official 3D plot command. "
-                    "Use plot_ff_polar for an EMERGE-rendered polar plot."
-                )
             self._info_bar.set_info(f"Output plotted: {name} ({plot_type}) from {simdata_path}")
             self._append_sim_log(f"[info] Output plotted: {name} ({plot_type}) from {simdata_path}")
             return

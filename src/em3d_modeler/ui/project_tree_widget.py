@@ -55,7 +55,7 @@ _OBJECT_BC_DEFAULT_PARAMS = {
 
 _LOG_VERBOSITY_LEVELS = ["Trace", "Debug", "Info", "Warning", "Error"]
 _SIMULATION_TYPES = ["Sweep", "Eigenmode", "Parametric"]
-_OUTPUT_PLOT_TYPES = ["plot_sp", "plot_vswr", "smith", "plot", "plot_ff", "plot_ff_polar"]
+_OUTPUT_PLOT_TYPES = ["plot_sp", "plot_vswr", "smith", "plot", "plot_ff", "plot_ff_polar", "plot_ff_3d"]
 
 _SECTION_STYLES = {
     "Boundaries": (QStyle.SP_MessageBoxWarning, QColor("#d98c3f"), QColor("#3a2d20")),
@@ -301,8 +301,6 @@ class ProjectTreeWidget(QWidget):
             if not simulation and valid_sim_names:
                 simulation = sorted(valid_sim_names, key=lambda s: s.lower())[0]
             plot_type = str(output.get("plot_type", "plot_sp")).strip()
-            if plot_type == "plot_ff_3d":
-                plot_type = "plot_ff_polar"
             if plot_type not in _OUTPUT_PLOT_TYPES:
                 plot_type = "plot_sp"
             normalized_outputs.append(
@@ -1052,7 +1050,9 @@ class ProjectTreeWidget(QWidget):
         cb_plane.setCurrentText(selected_plane)
 
         cb_polar_view = QComboBox(dlg)
-        cb_polar_view.addItem("2D polar")
+        cb_polar_view.addItems(["2D polar", "3D polar"])
+        polar_3d = bool(params.get("polar_3d", False))
+        cb_polar_view.setCurrentText("3D polar" if polar_3d else "2D polar")
 
         form.addRow("Name", le_name)
         form.addRow("Simulation", cb_sim)
@@ -1070,7 +1070,7 @@ class ProjectTreeWidget(QWidget):
             is_smith = plot_type == "smith"
             for row in smith_rows:
                 form.setRowVisible(row, is_smith)
-            is_farfield = plot_type in {"plot_ff", "plot_ff_polar"}
+            is_farfield = plot_type in {"plot_ff", "plot_ff_polar", "plot_ff_3d"}
             for row in farfield_rows:
                 form.setRowVisible(row, is_farfield)
 
@@ -1095,7 +1095,7 @@ class ProjectTreeWidget(QWidget):
                 "port_i": int(port_i.value()),
                 "port_j": int(port_j.value()),
                 "plane": cb_plane.currentText().strip().upper() or "XY",
-                "polar_3d": False,
+                "polar_3d": cb_polar_view.currentText().strip() == "3D polar",
             },
         }
 
