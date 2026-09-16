@@ -2848,7 +2848,15 @@ class MainWindow(QMainWindow):
                         ref_direction, plane_normal = plane_axes.get(plane, plane_axes["XY"])
                         farfield = field_entry.farfield_2d(ref_direction, plane_normal, faces)
                         theta = farfield.ang
-                    ff_data = np.linalg.norm(np.asarray(farfield.E), axis=0)
+                    electric_field = getattr(farfield, "E", None)
+                    ff_data = getattr(electric_field, "norm", None)
+                    if ff_data is None:
+                        field_values = np.asarray(getattr(electric_field, "F", electric_field))
+                        ff_data = (
+                            np.linalg.norm(field_values, axis=0)
+                            if field_values.ndim > 1
+                            else np.abs(field_values)
+                        )
             if ff_data is None:
                 raise RuntimeError(
                     "This result does not contain saved E/H fields for far-field plotting. "
