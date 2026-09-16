@@ -491,6 +491,11 @@ class ProjectTreeWidget(QWidget):
         node = getattr(self, "_o_node", None)
         if node is None:
             return
+        expanded_simulations = {
+            node.child(i).text(0)
+            for i in range(node.childCount())
+            if node.child(i).isExpanded()
+        }
         node.takeChildren()
 
         sim_names = self._simulation_names()
@@ -511,6 +516,7 @@ class ProjectTreeWidget(QWidget):
         for sim_name in sim_names:
             sim_node = self._make_section(node, sim_name)
             sim_node.setData(0, Qt.UserRole, ("__out_sim__", sim_name))
+            sim_node.setExpanded(sim_name in expanded_simulations)
             rows = grouped.get(sim_name, [])
             if not rows:
                 hint = QTreeWidgetItem(["[double-click to add plot]", ""])
