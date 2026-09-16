@@ -2838,17 +2838,26 @@ class MainWindow(QMainWindow):
                     if plot_type == "plot_ff_3d":
                         farfield = field_entry.farfield_3d(faces)
                         display = loaded_sim.display
-                        visible_names = {
-                            str(getattr(obj, "name", "")).strip()
+                        model_display_state = {
+                            str(getattr(obj, "name", "")).strip(): (
+                                bool(obj.is_visible()),
+                                max(0.0, min(1.0, float(getattr(obj, "opacity", 0.85)))),
+                            )
                             for obj in self._viewport.scene.objects
                             if bool(getattr(obj, "is_model", True))
-                            and bool(obj.is_visible())
                         }
                         for geometry in loaded_sim.all_geos():
                             geometry_name = str(getattr(geometry, "name", "")).strip()
                             source_name = geometry_name.split("_OCC", 1)[0].strip()
-                            if source_name in visible_names or geometry_name in visible_names:
-                                display.add_object(geometry, opacity=0.35)
+                            display_state = model_display_state.get(source_name)
+                            if display_state is None:
+                                display_state = model_display_state.get(geometry_name)
+                            if display_state is not None:
+                                _visible, source_opacity = display_state
+                                display.add_object(
+                                    geometry,
+                                    opacity=source_opacity if _visible else 0.0,
+                                )
                         mesh_nodes = np.asarray(getattr(loaded_sim.mesh, "nodes", []))
                         rmax = None
                         if mesh_nodes.ndim == 2 and mesh_nodes.shape[0] == 3 and mesh_nodes.shape[1]:
