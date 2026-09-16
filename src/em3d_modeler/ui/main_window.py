@@ -145,7 +145,7 @@ class MainWindow(QMainWindow):
         self._body_props     = BodyPropertiesWidget()
         self._viewport       = Viewport3DWidget()
         self._viewport.set_plane_triad_size(self._plane_triad_size)
-        self._materials      = MaterialsWidget()
+        self._materials      = MaterialsWidget(self)
         self._info_bar       = InfoBarWidget()
 
         # ������ left column: project tree (top) + body props (bottom) ���������������������������������
