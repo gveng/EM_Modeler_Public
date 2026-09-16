@@ -41,8 +41,8 @@ from PySide6.QtWidgets import (
     QPushButton, QHBoxLayout, QGroupBox, QCheckBox,
     QProgressDialog, QApplication, QTabWidget,
 )
-from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize
-from PySide6.QtGui  import QIcon, QKeySequence, QAction
+from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize, QUrl
+from PySide6.QtGui  import QIcon, QKeySequence, QAction, QDesktopServices
 
 # Undo/Redo CommandStack
 
@@ -71,8 +71,11 @@ from .. import __version__, __release_date__
 
 # ������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������
 _UNITS  = ["mm", "um", "cm", "m", "mil", "inch"]
-_DOCS_HELP = Path(__file__).parent.parent.parent.parent / "docs" / "HELP.md"
-_DOCS_README = Path(__file__).parent.parent.parent.parent / "README.md"
+_APP_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).parent.parent.parent.parent))
+_DOCS_ROOT = _APP_ROOT / "docs"
+_DOCS_HELP = _DOCS_ROOT / "HELP.md"
+_DOCS_HTML = _DOCS_ROOT / "HELP.html"
+_DOCS_README = _APP_ROOT / "README.md"
 _LOG_LEVEL_ORDER = {"TRACE": 5, "DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
 
 # Unit conversion: mm per unit (reference base)
@@ -247,6 +250,10 @@ class MainWindow(QMainWindow):
         self._apply_grid_visibility(show)
 
     def _open_help(self) -> None:
+        if _DOCS_HTML.exists():
+            if QDesktopServices.openUrl(QUrl.fromLocalFile(str(_DOCS_HTML))):
+                return
+
         for p in (_DOCS_HELP, _DOCS_README):
             if not p.exists():
                 continue
