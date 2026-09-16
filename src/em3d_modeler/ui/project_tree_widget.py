@@ -1066,7 +1066,10 @@ class ProjectTreeWidget(QWidget):
                  if isinstance(sim, dict) and str(sim.get("name", "")).strip() == cb_sim.currentText().strip()),
                 {},
             )
-            selected_frequency = float(selected_sim.get("Fmin_GHz", 0.1))
+            selected_frequency = (
+                float(selected_sim.get("Fmin_GHz", 0.1))
+                + float(selected_sim.get("Fmax_GHz", 10.0))
+            ) / 2.0
         farfield_frequency.setValue(selected_frequency)
 
         form.addRow("Name", le_name)
@@ -1080,7 +1083,7 @@ class ProjectTreeWidget(QWidget):
         form.addRow("Polar view", cb_polar_view)
         form.addRow("Far-field frequency", farfield_frequency)
         smith_rows = (5, 6)
-        farfield_rows = (7, 8, 9)
+        farfield_rows = (7, 8)
 
         def update_parameter_visibility(plot_type: str) -> None:
             is_smith = plot_type == "smith"

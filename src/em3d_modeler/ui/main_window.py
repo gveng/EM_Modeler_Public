@@ -2825,7 +2825,7 @@ class MainWindow(QMainWindow):
                     requested_frequency_ghz = float(plot_params.get("frequency_GHz", 0.0) or 0.0)
                     requested_frequency = requested_frequency_ghz * 1e9
                     if requested_frequency <= 0.0:
-                        requested_frequency = float(frequencies[0])
+                        requested_frequency = (float(frequencies[0]) + float(frequencies[-1])) / 2.0
                     selected_frequency = float(
                         frequencies[int(np.argmin(np.abs(frequencies - requested_frequency)))]
                     )
