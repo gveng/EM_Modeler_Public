@@ -2838,13 +2838,28 @@ class MainWindow(QMainWindow):
                     if plot_type == "plot_ff_3d":
                         farfield = field_entry.farfield_3d(faces)
                         display = loaded_sim.display
-                        display.populate()
+                        visible_names = {
+                            str(getattr(obj, "name", "")).strip()
+                            for obj in self._viewport.scene.objects
+                            if bool(getattr(obj, "is_model", True))
+                            and bool(obj.is_visible())
+                        }
+                        for geometry in loaded_sim.all_geos():
+                            geometry_name = str(getattr(geometry, "name", "")).strip()
+                            source_name = geometry_name.split("_OCC", 1)[0].strip()
+                            if source_name in visible_names or geometry_name in visible_names:
+                                display.add_object(geometry, opacity=0.35)
+                        mesh_nodes = np.asarray(getattr(loaded_sim.mesh, "nodes", []))
+                        rmax = None
+                        if mesh_nodes.ndim == 2 and mesh_nodes.shape[0] == 3 and mesh_nodes.shape[1]:
+                            rmax = max(float(np.ptp(mesh_nodes, axis=1).max()) * 2.0, 1e-6)
                         display.add_farfield3d(
                             farfield,
                             component="normE",
                             quantity="abs",
                             dB=True,
                             dBfloor=-40,
+                            rmax=rmax,
                             opacity=0.75,
                         )
                         display.show()
