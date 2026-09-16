@@ -1,6 +1,6 @@
 # EM 3D Modeler Help
 
-Version: 1.1.8  
+Version: 1.1.9 Beta
 Release date: 2026-09-16
 
 EM 3D Modeler is a desktop CAD and electromagnetic pre/post-processor for building 3D models, assigning materials, preparing meshes and ports, generating EMERGE scripts, and reviewing simulation results.
@@ -262,7 +262,7 @@ The portable build is generated with PyInstaller in `onedir` mode. Distribute th
 
 The portable folder includes:
 
-- `EM3D_Modeler_1.1.8.exe`;
+- `EM3D_Modeler_1.1.9_Beta.exe`;
 - `_internal` runtime files;
 - `docs` and `Icons` resources where applicable.
 
