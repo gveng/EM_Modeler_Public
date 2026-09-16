@@ -317,6 +317,8 @@ def export_emerge_python_script(
         }
         if plot_type in {"plot_sp", "plot_vswr", "smith", "plot"}:
             output_configs.append(output_config)
+        elif plot_type in {"plot_ff", "plot_ff_polar", "plot_ff_3d"}:
+            output_configs.append(output_config)
 
     lines: List[str] = [
         "# Auto-generated EMERGE Python script from EM 3D Modeler",
@@ -382,6 +384,7 @@ def export_emerge_python_script(
         f"SPARAM_FIT_ENABLED = {fit_enabled}",
         f"SPARAM_FIT_POINTS = {fit_points}",
         f"OUTPUT_CONFIGS = {repr(output_configs)}",
+        "SAVE_FARFIELDS = any(output.get('plot_type') in ('plot_ff', 'plot_ff_polar', 'plot_ff_3d') for output in OUTPUT_CONFIGS)",
         "print(f\"[job] {JOB_NAME} | type={JOB_TYPE} | range={FMIN_GHZ}..{FMAX_GHZ} GHz step {FSTEP_GHZ}\")",
         "",
         "# =============================================================================",
@@ -580,6 +583,8 @@ def export_emerge_python_script(
     lines += [
         "simulationObj.mw.set_frequency_range(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, NPOINTS)",
         "simulationObj.mw.set_resolution(MESH_RESOLUTION)",
+        "if SAVE_FARFIELDS:",
+        "    simulationObj.mw.save_fields = ['E', 'H']",
         "for object_name, mesh_size in OBJECT_MESH_SIZES_M.items():",
         "    geometry_group = geometry_groups[object_name]",
         "    for geometry_obj in geometry_group.objects:",

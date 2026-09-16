@@ -2818,7 +2818,31 @@ class MainWindow(QMainWindow):
             if ff_data is None and hasattr(grid, "farfield"):
                 ff_data = getattr(grid, "farfield")
             if ff_data is None:
-                raise RuntimeError("Loaded simdata has no far-field data for polar output.")
+                mw_data = getattr(getattr(loaded_sim, "data", None), "mw", None)
+                field_data = getattr(mw_data, "field", None)
+                frequencies = np.asarray(getattr(grid, "freq", []))
+                if field_data is not None and frequencies.size:
+                    field_entry = field_data.find(freq=float(frequencies[0]))
+                    faces = loaded_sim.all_boundaries()
+                    if plot_type == "plot_ff_3d":
+                        farfield = field_entry.farfield_3d(faces)
+                        theta = farfield.theta
+                        phi = farfield.phi
+                    else:
+                        plane_axes = {
+                            "XY": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+                            "XZ": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                            "YZ": ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0)),
+                        }
+                        ref_direction, plane_normal = plane_axes.get(plane, plane_axes["XY"])
+                        farfield = field_entry.farfield_2d(ref_direction, plane_normal, faces)
+                        theta = farfield.ang
+                    ff_data = np.linalg.norm(np.asarray(farfield.E), axis=0)
+            if ff_data is None:
+                raise RuntimeError(
+                    "This result does not contain saved E/H fields for far-field plotting. "
+                    "Enable a far-field output and rerun the simulation."
+                )
 
             value = ff_data
             if isinstance(ff_data, dict):
@@ -2835,6 +2859,8 @@ class MainWindow(QMainWindow):
             theta_arr = np.asarray(theta) if theta is not None else None
             phi_arr = np.asarray(phi) if phi is not None else None
             values_arr = np.asarray(value)
+            if values_arr.ndim > 1 and theta_arr is not None and values_arr.size == theta_arr.size:
+                values_arr = values_arr.reshape(theta_arr.shape)
             if theta_arr is None and phi_arr is None and values_arr.ndim >= 1:
                 theta_arr = np.linspace(0.0, 2.0 * np.pi, values_arr.size)
 
