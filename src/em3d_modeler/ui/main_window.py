@@ -73,7 +73,7 @@ from .. import __version__, __release_date__
 _UNITS  = ["mm", "um", "cm", "m", "mil", "inch"]
 _DOCS_HELP = Path(__file__).parent.parent.parent.parent / "docs" / "HELP.md"
 _DOCS_README = Path(__file__).parent.parent.parent.parent / "README.md"
-_LOG_LEVEL_ORDER = {"DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
+_LOG_LEVEL_ORDER = {"TRACE": 5, "DEBUG": 10, "INFO": 20, "WARNING": 30, "ERROR": 40}
 
 # Unit conversion: mm per unit (reference base)
 _MM_PER_UNIT = {
@@ -1458,7 +1458,8 @@ class MainWindow(QMainWindow):
 
             self._sim_chk_run_sweep = QCheckBox("Run Sweep")
             self._sim_chk_run_sweep.setChecked(True)
-            self._sim_chk_run_sweep.toggled.connect(self._on_sim_option_changed)
+            self._sim_chk_run_sweep.setEnabled(False)
+            self._sim_chk_run_sweep.setToolTip("Simulation execution is always enabled")
             btn_row.addWidget(self._sim_chk_run_sweep)
 
             self._sim_chk_boolean_debug = QCheckBox("Boolean Debug")
@@ -1469,7 +1470,7 @@ class MainWindow(QMainWindow):
 
             btn_row.addWidget(QLabel("Log:"))
             self._sim_log_level = QComboBox()
-            self._sim_log_level.addItems(["Debug", "Info", "Warning", "Error"])
+            self._sim_log_level.addItems(["Trace", "Debug", "Info", "Warning", "Error"])
             self._sim_log_level.setCurrentText(self._sim_log_verbosity.title())
             self._sim_log_level.currentTextChanged.connect(self._on_sim_log_level_changed)
             btn_row.addWidget(self._sim_log_level)
@@ -1725,11 +1726,6 @@ class MainWindow(QMainWindow):
                 pass
 
         enabled_sims = self._enabled_simulations(settings)
-        if not bool(run_sweep):
-            enabled_sims = [
-                s for s in enabled_sims
-                if str(s.get("type", "Sweep")).strip().lower() not in {"sweep", "parametric"}
-            ]
         scripts: list[dict] = []
         for idx, sim_cfg in enumerate(enabled_sims, start=1):
             sim_name = str(sim_cfg.get("name", f"Simulation_{idx}")).strip() or f"Simulation_{idx}"
@@ -2774,45 +2770,6 @@ class MainWindow(QMainWindow):
         except Exception:
             return [1]
 
-    def _plot_loaded_far_field(
-        self,
-        simulation,
-        plot_type: str,
-        plot_params: dict,
-        output_name: str,
-        simdata_path: Path,
-    ) -> None:
-        """Plot far-field data generated and saved by the EMERGE job."""
-        import numpy as np
-
-        result_dir = simdata_path.parent.parent
-        data_path = result_dir / f"{self._safe_script_token(output_name)}.farfield.txt"
-        if not data_path.exists():
-            field_dataset = getattr(getattr(getattr(simulation, "data", None), "mw", None), "field", None)
-            raise RuntimeError(
-                "Far-field data file was not found in the simulation folder: "
-                f"{data_path}. Saved microwave field dataset available: {field_dataset is not None}. "
-                "Regenerate the simulation with a Far Field output enabled."
-            )
-
-        values = np.loadtxt(data_path, comments="#", ndmin=2)
-        if values.shape[1] < 2:
-            raise RuntimeError(f"Invalid far-field data file: {data_path}")
-        theta = values[:, 0]
-        field_values = values[:, 1]
-        labels = [str(output_name)]
-        use_db = bool(plot_params.get("far_field_db", False))
-
-        import importlib
-        emerge_plot = importlib.import_module("emerge.plot")
-        if plot_type == "plot_ff_polar":
-            emerge_plot.plot_ff_polar(theta, field_values, dB=use_db, labels=labels)
-        else:
-            emerge_plot.plot_ff(theta, field_values, dB=use_db, labels=labels)
-
-        self._info_bar.set_info(f"Far-field plotted: {output_name} from {data_path}")
-        self._append_sim_log(f"[info] Far-field plotted: {output_name} from {data_path}")
-
     def _on_output_plot_requested(self, payload: dict) -> None:
         name = str(payload.get("name", "Output")).strip() or "Output"
         sim_name = str(payload.get("simulation", "")).strip()
@@ -2831,16 +2788,90 @@ class MainWindow(QMainWindow):
 
         try:
             import importlib
+            import numpy as np
             self._import_installed_emerge()
             emerge_plot = importlib.import_module("emerge.plot")
             plot_sp = emerge_plot.plot_sp
             plot_vswr = emerge_plot.plot_vswr
             smith = emerge_plot.smith
             plot = emerge_plot.plot
-            plot_ff = emerge_plot.plot_ff
-            plot_ff_polar = emerge_plot.plot_ff_polar
+            plot_ff = getattr(emerge_plot, "plot_ff", None)
+            plot_ff_polar = getattr(emerge_plot, "plot_ff_polar", None)
         except Exception as exc:
             QMessageBox.warning(self, "Output", f"Unable to import emerge.plot: {exc}")
+            return
+
+        def _as_2d_curve(array):
+            arr = np.asarray(array)
+            if arr.ndim == 0:
+                return arr.reshape(1)
+            return arr.reshape(-1)
+
+        if plot_type in {"plot_ff", "plot_ff_polar", "plot_ff_3d"}:
+            plane = str(plot_params.get("plane", "XY")).strip().upper() or "XY"
+            polar_3d = bool(plot_params.get("polar_3d", False))
+            theta = getattr(grid, "theta", None)
+            phi = getattr(grid, "phi", None)
+            ff_data = getattr(grid, "ff", None)
+            if ff_data is None and hasattr(grid, "E"):
+                ff_data = getattr(grid, "E")
+            if ff_data is None and hasattr(grid, "farfield"):
+                ff_data = getattr(grid, "farfield")
+            if ff_data is None:
+                raise RuntimeError("Loaded simdata has no far-field data for polar output.")
+
+            value = ff_data
+            if isinstance(ff_data, dict):
+                for key in ("E", "field", "value", "magnitude", "Et", "Etheta", "Ephi"):
+                    if key in ff_data:
+                        value = ff_data[key]
+                        break
+                if isinstance(value, dict):
+                    for key in ("theta", "phi", "ang", "angles"):
+                        if key in value:
+                            theta = value[key]
+                            break
+
+            theta_arr = np.asarray(theta) if theta is not None else None
+            phi_arr = np.asarray(phi) if phi is not None else None
+            values_arr = np.asarray(value)
+            if theta_arr is None and phi_arr is None and values_arr.ndim >= 1:
+                theta_arr = np.linspace(0.0, 2.0 * np.pi, values_arr.size)
+
+            if plot_type in {"plot_ff", "plot_ff_polar"}:
+                if theta_arr is None or values_arr.size == 0:
+                    raise RuntimeError("Far-field result does not expose angle and magnitude data for a polar plot.")
+                if plot_type == "plot_ff":
+                    if plot_ff is None:
+                        raise RuntimeError("EMERGE does not expose plot_ff in this installation.")
+                    plot_ff(theta_arr, values_arr, dB=True, labels=[name], xlabel="Theta (rad)", ylabel="Magnitude (dB)", title=f"{name} - {plane} plane")
+                else:
+                    if plot_ff_polar is None:
+                        raise RuntimeError("EMERGE does not expose plot_ff_polar in this installation.")
+                    plot_ff_polar(theta_arr, values_arr, dB=True, labels=[name], title=f"{name} - {plane} plane", zero_location="N", clockwise=False)
+            elif plot_type == "plot_ff_3d":
+                if theta_arr is None or phi_arr is None:
+                    raise RuntimeError("3D polar plot requires theta/phi far-field data.")
+                import matplotlib.pyplot as plt
+                from mpl_toolkits.mplot3d import Axes3D  # noqa: F401
+                theta_grid, phi_grid = np.meshgrid(np.asarray(theta_arr), np.asarray(phi_arr), indexing="ij")
+                amp = np.abs(np.asarray(values_arr))
+                if amp.shape != theta_grid.shape:
+                    amp = np.resize(amp, theta_grid.shape)
+                r = np.clip(20.0 * np.log10(np.maximum(amp, 1e-12)), -120, 120)
+                x = r * np.sin(theta_grid) * np.cos(phi_grid)
+                y = r * np.sin(theta_grid) * np.sin(phi_grid)
+                z = r * np.cos(theta_grid)
+                fig = plt.figure()
+                ax = fig.add_subplot(111, projection="3d")
+                ax.plot_surface(x, y, z, cmap="viridis", alpha=0.9)
+                ax.set_title(f"{name} - 3D polar ({plane} plane)")
+                ax.set_xlabel("X")
+                ax.set_ylabel("Y")
+                ax.set_zlabel("Magnitude (dB)")
+                plt.show()
+            self._info_bar.set_info(f"Output plotted: {name} ({plot_type}) from {simdata_path}")
+            self._append_sim_log(f"[info] Output plotted: {name} ({plot_type}) from {simdata_path}")
             return
 
         freq = getattr(grid, "freq", None)
@@ -2848,29 +2879,40 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Output", "Loaded simdata has no frequency axis.")
             return
         ports = self._grid_port_numbers(grid)
+        import re
+        s_parameter = str(plot_params.get("s_parameter", "S11")).strip().upper()
+        match = re.fullmatch(r"S(\d+)[,:/_-]?(\d+)", s_parameter)
+        if match:
+            output_port = int(match.group(1))
+            input_port = int(match.group(2))
+        else:
+            output_port = max(1, int(plot_params.get("port_i", 1)))
+            input_port = max(1, int(plot_params.get("port_j", 1)))
+            s_parameter = f"S{output_port}{input_port}"
+        if output_port not in ports or input_port not in ports:
+            QMessageBox.warning(
+                self,
+                "Output",
+                f"S-parameter {s_parameter} is not available for this simulation ({len(ports)} port(s)).",
+            )
+            return
+        selected_curve = grid.S(output_port, input_port)
 
         try:
             if plot_type == "plot_sp":
-                curves = [grid.S(i, j) for i in ports for j in ports]
-                labels = [f"S{i}{j}" for i in ports for j in ports]
+                curves = [selected_curve]
+                labels = [s_parameter]
                 plot_sp(freq, curves, labels=labels)
             elif plot_type == "plot_vswr":
-                curves = [grid.S(i, i) for i in ports]
-                labels = [f"VSWR{i}{i}" for i in ports]
+                curves = [selected_curve]
+                labels = [f"VSWR{output_port}{input_port}"]
                 plot_vswr(freq, curves, labels=labels)
             elif plot_type == "smith":
-                port_i = max(1, int(plot_params.get("port_i", 1)))
-                port_j = max(1, int(plot_params.get("port_j", port_i)))
-                curves = [grid.S(port_i, port_j)]
-                smith(curves, f=freq, labels=[f"S{port_i}{port_j}"])
+                smith([selected_curve], f=freq, labels=[s_parameter])
             elif plot_type == "plot":
-                import numpy as np
-                curves = [20.0 * np.log10(np.maximum(np.abs(grid.S(i, i)), 1e-12)) for i in ports]
-                labels = [f"|S{i}{i}| dB" for i in ports]
+                curves = [20.0 * np.log10(np.maximum(np.abs(selected_curve), 1e-12))]
+                labels = [f"|{s_parameter}| dB"]
                 plot(freq, curves, labels=labels, xlabel="Frequency (Hz)", ylabel="Magnitude (dB)")
-            elif plot_type in {"plot_ff", "plot_ff_polar"}:
-                self._plot_loaded_far_field(loaded_sim, plot_type, plot_params, name, simdata_path)
-                return
             else:
                 QMessageBox.warning(self, "Output", f"Unsupported plot type: {plot_type}")
                 return

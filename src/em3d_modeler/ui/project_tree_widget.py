@@ -52,9 +52,9 @@ _OBJECT_BC_DEFAULT_PARAMS = {
     "Radiation": {"Order": 1},
 }
 
-_LOG_VERBOSITY_LEVELS = ["Debug", "Info", "Warning", "Error"]
+_LOG_VERBOSITY_LEVELS = ["Trace", "Debug", "Info", "Warning", "Error"]
 _SIMULATION_TYPES = ["Sweep", "Eigenmode", "Parametric"]
-_OUTPUT_PLOT_TYPES = ["plot_sp", "plot_vswr", "smith", "plot", "plot_ff", "plot_ff_polar"]
+_OUTPUT_PLOT_TYPES = ["plot_sp", "plot_vswr", "smith", "plot", "plot_ff", "plot_ff_polar", "plot_ff_3d"]
 
 
 def _default_simulation_item() -> Dict[str, Any]:
@@ -990,55 +990,61 @@ class ProjectTreeWidget(QWidget):
         cb_enabled.setCurrentText("Enabled" if bool(initial.get("enabled", True)) else "Disabled")
 
         params = initial.get("params", {}) if isinstance(initial.get("params", {}), dict) else {}
+        configured_ports = self._settings.get("ports", [])
+        port_count = len(configured_ports) if isinstance(configured_ports, list) else 0
+        port_count = max(1, port_count)
+        s_parameter = QComboBox(dlg)
+        s_parameter.addItems([
+            f"S{output_port}{input_port}"
+            for output_port in range(1, port_count + 1)
+            for input_port in range(1, port_count + 1)
+        ])
+        selected_s_parameter = str(params.get("s_parameter", "S11")).strip().upper() or "S11"
+        valid_parameters = {
+            f"S{output_port}{input_port}"
+            for output_port in range(1, port_count + 1)
+            for input_port in range(1, port_count + 1)
+        }
+        if selected_s_parameter not in valid_parameters:
+            selected_s_parameter = "S11"
+        s_parameter.setCurrentText(selected_s_parameter)
+        s_parameter.setToolTip(f"Select one of the {port_count * port_count} generated S-parameters")
         port_i = QSpinBox(dlg)
         port_i.setRange(1, 64)
         port_i.setValue(max(1, int(params.get("port_i", 1))))
         port_j = QSpinBox(dlg)
         port_j.setRange(1, 64)
         port_j.setValue(max(1, int(params.get("port_j", 1))))
-        ff_component = QComboBox(dlg)
-        ff_component.addItems(["E", "E_theta", "E_phi", "Gain", "Directivity"])
-        ff_component.setCurrentText(str(params.get("far_field_component", "E")))
-        ff_db = QCheckBox("Plot far-field data in dB", dlg)
-        ff_db.setChecked(bool(params.get("far_field_db", False)))
-        ff_points = QSpinBox(dlg)
-        ff_points.setRange(8, 10001)
-        ff_points.setSingleStep(1)
-        ff_points.setValue(max(8, int(params.get("far_field_points", 361))))
-        ff_phi = QDoubleSpinBox(dlg)
-        ff_phi.setRange(-360.0, 360.0)
-        ff_phi.setDecimals(3)
-        ff_phi.setSuffix(" deg")
-        ff_phi.setValue(float(params.get("far_field_phi_deg", params.get("far_field_theta_deg", 0.0))))
-        ff_frequency = QDoubleSpinBox(dlg)
-        ff_frequency.setRange(0.000001, 1.0e9)
-        ff_frequency.setDecimals(6)
-        ff_frequency.setSuffix(" GHz")
-        ff_frequency.setValue(float(params.get("far_field_frequency_ghz", 0.0)))
+
+        cb_plane = QComboBox(dlg)
+        cb_plane.addItems(["XY", "XZ", "YZ"])
+        selected_plane = str(params.get("plane", "XY")).strip().upper()
+        if selected_plane not in {"XY", "XZ", "YZ"}:
+            selected_plane = "XY"
+        cb_plane.setCurrentText(selected_plane)
+
+        cb_polar_view = QComboBox(dlg)
+        cb_polar_view.addItems(["2D polar", "3D polar"])
+        polar_3d = bool(params.get("polar_3d", False))
+        cb_polar_view.setCurrentText("3D polar" if polar_3d else "2D polar")
 
         form.addRow("Name", le_name)
         form.addRow("Simulation", cb_sim)
         form.addRow("Plot type", cb_type)
         form.addRow("State", cb_enabled)
+        form.addRow("S-parameter", s_parameter)
         form.addRow("Smith/S-parameter port i", port_i)
         form.addRow("Smith/S-parameter port j", port_j)
-        form.addRow("Far-field component", ff_component)
-        form.addRow("Far-field scale", ff_db)
-        ff_points_row = form.rowCount()
-        form.addRow("Far-field angular samples", ff_points)
-        ff_phi_row = form.rowCount()
-        form.addRow("Far-field phi cut", ff_phi)
-        ff_frequency_row = form.rowCount()
-        form.addRow("Far-field frequency", ff_frequency)
-
-        smith_rows = (4, 5)
-        farfield_rows = (6, 7, ff_points_row, ff_phi_row, ff_frequency_row)
+        form.addRow("Far-field plane", cb_plane)
+        form.addRow("Polar view", cb_polar_view)
+        smith_rows = (5, 6)
+        farfield_rows = (7, 8)
 
         def update_parameter_visibility(plot_type: str) -> None:
             is_smith = plot_type == "smith"
-            is_farfield = plot_type in {"plot_ff", "plot_ff_polar"}
             for row in smith_rows:
                 form.setRowVisible(row, is_smith)
+            is_farfield = plot_type in {"plot_ff", "plot_ff_polar", "plot_ff_3d"}
             for row in farfield_rows:
                 form.setRowVisible(row, is_farfield)
 
@@ -1059,13 +1065,11 @@ class ProjectTreeWidget(QWidget):
             "plot_type": cb_type.currentText().strip(),
             "enabled": cb_enabled.currentText() == "Enabled",
             "params": {
+                "s_parameter": s_parameter.currentText().strip().upper() or "S11",
                 "port_i": int(port_i.value()),
                 "port_j": int(port_j.value()),
-                "far_field_component": ff_component.currentText().strip(),
-                "far_field_db": bool(ff_db.isChecked()),
-                "far_field_points": int(ff_points.value()),
-                "far_field_phi_deg": float(ff_phi.value()),
-                "far_field_frequency_ghz": float(ff_frequency.value()),
+                "plane": cb_plane.currentText().strip().upper() or "XY",
+                "polar_3d": cb_polar_view.currentText().strip() == "3D polar",
             },
         }
 

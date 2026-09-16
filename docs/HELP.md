@@ -1,7 +1,7 @@
 # EM 3D Modeler Help
 
-Version: 1.1.6
-Release Date: 2026-06-12
+Version: 1.1.8
+Release Date: 2026-09-16
 
 ## 1. Overview
 EM 3D Modeler is a 3D CAD/EM environment for creating geometries, assigning materials, importing STEP files, performing boolean operations, and generating EMERGE scripts.
