@@ -413,6 +413,15 @@ def export_emerge_python_script(
         "        return 1, 1",
         "    return output_port, input_port",
         "",
+        "def _boundary_faces(geometry_group):",
+        "    geometry_objects = list(geometry_group.objects)",
+        "    if not geometry_objects:",
+        "        raise RuntimeError(f'Geometry group has no boundary objects: {geometry_group}')",
+        "    faces = geometry_objects[0].boundary()",
+        "    for geometry_object in geometry_objects[1:]:",
+        "        faces = faces + geometry_object.boundary()",
+        "    return faces",
+        "",
         "def _write_sputility_touchstone(grid):",
         "    nports = _number_of_ports(grid)",
         "    frequencies = grid.dense_f(SPARAM_FIT_POINTS) if SPARAM_FIT_ENABLED else grid.freq",
@@ -639,7 +648,7 @@ def export_emerge_python_script(
             if object_name in port_surface_names:
                 boundary_target = f"port_surfaces[{_q(object_name)}].boundary()"
             else:
-                boundary_target = f"geometry_groups[{_q(object_name)}].boundary()"
+                boundary_target = f"_boundary_faces(geometry_groups[{_q(object_name)}])"
             if boundary_type == "PEC":
                 lines.append(f"simulationObj.mw.bc.PEC({boundary_target})")
             elif boundary_type == "PMC":
