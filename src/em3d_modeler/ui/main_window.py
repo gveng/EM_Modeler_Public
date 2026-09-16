@@ -2823,7 +2823,18 @@ class MainWindow(QMainWindow):
                 frequencies = np.asarray(getattr(grid, "freq", []))
                 if field_data is not None and frequencies.size:
                     field_entry = field_data.find(freq=float(frequencies[0]))
-                    faces = loaded_sim.all_boundaries()
+                    boundary_geometries = [
+                        geometry
+                        for geometry in loaded_sim.all_geos()
+                        if callable(getattr(geometry, "boundary", None))
+                    ]
+                    if not boundary_geometries:
+                        raise RuntimeError(
+                            "Far-field plotting requires at least one geometry with boundary faces."
+                        )
+                    faces = boundary_geometries[0].boundary()
+                    for geometry in boundary_geometries[1:]:
+                        faces = faces + geometry.boundary()
                     if plot_type == "plot_ff_3d":
                         farfield = field_entry.farfield_3d(faces)
                         theta = farfield.theta
