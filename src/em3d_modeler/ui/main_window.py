@@ -2822,7 +2822,14 @@ class MainWindow(QMainWindow):
                 field_data = getattr(mw_data, "field", None)
                 frequencies = np.asarray(getattr(grid, "freq", []))
                 if field_data is not None and frequencies.size:
-                    field_entry = field_data.find(freq=float(frequencies[0]))
+                    requested_frequency_ghz = float(plot_params.get("frequency_GHz", 0.0) or 0.0)
+                    requested_frequency = requested_frequency_ghz * 1e9
+                    if requested_frequency <= 0.0:
+                        requested_frequency = float(frequencies[0])
+                    selected_frequency = float(
+                        frequencies[int(np.argmin(np.abs(frequencies - requested_frequency)))]
+                    )
+                    field_entry = field_data.find(freq=selected_frequency)
                     boundary_geometries = [
                         geometry
                         for geometry in loaded_sim.all_geos()

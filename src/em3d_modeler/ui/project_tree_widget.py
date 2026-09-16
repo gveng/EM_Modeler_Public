@@ -1054,6 +1054,21 @@ class ProjectTreeWidget(QWidget):
         polar_3d = bool(params.get("polar_3d", False))
         cb_polar_view.setCurrentText("3D polar" if polar_3d else "2D polar")
 
+        farfield_frequency = QDoubleSpinBox(dlg)
+        farfield_frequency.setRange(1e-6, 1e6)
+        farfield_frequency.setDecimals(6)
+        farfield_frequency.setSingleStep(0.1)
+        farfield_frequency.setSuffix(" GHz")
+        selected_frequency = float(params.get("frequency_GHz", 0.0) or 0.0)
+        if selected_frequency <= 0.0:
+            selected_sim = next(
+                (sim for sim in self._settings.get("simulations", [])
+                 if isinstance(sim, dict) and str(sim.get("name", "")).strip() == cb_sim.currentText().strip()),
+                {},
+            )
+            selected_frequency = float(selected_sim.get("Fmin_GHz", 0.1))
+        farfield_frequency.setValue(selected_frequency)
+
         form.addRow("Name", le_name)
         form.addRow("Simulation", cb_sim)
         form.addRow("Plot type", cb_type)
@@ -1063,8 +1078,9 @@ class ProjectTreeWidget(QWidget):
         form.addRow("Smith/S-parameter port j", port_j)
         form.addRow("Far-field plane", cb_plane)
         form.addRow("Polar view", cb_polar_view)
+        form.addRow("Far-field frequency", farfield_frequency)
         smith_rows = (5, 6)
-        farfield_rows = (7, 8)
+        farfield_rows = (7, 8, 9)
 
         def update_parameter_visibility(plot_type: str) -> None:
             is_smith = plot_type == "smith"
@@ -1096,6 +1112,7 @@ class ProjectTreeWidget(QWidget):
                 "port_j": int(port_j.value()),
                 "plane": cb_plane.currentText().strip().upper() or "XY",
                 "polar_3d": cb_polar_view.currentText().strip() == "3D polar",
+                "frequency_GHz": float(farfield_frequency.value()),
             },
         }
 
