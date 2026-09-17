@@ -53,7 +53,7 @@ Use the toolbar to create Box, Cylinder, Cone or Sphere. The active reference pl
 
 ### Parametric Sketch
 
-![Parametric sketch snapshot](snapshots/sketch-dialog.svg)
+![Parametric sketch snapshot](snapshots/sketch-dialog-real.png)
 
 The sketch window contains:
 
