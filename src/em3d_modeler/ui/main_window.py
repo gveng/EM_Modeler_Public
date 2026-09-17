@@ -19,9 +19,17 @@ import traceback
 import sys
 import vtk
 
-# Resolve resources from the source root or PyInstaller's _internal directory.
+# Resolve resources from source, PyInstaller's internal directory, or the EXE folder.
 _APP_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).parent.parent.parent.parent))
-_ICONS_DIR = _APP_ROOT / "Icons"
+_RESOURCE_ROOTS = [
+    _APP_ROOT,
+    Path(sys.executable).resolve().parent,
+    Path(__file__).parent.parent.parent.parent,
+]
+_ICONS_DIR = next(
+    (root / "Icons" for root in _RESOURCE_ROOTS if (root / "Icons").is_dir()),
+    _APP_ROOT / "Icons",
+)
 
 
 def _icon(name: str) -> "QIcon":
