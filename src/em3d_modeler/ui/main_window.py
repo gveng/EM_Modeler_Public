@@ -19,8 +19,9 @@ import traceback
 import sys
 import vtk
 
-# Resolve Icons folder relative to this file (4 levels up from ui/)
-_ICONS_DIR = Path(__file__).parent.parent.parent.parent / "Icons"
+# Resolve resources from the source root or PyInstaller's _internal directory.
+_APP_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).parent.parent.parent.parent))
+_ICONS_DIR = _APP_ROOT / "Icons"
 
 
 def _icon(name: str) -> "QIcon":
@@ -71,7 +72,6 @@ from .. import __version__, __release_date__
 
 # ������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������
 _UNITS  = ["mm", "um", "cm", "m", "mil", "inch"]
-_APP_ROOT = Path(getattr(sys, "_MEIPASS", Path(__file__).parent.parent.parent.parent))
 _DOCS_ROOT = _APP_ROOT / "docs"
 _DOCS_HELP = _DOCS_ROOT / "HELP.md"
 _DOCS_HTML = _DOCS_ROOT / "HELP.html"

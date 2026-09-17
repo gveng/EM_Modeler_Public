@@ -62,7 +62,10 @@ for _package in _runtime_packages:
 
 _runtime_datas = list(dict.fromkeys(_runtime_datas))
 _runtime_binaries = list(dict.fromkeys(_runtime_binaries))
-_runtime_hiddenimports = sorted(set(_runtime_hiddenimports))
+_runtime_hiddenimports = sorted({{
+    _module for _module in _runtime_hiddenimports
+    if ".tests" not in _module and not _module.endswith(".conftest")
+}})
 
 _gmsh_dll = Path(sys.prefix) / "Lib" / "gmsh-4.14.dll"
 if _gmsh_dll.exists():
