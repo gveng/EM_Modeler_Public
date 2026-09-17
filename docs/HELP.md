@@ -133,7 +133,7 @@ After import, check:
 ## 7. Reference Plane
 
 ![Reference plane snapshot](snapshots/reference-plane-dialog.svg)
-![Reference Planes context menu](snapshots/reference-planes-context-real.png)
+![Reference Planes context menu](snapshots/reference-planes-visible-real.png)
 
 The non-modal Reference Plane window lets you continue working in the viewport while defining a plane.
 
