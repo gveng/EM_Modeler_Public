@@ -86,6 +86,10 @@ The context menu supports:
 
 On a material group, the context menu changes material priority with Set Higher Priority and Set Lower Priority.
 
+![Active object context menu](snapshots/active-object-context-real.png)
+
+The object context menu provides Rename, Assign Port, Assign Boundary Condition, Assign Mesh Resolution, MODEL/NON MODEL role, Hide Selected and Show Selected.
+
 Hidden objects remain part of the EMERGE simulation. In the EMERGE 3D viewer they are rendered with opacity `0.0`; visible objects keep their modeler opacity.
 
 ### Assign Material
