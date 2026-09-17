@@ -20,6 +20,39 @@ The main window has three working areas:
 
 The toolbar provides shortcuts for primitives, sketches, booleans, STEP import, reference planes, grid, units and selection modes.
 
+### Toolbar icons, left to right
+
+**Creation tools**
+
+1. **Box:** draw a box on the active plane.
+2. **Plate:** create a planar plate on the active plane.
+3. **Cylinder:** draw a cylinder from its base and height.
+4. **Cone:** draw a cone with its base and height.
+5. **Sphere:** create a sphere from center and radius.
+6. **Pyramid:** create a pyramid primitive.
+7. **Wedge:** create a wedge primitive.
+8. **Torus:** create a torus primitive.
+9. **Ellipsoid:** create an ellipsoid primitive.
+10. **Sketch:** open the parametric sketch canvas for extrusion or revolution.
+11. **Planar:** define a planar structure by snapping start and end points on the active plane.
+
+**Geometry operations**
+
+12. **Cut:** subtract the selected tool geometry from the base geometry.
+13. **Fuse:** unite selected solids. The counter beside Fuse shows the current selection count.
+14. **Common:** keep only the intersection of selected solids.
+15. **Scale:** apply a numeric scale factor to selected objects.
+16. **Move On Plane:** move selected objects toward the active plane origin.
+17. **Dissolve Boolean:** restore the source objects of a boolean result.
+
+**Simulation and selection**
+
+18. **Import STEP:** import `.step` or `.stp` CAD geometry.
+19. **Play:** open the EMERGE Simulation panel for script generation, execution and logs.
+20. **Select combo:** choose `All` for whole objects, `Surface` for faces, `Edge` for edges or `Vertex` for vertices.
+
+Every toolbar action has a tooltip with the same operation summary. Drawing tools start after clicking a location in the 3D viewport; operation tools act on the current selection.
+
 ![File menu screenshot](snapshots/file-menu-real.png)
 
 The File menu contains New/Open/Save Project, STEP import, EMERGE script export, global material database actions and Exit.
