@@ -28,6 +28,10 @@ The File menu contains New/Open/Save Project, STEP import, EMERGE script export,
 
 The Edit menu provides Delete Selected and Cancel Drawing.
 
+![Tools menu screenshot](snapshots/tools-menu-real.png)
+
+The Tools menu opens Settings and Material Library.
+
 ## 2. Project Tree
 
 The tree is the control center for EMERGE preparation.
@@ -129,6 +133,7 @@ After import, check:
 ## 7. Reference Plane
 
 ![Reference plane snapshot](snapshots/reference-plane-dialog.svg)
+![Reference Planes context menu](snapshots/reference-planes-context-real.png)
 
 The non-modal Reference Plane window lets you continue working in the viewport while defining a plane.
 
@@ -257,6 +262,8 @@ The generated bundle contains a master script and one child script per enabled s
 Project files preserve object visibility and opacity. These values are also used when the EMERGE 3D result viewer is populated.
 
 ## 14. View and Navigation
+
+![View menu screenshot](snapshots/view-menu-real.png)
 
 - **Reset Camera:** restore the default camera.
 - **Top (XY), Front (XZ), Right (YZ):** orthographic views.
