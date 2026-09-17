@@ -191,6 +191,7 @@ The log verbosity can be set to Trace, Debug, Info, Warning or Error.
 Port definitions provide the excitation geometry and electrical parameters. A LumpedPort includes width, height, direction, impedance and power. Port plates are excitation surfaces and are not treated as ordinary object boundaries.
 
 ![Port editor snapshot](snapshots/port-editor.svg)
+![Add Port real screenshot](snapshots/port-editor-real.png)
 
 The port editor is used to define the excitation plate, dimensions, direction, impedance and power. Keep the port plate separate from ordinary object boundary assignments.
 
