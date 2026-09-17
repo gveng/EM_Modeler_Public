@@ -20,6 +20,10 @@ The main window has three working areas:
 
 The toolbar provides shortcuts for primitives, sketches, booleans, STEP import, reference planes, grid, units and selection modes.
 
+![File menu screenshot](snapshots/file-menu-real.png)
+
+The File menu contains New/Open/Save Project, STEP import, EMERGE script export, global material database actions and Exit.
+
 ## 2. Project Tree
 
 The tree is the control center for EMERGE preparation.
