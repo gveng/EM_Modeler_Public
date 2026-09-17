@@ -309,6 +309,7 @@ class MainWindow(QMainWindow):
         tb.setObjectName("main_toolbar")
         tb.setMovable(False)
         tb.setIconSize(QSize(22, 22))
+        tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
         # ������ Primitive shapes ������������������������������������������������������������������������������������������������������������������������
         _DRAW_ICONS = [

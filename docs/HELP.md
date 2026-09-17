@@ -1,7 +1,7 @@
 # EM 3D Modeler Help
 
 Version: 1.1.9 Beta
-Release date: 2026-09-16
+Release date: 2026-09-17
 
 EM 3D Modeler is a desktop CAD and electromagnetic pre/post-processor for building 3D models, assigning materials, preparing meshes and ports, generating EMERGE scripts, and reviewing simulation results.
 
