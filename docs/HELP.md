@@ -86,7 +86,7 @@ The assignment window is divided into categories, material list and details:
 
 ### Material Library
 
-![Material library snapshot](snapshots/material-library.svg)
+![Material library snapshot](snapshots/material-library-real.png)
 
 The library manages Project Library and Global Library records. It supports search, property inspection, creation, editing, deletion, global-to-project append, global database selection and reload.
 
@@ -137,7 +137,9 @@ The active plane controls the drawing grid and the orientation of new sketches.
 
 ## 8. Settings
 
-![Settings snapshot](snapshots/settings-dialog.png)
+![Settings Display](snapshots/settings-display.png)
+![Settings Simulation](snapshots/settings-simulation.png)
+![Settings Mesh](snapshots/settings-mesh.png)
 
 ### Display tab
 
