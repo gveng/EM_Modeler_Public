@@ -205,7 +205,7 @@ For an object boundary, choose the object, boundary type and any type-specific p
 
 ### Simulation editor
 
-![Simulation editor snapshot](snapshots/simulation-editor.svg)
+![Simulation editor snapshot](snapshots/simulation-window-real.png)
 
 The simulation editor defines the job name, job type, enabled state, sweep range, log verbosity and optional S-parameter fitting. The midpoint of the sweep is also used as the default far-field output frequency.
 
