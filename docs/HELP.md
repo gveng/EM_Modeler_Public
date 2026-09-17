@@ -24,6 +24,10 @@ The toolbar provides shortcuts for primitives, sketches, booleans, STEP import, 
 
 The File menu contains New/Open/Save Project, STEP import, EMERGE script export, global material database actions and Exit.
 
+![Edit menu screenshot](snapshots/edit-menu-real.png)
+
+The Edit menu provides Delete Selected and Cancel Drawing.
+
 ## 2. Project Tree
 
 The tree is the control center for EMERGE preparation.
