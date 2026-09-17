@@ -318,10 +318,6 @@ class MainWindow(QMainWindow):
             ("Cylinder",  "cylinder",  "Part_Cylinder"),
             ("Cone",      "cone",      "Part_Cone"),
             ("Sphere",    "sphere",    "Part_Sphere"),
-            ("Pyramid",   "pyramid",   "Std_Tool1"),
-            ("Wedge",     "wedge",     "Std_Tool2"),
-            ("Torus",     "torus",     "Std_Tool3"),
-            ("Ellipsoid", "ellipsoid", "Part_Sphere"),
         ]
         for label, mode, icon_name in _DRAW_ICONS:
             act = QAction(_icon(icon_name), label, self)
