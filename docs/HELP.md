@@ -82,6 +82,10 @@ The context menu supports:
 - Assign Mesh Resolution.
 - Set or clear the model role used for simulation export.
 
+![Active material context menu](snapshots/active-material-context-real.png)
+
+On a material group, the context menu changes material priority with Set Higher Priority and Set Lower Priority.
+
 Hidden objects remain part of the EMERGE simulation. In the EMERGE 3D viewer they are rendered with opacity `0.0`; visible objects keep their modeler opacity.
 
 ### Assign Material
