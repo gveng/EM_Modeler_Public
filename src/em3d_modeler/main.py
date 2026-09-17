@@ -2,10 +2,19 @@
 import sys
 import os
 import locale
+import io
+
+
+def _ensure_standard_streams() -> None:
+    if sys.stdout is None:
+        sys.stdout = io.StringIO()
+    if sys.stderr is None:
+        sys.stderr = io.StringIO()
 
 def main():
     # Must set this before importing VTK / Qt to avoid OpenGL conflicts on Windows
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
+    _ensure_standard_streams()
 
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore    import QLocale
