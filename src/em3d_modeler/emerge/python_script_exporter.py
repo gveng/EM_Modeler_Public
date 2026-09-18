@@ -204,6 +204,7 @@ def export_emerge_python_script(
     units: str = "mm",
     materials_catalog: Dict[str, Dict[str, Any]] | None = None,
     show_model: bool = False,
+    preview_only: bool = False,
     show_mesh: bool = False,
     run_sweep: bool = True,
     lumped_ports: List[Dict[str, Any]] | None = None,
@@ -319,6 +320,11 @@ def export_emerge_python_script(
             "name": str(output.get("name", "Output")).strip() or "Output",
             "plot_type": plot_type,
             "s_parameter": str(params.get("s_parameter", "S11")).strip().upper() or "S11",
+            "s_parameters": [
+                str(value).strip().upper()
+                for value in params.get("s_parameters", [])
+                if str(value).strip()
+            ] if isinstance(params.get("s_parameters", []), list) else [],
             "port_i": max(1, _to_int(params.get("port_i", 1), 1)),
             "port_j": max(1, _to_int(params.get("port_j", 1), 1)),
         }
@@ -420,6 +426,18 @@ def export_emerge_python_script(
         "    if output_port < 1 or input_port < 1 or output_port > nports or input_port > nports:",
         "        return 1, 1",
         "    return output_port, input_port",
+        "",
+        "def _selected_s_parameters(output, grid):",
+        "    selected = []",
+        "    for value in output.get('s_parameters', []):",
+        "        match = re.fullmatch(r'S(\\d+)[,:/_-]?(\\d+)', str(value).upper())",
+        "        if match:",
+        "            selected.append((int(match.group(1)), int(match.group(2)), str(value).upper()))",
+        "    if not selected:",
+        "        output_port, input_port = _selected_s_parameter(output, grid)",
+        "        selected = [(output_port, input_port, f'S{output_port}{input_port}')]",
+        "    nports = _number_of_ports(grid)",
+        "    return [(output_port, input_port, label) for output_port, input_port, label in selected if 1 <= output_port <= nports and 1 <= input_port <= nports] or [(1, 1, 'S11')]",
         "",
         "def _boundary_faces(geometry_group):",
         "    geometry_objects = list(geometry_group.objects)",
@@ -601,6 +619,8 @@ def export_emerge_python_script(
                 f"    u=_port_{idx}_u,",
                 f"    v=_port_{idx}_v,",
                 ")",
+                f"port_surfaces[{_q(str(p.get('plate_name', name)))}].set_material(materials['PEC'])",
+                f"geometry_groups[{_q(str(p.get('plate_name', name)))}] = port_surfaces[{_q(str(p.get('plate_name', name)))}]",
                 f"port[{idx}]['object'] = port_surfaces[{_q(str(p.get('plate_name', name)))}]",
                 "",
             ]
@@ -609,8 +629,18 @@ def export_emerge_python_script(
         "# =============================================================================",
         "# [7] GEOMETRY COMMIT AND SIMULATION SETUP",
         "# =============================================================================",
-        "simulationObj.commit_geometry()",
     ]
+    if preview_only:
+        lines += [
+            "# Preview raw exported geometry in Gmsh without commit, meshing or simulation.",
+            "simulationObj.view(use_gmsh=True)",
+            "print('[job] Geometry preview closed; no commit, mesh or simulation was run.')",
+            "raise SystemExit(0)",
+        ]
+    else:
+        lines += [
+            "simulationObj.commit_geometry()",
+        ]
     lines += [
         "simulationObj.mw.set_frequency_range(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, NPOINTS)",
         "simulationObj.mw.set_resolution(MESH_RESOLUTION)",
