@@ -610,8 +610,6 @@ def export_emerge_python_script(
         "# =============================================================================",
         "simulationObj.commit_geometry()",
     ]
-    if show_model:
-        lines.append("simulationObj.view()")
     lines += [
         "simulationObj.mw.set_frequency_range(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, NPOINTS)",
         "simulationObj.mw.set_resolution(MESH_RESOLUTION)",
@@ -644,6 +642,13 @@ def export_emerge_python_script(
             ]
         lines += [
         "",
+        ]
+
+    if show_model:
+        lines += [
+            "# Show the committed geometry after port plates and LumpedPorts are defined.",
+            "simulationObj.view()",
+            "",
         ]
 
     lines += [
