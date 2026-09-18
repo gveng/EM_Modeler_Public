@@ -53,7 +53,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='EM3D_Modeler_1.1.9_Beta',
+    name='EM3D_Modeler_1.2.0_Beta',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -72,5 +72,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='EM3D_Modeler_1.1.9_Beta',
+    name='EM3D_Modeler_1.2.0_Beta',
 )
