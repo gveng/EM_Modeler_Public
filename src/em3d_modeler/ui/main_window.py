@@ -154,6 +154,11 @@ from .. import __version__, __release_date__
 
 # ������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������
 _UNITS  = ["mm", "um", "cm", "m", "mil", "inch"]
+_EMERGE_SOLVERS = frozenset({
+    "PARDISO", "CUDSS", "SUPERLU", "UMFPACK", "LAPACK", "ARPACK",
+    "SMART_ARPACK_BMA", "MUMPS", "AASDS", "BICGSTAB", "CG", "CHOLMOD",
+    "RSLAB", "SPARTA", "TEST",
+})
 _DOCS_ROOT = _APP_ROOT / "docs"
 _DOCS_HELP = _DOCS_ROOT / "HELP.md"
 _DOCS_HTML = _DOCS_ROOT / "HELP.html"
@@ -2840,8 +2845,8 @@ class MainWindow(QMainWindow):
         self._ui_locale = self._make_numeric_locale(self._decimal_separator)
 
         # Load simulation & mesh settings
-        solver = str(settings.value("simulation/solver", self._sim_solver)).strip()
-        if solver in {"PARDISO", "CUDSS", "SUPERLU", "UMFPACK", "LAPACK", "ARPACK", "SMART_ARPACK_BMA", "MUMPS", "AASDS", "BICGSTAB", "CG", "CHOLMOD", "RSLAB", "SPARTA", "TEST"}:
+        solver = str(settings.value("simulation/solver", self._sim_solver)).strip().upper()
+        if solver in _EMERGE_SOLVERS:
             self._sim_solver = solver
 
         try:
@@ -2894,6 +2899,7 @@ class MainWindow(QMainWindow):
         settings.setValue("mesh/resolution", float(self._mesh_resolution))
         settings.setValue("simulation/plot_sparams_after_sim", int(self._sim_plot_sparams_after_sim))
         settings.setValue("simulation/export_sparams_after_sim", int(self._sim_export_sparams_after_sim))
+        settings.sync()
 
     def _sync_settings_dialog_values(self) -> None:
         dlg = getattr(self, "_settings_dlg", None)
@@ -2938,8 +2944,8 @@ class MainWindow(QMainWindow):
         self._plane_triad_size = max(1e-6, float(values.get("plane_triad_size", self._plane_triad_size)))
 
         # Apply simulation & mesh settings
-        solver = str(values.get("solver", self._sim_solver)).strip()
-        if solver in {"PARDISO", "CUDSS", "SUPERLU", "UMFPACK", "LAPACK", "ARPACK", "SMART_ARPACK_BMA", "MUMPS", "AASDS", "BICGSTAB", "CG", "CHOLMOD", "RSLAB", "SPARTA", "TEST"}:
+        solver = str(values.get("solver", self._sim_solver)).strip().upper()
+        if solver in _EMERGE_SOLVERS:
             self._sim_solver = solver
         self._sim_parallel_enabled = bool(values.get("parallel_enabled", self._sim_parallel_enabled))
         self._sim_pardiso_threads = max(1, int(values.get("pardiso_threads", self._sim_pardiso_threads)))
