@@ -656,15 +656,22 @@ class MainWindow(QMainWindow):
         self._viewport.start_draw(mode, plane, material)
 
     def _delete_selected(self) -> None:
-        obj = self._viewport.scene.selected
-        if obj:
+        objects = list(self._viewport.scene.selection)
+        if not objects:
+            obj = self._viewport.scene.selected
+            if obj is not None:
+                objects = [obj]
+        if not objects:
+            return
+        names = [str(obj.name) for obj in objects]
+        for obj in objects:
             self._viewport.scene.remove_object(obj)
-            self._viewport.scene.select(None)
-            self._body_props.set_object(None)
-            self._refresh_materials()
-            self._sync_port_reference_state()
-            self._viewport._render()
-            self._info_bar.set_info(f"Deleted: {obj.name}")
+        self._viewport.scene.deselect_all()
+        self._body_props.set_object(None)
+        self._refresh_materials()
+        self._sync_port_reference_state()
+        self._viewport._render()
+        self._info_bar.set_info(f"Deleted {len(names)} object(s): {', '.join(names)}")
 
     def _scale_mesh_object(self, obj, factor: float) -> bool:
         actor = getattr(obj, "actor", None)
@@ -948,24 +955,14 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Move/Rotate", "Select one or more objects first.")
             return
 
-        if len(selection) != 1:
-            QMessageBox.information(self, "Move/Rotate", "Select exactly one object first.")
-            return
-
-        obj = selection[0]
-        actor = getattr(obj, "actor", None)
-        if actor is None:
-            QMessageBox.warning(self, "Move/Rotate", "The selected object has no visual actor.")
-            return
-
-        bounds = actor.GetBounds()
-        if bounds is None:
+        bounds_list = [obj.actor.GetBounds() for obj in selection]
+        if any(bounds is None for bounds in bounds_list):
             QMessageBox.warning(self, "Move/Rotate", "Unable to determine the selected object bounds.")
             return
         reference = [
-            (float(bounds[0]) + float(bounds[1])) * 0.5,
-            (float(bounds[2]) + float(bounds[3])) * 0.5,
-            (float(bounds[4]) + float(bounds[5])) * 0.5,
+            (min(float(bounds[0]) for bounds in bounds_list) + max(float(bounds[1]) for bounds in bounds_list)) * 0.5,
+            (min(float(bounds[2]) for bounds in bounds_list) + max(float(bounds[3]) for bounds in bounds_list)) * 0.5,
+            (min(float(bounds[4]) for bounds in bounds_list) + max(float(bounds[5]) for bounds in bounds_list)) * 0.5,
         ]
 
         dlg = QDialog(self)
@@ -1017,21 +1014,27 @@ class MainWindow(QMainWindow):
         def apply_transform() -> None:
             pivot = tuple(float(field.value()) for field in ref_fields)
             target = tuple(float(field.value()) for field in target_fields)
-            actor.SetOrigin(*pivot)
-            actor.RotateX(float(rotation_fields[0].value()))
-            actor.RotateY(float(rotation_fields[1].value()))
-            actor.RotateZ(float(rotation_fields[2].value()))
-            actor.AddPosition(
-                target[0] - pivot[0],
-                target[1] - pivot[1],
-                target[2] - pivot[2],
-            )
+            dx = target[0] - pivot[0]
+            dy = target[1] - pivot[1]
+            dz = target[2] - pivot[2]
+            rotate_x = float(rotation_fields[0].value())
+            rotate_y = float(rotation_fields[1].value())
+            rotate_z = float(rotation_fields[2].value())
+            for selected_obj in selection:
+                selected_actor = selected_obj.actor
+                selected_actor.SetOrigin(*pivot)
+                selected_actor.RotateX(rotate_x)
+                selected_actor.RotateY(rotate_y)
+                selected_actor.RotateZ(rotate_z)
+                selected_actor.AddPosition(dx, dy, dz)
             self._viewport.scene_changed.emit()
             self._refresh_materials()
             self._viewport._render()
             self._viewport.selection_changed.emit(selection)
             self._mark_simulation_dirty(steps=True, script=True)
-            self._info_bar.set_info(f"Transformed {obj.name} around the selected reference point.")
+            self._info_bar.set_info(
+                f"Transformed {len(selection)} object(s) around the selected reference point."
+            )
 
         dlg.accepted.connect(apply_transform)
         return
@@ -1679,9 +1682,16 @@ class MainWindow(QMainWindow):
         self._viewport._render()
         self._info_bar.set_info(f"Shown {len(objects)} object(s)")
 
-    def _on_transform_edit_requested(self, obj) -> None:
-        self._viewport.scene.select(obj)
-        self._body_props.set_object(obj)
+    def _on_transform_edit_requested(self, objects) -> None:
+        if not isinstance(objects, (list, tuple)):
+            objects = [objects]
+        objects = [obj for obj in objects if obj is not None and getattr(obj, "actor", None) is not None]
+        if not objects:
+            return
+        self._viewport.scene.deselect_all()
+        for obj in objects:
+            self._viewport.scene.select_add(obj)
+        self._body_props.set_selection(objects)
         self._move_selection_to_plane_origin()
 
     def _on_materials_model_role_changed(self, objects: list, is_model: bool) -> None:
@@ -1743,11 +1753,14 @@ class MainWindow(QMainWindow):
         self._project_tree.assign_port_to_object(obj.name)
         self._info_bar.set_info(f"Port assignment updated for {obj.name}")
 
-    def _on_assign_boundary_requested(self, obj) -> None:
-        if obj is None:
+    def _on_assign_boundary_requested(self, objects: list) -> None:
+        if not objects:
             return
-        self._project_tree.assign_boundary_to_object(obj.name)
-        self._info_bar.set_info(f"Boundary assignment updated for {obj.name}")
+        names = [str(obj.name).strip() for obj in objects if getattr(obj, "name", "")]
+        if not names:
+            return
+        self._project_tree.assign_boundary_to_objects(names)
+        self._info_bar.set_info(f"Boundary assignment updated for {len(names)} object(s)")
 
     def _on_assign_mesh_resolution_requested(self, objects: list) -> None:
         if not objects:
@@ -1909,6 +1922,14 @@ class MainWindow(QMainWindow):
             self._sim_chk_show_model.toggled.connect(self._on_sim_option_changed)
             btn_row.addWidget(self._sim_chk_show_model)
 
+            self._sim_chk_preview_only = QCheckBox("Preview Export (no mesh/run)")
+            self._sim_chk_preview_only.setChecked(False)
+            self._sim_chk_preview_only.setToolTip(
+                "Open the raw exported geometry in Gmsh before EMERGE commit; do not mesh or run the simulation"
+            )
+            self._sim_chk_preview_only.toggled.connect(self._on_sim_option_changed)
+            btn_row.addWidget(self._sim_chk_preview_only)
+
             self._sim_chk_show_mesh = QCheckBox("Show Mesh")
             self._sim_chk_show_mesh.setChecked(False)
             self._sim_chk_show_mesh.toggled.connect(self._on_sim_option_changed)
@@ -2015,7 +2036,8 @@ class MainWindow(QMainWindow):
         }
 
         entries: list[dict] = []
-        for idx, port in enumerate(settings_ports, start=1):
+        port_index = 1
+        for port in settings_ports:
             if not isinstance(port, dict):
                 continue
             if str(port.get("type", "")).strip() != "LumpedPort":
@@ -2039,13 +2061,29 @@ class MainWindow(QMainWindow):
 
             mins = [xmin, ymin, zmin]
             maxs = [xmax, ymax, zmax]
-            origin = [mins[0], mins[1], mins[2]]
-            origin[normal_axis] = (mins[normal_axis] + maxs[normal_axis]) / 2.0
+            corners = {
+                0: ((xmin, ymin, zmin), (xmin, ymax, zmin), (xmin, ymax, zmax), (xmin, ymin, zmax)),
+                1: ((xmin, ymin, zmin), (xmax, ymin, zmin), (xmax, ymin, zmax), (xmin, ymin, zmax)),
+                2: ((xmin, ymin, zmin), (xmax, ymin, zmin), (xmax, ymax, zmin), (xmin, ymax, zmin)),
+            }[normal_axis]
+            matrix = plate.actor.GetMatrix()
+            world = [matrix.MultiplyPoint([*point, 1.0]) for point in corners]
+            origin = list(world[0][:3])
+            u = [world[1][axis] - world[0][axis] for axis in range(3)]
+            v = [world[3][axis] - world[0][axis] for axis in range(3)]
 
-            u = [0.0, 0.0, 0.0]
-            v = [0.0, 0.0, 0.0]
-            u[tangent_axes[0]] = maxs[tangent_axes[0]] - mins[tangent_axes[0]]
-            v[tangent_axes[1]] = maxs[tangent_axes[1]] - mins[tangent_axes[1]]
+            normal_local = [0.0, 0.0, 0.0]
+            normal_local[normal_axis] = 1.0
+            normal_tip_local = [
+                origin_local + component
+                for origin_local, component in zip(corners[0], normal_local)
+            ]
+            normal_origin_world = matrix.MultiplyPoint([*corners[0], 1.0])
+            normal_tip_world = matrix.MultiplyPoint([*normal_tip_local, 1.0])
+            normal_vector = [
+                normal_tip_world[axis] - normal_origin_world[axis]
+                for axis in range(3)
+            ]
 
             params = port.get("params", {}) if isinstance(port.get("params", {}), dict) else {}
             configured_direction = [
@@ -2059,26 +2097,33 @@ class MainWindow(QMainWindow):
                 # definition and must be preserved in the generated script.
                 direction = [value / direction_magnitude for value in configured_direction]
             else:
-                direction = [0.0, 0.0, 0.0]
-                direction[normal_axis] = 1.0
+                normal_length = sum(value * value for value in normal_vector) ** 0.5
+                direction = (
+                    [value / normal_length for value in normal_vector]
+                    if normal_length > 1e-12
+                    else [0.0, 0.0, 1.0]
+                )
             z0 = float(params.get("Resistance_Ohm", 50.0))
             power = float(params.get("Voltage_V", 1.0))
-
             entries.append(
                 {
-                    "index": idx,
-                    "name": str(port.get("name", f"Port_{idx}")),
+                    # EMERGE requires contiguous technical port IDs (1..N).
+                    # The user-selected number remains available as metadata/display.
+                    "index": port_index,
+                    "display_number": port.get("number", port_index),
+                    "name": str(port.get("name", f"Port_{port_index}")),
                     "plate_name": obj_name,
                     "origin": origin,
                     "u": u,
                     "v": v,
-                    "width": abs(u[tangent_axes[0]]),
-                    "height": abs(v[tangent_axes[1]]),
+                    "width": sum(value * value for value in u) ** 0.5,
+                    "height": sum(value * value for value in v) ** 0.5,
                     "direction": direction,
                     "z0": z0,
                     "power": power,
                 }
             )
+            port_index += 1
         return entries
 
     def _collect_emerge_plates(self) -> list[dict]:
@@ -2204,7 +2249,7 @@ class MainWindow(QMainWindow):
             "    raise SystemExit(_run_children())\n"
         )
 
-    def _build_simulation_script_bundle(self, step_entries: list[dict], show_model: bool, show_mesh: bool, run_sweep: bool) -> dict:
+    def _build_simulation_script_bundle(self, step_entries: list[dict], show_model: bool, show_mesh: bool, run_sweep: bool, preview_only: bool = False) -> dict:
         settings = self._project_tree.get_settings()
         mesh_cfg = settings.get("mesh", {}) if isinstance(settings, dict) else {}
         mesh_fraction = self._mesh_resolution
@@ -2236,6 +2281,7 @@ class MainWindow(QMainWindow):
                 units=self._units,
                 materials_catalog=self._material_store.material_export_catalog(),
                 show_model=show_model,
+                preview_only=preview_only,
                 show_mesh=show_mesh,
                 run_sweep=run_sweep,
                 lumped_ports=self._collect_plate_lumped_ports(),
@@ -2397,12 +2443,14 @@ class MainWindow(QMainWindow):
 
             if need_script:
                 show_model = bool(getattr(self, "_sim_chk_show_model", None) and self._sim_chk_show_model.isChecked())
+                preview_only = bool(getattr(self, "_sim_chk_preview_only", None) and self._sim_chk_preview_only.isChecked())
                 show_mesh = bool(getattr(self, "_sim_chk_show_mesh", None) and self._sim_chk_show_mesh.isChecked())
                 run_sweep = bool(getattr(self, "_sim_chk_run_sweep", None) and self._sim_chk_run_sweep.isChecked())
 
                 script_bundle = self._build_simulation_script_bundle(
                     bundle.get("entries", []),
                     show_model=show_model,
+                    preview_only=preview_only,
                     show_mesh=show_mesh,
                     run_sweep=run_sweep,
                 )
@@ -3436,39 +3484,44 @@ class MainWindow(QMainWindow):
             return
         ports = self._grid_port_numbers(grid)
         import re
-        s_parameter = str(plot_params.get("s_parameter", "S11")).strip().upper()
-        match = re.fullmatch(r"S(\d+)[,:/_-]?(\d+)", s_parameter)
-        if match:
-            output_port = int(match.group(1))
-            input_port = int(match.group(2))
-        else:
-            output_port = max(1, int(plot_params.get("port_i", 1)))
-            input_port = max(1, int(plot_params.get("port_j", 1)))
-            s_parameter = f"S{output_port}{input_port}"
-        if output_port not in ports or input_port not in ports:
+        raw_parameters = plot_params.get("s_parameters", [])
+        if not isinstance(raw_parameters, list) or not raw_parameters:
+            raw_parameters = [plot_params.get("s_parameter", "S11")]
+        selected_parameters = []
+        for raw_parameter in raw_parameters:
+            parameter = str(raw_parameter).strip().upper()
+            match = re.fullmatch(r"S(\d+)[,:/_-]?(\d+)", parameter)
+            if match:
+                output_port = int(match.group(1))
+                input_port = int(match.group(2))
+            else:
+                output_port = max(1, int(plot_params.get("port_i", 1)))
+                input_port = max(1, int(plot_params.get("port_j", 1)))
+                parameter = f"S{output_port}{input_port}"
+            if (output_port, input_port, parameter) not in selected_parameters:
+                selected_parameters.append((output_port, input_port, parameter))
+        invalid = [parameter for output_port, input_port, parameter in selected_parameters
+                   if output_port not in ports or input_port not in ports]
+        if invalid:
             QMessageBox.warning(
                 self,
                 "Output",
-                f"S-parameter {s_parameter} is not available for this simulation ({len(ports)} port(s)).",
+                f"S-parameter(s) {', '.join(invalid)} are not available for this simulation ({len(ports)} port(s)).",
             )
             return
-        selected_curve = grid.S(output_port, input_port)
+        curves = [grid.S(output_port, input_port) for output_port, input_port, _ in selected_parameters]
+        labels = [parameter for _, _, parameter in selected_parameters]
 
         try:
             if plot_type == "plot_sp":
-                curves = [selected_curve]
-                labels = [s_parameter]
                 plot_sp(freq, curves, labels=labels)
             elif plot_type == "plot_vswr":
-                curves = [selected_curve]
-                labels = [f"VSWR{output_port}{input_port}"]
-                plot_vswr(freq, curves, labels=labels)
+                plot_vswr(freq, curves, labels=[f"VSWR{label[1:]}" for label in labels])
             elif plot_type == "smith":
-                smith([selected_curve], f=freq, labels=[s_parameter])
+                smith(curves, f=freq, labels=labels)
             elif plot_type == "plot":
-                curves = [20.0 * np.log10(np.maximum(np.abs(selected_curve), 1e-12))]
-                labels = [f"|{s_parameter}| dB"]
-                plot(freq, curves, labels=labels, xlabel="Frequency (Hz)", ylabel="Magnitude (dB)")
+                magnitude_curves = [20.0 * np.log10(np.maximum(np.abs(curve), 1e-12)) for curve in curves]
+                plot(freq, magnitude_curves, labels=[f"|{label}| dB" for label in labels], xlabel="Frequency (Hz)", ylabel="Magnitude (dB)")
             else:
                 QMessageBox.warning(self, "Output", f"Unsupported plot type: {plot_type}")
                 return

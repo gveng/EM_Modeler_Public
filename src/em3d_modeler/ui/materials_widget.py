@@ -43,10 +43,10 @@ class MaterialsWidget(QWidget):
     object_rename     = Signal(object, str)  # EMObject, new_name
     objects_bulk_rename = Signal(list, str, int)  # List[EMObject], base_name, start_index
     assign_port_requested = Signal(object)   # EMObject
-    assign_boundary_requested = Signal(object)  # EMObject
+    assign_boundary_requested = Signal(list)  # List[EMObject]
     assign_mesh_resolution_requested = Signal(list)  # List[EMObject]
     material_priority_changed = Signal(str, int)  # material_name, delta (1 for higher, -1 for lower)
-    transform_edit_requested = Signal(object)  # EMObject
+    transform_edit_requested = Signal(list)  # List[EMObject]
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -241,7 +241,7 @@ class MaterialsWidget(QWidget):
         if transform_id is not None:
             obj = self._obj_map.get(transform_id)
             if obj is not None:
-                self.transform_edit_requested.emit(obj)
+                self.transform_edit_requested.emit([obj])
 
     def _on_selection_changed(self) -> None:
         selected = []
@@ -365,10 +365,14 @@ class MaterialsWidget(QWidget):
             return
         menu = QMenu(self._tree)
 
+        act_transform = QAction(
+            "Edit Transform…" if len(objs) == 1 else f"Edit Group Transform ({len(objs)} objects)…",
+            menu,
+        )
+        act_transform.triggered.connect(lambda: self.transform_edit_requested.emit(list(objs)))
+        menu.addAction(act_transform)
+
         if len(objs) == 1:
-            act_transform = QAction("Edit Transform…", menu)
-            act_transform.triggered.connect(lambda: self.transform_edit_requested.emit(objs[0]))
-            menu.addAction(act_transform)
 
             menu.addSeparator()
             act_rename = QAction("Rename…", menu)
@@ -380,11 +384,11 @@ class MaterialsWidget(QWidget):
             act_assign_port.triggered.connect(lambda: self.assign_port_requested.emit(objs[0]))
             menu.addAction(act_assign_port)
 
-            act_assign_bc = QAction("Assign Boundary Condition…", menu)
-            act_assign_bc.triggered.connect(lambda: self.assign_boundary_requested.emit(objs[0]))
-            menu.addAction(act_assign_bc)
-
             menu.addSeparator()
+
+        act_assign_bc = QAction("Assign Boundary Condition…", menu)
+        act_assign_bc.triggered.connect(lambda: self.assign_boundary_requested.emit(list(objs)))
+        menu.addAction(act_assign_bc)
 
         if len(objs) >= 2:
             act_bulk_rename = QAction(f"Bulk Rename {len(objs)} objects…", menu)

@@ -25,6 +25,7 @@ from PySide6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QPushButton, QInputDialog, QComboBox,
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox,
     QMenu, QMessageBox, QSpinBox, QDoubleSpinBox, QCheckBox,
+    QTableWidget, QTableWidgetItem,
     QStyle,
 )
 from PySide6.QtCore import Qt, Signal, QLocale
@@ -416,12 +417,16 @@ class ProjectTreeWidget(QWidget):
     def _refresh_ports(self) -> None:
         self._p_node.takeChildren()
         for i, port in enumerate(self._settings["ports"]):
+            try:
+                port_number = max(1, int(port.get("number", i + 1)))
+            except (TypeError, ValueError):
+                port_number = i + 1
             obj_name = str(port.get("object", "")).strip()
             missing_obj = bool(obj_name and obj_name not in self._scene_object_names)
             if obj_name:
-                txt = f"Port {i+1}: {port.get('type', '?')} -> {obj_name}"
+                txt = f"Port {port_number}: {port.get('type', '?')} -> {obj_name}"
             else:
-                txt = (f"Port {i+1}: {port.get('type','?')} "
+                txt = (f"Port {port_number}: {port.get('type','?')} "
                        f"@ [{port.get('x',0)},{port.get('y',0)},{port.get('z',0)}]")
             if missing_obj:
                 txt += "  [MISSING OBJECT]"
@@ -1025,28 +1030,38 @@ class ProjectTreeWidget(QWidget):
         configured_ports = self._settings.get("ports", [])
         port_count = len(configured_ports) if isinstance(configured_ports, list) else 0
         port_count = max(1, port_count)
-        s_parameter = QComboBox(dlg)
-        s_parameter.addItems([
-            f"S{output_port}{input_port}"
-            for output_port in range(1, port_count + 1)
-            for input_port in range(1, port_count + 1)
-        ])
-        selected_s_parameter = str(params.get("s_parameter", "S11")).strip().upper() or "S11"
         valid_parameters = {
             f"S{output_port}{input_port}"
             for output_port in range(1, port_count + 1)
             for input_port in range(1, port_count + 1)
         }
-        if selected_s_parameter not in valid_parameters:
-            selected_s_parameter = "S11"
-        s_parameter.setCurrentText(selected_s_parameter)
-        s_parameter.setToolTip(f"Select one of the {port_count * port_count} generated S-parameters")
-        port_i = QSpinBox(dlg)
-        port_i.setRange(1, 64)
-        port_i.setValue(max(1, int(params.get("port_i", 1))))
-        port_j = QSpinBox(dlg)
-        port_j.setRange(1, 64)
-        port_j.setValue(max(1, int(params.get("port_j", 1))))
+        stored_parameters = params.get("s_parameters", [])
+        if isinstance(stored_parameters, list):
+            selected_parameters = {
+                str(value).strip().upper()
+                for value in stored_parameters
+                if str(value).strip().upper() in valid_parameters
+            }
+        else:
+            selected_parameters = set()
+        if not selected_parameters:
+            legacy_parameter = str(params.get("s_parameter", "S11")).strip().upper() or "S11"
+            selected_parameters = {legacy_parameter if legacy_parameter in valid_parameters else "S11"}
+
+        s_parameter_matrix = QTableWidget(port_count, port_count, dlg)
+        s_parameter_matrix.setHorizontalHeaderLabels([f"Port {index}" for index in range(1, port_count + 1)])
+        s_parameter_matrix.setVerticalHeaderLabels([f"Port {index}" for index in range(1, port_count + 1)])
+        s_parameter_matrix.setToolTip("Click each matrix cell to select the S-parameters to plot")
+        s_parameter_matrix.setMaximumHeight(48 + port_count * 34)
+        for output_port in range(1, port_count + 1):
+            for input_port in range(1, port_count + 1):
+                parameter_name = f"S{output_port}{input_port}"
+                item = QTableWidgetItem(parameter_name)
+                item.setTextAlignment(Qt.AlignCenter)
+                item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable | Qt.ItemIsUserCheckable)
+                item.setCheckState(Qt.Checked if parameter_name in selected_parameters else Qt.Unchecked)
+                s_parameter_matrix.setItem(output_port - 1, input_port - 1, item)
+        s_parameter_matrix.resizeColumnsToContents()
 
         cb_plane = QComboBox(dlg)
         cb_plane.addItems(["XY", "XZ", "YZ"])
@@ -1082,24 +1097,18 @@ class ProjectTreeWidget(QWidget):
         form.addRow("Simulation", cb_sim)
         form.addRow("Plot type", cb_type)
         form.addRow("State", cb_enabled)
-        form.addRow("S-parameter", s_parameter)
-        form.addRow("Smith/S-parameter port i", port_i)
-        form.addRow("Smith/S-parameter port j", port_j)
+        form.addRow("S-parameters (output × input)", s_parameter_matrix)
         form.addRow("Far-field plane", cb_plane)
         form.addRow("Polar view", cb_polar_view)
         form.addRow("Far-field frequency", farfield_frequency)
         s_parameter_rows = (4,)
-        smith_rows = (5, 6)
-        farfield_rows = (7, 9)
-        polar_view_rows = (8,)
+        farfield_rows = (5, 7)
+        polar_view_rows = (6,)
 
         def update_parameter_visibility(plot_type: str) -> None:
             is_s_parameter = plot_type in {"plot_sp", "plot_vswr", "smith", "plot"}
             for row in s_parameter_rows:
                 form.setRowVisible(row, is_s_parameter)
-            is_smith = plot_type == "smith"
-            for row in smith_rows:
-                form.setRowVisible(row, is_smith)
             is_farfield = plot_type in {"plot_ff", "plot_ff_polar", "plot_ff_3d"}
             for row in farfield_rows:
                 form.setRowVisible(row, is_farfield)
@@ -1118,15 +1127,26 @@ class ProjectTreeWidget(QWidget):
         if dlg.exec_() != QDialog.Accepted:
             return None
 
+        selected_parameters = [
+            s_parameter_matrix.item(row, column).text()
+            for row in range(port_count)
+            for column in range(port_count)
+            if s_parameter_matrix.item(row, column).checkState() == Qt.Checked
+        ]
+        if not selected_parameters:
+            QMessageBox.warning(dlg, "Output", "Select at least one S-parameter in the matrix.")
+            return None
+        first_output, first_input = int(selected_parameters[0][1]), int(selected_parameters[0][2])
         return {
             "name": le_name.text().strip() or "Output",
             "simulation": cb_sim.currentText().strip(),
             "plot_type": cb_type.currentText().strip(),
             "enabled": cb_enabled.currentText() == "Enabled",
             "params": {
-                "s_parameter": s_parameter.currentText().strip().upper() or "S11",
-                "port_i": int(port_i.value()),
-                "port_j": int(port_j.value()),
+                "s_parameter": selected_parameters[0],
+                "s_parameters": selected_parameters,
+                "port_i": first_output,
+                "port_j": first_input,
                 "plane": cb_plane.currentText().strip().upper() or "XY",
                 "polar_3d": cb_polar_view.currentText().strip() == "3D polar",
                 "frequency_GHz": float(farfield_frequency.value()),
@@ -1291,8 +1311,12 @@ class ProjectTreeWidget(QWidget):
                 self.settings_changed.emit()
 
     def _add_port_dialog(self) -> None:
+        next_number = max(
+            [int(port.get("number", index + 1)) for index, port in enumerate(self._settings.get("ports", []))]
+            or [0]
+        ) + 1
         port = self._port_dialog_data(
-            initial={"name": "Port", "type": "WaveguidePort", "x": 0.0, "y": 0.0, "z": 0.0},
+            initial={"number": next_number, "name": "Port", "type": "WaveguidePort", "x": 0.0, "y": 0.0, "z": 0.0},
             fixed_object=None,
             title="Add Port",
         )
@@ -1324,7 +1348,12 @@ class ProjectTreeWidget(QWidget):
             title = f"Assign Port - {obj_name} (edit existing)"
         else:
             port_type = "WaveguidePort"
+            next_number = max(
+                [int(port.get("number", index + 1)) for index, port in enumerate(ports)]
+                or [0]
+            ) + 1
             initial = {
+                "number": next_number,
                 "name": f"Port_{obj_name}",
                 "type": port_type,
                 "x": 0.0,
@@ -1367,6 +1396,9 @@ class ProjectTreeWidget(QWidget):
                 current_params["Voltage_V"] = current_params.get("Excitation")
 
         le_name = QLineEdit(str(initial.get("name", "Port")))
+        sb_number = QSpinBox(dlg)
+        sb_number.setRange(1, 9999)
+        sb_number.setValue(max(1, int(initial.get("number", 1))))
         le_type = QComboBox()
         le_type.addItems(_PORT_TYPES)
         le_type.setCurrentText(current_type)
@@ -1444,6 +1476,7 @@ class ProjectTreeWidget(QWidget):
         le_type.currentTextChanged.connect(_rebuild_param_fields)
 
         form.addRow("Name", le_name)
+        form.addRow("Port number", sb_number)
         form.addRow("Type", le_type)
         form.addRow("Object", le_obj)
         form.addRow(lbl_x, le_x)
@@ -1477,6 +1510,7 @@ class ProjectTreeWidget(QWidget):
                     parsed_params.setdefault("Voltage_V", float(_PORT_TYPE_DEFAULT_PARAMS["LumpedPort"]["Voltage_V"]))
 
                 port = {
+                    "number": int(sb_number.value()),
                     "name": le_name.text().strip() or "Port",
                     "type": port_type,
                     "x": _parse_locale_float(le_x.text()),
@@ -1493,14 +1527,28 @@ class ProjectTreeWidget(QWidget):
         return None
 
     def assign_boundary_to_object(self, obj_name: str) -> None:
+        self.assign_boundary_to_objects([obj_name])
+
+    def assign_boundary_to_objects(self, object_names: list[str]) -> None:
+        names = [str(name).strip() for name in object_names if str(name).strip()]
+        if not names:
+            return
         bc = self._object_boundary_dialog_data(
-            initial={"name": f"BC_{obj_name}", "type": "PML"},
-            fixed_object=obj_name,
-            title=f"Assign Boundary Condition - {obj_name}",
+            initial={"name": "BC_Selected", "type": "PML"},
+            fixed_object=None,
+            title=f"Assign Boundary Condition - {len(names)} objects",
         )
         if bc is None:
             return
-        self._settings["object_boundaries"].append(bc)
+        rows = self._settings.setdefault("object_boundaries", [])
+        for name in names:
+            item = _deep_copy(bc)
+            item["object"] = name
+            if len(names) == 1:
+                item["name"] = bc.get("name", f"BC_{name}")
+            else:
+                item["name"] = f"{bc.get('name', 'BC_Selected')}_{name}"
+            rows.append(item)
         self._refresh_object_boundaries()
         self.settings_changed.emit()
 
