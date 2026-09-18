@@ -610,9 +610,12 @@ def export_emerge_python_script(
         "simulationObj.commit_geometry()",
     ]
     if show_model:
-        lines += [
-            "simulationObj.view()",
-        ]
+        if ports:
+            lines += [
+                "for _port_surface in port_surfaces.values():",
+                "    simulationObj.display.add_object(_port_surface, opacity=0.65)",
+            ]
+        lines.append("simulationObj.view()")
     lines += [
         "simulationObj.mw.set_frequency_range(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, NPOINTS)",
         "simulationObj.mw.set_resolution(MESH_RESOLUTION)",
