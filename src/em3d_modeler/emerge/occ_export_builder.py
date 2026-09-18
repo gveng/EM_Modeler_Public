@@ -45,6 +45,47 @@ def _build_occ_box_shape(obj: Any) -> Any | None:
     return None
 
 
+def _build_occ_plate_shape(obj: Any) -> Any | None:
+    try:
+        x1, x2 = sorted((float(obj.x1), float(obj.x2)))
+        y1, y2 = sorted((float(obj.y1), float(obj.y2)))
+        z1, z2 = sorted((float(obj.z1), float(obj.z2)))
+    except Exception:
+        return None
+
+    spans = (x2 - x1, y2 - y1, z2 - z1)
+    normal_axis = min(range(3), key=lambda index: abs(spans[index]))
+    corners = {
+        0: ((x1, y1, z1), (x1, y2, z1), (x1, y2, z2), (x1, y1, z2)),
+        1: ((x1, y1, z1), (x2, y1, z1), (x2, y1, z2), (x1, y1, z2)),
+        2: ((x1, y1, z1), (x2, y1, z1), (x2, y2, z1), (x1, y2, z1)),
+    }[normal_axis]
+
+    for pkg in ("OCP", "OCC.Core"):
+        try:
+            if pkg == "OCP":
+                from OCP.gp import gp_Pnt
+                from OCP.BRepBuilderAPI import BRepBuilderAPI_MakePolygon, BRepBuilderAPI_MakeFace
+            else:
+                from OCC.Core.gp import gp_Pnt
+                from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakePolygon, BRepBuilderAPI_MakeFace
+            wire = BRepBuilderAPI_MakePolygon()
+            for point in corners:
+                wire.Add(gp_Pnt(*point))
+            wire.Close()
+            if not wire.IsDone():
+                return None
+            face = BRepBuilderAPI_MakeFace(wire.Wire())
+            if not face.IsDone():
+                return None
+            return _apply_actor_transform(face.Face(), obj)
+        except ImportError:
+            continue
+        except Exception:
+            return None
+    return None
+
+
 def _translate_shape_local(shape: Any, dx: float, dy: float, dz: float) -> Any:
     for pkg in ("OCP", "OCC.Core"):
         try:
@@ -625,6 +666,11 @@ def build_occ_shape_for_export(obj: Any, cache: Dict[str, Any] | None = None, de
         if box_shape is not None:
             cache[oid] = box_shape
             return box_shape
+    elif obj_type == "PlateObject":
+        plate_shape = _build_occ_plate_shape(obj)
+        if plate_shape is not None:
+            cache[oid] = plate_shape
+            return plate_shape
     elif obj_type == "CylinderObject":
         cyl_shape = _build_occ_cylinder_shape(obj)
         if cyl_shape is not None:

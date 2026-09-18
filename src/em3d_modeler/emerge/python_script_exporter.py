@@ -207,6 +207,7 @@ def export_emerge_python_script(
     show_mesh: bool = False,
     run_sweep: bool = True,
     lumped_ports: List[Dict[str, Any]] | None = None,
+    plate_entries: List[Dict[str, Any]] | None = None,
     solver: str = "PARDISO",
     parallel_enabled: bool = True,
     pardiso_threads: int = 8,
@@ -268,6 +269,7 @@ def export_emerge_python_script(
         fraction_value = max(0.01, min(1.0, _to_float(fraction, mesh_resolution)))
         object_mesh_sizes[object_name] = fraction_value * wavelength_at_fmax
     ports = lumped_ports or []
+    plates = plate_entries or []
     port_surface_names = {
         str(port.get("plate_name", "")).strip()
         for port in ports
@@ -281,7 +283,12 @@ def export_emerge_python_script(
         for entry in step_entries
         if str(entry.get("object_name", "")).strip()
     }
-    valid_boundary_names = exported_object_names | port_surface_names
+    plate_names = {
+        str(plate.get("object_name", "")).strip()
+        for plate in plates
+        if str(plate.get("object_name", "")).strip()
+    }
+    valid_boundary_names = exported_object_names | port_surface_names | plate_names
     boundary_assignments = [
         {
             "object": str(item.get("object", "")).strip(),
@@ -296,7 +303,7 @@ def export_emerge_python_script(
     ]
     eff_pardiso_threads = max(1, int(pardiso_threads if parallel_enabled else 1))
     eff_acc_threads = max(1, int(acc_threads if parallel_enabled else 1))
-    used_materials = sorted({str(e.get("material", "PEC")) for e in step_entries})
+    used_materials = sorted({str(e.get("material", "PEC")) for e in [*step_entries, *plates]})
     detected_emerge_version = _detect_emerge_version()
     output_configs = []
     raw_outputs = settings.get("outputs", []) if isinstance(settings, dict) else []
@@ -513,6 +520,7 @@ def export_emerge_python_script(
         "# [5] GEOMETRY: ONE STEP FILE PER OBJECT",
         "# =============================================================================",
         "geometry_groups = {}",
+        "plate_objects = {}",
         "",
     ]
 
@@ -536,7 +544,23 @@ def export_emerge_python_script(
             "print('No STEP entries generated from current scene.')",
             "",
         ]
-
+    if plates:
+        lines += [
+            "# =============================================================================",
+            "# [5b] PLANAR PLATES (DIRECT EMERGE GEOMETRY)",
+            "# =============================================================================",
+        ]
+        for plate in plates:
+            plate_name = str(plate.get("object_name", "Plate"))
+            origin = tuple(float(value) * 0.001 for value in plate.get("origin", (0.0, 0.0, 0.0)))
+            u = tuple(float(value) * 0.001 for value in plate.get("u", (0.0, 0.0, 0.0)))
+            v = tuple(float(value) * 0.001 for value in plate.get("v", (0.0, 0.0, 0.0)))
+            lines += [
+                f"plate_objects[{_q(plate_name)}] = em.geo.Plate(name={_q(plate_name)}, origin={origin!r}, u={u!r}, v={v!r})",
+                f"plate_objects[{_q(plate_name)}].set_material(materials[{_q(str(plate.get('material', 'PEC')))}])",
+                f"geometry_groups[{_q(plate_name)}] = plate_objects[{_q(plate_name)}]",
+                "",
+            ]
     if ports:
         lines += [
             "# =============================================================================",
@@ -647,6 +671,8 @@ def export_emerge_python_script(
             boundary_type = assignment["type"]
             if object_name in port_surface_names:
                 boundary_target = f"port_surfaces[{_q(object_name)}].boundary()"
+            elif object_name in plate_names:
+                boundary_target = f"plate_objects[{_q(object_name)}]"
             else:
                 boundary_target = f"_boundary_faces(geometry_groups[{_q(object_name)}])"
             if boundary_type == "PEC":

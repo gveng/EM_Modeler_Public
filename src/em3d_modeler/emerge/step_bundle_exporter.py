@@ -302,22 +302,14 @@ def _write_step_from_occ_shape_with_modes(shape: Any, step_path: Path) -> None:
                     STEPControl_FacetedBrep,
                     STEPControl_AsIs,
                 )
-                writer = STEPControl_Writer()
-                if not _transfer_step_shape(
-                    writer,
-                    shape,
-                    [
-                        STEPControl_ManifoldSolidBrep,
-                        STEPControl_ShellBasedSurfaceModel,
-                        STEPControl_FacetedBrep,
-                        STEPControl_AsIs,
-                    ],
-                ):
-                    raise RuntimeError("STEP transfer failed")
-                status = int(writer.Write(str(step_path)))
-                if not _step_write_succeeded(step_path, status):
-                    raise RuntimeError(f"STEP writer failed with status={status}")
-                return
+                modes = [STEPControl_ShellBasedSurfaceModel, STEPControl_FacetedBrep, STEPControl_AsIs, STEPControl_ManifoldSolidBrep]
+                for mode in modes:
+                    writer = STEPControl_Writer()
+                    if _transfer_step_shape(writer, shape, [mode]):
+                        status = int(writer.Write(str(step_path)))
+                        if _step_write_succeeded(step_path, status):
+                            return
+                raise RuntimeError("STEP writer failed for all transfer modes")
 
             from OCC.Core.STEPControl import (
                 STEPControl_Writer,
@@ -326,22 +318,14 @@ def _write_step_from_occ_shape_with_modes(shape: Any, step_path: Path) -> None:
                 STEPControl_FacetedBrep,
                 STEPControl_AsIs,
             )
-            writer = STEPControl_Writer()
-            if not _transfer_step_shape(
-                writer,
-                shape,
-                [
-                    STEPControl_ManifoldSolidBrep,
-                    STEPControl_ShellBasedSurfaceModel,
-                    STEPControl_FacetedBrep,
-                    STEPControl_AsIs,
-                ],
-            ):
-                raise RuntimeError("STEP transfer failed")
-            status = int(writer.Write(str(step_path)))
-            if not _step_write_succeeded(step_path, status):
-                raise RuntimeError(f"STEP writer failed with status={status}")
-            return
+            modes = [STEPControl_ShellBasedSurfaceModel, STEPControl_FacetedBrep, STEPControl_AsIs, STEPControl_ManifoldSolidBrep]
+            for mode in modes:
+                writer = STEPControl_Writer()
+                if _transfer_step_shape(writer, shape, [mode]):
+                    status = int(writer.Write(str(step_path)))
+                    if _step_write_succeeded(step_path, status):
+                        return
+            raise RuntimeError("STEP writer failed for all transfer modes")
         except ImportError:
             continue
 

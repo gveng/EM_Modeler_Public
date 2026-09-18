@@ -2044,6 +2044,37 @@ class MainWindow(QMainWindow):
             )
         return entries
 
+    def _collect_emerge_plates(self) -> list[dict]:
+        port_names = {
+            str(port.get("object", "")).strip()
+            for port in self._project_tree.get_settings().get("ports", [])
+            if isinstance(port, dict) and str(port.get("object", "")).strip()
+        }
+        entries = []
+        for obj in self._viewport.scene.objects:
+            if type(obj).__name__ != "PlateObject" or not bool(getattr(obj, "is_model", True)):
+                continue
+            if str(getattr(obj, "name", "")).strip() in port_names:
+                continue
+            params = obj.get_parameters()
+            x1, x2 = sorted((float(params.get("X1", 0.0)), float(params.get("X2", 0.0))))
+            y1, y2 = sorted((float(params.get("Y1", 0.0)), float(params.get("Y2", 0.0))))
+            z1, z2 = sorted((float(params.get("Z1", 0.0)), float(params.get("Z2", 0.0))))
+            spans = (x2 - x1, y2 - y1, z2 - z1)
+            normal_axis = min(range(3), key=lambda index: abs(spans[index]))
+            corners = {
+                0: ((x1, y1, z1), (x1, y2, z1), (x1, y2, z2), (x1, y1, z2)),
+                1: ((x1, y1, z1), (x2, y1, z1), (x2, y1, z2), (x1, y1, z2)),
+                2: ((x1, y1, z1), (x2, y1, z1), (x2, y2, z1), (x1, y2, z1)),
+            }[normal_axis]
+            matrix = obj.actor.GetMatrix()
+            world = [matrix.MultiplyPoint([*point, 1.0]) for point in corners]
+            origin = world[0][:3]
+            u = tuple(world[1][index] - world[0][index] for index in range(3))
+            v = tuple(world[3][index] - world[0][index] for index in range(3))
+            entries.append({"object_name": str(obj.name), "material": str(obj.material), "origin": origin, "u": u, "v": v})
+        return entries
+
     def _enabled_simulations(self, settings: dict) -> list[dict]:
         sims = settings.get("simulations", [])
         out: list[dict] = []
@@ -2171,6 +2202,7 @@ class MainWindow(QMainWindow):
                 show_mesh=show_mesh,
                 run_sweep=run_sweep,
                 lumped_ports=self._collect_plate_lumped_ports(),
+                plate_entries=self._collect_emerge_plates(),
                 solver=self._sim_solver,
                 parallel_enabled=self._sim_parallel_enabled,
                 pardiso_threads=self._sim_pardiso_threads,
@@ -2231,14 +2263,14 @@ class MainWindow(QMainWindow):
         progress = None
         canceled = {"value": False}
         sim_objects = self._simulation_model_objects()
-        port_plate_names = {
-            str(port.get("object", "")).strip()
-            for port in self._project_tree.get_settings().get("ports", [])
-            if isinstance(port, dict) and str(port.get("object", "")).strip()
+        plate_names = {
+            str(obj.name).strip()
+            for obj in sim_objects
+            if type(obj).__name__ == "PlateObject"
         }
         total_candidates = sum(
             1 for obj in sim_objects
-            if str(getattr(obj, "name", "")).strip() not in port_plate_names
+            if str(getattr(obj, "name", "")).strip() not in plate_names
         )
 
         need_step_export = force_step_export or self._sim_steps_dirty or (not self._sim_step_bundle_ready)
@@ -2279,7 +2311,7 @@ class MainWindow(QMainWindow):
                         log_callback=_step_cb,
                         debug_boolean_sources_only=bool(getattr(self, "_sim_chk_boolean_debug", None) and self._sim_chk_boolean_debug.isChecked()),
                         material_priorities=self._project_tree.get_settings().get("material_priorities", {}),
-                        excluded_object_names=port_plate_names,
+                        excluded_object_names=plate_names,
                     )
                 except Exception as exc:
                     self._append_step_export_log(f"[error] STEP export failed: {exc}", level="ERROR")
