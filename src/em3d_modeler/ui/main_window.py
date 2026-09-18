@@ -49,6 +49,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QFormLayout, QTextBrowser, QPlainTextEdit,
     QPushButton, QHBoxLayout, QGroupBox, QCheckBox,
     QProgressDialog, QApplication, QTabWidget, QDialogButtonBox,
+    QRadioButton,
 )
 from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize, QUrl
 from PySide6.QtGui  import QIcon, QKeySequence, QAction, QDesktopServices
@@ -370,6 +371,11 @@ class MainWindow(QMainWindow):
         act_move_plane.setToolTip("Move selected object(s) on active plane toward plane origin")
         act_move_plane.triggered.connect(self._move_selection_to_plane_origin)
         tb.addAction(act_move_plane)
+
+        act_pattern = QAction(_icon("Std_Tool4"), "Pattern", self)
+        act_pattern.setToolTip("Create linear or circular instances of the selected object")
+        act_pattern.triggered.connect(self._create_object_pattern)
+        tb.addAction(act_pattern)
 
         act_dissolve_boolean = QAction(QIcon(), "Dissolve Boolean", self)
         act_dissolve_boolean.setToolTip("Restore source objects from selected boolean result(s)")
@@ -924,6 +930,77 @@ class MainWindow(QMainWindow):
             return None
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� boolean operations
+    def _create_object_pattern(self) -> None:
+        selection = list(self._viewport.scene.selection)
+        if len(selection) != 1:
+            QMessageBox.information(self, "Pattern", "Select exactly one object first.")
+            return
+        source = selection[0]
+        actor = getattr(source, "actor", None)
+        if actor is None:
+            QMessageBox.warning(self, "Pattern", "The selected object has no visual actor.")
+            return
+        bounds = actor.GetBounds()
+        if bounds is None:
+            QMessageBox.warning(self, "Pattern", "Unable to determine the selected object bounds.")
+            return
+
+        pivot = tuple((float(bounds[i]) + float(bounds[i + 1])) * 0.5 for i in (0, 2, 4))
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Create Object Pattern")
+        form = QFormLayout(dlg)
+        mode = QComboBox(dlg); mode.addItems(["Linear", "Circular"])
+        count = QSpinBox(dlg); count.setRange(1, 1000); count.setValue(2)
+        offsets = [QDoubleSpinBox(dlg) for _ in range(3)]
+        for field in offsets:
+            field.setRange(-1e9, 1e9); field.setDecimals(6); field.setValue(0.0)
+        axis = QComboBox(dlg); axis.addItems(["X", "Y", "Z"])
+        angle = QDoubleSpinBox(dlg); angle.setRange(-3600.0, 3600.0); angle.setDecimals(4); angle.setValue(360.0); angle.setSuffix(" deg")
+        form.addRow("Pattern type", mode); form.addRow("Number of instances", count)
+        for label, field in zip(("Distance X", "Distance Y", "Distance Z"), offsets):
+            form.addRow(label, field)
+        form.addRow("Rotation axis", axis); form.addRow("Total angle", angle)
+
+        def update_visibility(pattern_type: str) -> None:
+            linear = pattern_type == "Linear"
+            for field in offsets: field.setEnabled(linear)
+            axis.setEnabled(not linear); angle.setEnabled(not linear)
+        update_visibility(mode.currentText()); mode.currentTextChanged.connect(update_visibility)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
+        buttons.accepted.connect(dlg.accept); buttons.rejected.connect(dlg.reject); form.addRow(buttons)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        snapshot = self._serialize_object_snapshot(source)
+        base_name = str(getattr(source, "name", type(source).__name__))
+        created = []
+        instance_count = int(count.value())
+        for instance_index in range(1, instance_count):
+            clone_data = dict(snapshot); clone_data["params"] = dict(snapshot.get("params", {}))
+            clone_data["name"] = f"{base_name}_Pattern_{instance_index + 1}"
+            clone_data["params"]["Name"] = clone_data["name"]
+            clone = self._rebuild_object_from_snapshot(clone_data)
+            if clone is None: continue
+            if mode.currentText() == "Linear":
+                if not self._translate_object(clone, *(float(field.value()) * instance_index for field in offsets)): continue
+            else:
+                clone_actor = getattr(clone, "actor", None)
+                if clone_actor is None: continue
+                clone_actor.SetOrigin(*pivot)
+                step_angle = float(angle.value()) * instance_index / max(1, instance_count - 1)
+                {"X": clone_actor.RotateX, "Y": clone_actor.RotateY, "Z": clone_actor.RotateZ}[axis.currentText()](step_angle)
+            self._viewport.scene.add_object(clone); created.append(clone)
+
+        if not created:
+            QMessageBox.warning(self, "Pattern", "No pattern instances could be created.")
+            return
+        self._viewport.scene.deselect_all()
+        for clone in created: self._viewport.scene.select_add(clone)
+        self._refresh_materials(); self._sync_port_reference_state(); self._viewport._render()
+        self._viewport.scene_changed.emit(); self._viewport.selection_changed.emit(created)
+        self._mark_simulation_dirty(steps=True, script=True)
+        self._info_bar.set_info(f"Created {len(created)} pattern instance(s) from {base_name}.")
+
     def _do_boolean(self, op: str, label: str) -> None:
         from ..scene.boolean_ops import boolean, fuse_many
         from ..scene.em_objects import MeshObject
