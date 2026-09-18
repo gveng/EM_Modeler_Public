@@ -1609,7 +1609,7 @@ class MainWindow(QMainWindow):
             selected_name=current_name,
             can_append_global=bool(self._material_store.global_records()),
         )
-        if dlg.exec_() != dlg.Accepted:
+        if dlg.exec_() != QDialog.Accepted:
             return
 
         rec = dlg.selected_record
@@ -2975,7 +2975,7 @@ class MainWindow(QMainWindow):
             dlg = SettingsDialog(self)
             self._settings_dlg = dlg
         self._sync_settings_dialog_values()
-        if dlg.exec_() == dlg.Accepted:
+        if dlg.exec_() == QDialog.Accepted:
             self._apply_display_settings(dlg.values())
             self._info_bar.set_info("Display settings updated.")
 
