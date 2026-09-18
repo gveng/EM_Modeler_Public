@@ -940,6 +940,13 @@ class MainWindow(QMainWindow):
             if getattr(obj, "actor", None) is not None and obj.actor.GetMapper() is not None:
                 mesh_poly = obj.actor.GetMapper().GetInput()
             item["mesh"] = self._viewport.scene._polydata_to_json(mesh_poly)
+        actor = getattr(obj, "actor", None)
+        if actor is not None:
+            item["actor_transform"] = {
+                "origin": list(actor.GetOrigin()),
+                "position": list(actor.GetPosition()),
+                "orientation": list(actor.GetOrientation()),
+            }
         return item
 
     def _rebuild_object_from_snapshot(self, item):
@@ -988,6 +995,17 @@ class MainWindow(QMainWindow):
             obj.set_visible(bool(item.get("visible", True)))
             obj.is_model = bool(item.get("is_model", True))
             obj.refresh_appearance()
+            transform = item.get("actor_transform", {})
+            if isinstance(transform, dict) and obj.actor is not None:
+                origin = transform.get("origin")
+                position = transform.get("position")
+                orientation = transform.get("orientation")
+                if isinstance(origin, (list, tuple)) and len(origin) == 3:
+                    obj.actor.SetOrigin(*[float(value) for value in origin])
+                if isinstance(position, (list, tuple)) and len(position) == 3:
+                    obj.actor.SetPosition(*[float(value) for value in position])
+                if isinstance(orientation, (list, tuple)) and len(orientation) == 3:
+                    obj.actor.SetOrientation(*[float(value) for value in orientation])
             return obj
         except Exception:
             return None
@@ -1045,7 +1063,13 @@ class MainWindow(QMainWindow):
             clone = self._rebuild_object_from_snapshot(clone_data)
             if clone is None: continue
             if mode.currentText() == "Linear":
-                if not self._translate_object(clone, *(float(field.value()) * instance_index for field in offsets)): continue
+                clone_actor = getattr(clone, "actor", None)
+                if clone_actor is None: continue
+                clone_actor.AddPosition(
+                    float(offsets[0].value()) * instance_index,
+                    float(offsets[1].value()) * instance_index,
+                    float(offsets[2].value()) * instance_index,
+                )
             else:
                 clone_actor = getattr(clone, "actor", None)
                 if clone_actor is None: continue
