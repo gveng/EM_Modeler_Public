@@ -283,6 +283,8 @@ class MainWindow(QMainWindow):
         file_menu.addSeparator()
         file_menu.addAction("&Import STEP...",            self._import_step)
         file_menu.addSeparator()
+        self._recent_menu = file_menu.addMenu("Recent Projects")
+        self._refresh_recent_projects()
         act_export = file_menu.addAction("&Export EMERGE Script...", self._export_emerge)
         file_menu.addSeparator()
         file_menu.addAction("Set &Global Material DB...", self._set_global_material_db)
@@ -335,6 +337,36 @@ class MainWindow(QMainWindow):
         help_menu.addAction("&Help", self._open_help)
         help_menu.addSeparator()
         help_menu.addAction("&About", self._show_about)
+
+    def _recent_project_paths(self) -> list[str]:
+        raw = QSettings().value("recent_projects", [], type=list)
+        paths = [str(path) for path in raw if str(path).strip()]
+        existing = []
+        for path in paths:
+            resolved = str(Path(path).expanduser().resolve())
+            if Path(resolved).is_file():
+                existing.append(resolved)
+        return existing[:5]
+
+    def _refresh_recent_projects(self) -> None:
+        if not hasattr(self, "_recent_menu"):
+            return
+        self._recent_menu.clear()
+        paths = self._recent_project_paths()
+        if not paths:
+            action = self._recent_menu.addAction("No recent projects")
+            action.setEnabled(False)
+            return
+        for path in paths:
+            action = self._recent_menu.addAction(Path(path).stem)
+            action.setToolTip(path)
+            action.triggered.connect(lambda _checked=False, p=path: self._load_project_path(p))
+
+    def _remember_recent_project(self, path: str) -> None:
+        resolved = str(Path(path).expanduser().resolve())
+        paths = [resolved] + [item for item in self._recent_project_paths() if item != resolved]
+        QSettings().setValue("recent_projects", paths[:5])
+        self._refresh_recent_projects()
 
     def _toggle_grid(self):
         show = self._act_grid_toggle.isChecked()
@@ -3501,6 +3533,9 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
+        self._load_project_path(path)
+
+    def _load_project_path(self, path: str) -> None:
         try:
             data = ProjectFile.load(path)
             loaded_name = str(data.get("project_name", "")).strip()
@@ -3565,6 +3600,7 @@ class MainWindow(QMainWindow):
             self._refresh_materials()
             self._viewport._render()
             self._info_bar.set_info(f"Project loaded: {path}")
+            self._remember_recent_project(path)
 
         except Exception as exc:
             QMessageBox.critical(self, "Load Error", str(exc))
@@ -3618,6 +3654,7 @@ class MainWindow(QMainWindow):
             )
             self.setWindowTitle(f"EM 3D Modeler - {self._project_name}")
             self._info_bar.set_info(f"Saved: {path}")
+            self._remember_recent_project(path)
         except Exception as exc:
             QMessageBox.critical(self, "Save Error", str(exc))
 
