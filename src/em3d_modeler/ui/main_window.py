@@ -441,6 +441,7 @@ class MainWindow(QMainWindow):
         self._materials.grid_visibility_changed.connect(self._on_grid_visibility_changed)
         self._materials.objects_hide.connect(self._on_materials_hide)
         self._materials.objects_show.connect(self._on_materials_show)
+        self._materials.transform_edit_requested.connect(self._on_transform_edit_requested)
         self._materials.objects_model_role_changed.connect(self._on_materials_model_role_changed)
         self._materials.object_rename.connect(self._on_materials_rename)
         self._materials.objects_bulk_rename.connect(self._on_materials_bulk_rename)
@@ -1339,6 +1340,11 @@ class MainWindow(QMainWindow):
         self._materials.highlight(objects)  # Preserve selection after refresh
         self._viewport._render()
         self._info_bar.set_info(f"Shown {len(objects)} object(s)")
+
+    def _on_transform_edit_requested(self, obj) -> None:
+        self._viewport.scene.select(obj)
+        self._body_props.set_object(obj)
+        self._move_selection_to_plane_origin()
 
     def _on_materials_model_role_changed(self, objects: list, is_model: bool) -> None:
         if not objects:

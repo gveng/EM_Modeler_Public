@@ -22,6 +22,7 @@ _ROLE_PLANES_ROOT = Qt.UserRole + 2   # True on the "Reference Planes" root node
 _ROLE_PLANE_TRIAD = Qt.UserRole + 3   # bool on the "Plane XYZ Triad" row
 _ROLE_GRID_VISIBLE = Qt.UserRole + 4  # bool on the "Grid" row
 _ROLE_MATERIAL     = Qt.UserRole + 5  # str(material_name) on material header row
+_ROLE_TRANSFORM_ID = Qt.UserRole + 6  # int(id(EMObject)) on transform child row
 
 
 class MaterialsWidget(QWidget):
@@ -45,6 +46,7 @@ class MaterialsWidget(QWidget):
     assign_boundary_requested = Signal(object)  # EMObject
     assign_mesh_resolution_requested = Signal(list)  # List[EMObject]
     material_priority_changed = Signal(str, int)  # material_name, delta (1 for higher, -1 for lower)
+    transform_edit_requested = Signal(object)  # EMObject
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -65,6 +67,7 @@ class MaterialsWidget(QWidget):
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
         self._tree.itemClicked.connect(self._on_item_click)
+        self._tree.itemDoubleClicked.connect(self._on_item_double_click)
         self._tree.itemSelectionChanged.connect(self._on_selection_changed)
         layout.addWidget(self._tree)
 
@@ -164,6 +167,24 @@ class MaterialsWidget(QWidget):
                 child.setData(0, _ROLE_OBJ_ID, id(obj))
                 mat_item.addChild(child)
                 self._obj_map[id(obj)] = obj
+                actor = getattr(obj, "actor", None)
+                if actor is not None:
+                    position = actor.GetPosition()
+                    rotation = actor.GetOrientation()
+                    pivot = actor.GetOrigin()
+                    transform = QTreeWidgetItem([
+                        "Transform: "
+                        f"P({position[0]:.3g}, {position[1]:.3g}, {position[2]:.3g}) "
+                        f"R({rotation[0]:.3g}, {rotation[1]:.3g}, {rotation[2]:.3g})"
+                    ])
+                    transform.setData(0, _ROLE_TRANSFORM_ID, id(obj))
+                    transform.setToolTip(
+                        0,
+                        f"Pivot: ({pivot[0]:.6g}, {pivot[1]:.6g}, {pivot[2]:.6g})\n"
+                        "Double-click to edit the reference point, position and rotation.",
+                    )
+                    transform.setForeground(0, QBrush(QColor(150, 170, 190)))
+                    child.addChild(transform)
                 if id(obj) in prev_selected_ids:
                     child.setSelected(True)
 
@@ -190,6 +211,10 @@ class MaterialsWidget(QWidget):
 
     # ─────────────────────────────────────────────────── events
     def _on_item_click(self, item: QTreeWidgetItem, _col: int) -> None:
+        transform_id = item.data(0, _ROLE_TRANSFORM_ID)
+        if transform_id is not None:
+            return
+
         triad_flag = item.data(0, _ROLE_PLANE_TRIAD)
         if triad_flag is not None:
             self.plane_triad_visibility_changed.emit(not bool(triad_flag))
@@ -210,6 +235,13 @@ class MaterialsWidget(QWidget):
         obj = self._obj_map.get(obj_id)
         if obj:
             self.object_selected.emit(obj)
+
+    def _on_item_double_click(self, item: QTreeWidgetItem, _col: int) -> None:
+        transform_id = item.data(0, _ROLE_TRANSFORM_ID)
+        if transform_id is not None:
+            obj = self._obj_map.get(transform_id)
+            if obj is not None:
+                self.transform_edit_requested.emit(obj)
 
     def _on_selection_changed(self) -> None:
         selected = []
@@ -334,6 +366,11 @@ class MaterialsWidget(QWidget):
         menu = QMenu(self._tree)
 
         if len(objs) == 1:
+            act_transform = QAction("Edit Transform…", menu)
+            act_transform.triggered.connect(lambda: self.transform_edit_requested.emit(objs[0]))
+            menu.addAction(act_transform)
+
+            menu.addSeparator()
             act_rename = QAction("Rename…", menu)
             act_rename.triggered.connect(lambda: self._rename_object(objs[0]))
             menu.addAction(act_rename)
