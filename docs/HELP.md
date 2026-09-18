@@ -1,7 +1,7 @@
 # EM 3D Modeler Help
 
-Version: 1.1.9 Beta
-Release date: 2026-09-17
+Version: 1.1.9 Beta 2
+Release date: 2026-09-18
 
 EM 3D Modeler is a desktop CAD and electromagnetic pre/post-processor for building 3D models, assigning materials, preparing meshes and ports, generating EMERGE scripts, and reviewing simulation results.
 
@@ -280,7 +280,16 @@ The application does not implement a separate 3D renderer. The viewer, color sca
 
 Bulk Rename applies a base name and sequential indices to the selected objects. The order follows the selection order shown by the Objects / Materials tree.
 
-## 12. Running a Simulation
+## 12. Object Patterns
+
+Select one object and press **Pattern** in the toolbar.
+
+- **Linear:** enable X, Y and/or Z independently. For each enabled axis set the number of instances and the step distance. X+Y creates a 2D array; X+Y+Z creates a 3D array.
+- **Circular:** set the number of instances, total angle, circle center and distance from the rotation axis. Use **Pick center**, **Pick axis point 1** and **Pick axis point 2** in the viewport.
+- Every instance is a separate object and inherits the original object's current transformation.
+- The dialog includes a live simplified preview and pattern creation is undoable.
+
+## 13. Running a Simulation
 
 ![Simulation window snapshot](snapshots/simulation-window.svg)
 
