@@ -367,8 +367,8 @@ class MainWindow(QMainWindow):
         act_scale.triggered.connect(self._scale_selected_objects)
         tb.addAction(act_scale)
 
-        act_move_plane = QAction(_icon("Std_TransformManip"), "Move On Plane", self)
-        act_move_plane.setToolTip("Move selected object(s) on active plane toward plane origin")
+        act_move_plane = QAction(_icon("Std_TransformManip"), "Move/Rotate", self)
+        act_move_plane.setToolTip("Move and rotate the selected object around a reference point")
         act_move_plane.triggered.connect(self._move_selection_to_plane_origin)
         tb.addAction(act_move_plane)
 
@@ -774,22 +774,22 @@ class MainWindow(QMainWindow):
     def _move_selection_to_plane_origin(self) -> None:
         selection = list(self._viewport.scene.selection)
         if not selection:
-            QMessageBox.information(self, "Move On Plane", "Select one or more objects first.")
+            QMessageBox.information(self, "Move/Rotate", "Select one or more objects first.")
             return
 
         if len(selection) != 1:
-            QMessageBox.information(self, "Move On Plane", "Select exactly one object first.")
+            QMessageBox.information(self, "Move/Rotate", "Select exactly one object first.")
             return
 
         obj = selection[0]
         actor = getattr(obj, "actor", None)
         if actor is None:
-            QMessageBox.warning(self, "Move On Plane", "The selected object has no visual actor.")
+            QMessageBox.warning(self, "Move/Rotate", "The selected object has no visual actor.")
             return
 
         bounds = actor.GetBounds()
         if bounds is None:
-            QMessageBox.warning(self, "Move On Plane", "Unable to determine the selected object bounds.")
+            QMessageBox.warning(self, "Move/Rotate", "Unable to determine the selected object bounds.")
             return
         reference = [
             (float(bounds[0]) + float(bounds[1])) * 0.5,
