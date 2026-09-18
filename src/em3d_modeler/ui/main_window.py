@@ -45,7 +45,7 @@ def _icon(name: str) -> "QIcon":
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QSplitter,
-    QFileDialog, QMessageBox, QComboBox,
+    QFileDialog, QMessageBox, QComboBox, QSpinBox,
     QLabel, QDoubleSpinBox, QDialog, QInputDialog,
     QVBoxLayout, QFormLayout, QTextBrowser, QPlainTextEdit,
     QPushButton, QHBoxLayout, QGroupBox, QCheckBox,
