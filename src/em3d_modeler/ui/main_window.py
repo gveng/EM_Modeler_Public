@@ -65,15 +65,21 @@ class _PatternPreview(QWidget):
         self._mode = "Linear"
         self._count = 2
         self._offsets = (0.0, 0.0, 0.0)
+        self._axis_enabled = (True, False, False)
+        self._axis_counts = (2, 1, 1)
         self._axis = "Z"
         self._angle = 360.0
 
-    def set_pattern(self, mode, count, offsets, axis, angle):
+    def set_pattern(self, mode, count, offsets, axis, angle, axis_enabled=None, axis_counts=None):
         self._mode = str(mode)
         self._count = max(1, int(count))
         self._offsets = tuple(float(value) for value in offsets)
         self._axis = str(axis)
         self._angle = float(angle)
+        if axis_enabled is not None:
+            self._axis_enabled = tuple(bool(value) for value in axis_enabled)
+        if axis_counts is not None:
+            self._axis_counts = tuple(max(1, int(value)) for value in axis_counts)
         self.update()
 
     def paintEvent(self, _event):
@@ -92,10 +98,21 @@ class _PatternPreview(QWidget):
         points = [(center_x, center_y)]
         if self._mode == "Linear":
             dx, dy, _dz = self._offsets
-            scale = max(abs(dx), abs(dy), 1.0)
-            step_x = dx / scale * 42.0
-            step_y = dy / scale * 42.0
-            points = [(center_x + step_x * i, center_y - step_y * i) for i in range(self._count)]
+            enabled = [index for index, active in enumerate(self._axis_enabled) if active]
+            if len(enabled) == 1:
+                axis_index = enabled[0]
+                step = self._offsets[axis_index] or 1.0
+                scale = max(abs(step), 1.0)
+                count = self._axis_counts[axis_index]
+                delta = step / scale * 42.0
+                points = [(center_x + delta * i, center_y) for i in range(count)]
+            else:
+                points = []
+                x_count = self._axis_counts[0] if self._axis_enabled[0] else 1
+                y_count = self._axis_counts[1] if self._axis_enabled[1] else 1
+                for ix in range(x_count):
+                    for iy in range(y_count):
+                        points.append((center_x + (ix - (x_count - 1) / 2) * 32, center_y - (iy - (y_count - 1) / 2) * 32))
         else:
             radius = min(self.width(), self.height()) * 0.28
             total = self._angle * 3.141592653589793 / 180.0
@@ -1087,6 +1104,12 @@ class MainWindow(QMainWindow):
         form = QFormLayout(dlg)
         mode = QComboBox(dlg); mode.addItems(["Linear", "Circular"])
         count = QSpinBox(dlg); count.setRange(1, 1000); count.setValue(2)
+        axis_checks = [QCheckBox(axis_name, dlg) for axis_name in ("X", "Y", "Z")]
+        axis_counts = [QSpinBox(dlg) for _ in range(3)]
+        for index, field in enumerate(axis_counts):
+            field.setRange(1, 1000)
+            field.setValue(2 if index == 0 else 1)
+        axis_checks[0].setChecked(True)
         offsets = [QDoubleSpinBox(dlg) for _ in range(3)]
         for field in offsets:
             field.setRange(-1e9, 1e9); field.setDecimals(6); field.setValue(0.0)
@@ -1094,25 +1117,43 @@ class MainWindow(QMainWindow):
         angle = QDoubleSpinBox(dlg); angle.setRange(-3600.0, 3600.0); angle.setDecimals(4); angle.setValue(360.0); angle.setSuffix(" deg")
         preview = _PatternPreview(dlg)
         form.addRow(preview)
-        form.addRow("Pattern type", mode); form.addRow("Number of instances", count)
-        for label, field in zip(("Distance X", "Distance Y", "Distance Z"), offsets):
-            form.addRow(label, field)
+        form.addRow("Pattern type", mode)
+        form.addRow("Circular instances", count)
+        axis_rows = []
+        for axis_name, check, number, distance in zip(("X", "Y", "Z"), axis_checks, axis_counts, offsets):
+            row = QHBoxLayout()
+            row.addWidget(check)
+            row.addWidget(QLabel("instances"))
+            row.addWidget(number)
+            row.addWidget(QLabel("step"))
+            row.addWidget(distance)
+            form.addRow(f"Linear {axis_name}", row)
+            axis_rows.append(row)
         form.addRow("Rotation axis", axis); form.addRow("Total angle", angle)
 
         def update_visibility(pattern_type: str) -> None:
             linear = pattern_type == "Linear"
-            for field in offsets: field.setEnabled(linear)
+            for check, number, field in zip(axis_checks, axis_counts, offsets):
+                check.setEnabled(linear); number.setEnabled(linear and check.isChecked()); field.setEnabled(linear and check.isChecked())
             axis.setEnabled(not linear); angle.setEnabled(not linear)
 
         def update_preview(*_args) -> None:
+            linear_count = 1
+            for check, field in zip(axis_checks, axis_counts):
+                if check.isChecked():
+                    linear_count *= field.value()
             preview.set_pattern(
-                mode.currentText(), count.value(),
-                [field.value() for field in offsets], axis.currentText(), angle.value()
+                mode.currentText(), linear_count if mode.currentText() == "Linear" else count.value(), [field.value() for field in offsets],
+                axis.currentText(), angle.value(),
+                [check.isChecked() for check in axis_checks],
+                [field.value() for field in axis_counts],
             )
         update_visibility(mode.currentText()); mode.currentTextChanged.connect(update_visibility)
         mode.currentTextChanged.connect(update_preview)
         count.valueChanged.connect(update_preview)
         for field in offsets: field.valueChanged.connect(update_preview)
+        for check in axis_checks: check.toggled.connect(lambda _checked: (update_visibility(mode.currentText()), update_preview()))
+        for field in axis_counts: field.valueChanged.connect(update_preview)
         axis.currentTextChanged.connect(update_preview)
         angle.valueChanged.connect(update_preview)
         update_preview()
@@ -1128,7 +1169,27 @@ class MainWindow(QMainWindow):
         base_name = str(getattr(source, "name", type(source).__name__))
         created = []
         instance_count = int(count.value())
-        for instance_index in range(1, instance_count):
+        if mode.currentText() == "Linear":
+            import itertools
+            enabled_axes = [index for index, check in enumerate(axis_checks) if check.isChecked()]
+            if not enabled_axes:
+                QMessageBox.warning(self, "Pattern", "Enable at least one linear axis.")
+                return
+            axis_ranges = [range(int(axis_counts[index].value())) if index in enabled_axes else range(1) for index in range(3)]
+            linear_offsets = [
+                (float(offsets[0].value()) * ix, float(offsets[1].value()) * iy, float(offsets[2].value()) * iz)
+                for ix, iy, iz in itertools.product(*axis_ranges)
+                if (ix, iy, iz) != (0, 0, 0)
+            ]
+        else:
+            linear_offsets = []
+
+        instance_specs = (
+            enumerate(linear_offsets, start=1)
+            if mode.currentText() == "Linear"
+            else enumerate(range(1, instance_count), start=1)
+        )
+        for instance_index, linear_offset in instance_specs:
             clone_data = dict(snapshot); clone_data["params"] = dict(snapshot.get("params", {}))
             clone_data["name"] = f"{base_name}_Pattern_{instance_index + 1}"
             clone_data["params"]["Name"] = clone_data["name"]
@@ -1138,9 +1199,7 @@ class MainWindow(QMainWindow):
                 clone_actor = getattr(clone, "actor", None)
                 if clone_actor is None: continue
                 clone_actor.AddPosition(
-                    float(offsets[0].value()) * instance_index,
-                    float(offsets[1].value()) * instance_index,
-                    float(offsets[2].value()) * instance_index,
+                    linear_offset[0], linear_offset[1], linear_offset[2],
                 )
             else:
                 clone_actor = getattr(clone, "actor", None)
