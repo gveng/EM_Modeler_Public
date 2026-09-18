@@ -46,9 +46,9 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QSplitter,
     QFileDialog, QMessageBox, QComboBox,
     QLabel, QDoubleSpinBox, QDialog, QInputDialog,
-    QVBoxLayout, QTextBrowser, QPlainTextEdit,
+    QVBoxLayout, QFormLayout, QTextBrowser, QPlainTextEdit,
     QPushButton, QHBoxLayout, QGroupBox, QCheckBox,
-    QProgressDialog, QApplication, QTabWidget,
+    QProgressDialog, QApplication, QTabWidget, QDialogButtonBox,
 )
 from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize, QUrl
 from PySide6.QtGui  import QIcon, QKeySequence, QAction, QDesktopServices
@@ -770,68 +770,93 @@ class MainWindow(QMainWindow):
             QMessageBox.information(self, "Move On Plane", "Select one or more objects first.")
             return
 
-        scene = self._viewport.scene
-        plane = scene.active_plane
-        if plane is None:
-            QMessageBox.warning(self, "Move On Plane", "No active reference plane.")
+        if len(selection) != 1:
+            QMessageBox.information(self, "Move On Plane", "Select exactly one object first.")
             return
 
-        centers = []
-        for obj in selection:
-            actor = getattr(obj, "actor", None)
-            if actor is None:
-                continue
-            b = actor.GetBounds()
-            if b is None:
-                continue
-            centers.append(((b[0] + b[1]) * 0.5, (b[2] + b[3]) * 0.5, (b[4] + b[5]) * 0.5))
-        if not centers:
-            QMessageBox.warning(self, "Move On Plane", "Unable to determine selected object centers.")
+        obj = selection[0]
+        actor = getattr(obj, "actor", None)
+        if actor is None:
+            QMessageBox.warning(self, "Move On Plane", "The selected object has no visual actor.")
             return
 
-        cx = sum(p[0] for p in centers) / len(centers)
-        cy = sum(p[1] for p in centers) / len(centers)
-        cz = sum(p[2] for p in centers) / len(centers)
+        bounds = actor.GetBounds()
+        if bounds is None:
+            QMessageBox.warning(self, "Move On Plane", "Unable to determine the selected object bounds.")
+            return
+        reference = [
+            (float(bounds[0]) + float(bounds[1])) * 0.5,
+            (float(bounds[2]) + float(bounds[3])) * 0.5,
+            (float(bounds[4]) + float(bounds[5])) * 0.5,
+        ]
 
-        ox, oy, oz = [float(v) for v in plane.origin]
-        nx, ny, nz = [float(v) for v in plane.normal]
-        mag = (nx * nx + ny * ny + nz * nz) ** 0.5
-        if mag < 1e-12:
-            nx, ny, nz = 0.0, 0.0, 1.0
-        else:
-            nx, ny, nz = nx / mag, ny / mag, nz / mag
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Move / Rotate Object")
+        dlg.setModal(False)
+        dlg.resize(360, 340)
+        form = QFormLayout(dlg)
 
-        dx = ox - cx
-        dy = oy - cy
-        dz = oz - cz
-        # Keep translation constrained on the active plane.
-        dot = dx * nx + dy * ny + dz * nz
-        dx -= dot * nx
-        dy -= dot * ny
-        dz -= dot * nz
+        def spin(value: float) -> QDoubleSpinBox:
+            field = QDoubleSpinBox(dlg)
+            field.setRange(-1e9, 1e9)
+            field.setDecimals(6)
+            field.setValue(value)
+            return field
 
-        moved = 0
-        failed = []
-        for obj in selection:
-            try:
-                if self._translate_object(obj, dx, dy, dz):
-                    moved += 1
-                else:
-                    failed.append(str(getattr(obj, "name", type(obj).__name__)))
-            except Exception:
-                failed.append(str(getattr(obj, "name", type(obj).__name__)))
+        ref_fields = [spin(value) for value in reference]
+        target_fields = [spin(value) for value in reference]
+        rotation_fields = [spin(0.0) for _ in range(3)]
+        for field in rotation_fields:
+            field.setRange(-360.0, 360.0)
+            field.setSuffix(" deg")
 
-        if moved:
+        pick_button = QPushButton("Pick reference point on object", dlg)
+        form.addRow(pick_button)
+        form.addRow("Reference X", ref_fields[0])
+        form.addRow("Reference Y", ref_fields[1])
+        form.addRow("Reference Z", ref_fields[2])
+        form.addRow("Target X", target_fields[0])
+        form.addRow("Target Y", target_fields[1])
+        form.addRow("Target Z", target_fields[2])
+        form.addRow("Rotate X", rotation_fields[0])
+        form.addRow("Rotate Y", rotation_fields[1])
+        form.addRow("Rotate Z", rotation_fields[2])
+
+        def set_reference(point: tuple[float, float, float]) -> None:
+            for field, value in zip(ref_fields, point):
+                field.setValue(float(value))
+
+        pick_button.clicked.connect(
+            lambda: self._viewport.request_pick("point", set_reference)
+        )
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        dlg.show()
+
+        def apply_transform() -> None:
+            pivot = tuple(float(field.value()) for field in ref_fields)
+            target = tuple(float(field.value()) for field in target_fields)
+            actor.SetOrigin(*pivot)
+            actor.RotateX(float(rotation_fields[0].value()))
+            actor.RotateY(float(rotation_fields[1].value()))
+            actor.RotateZ(float(rotation_fields[2].value()))
+            actor.AddPosition(
+                target[0] - pivot[0],
+                target[1] - pivot[1],
+                target[2] - pivot[2],
+            )
             self._viewport.scene_changed.emit()
             self._refresh_materials()
             self._viewport._render()
             self._viewport.selection_changed.emit(selection)
             self._mark_simulation_dirty(steps=True, script=True)
+            self._info_bar.set_info(f"Transformed {obj.name} around the selected reference point.")
 
-        msg = f"Moved {moved} object(s) on plane '{plane.name}' toward origin."
-        if failed:
-            msg += f" Failed: {', '.join(failed)}"
-        self._info_bar.set_info(msg)
+        dlg.accepted.connect(apply_transform)
+        return
 
     def _serialize_object_snapshot(self, obj):
         item = {
