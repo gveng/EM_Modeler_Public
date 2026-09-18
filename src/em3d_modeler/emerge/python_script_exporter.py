@@ -566,6 +566,7 @@ def export_emerge_python_script(
             "# =============================================================================",
             "# [6] LUMPED PORTS",
             "# =============================================================================",
+            "# Create every port Plate first; LumpedPort is assigned after geometry commit.",
             "port = {}",
             "port_surfaces = {}",
             "",
@@ -626,7 +627,7 @@ def export_emerge_python_script(
 
     if ports:
         lines += [
-            "# Apply lumped ports before mesh generation",
+            "# Assign LumpedPort excitations to the already-created and committed Plates",
         ]
         for p in ports:
             idx = int(p.get("index", 1))
