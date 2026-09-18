@@ -53,9 +53,64 @@ from PySide6.QtWidgets import (
     QRadioButton,
 )
 from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize, QUrl
-from PySide6.QtGui  import QIcon, QKeySequence, QAction, QDesktopServices
+from PySide6.QtGui  import QIcon, QKeySequence, QAction, QDesktopServices, QPainter, QPen, QColor
 
 # Undo/Redo CommandStack
+
+
+class _PatternPreview(QWidget):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setMinimumHeight(150)
+        self._mode = "Linear"
+        self._count = 2
+        self._offsets = (0.0, 0.0, 0.0)
+        self._axis = "Z"
+        self._angle = 360.0
+
+    def set_pattern(self, mode, count, offsets, axis, angle):
+        self._mode = str(mode)
+        self._count = max(1, int(count))
+        self._offsets = tuple(float(value) for value in offsets)
+        self._axis = str(axis)
+        self._angle = float(angle)
+        self.update()
+
+    def paintEvent(self, _event):
+        import math
+
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        painter.fillRect(self.rect(), QColor("#20242b"))
+        painter.setPen(QPen(QColor("#596273"), 1))
+        painter.drawRect(self.rect().adjusted(0, 0, -1, -1))
+        painter.setPen(QColor("#b9c5d6"))
+        painter.drawText(10, 20, "Pattern preview")
+
+        center_x = self.width() * 0.5
+        center_y = self.height() * 0.58
+        points = [(center_x, center_y)]
+        if self._mode == "Linear":
+            dx, dy, _dz = self._offsets
+            scale = max(abs(dx), abs(dy), 1.0)
+            step_x = dx / scale * 42.0
+            step_y = dy / scale * 42.0
+            points = [(center_x + step_x * i, center_y - step_y * i) for i in range(self._count)]
+        else:
+            radius = min(self.width(), self.height()) * 0.28
+            total = self._angle * 3.141592653589793 / 180.0
+            points = []
+            for i in range(self._count):
+                fraction = i / max(1, self._count - 1)
+                angle = total * fraction
+                points.append((center_x + radius * math.cos(angle), center_y - radius * math.sin(angle)))
+
+        for index, point in enumerate(points):
+            painter.setBrush(QColor("#f2a65a") if index == 0 else QColor("#63b3ed"))
+            painter.setPen(QPen(QColor("#e7edf5"), 1))
+            painter.drawEllipse(point[0] - 6, point[1] - 6, 12, 12)
+        painter.setPen(QColor("#8f9bad"))
+        painter.drawText(10, self.height() - 10, f"{self._mode} | {self._count} instances")
 
 
 from .viewport_widget        import Viewport3DWidget
@@ -1037,6 +1092,8 @@ class MainWindow(QMainWindow):
             field.setRange(-1e9, 1e9); field.setDecimals(6); field.setValue(0.0)
         axis = QComboBox(dlg); axis.addItems(["X", "Y", "Z"])
         angle = QDoubleSpinBox(dlg); angle.setRange(-3600.0, 3600.0); angle.setDecimals(4); angle.setValue(360.0); angle.setSuffix(" deg")
+        preview = _PatternPreview(dlg)
+        form.addRow(preview)
         form.addRow("Pattern type", mode); form.addRow("Number of instances", count)
         for label, field in zip(("Distance X", "Distance Y", "Distance Z"), offsets):
             form.addRow(label, field)
@@ -1046,7 +1103,19 @@ class MainWindow(QMainWindow):
             linear = pattern_type == "Linear"
             for field in offsets: field.setEnabled(linear)
             axis.setEnabled(not linear); angle.setEnabled(not linear)
+
+        def update_preview(*_args) -> None:
+            preview.set_pattern(
+                mode.currentText(), count.value(),
+                [field.value() for field in offsets], axis.currentText(), angle.value()
+            )
         update_visibility(mode.currentText()); mode.currentTextChanged.connect(update_visibility)
+        mode.currentTextChanged.connect(update_preview)
+        count.valueChanged.connect(update_preview)
+        for field in offsets: field.valueChanged.connect(update_preview)
+        axis.currentTextChanged.connect(update_preview)
+        angle.valueChanged.connect(update_preview)
+        update_preview()
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
         buttons.accepted.connect(dlg.accept); buttons.rejected.connect(dlg.reject); form.addRow(buttons)
         if dlg.exec_() != QDialog.Accepted:
