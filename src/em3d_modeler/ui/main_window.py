@@ -14,6 +14,7 @@ Layout
 from __future__ import annotations
 from datetime import datetime
 from pathlib import Path
+from copy import deepcopy
 import os
 import traceback
 import sys
@@ -133,6 +134,10 @@ class MainWindow(QMainWindow):
         self._mesh_resolution = 0.3  # 1/3 wavelength, ~3.3 lines/wavelength
         self._sim_plot_sparams_after_sim = True
         self._sim_export_sparams_after_sim = True
+        self._history_limit = 10
+        self._history_undo: list[list[dict]] = []
+        self._history_redo: list[list[dict]] = []
+        self._history_restoring = False
 
         self._load_app_settings()
         set_selection_color(self._selection_color)
@@ -148,6 +153,7 @@ class MainWindow(QMainWindow):
         self._sync_material_choices()
 
         self._new_project()
+        self._history_reset()
 
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� UI construction
@@ -216,6 +222,10 @@ class MainWindow(QMainWindow):
         edit_menu = mb.addMenu("&Edit")
         self._act_del = edit_menu.addAction("&Delete Selected", self._delete_selected, QKeySequence.Delete)
         edit_menu.addAction("&Cancel Drawing",    self._viewport.cancel_draw, Qt.Key_Escape)
+        edit_menu.addSeparator()
+        self._act_undo = edit_menu.addAction("&Undo", self._undo, QKeySequence.Undo)
+        self._act_redo = edit_menu.addAction("&Redo", self._redo, QKeySequence.Redo)
+        self._update_history_actions()
 
 
         # View
@@ -470,9 +480,61 @@ class MainWindow(QMainWindow):
             self._sim_script_dirty = True
 
     def _on_scene_changed(self) -> None:
+        if not self._history_restoring:
+            self._history_record()
         self._refresh_materials()
         self._sync_port_reference_state()
         self._mark_simulation_dirty(steps=True, script=True)
+
+    def _history_reset(self) -> None:
+        self._history_undo = [deepcopy(self._viewport.scene.to_json())]
+        self._history_redo = []
+        self._update_history_actions()
+
+    def _history_record(self) -> None:
+        current = deepcopy(self._viewport.scene.to_json())
+        if self._history_undo and current == self._history_undo[-1]:
+            return
+        self._history_undo.append(current)
+        max_states = self._history_limit + 1
+        if len(self._history_undo) > max_states:
+            self._history_undo = self._history_undo[-max_states:]
+        self._history_redo.clear()
+        self._update_history_actions()
+
+    def _update_history_actions(self) -> None:
+        if hasattr(self, "_act_undo"):
+            self._act_undo.setEnabled(len(self._history_undo) > 1)
+            self._act_redo.setEnabled(bool(self._history_redo))
+
+    def _restore_history_snapshot(self, snapshot: list[dict]) -> None:
+        self._history_restoring = True
+        try:
+            self._viewport.scene.from_json(deepcopy(snapshot))
+            self._viewport.scene.deselect_all()
+            self._refresh_materials()
+            self._sync_port_reference_state()
+            self._body_props.set_object(None)
+            self._viewport._render()
+            self._viewport.scene_changed.emit()
+        finally:
+            self._history_restoring = False
+            self._update_history_actions()
+
+    def _undo(self) -> None:
+        if len(self._history_undo) <= 1:
+            return
+        self._history_redo.append(self._history_undo.pop())
+        self._restore_history_snapshot(self._history_undo[-1])
+        self._info_bar.set_info("Undo")
+
+    def _redo(self) -> None:
+        if not self._history_redo:
+            return
+        snapshot = self._history_redo.pop()
+        self._history_undo.append(snapshot)
+        self._restore_history_snapshot(snapshot)
+        self._info_bar.set_info("Redo")
 
     def _sync_port_reference_state(self) -> None:
         object_names = [str(o.name) for o in self._viewport.scene.objects if getattr(o, "name", None)]
