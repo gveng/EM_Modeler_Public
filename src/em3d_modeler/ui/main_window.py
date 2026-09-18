@@ -1084,6 +1084,8 @@ class MainWindow(QMainWindow):
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� boolean operations
     def _create_object_pattern(self) -> None:
+        import math
+
         selection = list(self._viewport.scene.selection)
         if len(selection) != 1:
             QMessageBox.information(self, "Pattern", "Select exactly one object first.")
@@ -1115,6 +1117,20 @@ class MainWindow(QMainWindow):
             field.setRange(-1e9, 1e9); field.setDecimals(6); field.setValue(0.0)
         axis = QComboBox(dlg); axis.addItems(["X", "Y", "Z"])
         angle = QDoubleSpinBox(dlg); angle.setRange(-3600.0, 3600.0); angle.setDecimals(4); angle.setValue(360.0); angle.setSuffix(" deg")
+        circular_fields = [QDoubleSpinBox(dlg) for _ in range(9)]
+        for field in circular_fields:
+            field.setRange(-1e9, 1e9); field.setDecimals(6)
+        center_fields = circular_fields[0:3]
+        axis_start_fields = circular_fields[3:6]
+        axis_end_fields = circular_fields[6:9]
+        for field, value in zip(center_fields, pivot): field.setValue(value)
+        for field, value in zip(axis_start_fields, pivot): field.setValue(value)
+        axis_end_fields[0].setValue(pivot[0]); axis_end_fields[1].setValue(pivot[1]); axis_end_fields[2].setValue(pivot[2] + 1.0)
+        default_radius = max((sum((float(bounds[i + 1]) - float(bounds[i])) ** 2 for i in (0, 2, 4))) ** 0.5 * 0.5, 1.0)
+        radius = QDoubleSpinBox(dlg); radius.setRange(0.0, 1e9); radius.setDecimals(6); radius.setValue(default_radius)
+        pick_center = QPushButton("Pick center", dlg)
+        pick_axis_start = QPushButton("Pick axis point 1", dlg)
+        pick_axis_end = QPushButton("Pick axis point 2", dlg)
         preview = _PatternPreview(dlg)
         form.addRow(preview)
         form.addRow("Pattern type", mode)
@@ -1129,13 +1145,38 @@ class MainWindow(QMainWindow):
             row.addWidget(distance)
             form.addRow(f"Linear {axis_name}", row)
             axis_rows.append(row)
-        form.addRow("Rotation axis", axis); form.addRow("Total angle", angle)
+        form.addRow("Total angle", angle)
+        def coordinate_row(fields, button):
+            row = QHBoxLayout()
+            for field in fields:
+                row.addWidget(field)
+            row.addWidget(button)
+            return row
+
+        form.addRow("Circle center", coordinate_row(center_fields, pick_center))
+        form.addRow("Distance from axis", radius)
+        form.addRow("Axis point 1", coordinate_row(axis_start_fields, pick_axis_start))
+        form.addRow("Axis point 2", coordinate_row(axis_end_fields, pick_axis_end))
+
+        def set_fields(fields, point):
+            for field, value in zip(fields, point):
+                field.setValue(float(value))
+
+        def pick_into(fields):
+            dlg.hide()
+            self._viewport.request_pick("point", lambda point: (set_fields(fields, point), dlg.show(), dlg.raise_(), dlg.activateWindow()))
+
+        pick_center.clicked.connect(lambda: pick_into(center_fields))
+        pick_axis_start.clicked.connect(lambda: pick_into(axis_start_fields))
+        pick_axis_end.clicked.connect(lambda: pick_into(axis_end_fields))
 
         def update_visibility(pattern_type: str) -> None:
             linear = pattern_type == "Linear"
             for check, number, field in zip(axis_checks, axis_counts, offsets):
                 check.setEnabled(linear); number.setEnabled(linear and check.isChecked()); field.setEnabled(linear and check.isChecked())
             axis.setEnabled(not linear); angle.setEnabled(not linear)
+            for field in (*center_fields, *axis_start_fields, *axis_end_fields, radius, pick_center, pick_axis_start, pick_axis_end):
+                field.setEnabled(not linear)
 
         def update_preview(*_args) -> None:
             linear_count = 1
@@ -1184,6 +1225,40 @@ class MainWindow(QMainWindow):
         else:
             linear_offsets = []
 
+        circular_center = tuple(field.value() for field in center_fields)
+        axis_start = tuple(field.value() for field in axis_start_fields)
+        axis_end = tuple(field.value() for field in axis_end_fields)
+        axis_vector = tuple(axis_end[index] - axis_start[index] for index in range(3))
+        axis_length = sum(value * value for value in axis_vector) ** 0.5
+        if mode.currentText() == "Circular" and axis_length < 1e-12:
+            QMessageBox.warning(self, "Pattern", "Rotation axis points must be different.")
+            return
+        if axis_length > 1e-12:
+            axis_vector = tuple(value / axis_length for value in axis_vector)
+
+        source_bounds_center = tuple((float(bounds[i]) + float(bounds[i + 1])) * 0.5 for i in (0, 2, 4))
+        radial = tuple(source_bounds_center[index] - circular_center[index] for index in range(3))
+        radial_length = sum(value * value for value in radial) ** 0.5
+        requested_radius = float(radius.value())
+        if mode.currentText() == "Circular" and radial_length < 1e-12:
+            radial = (1.0, 0.0, 0.0)
+            radial_length = 1.0
+
+        def rotate_vector(vector, axis_value, degrees):
+            radians = math.radians(degrees)
+            cosine = math.cos(radians)
+            sine = math.sin(radians)
+            cross = (
+                axis_value[1] * vector[2] - axis_value[2] * vector[1],
+                axis_value[2] * vector[0] - axis_value[0] * vector[2],
+                axis_value[0] * vector[1] - axis_value[1] * vector[0],
+            )
+            dot = sum(axis_value[index] * vector[index] for index in range(3))
+            return tuple(
+                vector[index] * cosine + cross[index] * sine + axis_value[index] * dot * (1.0 - cosine)
+                for index in range(3)
+            )
+
         instance_specs = (
             enumerate(linear_offsets, start=1)
             if mode.currentText() == "Linear"
@@ -1204,9 +1279,18 @@ class MainWindow(QMainWindow):
             else:
                 clone_actor = getattr(clone, "actor", None)
                 if clone_actor is None: continue
-                clone_actor.SetOrigin(*pivot)
                 step_angle = float(angle.value()) * instance_index / max(1, instance_count - 1)
-                {"X": clone_actor.RotateX, "Y": clone_actor.RotateY, "Z": clone_actor.RotateZ}[axis.currentText()](step_angle)
+                clone_actor.SetOrigin(*circular_center)
+                clone_actor.RotateWXYZ(step_angle, *axis_vector)
+                direction = tuple(value / radial_length for value in radial)
+                rotated_direction = rotate_vector(direction, axis_vector, step_angle)
+                target_center = tuple(
+                    circular_center[index] + rotated_direction[index] * requested_radius
+                    for index in range(3)
+                )
+                clone_bounds = clone_actor.GetBounds()
+                clone_center = tuple((float(clone_bounds[index]) + float(clone_bounds[index + 1])) * 0.5 for index in (0, 2, 4))
+                clone_actor.AddPosition(*(target_center[index] - clone_center[index] for index in range(3)))
             self._viewport.scene.add_object(clone); created.append(clone)
 
         if not created:
