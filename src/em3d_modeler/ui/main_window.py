@@ -1052,6 +1052,9 @@ class MainWindow(QMainWindow):
         if dlg.exec_() != QDialog.Accepted:
             return
 
+        # Ensure Undo returns to the current original object, even when the
+        # pattern is the first operation after the object was created.
+        self._history_record()
         snapshot = self._serialize_object_snapshot(source)
         base_name = str(getattr(source, "name", type(source).__name__))
         created = []
