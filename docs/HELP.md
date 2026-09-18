@@ -201,7 +201,7 @@ Controls units, decimal separator, workspace size, grid size, plane triad size a
 
 ### Simulation tab
 
-Controls the EMERGE solver, parallel computation, PARDISO/ACC thread counts, automatic S-parameter plotting and Touchstone export.
+Controls the EMERGE solver, parallel computation, PARDISO/ACC thread counts, automatic S-parameter plotting and Touchstone export. Available solver entries include PARDISO, CUDSS, SUPERLU, UMFPACK, LAPACK, ARPACK, SMART_ARPACK_BMA, MUMPS, AASDS, BICGSTAB, CG, CHOLMOD, RSLAB, SPARTA and TEST. CUDSS requires a working CUDA/cuDSS installation visible to EMERGE.
 
 ### Mesh tab
 

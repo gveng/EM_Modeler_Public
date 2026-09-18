@@ -110,7 +110,11 @@ class SettingsDialog(QDialog):
         sim_form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         self._solver_combo = QComboBox(self._simulation_tab)
-        self._solver_combo.addItems(["PARDISO"])
+        self._solver_combo.addItems([
+            "PARDISO", "CUDSS", "SUPERLU", "UMFPACK", "LAPACK", "ARPACK",
+            "SMART_ARPACK_BMA", "MUMPS", "AASDS", "BICGSTAB", "CG",
+            "CHOLMOD", "RSLAB", "SPARTA", "TEST",
+        ])
         sim_form.addRow("Solver", self._solver_combo)
 
         self._parallel_check = QCheckBox("Enable parallel computation", self._simulation_tab)
@@ -253,7 +257,7 @@ class SettingsDialog(QDialog):
         self._update_color_preview(selection_color)
 
         # Simulation settings
-        if solver in ["PARDISO"]:
+        if solver in [self._solver_combo.itemText(i) for i in range(self._solver_combo.count())]:
             self._solver_combo.setCurrentText(solver)
         self._parallel_check.setChecked(bool(parallel_enabled))
         self._pardiso_threads_spin.setValue(int(pardiso_threads))

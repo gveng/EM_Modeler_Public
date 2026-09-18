@@ -398,6 +398,7 @@ def export_emerge_python_script(
         "# [3] EMERGE SETUP",
         "# =============================================================================",
         "simulationObj = em.Simulation(PROJECT_NAME, save_file=True, write_log=True)",
+        f"simulationObj.set_solver(em.EMSolver.{str(solver).strip().upper()})",
         "",
         "def _safe_token(v: str) -> str:",
         "    t = ''.join(ch if (ch.isalnum() or ch in ('-', '_')) else '_' for ch in str(v))",

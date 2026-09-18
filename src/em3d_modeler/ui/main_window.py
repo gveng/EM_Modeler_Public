@@ -2841,7 +2841,7 @@ class MainWindow(QMainWindow):
 
         # Load simulation & mesh settings
         solver = str(settings.value("simulation/solver", self._sim_solver)).strip()
-        if solver in ["PARDISO"]:
+        if solver in {"PARDISO", "CUDSS", "SUPERLU", "UMFPACK", "LAPACK", "ARPACK", "SMART_ARPACK_BMA", "MUMPS", "AASDS", "BICGSTAB", "CG", "CHOLMOD", "RSLAB", "SPARTA", "TEST"}:
             self._sim_solver = solver
 
         try:
@@ -2939,7 +2939,7 @@ class MainWindow(QMainWindow):
 
         # Apply simulation & mesh settings
         solver = str(values.get("solver", self._sim_solver)).strip()
-        if solver in ["PARDISO"]:
+        if solver in {"PARDISO", "CUDSS", "SUPERLU", "UMFPACK", "LAPACK", "ARPACK", "SMART_ARPACK_BMA", "MUMPS", "AASDS", "BICGSTAB", "CG", "CHOLMOD", "RSLAB", "SPARTA", "TEST"}:
             self._sim_solver = solver
         self._sim_parallel_enabled = bool(values.get("parallel_enabled", self._sim_parallel_enabled))
         self._sim_pardiso_threads = max(1, int(values.get("pardiso_threads", self._sim_pardiso_threads)))
