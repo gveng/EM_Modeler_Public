@@ -594,8 +594,9 @@ def export_objects_to_step_bundle(
     log_callback: Callable[[str, str], None] | None = None,
     debug_boolean_sources_only: bool = False,
     material_priorities: Dict[str, int] | None = None,
+    excluded_object_names: set[str] | None = None,
 ) -> Dict[str, Any]:
-    """Export one STEP file per object (excluding PlateObject).
+    """Export one STEP file per model object, excluding only named port plates.
 
     Returns a dict with:
       - entries: list of dicts with keys object_name, step_file, material, priority
@@ -611,13 +612,17 @@ def export_objects_to_step_bundle(
     """
     if material_priorities is None:
         material_priorities = {}
+    excluded_object_names = excluded_object_names or set()
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
     entries: List[Dict[str, Any]] = []
     skipped: List[str] = []
     used_filenames: set[str] = set()
     occ_cache: Dict[str, Any] = {}
-    export_candidates = [obj for obj in objects if type(obj).__name__ != "PlateObject"]
+    export_candidates = [
+        obj for obj in objects
+        if str(getattr(obj, "name", "")).strip() not in excluded_object_names
+    ]
 
     total = 0
     for obj in export_candidates:

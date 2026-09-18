@@ -2231,9 +2231,14 @@ class MainWindow(QMainWindow):
         progress = None
         canceled = {"value": False}
         sim_objects = self._simulation_model_objects()
+        port_plate_names = {
+            str(port.get("object", "")).strip()
+            for port in self._project_tree.get_settings().get("ports", [])
+            if isinstance(port, dict) and str(port.get("object", "")).strip()
+        }
         total_candidates = sum(
             1 for obj in sim_objects
-            if type(obj).__name__ != "PlateObject"
+            if str(getattr(obj, "name", "")).strip() not in port_plate_names
         )
 
         need_step_export = force_step_export or self._sim_steps_dirty or (not self._sim_step_bundle_ready)
@@ -2274,6 +2279,7 @@ class MainWindow(QMainWindow):
                         log_callback=_step_cb,
                         debug_boolean_sources_only=bool(getattr(self, "_sim_chk_boolean_debug", None) and self._sim_chk_boolean_debug.isChecked()),
                         material_priorities=self._project_tree.get_settings().get("material_priorities", {}),
+                        excluded_object_names=port_plate_names,
                     )
                 except Exception as exc:
                     self._append_step_export_log(f"[error] STEP export failed: {exc}", level="ERROR")
