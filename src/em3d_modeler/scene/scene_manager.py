@@ -329,6 +329,12 @@ class SceneManager:
                 "is_model": bool(getattr(obj, "is_model", True)),
                 **obj.to_json_state(),
             }
+            if obj.actor is not None:
+                item["actor_transform"] = {
+                    "origin": list(obj.actor.GetOrigin()),
+                    "position": list(obj.actor.GetPosition()),
+                    "orientation": list(obj.actor.GetOrientation()),
+                }
             if isinstance(obj, MeshObject):
                 mesh_poly = None
                 if obj.actor is not None and obj.actor.GetMapper() is not None:
@@ -434,6 +440,17 @@ class SceneManager:
                 obj.set_visible(bool(item.get("visible", True)))
                 obj.is_model = bool(item.get("is_model", True))
                 self.add_object(obj)
+                transform = item.get("actor_transform", {})
+                if isinstance(transform, dict) and obj.actor is not None:
+                    origin = transform.get("origin")
+                    position = transform.get("position")
+                    orientation = transform.get("orientation")
+                    if isinstance(origin, (list, tuple)) and len(origin) == 3:
+                        obj.actor.SetOrigin(*[float(value) for value in origin])
+                    if isinstance(position, (list, tuple)) and len(position) == 3:
+                        obj.actor.SetPosition(*[float(value) for value in position])
+                    if isinstance(orientation, (list, tuple)) and len(orientation) == 3:
+                        obj.actor.SetOrientation(*[float(value) for value in orientation])
 
                 if isinstance(obj, MeshObject) and obj.boolean_source_names:
                     pending_boolean_sources.append((obj, list(obj.boolean_source_names)))
