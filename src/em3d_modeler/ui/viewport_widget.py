@@ -683,7 +683,7 @@ class Viewport3DWidget(QWidget):
         if mode in {"all", "edge"}:
             edge_pick = self._pick_edge_segment_local(ds, cell_id, actor, pos)
             if edge_pick is not None:
-                _, _, closest_local = edge_pick
+                _, closest_local = edge_pick
                 m = actor.GetMatrix()
                 world4 = m.MultiplyPoint([closest_local[0], closest_local[1], closest_local[2], 1.0])
                 w = world4[3] if abs(world4[3]) > 1e-12 else 1.0

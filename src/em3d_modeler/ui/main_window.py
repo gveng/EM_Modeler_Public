@@ -282,6 +282,7 @@ class MainWindow(QMainWindow):
         # File
         file_menu = mb.addMenu("&File")
         self._act_new    = file_menu.addAction("&New Project",    self._new_project,  QKeySequence.New)
+        self._act_close  = file_menu.addAction("&Close Project", self._close_project, QKeySequence.Close)
         self._act_open   = file_menu.addAction("&Open Project...",  self._open_project, QKeySequence.Open)
         self._act_save   = file_menu.addAction("&Save Project",   self._save_project, QKeySequence.Save)
         self._act_saveas = file_menu.addAction("Save Project &As...", self._save_project_as)
@@ -1127,18 +1128,24 @@ class MainWindow(QMainWindow):
         import math
 
         selection = list(self._viewport.scene.selection)
-        if len(selection) != 1:
-            QMessageBox.information(self, "Pattern", "Select exactly one object first.")
+        if not selection:
+            QMessageBox.information(self, "Pattern", "Select one or more objects first.")
             return
-        source = selection[0]
-        actor = getattr(source, "actor", None)
-        if actor is None:
-            QMessageBox.warning(self, "Pattern", "The selected object has no visual actor.")
-            return
-        bounds = actor.GetBounds()
-        if bounds is None:
-            QMessageBox.warning(self, "Pattern", "Unable to determine the selected object bounds.")
-            return
+
+        source_bounds = []
+        for source in selection:
+            actor = getattr(source, "actor", None)
+            bounds = actor.GetBounds() if actor is not None else None
+            if bounds is None:
+                QMessageBox.warning(self, "Pattern", f"Unable to determine the bounds for {source.name}.")
+                return
+            source_bounds.append(bounds)
+
+        bounds = (
+            min(float(item[0]) for item in source_bounds), max(float(item[1]) for item in source_bounds),
+            min(float(item[2]) for item in source_bounds), max(float(item[3]) for item in source_bounds),
+            min(float(item[4]) for item in source_bounds), max(float(item[5]) for item in source_bounds),
+        )
 
         pivot = tuple((float(bounds[i]) + float(bounds[i + 1])) * 0.5 for i in (0, 2, 4))
         dlg = QDialog(self)
@@ -1243,11 +1250,17 @@ class MainWindow(QMainWindow):
         if dlg.exec_() != QDialog.Accepted:
             return
 
-        # Ensure Undo returns to the current original object, even when the
-        # pattern is the first operation after the object was created.
+        # Ensure Undo returns to the current original objects, even when the
+        # pattern is the first operation after they were created.
         self._history_record()
-        snapshot = self._serialize_object_snapshot(source)
-        base_name = str(getattr(source, "name", type(source).__name__))
+        source_data = [
+            (
+                source,
+                self._serialize_object_snapshot(source),
+                tuple((float(bounds[index]) + float(bounds[index + 1])) * 0.5 for index in (0, 2, 4)),
+            )
+            for source, bounds in zip(selection, source_bounds)
+        ]
         created = []
         instance_count = int(count.value())
         if mode.currentText() == "Linear":
@@ -1305,33 +1318,36 @@ class MainWindow(QMainWindow):
             else enumerate(range(1, instance_count), start=1)
         )
         for instance_index, linear_offset in instance_specs:
-            clone_data = dict(snapshot); clone_data["params"] = dict(snapshot.get("params", {}))
-            clone_data["name"] = f"{base_name}_Pattern_{instance_index + 1}"
-            clone_data["params"]["Name"] = clone_data["name"]
-            clone = self._rebuild_object_from_snapshot(clone_data)
-            if clone is None: continue
-            if mode.currentText() == "Linear":
+            for source, snapshot, source_center in source_data:
+                clone_data = dict(snapshot); clone_data["params"] = dict(snapshot.get("params", {}))
+                source_name = str(getattr(source, "name", type(source).__name__))
+                clone_data["name"] = f"{source_name}_Pattern_{instance_index + 1}"
+                clone_data["params"]["Name"] = clone_data["name"]
+                clone = self._rebuild_object_from_snapshot(clone_data)
+                if clone is None:
+                    continue
                 clone_actor = getattr(clone, "actor", None)
-                if clone_actor is None: continue
-                clone_actor.AddPosition(
-                    linear_offset[0], linear_offset[1], linear_offset[2],
-                )
-            else:
-                clone_actor = getattr(clone, "actor", None)
-                if clone_actor is None: continue
-                step_angle = float(angle.value()) * instance_index / max(1, instance_count - 1)
-                clone_actor.SetOrigin(*circular_center)
-                clone_actor.RotateWXYZ(step_angle, *axis_vector)
-                direction = tuple(value / radial_length for value in radial)
-                rotated_direction = rotate_vector(direction, axis_vector, step_angle)
-                target_center = tuple(
-                    circular_center[index] + rotated_direction[index] * requested_radius
-                    for index in range(3)
-                )
-                clone_bounds = clone_actor.GetBounds()
-                clone_center = tuple((float(clone_bounds[index]) + float(clone_bounds[index + 1])) * 0.5 for index in (0, 2, 4))
-                clone_actor.AddPosition(*(target_center[index] - clone_center[index] for index in range(3)))
-            self._viewport.scene.add_object(clone); created.append(clone)
+                if clone_actor is None:
+                    continue
+                if mode.currentText() == "Linear":
+                    clone_actor.AddPosition(*linear_offset)
+                else:
+                    step_angle = float(angle.value()) * instance_index / max(1, instance_count - 1)
+                    direction = tuple(value / radial_length for value in radial)
+                    rotated_direction = rotate_vector(direction, axis_vector, step_angle)
+                    group_target = tuple(
+                        circular_center[index] + rotated_direction[index] * requested_radius
+                        for index in range(3)
+                    )
+                    relative = tuple(source_center[index] - source_bounds_center[index] for index in range(3))
+                    rotated_relative = rotate_vector(relative, axis_vector, step_angle)
+                    target_center = tuple(group_target[index] + rotated_relative[index] for index in range(3))
+                    clone_actor.SetOrigin(*source_center)
+                    clone_actor.RotateWXYZ(step_angle, *axis_vector)
+                    clone_bounds = clone_actor.GetBounds()
+                    clone_center = tuple((float(clone_bounds[index]) + float(clone_bounds[index + 1])) * 0.5 for index in (0, 2, 4))
+                    clone_actor.AddPosition(*(target_center[index] - clone_center[index] for index in range(3)))
+                self._viewport.scene.add_object(clone); created.append(clone)
 
         if not created:
             QMessageBox.warning(self, "Pattern", "No pattern instances could be created.")
@@ -1341,7 +1357,7 @@ class MainWindow(QMainWindow):
         self._refresh_materials(); self._sync_port_reference_state(); self._viewport._render()
         self._viewport.scene_changed.emit(); self._viewport.selection_changed.emit(created)
         self._mark_simulation_dirty(steps=True, script=True)
-        self._info_bar.set_info(f"Created {len(created)} pattern instance(s) from {base_name}.")
+        self._info_bar.set_info(f"Created {len(created)} pattern instance(s) from {len(selection)} object(s).")
 
     def _do_boolean(self, op: str, label: str) -> None:
         from ..scene.boolean_ops import boolean_many, fuse_many
@@ -3577,6 +3593,22 @@ class MainWindow(QMainWindow):
         self._refresh_materials()
         self._viewport._render()
         self._info_bar.set_info("New project created.")
+
+    def _close_project(self) -> None:
+        has_project = self._project_path is not None or bool(self._viewport.scene.objects)
+        if has_project:
+            reply = QMessageBox.question(
+                self,
+                "Close Project",
+                "Close the current project and discard any unsaved changes?",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No,
+            )
+            if reply != QMessageBox.Yes:
+                return
+
+        self._new_project()
+        self._info_bar.set_info("Project closed.")
 
     def _open_project(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
