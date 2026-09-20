@@ -114,6 +114,11 @@ class Viewport3DWidget(QWidget):
         self._vtk_widget   = QVTKRenderWindowInteractor(self)
         self._renderer     = vtk.vtkRenderer()
         self._render_window = self._vtk_widget.GetRenderWindow()
+        self._render_window.SetAlphaBitPlanes(1)
+        self._render_window.SetMultiSamples(0)
+        self._renderer.UseDepthPeelingOn()
+        self._renderer.SetMaximumNumberOfPeels(100)
+        self._renderer.SetOcclusionRatio(0.1)
         self._render_window.AddRenderer(self._renderer)
         self._interactor   = self._render_window.GetInteractor()
 
@@ -962,8 +967,8 @@ class Viewport3DWidget(QWidget):
             marker = None
             edge_world = pos
             if edge_pick is not None:
-                p0, p1, closest_local = edge_pick
-                marker = self._build_edge_segment_marker(p0, p1, actor)
+                edge_points, closest_local = edge_pick
+                marker = self._build_edge_marker(edge_points, actor)
                 w = actor.GetMatrix().MultiplyPoint([closest_local[0], closest_local[1], closest_local[2], 1.0])
                 ww = w[3] if abs(w[3]) > 1e-12 else 1.0
                 edge_world = (w[0] / ww, w[1] / ww, w[2] / ww)
@@ -1030,7 +1035,16 @@ class Viewport3DWidget(QWidget):
         if poly is None:
             return self._build_face_marker(dataset, cell_id, ref_actor)
 
-        region_ids = self._coplanar_region_cell_ids(poly, cell_id)
+        face_ids = poly.GetCellData().GetArray("OCCFaceId")
+        if face_ids is not None and cell_id < face_ids.GetNumberOfTuples():
+            face_id = face_ids.GetValue(cell_id)
+            region_ids = {
+                cell_index
+                for cell_index in range(poly.GetNumberOfCells())
+                if face_ids.GetValue(cell_index) == face_id
+            }
+        else:
+            region_ids = self._coplanar_region_cell_ids(poly, cell_id)
         if not region_ids:
             return self._build_face_marker(dataset, cell_id, ref_actor)
 
@@ -1068,7 +1082,7 @@ class Viewport3DWidget(QWidget):
         return actor
 
     def _pick_edge_segment_local(self, dataset, cell_id: int, ref_actor, pos):
-        """Return (p0, p1, closest_local) for the best edge candidate in local coords."""
+        """Return the complete nearest feature edge and its closest local point."""
         m = ref_actor.GetMatrix()
         inv = vtk.vtkMatrix4x4()
         vtk.vtkMatrix4x4.Invert(m, inv)
@@ -1105,10 +1119,11 @@ class Viewport3DWidget(QWidget):
                         closest_local, d = self._closest_point_on_segment(lp, p0, p1)
                         if d < best_dist:
                             best_dist = d
-                            best_edge = (p0, p1, closest_local)
+                            best_edge = (edge_poly, cid, closest_local)
 
         if best_edge is not None:
-            return best_edge
+            edge_poly, cell_id, closest_local = best_edge
+            return self._feature_edge_polyline(edge_poly, cell_id), closest_local
 
         # Fallback: closest edge on picked triangle/cell.
         cell = dataset.GetCell(cell_id)
@@ -1126,20 +1141,73 @@ class Viewport3DWidget(QWidget):
         if best_edge is None:
             return None
 
-        return best_edge
+        p0, p1, closest_local = best_edge
+        return [p0, p1], closest_local
 
-    def _build_edge_segment_marker(self, p0, p1, ref_actor) -> Optional[vtk.vtkActor]:
-        if p0 is None or p1 is None:
+    def _feature_edge_polyline(self, edge_poly, cell_id: int) -> list:
+        """Join collinear feature segments while stopping at a hard corner."""
+        cell = edge_poly.GetCell(cell_id)
+        if cell is None or cell.GetNumberOfPoints() < 2:
+            return []
+        start_id, end_id = cell.GetPointId(0), cell.GetPointId(1)
+        adjacency = {}
+        for index in range(edge_poly.GetNumberOfCells()):
+            segment = edge_poly.GetCell(index)
+            if segment is None or segment.GetNumberOfPoints() != 2:
+                continue
+            first, second = segment.GetPointId(0), segment.GetPointId(1)
+            adjacency.setdefault(first, []).append(second)
+            adjacency.setdefault(second, []).append(first)
+
+        def extend(previous_id, current_id):
+            chain = []
+            while True:
+                candidates = [item for item in adjacency.get(current_id, []) if item != previous_id]
+                if not candidates:
+                    break
+                previous = edge_poly.GetPoint(previous_id)
+                current = edge_poly.GetPoint(current_id)
+                incoming = [current[index] - previous[index] for index in range(3)]
+                incoming_length = math.sqrt(sum(value * value for value in incoming))
+                if incoming_length <= 1e-12:
+                    break
+                next_id = max(
+                    candidates,
+                    key=lambda item: sum(
+                        incoming[index] * (edge_poly.GetPoint(item)[index] - current[index])
+                        for index in range(3)
+                    ),
+                )
+                following = edge_poly.GetPoint(next_id)
+                outgoing = [following[index] - current[index] for index in range(3)]
+                outgoing_length = math.sqrt(sum(value * value for value in outgoing))
+                if outgoing_length <= 1e-12:
+                    break
+                alignment = sum(incoming[index] * outgoing[index] for index in range(3)) / (incoming_length * outgoing_length)
+                if alignment < 0.75:
+                    break
+                chain.append(next_id)
+                previous_id, current_id = current_id, next_id
+            return chain
+
+        left = extend(end_id, start_id)
+        right = extend(start_id, end_id)
+        point_ids = list(reversed(left)) + [start_id, end_id] + right
+        return [edge_poly.GetPoint(point_id) for point_id in point_ids]
+
+    def _build_edge_marker(self, edge_points, ref_actor) -> Optional[vtk.vtkActor]:
+        if len(edge_points) < 2:
             return None
 
         pts = vtk.vtkPoints()
-        pts.InsertNextPoint(*p0)
-        pts.InsertNextPoint(*p1)
+        for point in edge_points:
+            pts.InsertNextPoint(*point)
         line = vtk.vtkCellArray()
-        seg = vtk.vtkLine()
-        seg.GetPointIds().SetId(0, 0)
-        seg.GetPointIds().SetId(1, 1)
-        line.InsertNextCell(seg)
+        polyline = vtk.vtkPolyLine()
+        polyline.GetPointIds().SetNumberOfIds(len(edge_points))
+        for index in range(len(edge_points)):
+            polyline.GetPointIds().SetId(index, index)
+        line.InsertNextCell(polyline)
         poly = vtk.vtkPolyData()
         poly.SetPoints(pts)
         poly.SetLines(line)

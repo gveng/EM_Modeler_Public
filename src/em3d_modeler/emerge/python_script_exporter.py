@@ -133,13 +133,14 @@ def _material_block(
 
         rec = (materials_catalog or {}).get(name, {})
         er = _to_float(rec.get("er", 1.0), 1.0)
+        ur = _to_float(rec.get("ur", 1.0), 1.0)
         tan_d = _to_float(rec.get("tan_d", 0.0), 0.0)
         sigma = _to_float(rec.get("sigma", 0.0), 0.0)
         color = str(rec.get("color", "#bebebe"))
         opacity = _to_float(rec.get("opacity", 0.85), 0.85)
 
         lines += [
-            f"materials[{_q(name)}] = em.Material(name={_q(name)}, er={er}, ur=1.0, tand={tan_d}, cond={sigma})",
+            f"materials[{_q(name)}] = em.Material(name={_q(name)}, er={er}, ur={ur}, tand={tan_d}, cond={sigma})",
             f"materials[{_q(name)}].color = {_q(color)}",
             f"materials[{_q(name)}].opacity = {opacity}",
             "",

@@ -263,10 +263,14 @@ def _ocp_shape_to_vtk(shape) -> vtk.vtkPolyData:
 
     vtk_pts   = vtk.vtkPoints()
     vtk_cells = vtk.vtkCellArray()
+    face_ids = vtk.vtkIdTypeArray()
+    face_ids.SetName("OCCFaceId")
     pt_offset = 0
+    face_index = 0
 
     exp = TopExp_Explorer(shape, TopAbs_FACE)
     while exp.More():
+        face_index += 1
         face = TopoDS.Face_s(exp.Current())
         loc  = TopLoc_Location()
         triangulation = BRep_Tool.Triangulation_s(face, loc)
@@ -292,6 +296,7 @@ def _ocp_shape_to_vtk(shape) -> vtk.vtkPolyData:
             tri_cell.GetPointIds().SetId(1, pt_offset + n2 - 1)
             tri_cell.GetPointIds().SetId(2, pt_offset + n3 - 1)
             vtk_cells.InsertNextCell(tri_cell)
+            face_ids.InsertNextValue(face_index)
 
         pt_offset += n_nodes
         exp.Next()
@@ -299,6 +304,7 @@ def _ocp_shape_to_vtk(shape) -> vtk.vtkPolyData:
     poly = vtk.vtkPolyData()
     poly.SetPoints(vtk_pts)
     poly.SetPolys(vtk_cells)
+    poly.GetCellData().AddArray(face_ids)
 
     # Compute smooth normals for nicer rendering
     if poly.GetNumberOfPolys() > 0:
@@ -353,10 +359,14 @@ def _occ_shape_to_vtk(shape) -> vtk.vtkPolyData:
 
     vtk_pts   = vtk.vtkPoints()
     vtk_cells = vtk.vtkCellArray()
+    face_ids = vtk.vtkIdTypeArray()
+    face_ids.SetName("OCCFaceId")
     pt_offset = 0
+    face_index = 0
 
     exp = TopExp_Explorer(shape, TopAbs_FACE)
     while exp.More():
+        face_index += 1
         face = exp.Current()
         loc  = TopLoc_Location()
         triangulation = BRep_Tool.Triangulation(face, loc)
@@ -380,6 +390,7 @@ def _occ_shape_to_vtk(shape) -> vtk.vtkPolyData:
             tri_cell.GetPointIds().SetId(1, pt_offset + n2 - 1)
             tri_cell.GetPointIds().SetId(2, pt_offset + n3 - 1)
             vtk_cells.InsertNextCell(tri_cell)
+            face_ids.InsertNextValue(face_index)
 
         pt_offset += n_nodes
         exp.Next()
@@ -387,6 +398,7 @@ def _occ_shape_to_vtk(shape) -> vtk.vtkPolyData:
     poly = vtk.vtkPolyData()
     poly.SetPoints(vtk_pts)
     poly.SetPolys(vtk_cells)
+    poly.GetCellData().AddArray(face_ids)
     return poly
 
 

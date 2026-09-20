@@ -102,9 +102,11 @@ class MaterialAssignDialog(QDialog):
         details_layout.addSpacing(4)
 
         self._er_label = QLabel("er: -")
+        self._ur_label = QLabel("ur: -")
         self._tan_d_label = QLabel("tan d: -")
         self._sigma_label = QLabel("sigma [S/m]: -")
         details_layout.addWidget(self._er_label)
+        details_layout.addWidget(self._ur_label)
         details_layout.addWidget(self._tan_d_label)
         details_layout.addWidget(self._sigma_label)
 
@@ -220,6 +222,7 @@ class MaterialAssignDialog(QDialog):
             self._name_title.setText("No material selected")
             self._family_label.setText("Family: -")
             self._er_label.setText("er: -")
+            self._ur_label.setText("ur: -")
             self._tan_d_label.setText("tan d: -")
             self._sigma_label.setText("sigma [S/m]: -")
             self._color_value.setText("-")
@@ -230,6 +233,7 @@ class MaterialAssignDialog(QDialog):
         self._name_title.setText(rec.name)
         self._family_label.setText(f"Family: {rec.family}")
         self._er_label.setText(f"er: {self._fmt_number(rec.er)}")
+        self._ur_label.setText(f"ur: {self._fmt_number(rec.ur)}")
         self._tan_d_label.setText(f"tan d: {self._fmt_number(rec.tan_d)}")
         self._sigma_label.setText(f"sigma [S/m]: {self._fmt_number(rec.sigma)}")
         self._color_value.setText(rec.color)
@@ -265,6 +269,9 @@ class MaterialAssignDialog(QDialog):
         tan_d = self._ask_float("Loss Tangent", "tan d:", 0.0)
         if tan_d is None:
             return
+        ur = self._ask_float("Permeability", "ur:", 1.0)
+        if ur is None:
+            return
         sigma = self._ask_float("Conductivity", "sigma [S/m]:", 0.0)
         if sigma is None:
             return
@@ -274,6 +281,7 @@ class MaterialAssignDialog(QDialog):
             name=name,
             family=family,
             er=float(er),
+            ur=float(ur),
             tan_d=float(tan_d),
             sigma=float(sigma),
             source="project",

@@ -1344,7 +1344,7 @@ class MainWindow(QMainWindow):
         self._info_bar.set_info(f"Created {len(created)} pattern instance(s) from {base_name}.")
 
     def _do_boolean(self, op: str, label: str) -> None:
-        from ..scene.boolean_ops import boolean, fuse_many
+        from ..scene.boolean_ops import boolean_many, fuse_many
         from ..scene.em_objects import MeshObject
 
         sel = list(self._viewport.scene.selection)
@@ -1379,20 +1379,12 @@ class MainWindow(QMainWindow):
             self._info_bar.set_info(f"Boolean {label} cancelled.")
             return
 
-        current = base
         current_poly = None
         try:
-            if op == "fuse" and len(sel) > 2:
+            if op == "fuse":
                 current_poly = fuse_many(sel)
             else:
-                for idx, tool in enumerate(tools):
-                    current_poly = boolean(op, current, tool)
-                    if idx < len(tools) - 1:
-                        current = MeshObject(
-                            name=f"_tmp_{label}_{idx}",
-                            polydata=current_poly,
-                            material=base.material,
-                        )
+                current_poly = boolean_many(op, sel)
         except Exception as exc:
             QMessageBox.critical(self, f"Boolean {label} failed", str(exc))
             self._info_bar.set_info(f"Boolean {label} failed: {exc}")

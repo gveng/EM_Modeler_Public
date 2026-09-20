@@ -23,6 +23,7 @@ class MaterialRecord:
     name: str
     family: str
     er: float
+    ur: float
     tan_d: float
     sigma: float
     color: str = DEFAULT_COLOR
@@ -36,6 +37,7 @@ class MaterialRecord:
             "name": self.name,
             "family": self.family,
             "er": self.er,
+            "ur": self.ur,
             "tan_d": self.tan_d,
             "sigma": self.sigma,
             "color": self.color,
@@ -51,6 +53,7 @@ class MaterialRecord:
             name=str(data.get("name") or "Unnamed").strip() or "Unnamed",
             family=str(data.get("family") or "Common").strip() or "Common",
             er=float(data.get("er", 1.0)),
+            ur=float(data.get("ur", 1.0)),
             tan_d=float(data.get("tan_d", 0.0)),
             sigma=float(data.get("sigma", 0.0)),
             color=str(data.get("color") or DEFAULT_COLOR),
@@ -150,6 +153,7 @@ class MaterialStore:
         name: str,
         family: str = "Common",
         er: float = 1.0,
+        ur: float = 1.0,
         tan_d: float = 0.0,
         sigma: float = 0.0,
         color: str = DEFAULT_COLOR,
@@ -160,6 +164,7 @@ class MaterialStore:
             name=name.strip(),
             family=family.strip() or "Common",
             er=float(er),
+            ur=float(ur),
             tan_d=float(tan_d),
             sigma=float(sigma),
             color=color or DEFAULT_COLOR,
@@ -175,6 +180,7 @@ class MaterialStore:
             name=str(record.name).strip(),
             family=str(record.family or "Common").strip() or "Common",
             er=float(record.er),
+            ur=float(record.ur),
             tan_d=float(record.tan_d),
             sigma=float(record.sigma),
             color=str(record.color or DEFAULT_COLOR),
@@ -202,6 +208,7 @@ class MaterialStore:
                 name=rec.name,
                 family=rec.family,
                 er=rec.er,
+                ur=rec.ur,
                 tan_d=rec.tan_d,
                 sigma=rec.sigma,
                 color=rec.color,
@@ -264,10 +271,10 @@ class MaterialStore:
 
         # Minimal fallback set if emsutil is unavailable.
         fallback = {
-            "PEC": MaterialRecord(str(uuid.uuid4()), "PEC", "Metals", 1.0, 0.0, 1e9, "#bebee6", 0.9, "builtin"),
-            "PMC": MaterialRecord(str(uuid.uuid4()), "PMC", "Common", 1.0, 0.0, 0.0, "#d0d0d0", 0.9, "builtin"),
-            "PML": MaterialRecord(str(uuid.uuid4()), "PML", "Common", 1.0, 0.0, 0.0, "#dfdf9b", 0.6, "builtin"),
-            "Air": MaterialRecord(str(uuid.uuid4()), "Air", "Common", 1.0, 0.0, 0.0, "#b4d8ff", 0.2, "builtin"),
+            "PEC": MaterialRecord(str(uuid.uuid4()), "PEC", "Metals", 1.0, 1.0, 0.0, 1e9, "#bebee6", 0.9, "builtin"),
+            "PMC": MaterialRecord(str(uuid.uuid4()), "PMC", "Common", 1.0, 1.0, 0.0, 0.0, "#d0d0d0", 0.9, "builtin"),
+            "PML": MaterialRecord(str(uuid.uuid4()), "PML", "Common", 1.0, 1.0, 0.0, 0.0, "#dfdf9b", 0.6, "builtin"),
+            "Air": MaterialRecord(str(uuid.uuid4()), "Air", "Common", 1.0, 1.0, 0.0, 0.0, "#b4d8ff", 0.2, "builtin"),
         }
 
         try:
@@ -289,6 +296,7 @@ class MaterialStore:
                     name=name,
                     family=_family_from_name(attr),
                     er=_extract_scalar_property(getattr(value, "er", 1.0), 1.0),
+                    ur=_extract_scalar_property(getattr(value, "ur", 1.0), 1.0),
                     tan_d=_extract_scalar_property(getattr(value, "tand", 0.0), 0.0),
                     sigma=_extract_scalar_property(getattr(value, "cond", 0.0), 0.0),
                     color=str(getattr(value, "color", DEFAULT_COLOR) or DEFAULT_COLOR),
@@ -303,7 +311,7 @@ class MaterialStore:
                 air = records["AIR"]
                 records["Air"] = MaterialRecord(
                     uid=str(uuid.uuid4()), name="Air", family=air.family,
-                    er=air.er, tan_d=air.tan_d, sigma=air.sigma,
+                    er=air.er, ur=air.ur, tan_d=air.tan_d, sigma=air.sigma,
                     color=air.color, opacity=air.opacity, source="builtin",
                 )
         except Exception:

@@ -60,6 +60,12 @@ class _MaterialEditorDialog(QDialog):
         self._er.setValue(float(record.er) if record is not None else 1.0)
         form.addRow("er", self._er)
 
+        self._ur = QDoubleSpinBox()
+        self._ur.setRange(0.0, 1e9)
+        self._ur.setDecimals(6)
+        self._ur.setValue(float(record.ur) if record is not None else 1.0)
+        form.addRow("ur", self._ur)
+
         self._tan_d = QDoubleSpinBox()
         self._tan_d.setRange(0.0, 1.0)
         self._tan_d.setDecimals(8)
@@ -122,6 +128,7 @@ class _MaterialEditorDialog(QDialog):
             name=name,
             family=self._family.currentText(),
             er=float(self._er.value()),
+            ur=float(self._ur.value()),
             tan_d=float(self._tan_d.value()),
             sigma=float(self._sigma.value()),
             color=self._color,
@@ -180,12 +187,14 @@ class MaterialLibraryDialog(QDialog):
         self._family = QLabel("Family: -")
         self._source = QLabel("Source: -")
         self._er = QLabel("er: -")
+        self._ur = QLabel("ur: -")
         self._tan_d = QLabel("tan d: -")
         self._sigma = QLabel("sigma [S/m]: -")
         self._opacity = QLabel("opacity: -")
         details_layout.addWidget(self._family)
         details_layout.addWidget(self._source)
         details_layout.addWidget(self._er)
+        details_layout.addWidget(self._ur)
         details_layout.addWidget(self._tan_d)
         details_layout.addWidget(self._sigma)
         details_layout.addWidget(self._opacity)
@@ -295,6 +304,7 @@ class MaterialLibraryDialog(QDialog):
             self._family.setText("Family: -")
             self._source.setText("Source: -")
             self._er.setText("er: -")
+            self._ur.setText("ur: -")
             self._tan_d.setText("tan d: -")
             self._sigma.setText("sigma [S/m]: -")
             self._opacity.setText("opacity: -")
@@ -305,6 +315,7 @@ class MaterialLibraryDialog(QDialog):
             self._family.setText(f"Family: {rec.family}")
             self._source.setText(f"Source: {rec.source}")
             self._er.setText(f"er: {rec.er:.6g}")
+            self._ur.setText(f"ur: {rec.ur:.6g}")
             self._tan_d.setText(f"tan d: {rec.tan_d:.6g}")
             self._sigma.setText(f"sigma [S/m]: {rec.sigma:.6g}")
             self._opacity.setText(f"opacity: {rec.opacity:.2f}")
@@ -324,7 +335,7 @@ class MaterialLibraryDialog(QDialog):
 
     def _new_material(self) -> None:
         dlg = _MaterialEditorDialog(self)
-        if dlg.exec_() != dlg.Accepted or dlg.result_record is None:
+        if dlg.exec_() != QDialog.Accepted or dlg.result_record is None:
             return
         self._store.upsert_project_record(dlg.result_record)
         self._mark_changed()
@@ -334,7 +345,7 @@ class MaterialLibraryDialog(QDialog):
         if rec is None or rec.source != "project":
             return
         dlg = _MaterialEditorDialog(self, rec)
-        if dlg.exec_() != dlg.Accepted or dlg.result_record is None:
+        if dlg.exec_() != QDialog.Accepted or dlg.result_record is None:
             return
         self._store.upsert_project_record(dlg.result_record)
         self._mark_changed()
