@@ -1,24 +1,137 @@
 # EM 3D Modeler
 
-A Python-based 3D electromagnetic modeling project for scientific computing and visualization.
+EM 3D Modeler is a desktop 3D CAD workspace for preparing electromagnetic
+geometries and exporting them to the EMERGE simulation workflow. It combines a
+VTK viewport, parametric primitives, CAD import, material assignment, boolean
+modeling, and EMERGE-oriented project export in one application.
 
-## Features
-- 3D electromagnetic simulation
-- Scientific computing with NumPy and SciPy
-- Visualization with Matplotlib and Mayavi
+Current version: `1.2.1b2`
 
-## Project Structure
-- `src/` - Source code
-- `tests/` - Unit and integration tests
-- `docs/` - Documentation
+## What You Can Do
 
-## Setup
-1. Create a Python virtual environment
-2. Install dependencies: `pip install -r requirements.txt`
+### Build and Edit Geometry
 
-## Usage
-- Main code will be in the `src/` directory.
-- Run tests from the `tests/` directory.
+- Draw boxes, cylinders, cones, spheres, planar structures, and other supported
+	primitives directly in the 3D viewport.
+- Create parametric sketches, then extrude or revolve them into 3D geometry.
+- Work on the XY, XZ, YZ, or a custom reference plane with a configurable grid
+	and snap support for vertices, edges, and surfaces.
+- Move, rotate, scale, duplicate, and delete selected objects.
+- Create linear or circular patterns from one object or from a multi-object
+	selection while preserving the group layout.
 
-## License
-MIT
+### Work with CAD and Boolean Solids
+
+- Import STEP files (`.step` and `.stp`) as individual solids.
+- Combine objects with Boolean Cut, Fuse, and Common operations.
+- Use one base object with multiple tools in a single Boolean operation.
+- Dissolve a Boolean result to recover its source objects.
+- Preserve CAD face identity for Boolean results so surface selection acts on
+	the complete resulting face instead of one display triangle.
+
+### Select, Inspect, and Organize
+
+- Select whole bodies, individual surfaces, edges, or vertices in the viewport.
+- Select multiple objects from the Objects/Materials tree with `Ctrl` or `Shift`.
+- Inspect and edit body parameters, material, color, opacity, and transforms.
+- Group objects by material and apply a material to the current selection.
+- Manage local project materials as well as a reusable global material database.
+
+### Prepare EMERGE Simulations
+
+- Save and reopen complete `.em3d` projects, including geometry, view settings,
+	materials, reference planes, and Boolean-source metadata.
+- Export EMERGE scripts and STEP bundles from the current model.
+- Open the simulation panel to generate and run EMERGE Python workflows and
+	review their output.
+
+## Typical Workflow
+
+1. Start a project and set the units, grid, and active reference plane.
+2. Draw primitives, create sketches, or import STEP solids.
+3. Assign materials and adjust object properties.
+4. Use multi-selection for Boolean operations or pattern creation.
+5. Inspect the result with body, surface, edge, and vertex selection modes.
+6. Save the model as an `.em3d` project.
+7. Export an EMERGE script or run the simulation workflow.
+
+For a detailed UI reference, see [docs/HELP.md](docs/HELP.md).
+
+## Installation
+
+Requirements:
+
+- Python 3.8 or newer
+- Windows is the primary development and packaging target
+
+Create and activate a virtual environment, then install the project:
+
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -r requirements.txt
+pip install -e .
+```
+
+STEP import and exact solid booleans use an OpenCascade-compatible backend when
+available. Install CadQuery when that capability is not already present in your
+Python environment:
+
+```powershell
+pip install cadquery
+```
+
+## Run the Application
+
+From the repository root:
+
+```powershell
+python src/em3d_modeler/main.py
+```
+
+After editable installation, the command-line entry point is also available:
+
+```powershell
+em3d-modeler
+```
+
+## Build a Portable Distribution
+
+The repository includes a PyInstaller build script for Windows:
+
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\scripts\build_portable.ps1
+```
+
+The generated portable folder is placed under `dist/`, for example:
+
+```text
+dist/EM3D_Modeler_1.2.1_Beta/
+```
+
+Run the executable inside that folder without installing the package into the
+target user's Python environment.
+
+## Project Layout
+
+```text
+src/em3d_modeler/       Application source code
+src/em3d_modeler/ui/    Qt user interface and viewport tools
+src/em3d_modeler/scene/ Geometry, scene management, and Boolean operations
+src/em3d_modeler/emerge/ EMERGE, materials, STEP, and export integration
+docs/                   User documentation
+tests/                  Example projects and test assets
+scripts/                Build and maintenance scripts
+```
+
+## Shortcuts
+
+| Command | Shortcut |
+| --- | --- |
+| New Project | `Ctrl+N` |
+| Open Project | `Ctrl+O` |
+| Save Project | `Ctrl+S` |
+| Close Project | `Ctrl+W` |
+| Delete Selected | `Delete` |
+| Cancel Drawing | `Esc` |
