@@ -10,7 +10,7 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    QDoubleSpinBox,
+    
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -24,6 +24,7 @@ from PySide6.QtWidgets import (
     QVBoxLayout,
     QWidget,
 )
+from .formula_widgets import FormulaDoubleSpinBox as QDoubleSpinBox
 
 from ..emerge.material_store import DEFAULT_COLOR, MaterialRecord, MaterialStore
 

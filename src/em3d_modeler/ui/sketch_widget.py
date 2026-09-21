@@ -19,10 +19,11 @@ from typing import List, Optional, Tuple
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QToolBar,
-    QSplitter, QGroupBox, QFormLayout, QDoubleSpinBox,
+    QSplitter, QGroupBox, QFormLayout,
     QLabel, QPushButton, QWidget, QSizePolicy,
     QDialogButtonBox, QComboBox, QColorDialog,
 )
+from .formula_widgets import FormulaDoubleSpinBox as QDoubleSpinBox
 from PySide6.QtCore import Qt, QPointF, QRectF, QSizeF, Signal
 from PySide6.QtGui  import QPainter, QPen, QBrush, QColor, QMouseEvent, QAction
 

@@ -138,8 +138,8 @@ class BodyPropertiesWidget(QWidget):
         layout.addWidget(self._apply_btn)
 
         # ── Geometry parameters table (single selection only)
-        self._table = QTableWidget(0, 2)
-        self._table.setHorizontalHeaderLabels(["Parameter", "Value"])
+        self._table = QTableWidget(0, 3)
+        self._table.setHorizontalHeaderLabels(["Parameter", "Value", "Resolved"])
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._table.setAlternatingRowColors(True)
         self._table.itemChanged.connect(self._table_item_changed)
@@ -205,6 +205,10 @@ class BodyPropertiesWidget(QWidget):
             self._apply_btn.setVisible(False)
             self._table.setColumnCount(3)
             self._table.setHorizontalHeaderLabels(["Name", "Value", "Unit"])
+            self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+            self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+            self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Fixed)
+            self._table.setColumnWidth(2, 58)
             rows = []
             for entry in parameters if isinstance(parameters, list) else []:
                 if not isinstance(entry, dict):
@@ -284,6 +288,8 @@ class BodyPropertiesWidget(QWidget):
         self._title.setText("Properties")
         self._name_widget.setVisible(False)
         self._name_edit.setText("")
+        self._table.setColumnCount(3)
+        self._table.setHorizontalHeaderLabels(["Parameter", "Value", "Resolved"])
         self._table.setRowCount(0)
         self._table.setVisible(False)
         self._mat_combo.setEnabled(False)
@@ -329,6 +335,11 @@ class BodyPropertiesWidget(QWidget):
                 rows.append(("Color", f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"))
         self._table.setRowCount(len(rows))
         self._table.setVisible(bool(rows))
+        self._table.setColumnCount(3)
+        self._table.setHorizontalHeaderLabels(["Parameter", "Value", "Resolved"])
+        self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(1, QHeaderView.Stretch)
+        self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeToContents)
         for row, (k, v) in enumerate(rows):
             key_item = QTableWidgetItem(k)
             key_item.setFlags(Qt.ItemIsEnabled)
@@ -338,6 +349,8 @@ class BodyPropertiesWidget(QWidget):
             if formula is not None:
                 val_item.setForeground(QColor("#3a7bd5"))
                 val_item.setToolTip(f"Formula: {formula}\nResolved value: {v}")
+            resolved_item = QTableWidgetItem(str(v) if formula is not None else "")
+            resolved_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
             if k == "Color":
                 # For Color parameter, add a color preview button
                 val_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
@@ -346,6 +359,7 @@ class BodyPropertiesWidget(QWidget):
                     val_item.setBackground(qcolor)
             self._table.setItem(row, 0, key_item)
             self._table.setItem(row, 1, val_item)
+            self._table.setItem(row, 2, resolved_item)
 
     def _refresh_multi(self, objects: List[EMObject]) -> None:
         self._set_content_visible(True)
@@ -353,6 +367,8 @@ class BodyPropertiesWidget(QWidget):
         self._name_widget.setVisible(False)
         self._table.setRowCount(0)
         self._table.setVisible(False)
+        self._table.setColumnCount(3)
+        self._table.setHorizontalHeaderLabels(["Parameter", "Value", "Resolved"])
         self._mat_combo.setEnabled(True)
         self._model_role_combo.setEnabled(False)
         self._opacity_slider.setEnabled(True)

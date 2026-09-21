@@ -16,11 +16,12 @@ from PySide6.QtWidgets import (
     QTabWidget,
     QVBoxLayout,
     QWidget,
-    QDoubleSpinBox,
+    
     QColorDialog,
     QSpinBox,
     QCheckBox,
 )
+from .formula_widgets import FormulaDoubleSpinBox as QDoubleSpinBox
 
 
 _SELECTION_COLOR_PRESETS: Dict[str, Tuple[float, float, float]] = {

@@ -24,12 +24,14 @@ from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QTreeWidget, QTreeWidgetItem, QPushButton, QInputDialog, QComboBox,
     QDialog, QFormLayout, QLineEdit, QDialogButtonBox,
-    QMenu, QMessageBox, QSpinBox, QDoubleSpinBox, QCheckBox,
+    QMenu, QMessageBox, QSpinBox, QCheckBox,
     QTableWidget, QTableWidgetItem,
     QStyle,
 )
 from PySide6.QtCore import Qt, Signal, QLocale
 from PySide6.QtGui import QColor, QBrush, QAction, QIcon
+from .formula_widgets import FormulaDoubleSpinBox as QDoubleSpinBox
+from ..scene.param_expr import evaluate_expression
 
 
 # ──────────────────────────────────────────────────────────────────── constants
@@ -201,6 +203,23 @@ class ProjectTreeWidget(QWidget):
 
     def get_settings(self) -> Dict[str, Any]:
         return _deep_copy(self._settings)
+
+    def _parse_formula_float(self, text: str) -> float:
+        raw = str(text).strip()
+        try:
+            return _parse_locale_float(raw)
+        except (TypeError, ValueError):
+            values = {}
+            for entry in self._settings.get("parameters", []):
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name", "")).strip()
+                if name:
+                    try:
+                        values[name] = float(entry.get("value", 0.0))
+                    except (TypeError, ValueError):
+                        pass
+            return evaluate_expression(raw, values)
 
     def set_scene_object_names(self, object_names: list[str]) -> None:
         names: set[str] = set()
@@ -1223,9 +1242,9 @@ class ProjectTreeWidget(QWidget):
             sim_type = cb_type.currentText().strip().title()
             if sim_type not in _SIMULATION_TYPES:
                 sim_type = "Sweep"
-            fmin = _parse_locale_float(le_fmin.text())
-            fmax = _parse_locale_float(le_fmax.text())
-            fstep = _parse_locale_float(le_fstep.text())
+            fmin = self._parse_formula_float(le_fmin.text())
+            fmax = self._parse_formula_float(le_fmax.text())
+            fstep = self._parse_formula_float(le_fstep.text())
             modes = max(1, _parse_locale_int(le_modes.text()))
             name = le_name.text().strip() or "Simulation"
             log_v = cb_log.currentText().strip().title()
@@ -1491,7 +1510,7 @@ class ProjectTreeWidget(QWidget):
                         val = _parse_locale_int(raw) if raw else None
                         parsed_params[key] = val if val is not None else default_val
                     elif isinstance(default_val, float):
-                        val = _parse_locale_float(raw) if raw else None
+                        val = self._parse_formula_float(raw) if raw else None
                         parsed_params[key] = val if val is not None else default_val
                     else:
                         parsed_params[key] = raw if raw else ""
@@ -1505,9 +1524,9 @@ class ProjectTreeWidget(QWidget):
                     "number": int(sb_number.value()),
                     "name": le_name.text().strip() or "Port",
                     "type": port_type,
-                    "x": _parse_locale_float(le_x.text()),
-                    "y": _parse_locale_float(le_y.text()),
-                    "z": _parse_locale_float(le_z.text()),
+                    "x": self._parse_formula_float(le_x.text()),
+                    "y": self._parse_formula_float(le_y.text()),
+                    "z": self._parse_formula_float(le_z.text()),
                     "params": parsed_params,
                 }
                 obj_txt = le_obj.text().strip()
@@ -1613,9 +1632,9 @@ class ProjectTreeWidget(QWidget):
                     raw = edit.text().strip()
                     default_val = defaults.get(key)
                     if isinstance(default_val, int) and not isinstance(default_val, bool):
-                        parsed_params[key] = _parse_locale_int(raw)
+                        parsed_params[key] = int(round(self._parse_formula_float(raw)))
                     elif isinstance(default_val, float):
-                        parsed_params[key] = _parse_locale_float(raw)
+                        parsed_params[key] = self._parse_formula_float(raw)
                     else:
                         parsed_params[key] = raw
 

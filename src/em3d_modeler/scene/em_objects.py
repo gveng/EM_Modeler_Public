@@ -46,6 +46,7 @@ class EMObject:
         self.creation_plane_origin: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.creation_plane_normal: tuple[float, float, float] = (0.0, 0.0, 1.0)
         self.param_formulas: Dict[str, str] = {}
+        self.creation_history: Dict[str, Any] = {}
         self._actor: vtk.vtkActor | None = None
         self._build()
 
@@ -160,6 +161,7 @@ class EMObject:
             "creation_plane": self.creation_plane,
             "creation_plane_origin": list(self.creation_plane_origin),
             "creation_plane_normal": list(self.creation_plane_normal),
+            "creation_history": dict(self.creation_history),
         }
 
     def from_json_state(self, data: Dict[str, Any]) -> None:
@@ -179,6 +181,8 @@ class EMObject:
         except Exception:
             normal_tuple = self.creation_plane_normal
         self.set_creation_plane(plane, origin_tuple, normal_tuple)
+        history = data.get("creation_history", {})
+        self.creation_history = dict(history) if isinstance(history, dict) else {}
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

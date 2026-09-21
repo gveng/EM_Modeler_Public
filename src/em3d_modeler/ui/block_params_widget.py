@@ -23,6 +23,7 @@ class BlockParamsWidget(QWidget):
         super().__init__(parent)
         self._obj: Optional[EMObject] = None
         self._blocked = False
+        self._formula_resolver = None
 
         layout = QVBoxLayout(self)
         layout.setContentsMargins(2, 2, 2, 2)
@@ -75,6 +76,9 @@ class BlockParamsWidget(QWidget):
         finally:
             self._blocked = False
 
+    def set_formula_resolver(self, resolver) -> None:
+        self._formula_resolver = resolver
+
     # ─────────────────────────────────────────────────── display
     def _set_no_selection(self) -> None:
         self._title.setText("Block Parameters")
@@ -118,7 +122,10 @@ class BlockParamsWidget(QWidget):
                 try:
                     params[k.text()] = float(v.text())
                 except ValueError:
-                    params[k.text()] = v.text()
+                    if self._formula_resolver is None:
+                        params[k.text()] = v.text()
+                    else:
+                        params[k.text()] = self._formula_resolver(v.text())
         params["Material"] = self._mat_combo.currentText()
         params["Opacity"]  = self._opacity_slider.value() / 100.0
         return params

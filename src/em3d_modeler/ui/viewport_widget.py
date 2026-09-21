@@ -159,6 +159,7 @@ class Viewport3DWidget(QWidget):
         self._draw_material: str = "PEC"
         self._draw_state: int = 0               # step counter within current shape
         self._draw_pts: list = []               # world-coord points collected so far
+        self._snap_records: list[dict] = []
         self._preview_actor: Optional[vtk.vtkActor] = None
         self._selection_point_actors: list[vtk.vtkActor] = []
 
@@ -201,6 +202,7 @@ class Viewport3DWidget(QWidget):
         self._draw_material = material
         self._draw_state    = 0
         self._draw_pts      = []
+        self._snap_records  = []
         self.setCursor(Qt.CrossCursor)
         if mode == "planar":
             self.status_message.emit(
@@ -665,7 +667,16 @@ class Viewport3DWidget(QWidget):
             if point_actor is not None and point_id >= 0 and point_picker.GetDataSet() is not None:
                 local = point_picker.GetDataSet().GetPoint(point_id)
                 world = point_actor.GetMatrix().MultiplyPoint([local[0], local[1], local[2], 1.0])
-                return (tuple(self._project_point_to_draw_plane((world[0], world[1], world[2]))), "vertex")
+                point = tuple(self._project_point_to_draw_plane((world[0], world[1], world[2])))
+                source = next((obj for obj in self.scene.objects if obj.actor is point_actor), None)
+                self._snap_records.append({
+                    "kind": "vertex",
+                    "object": str(source.name) if source is not None else "",
+                    "point_id": int(point_id),
+                    "local": [float(local[i]) for i in range(3)],
+                    "point": list(point),
+                })
+                return (point, "vertex")
             if mode == "vertex":
                 return None
 
@@ -688,12 +699,33 @@ class Viewport3DWidget(QWidget):
                 world4 = m.MultiplyPoint([closest_local[0], closest_local[1], closest_local[2], 1.0])
                 w = world4[3] if abs(world4[3]) > 1e-12 else 1.0
                 world = (world4[0] / w, world4[1] / w, world4[2] / w)
-                return (tuple(self._project_point_to_draw_plane(world)), "edge")
+                point = tuple(self._project_point_to_draw_plane(world))
+                source = next((obj for obj in self.scene.objects if obj.actor is actor), None)
+                self._snap_records.append({
+                    "kind": "edge",
+                    "object": str(source.name) if source is not None else "",
+                    "cell_id": int(cell_id),
+                    "local": [float(closest_local[i]) for i in range(3)],
+                    "point": list(point),
+                })
+                return (point, "edge")
             if mode == "edge":
                 return None
 
         if mode in {"all", "face"}:
-            return (tuple(self._project_point_to_draw_plane(pos)), "surface")
+            point = tuple(self._project_point_to_draw_plane(pos))
+            source = next((obj for obj in self.scene.objects if obj.actor is actor), None)
+            inverse = vtk.vtkMatrix4x4()
+            vtk.vtkMatrix4x4.Invert(actor.GetMatrix(), inverse)
+            local4 = inverse.MultiplyPoint([pos[0], pos[1], pos[2], 1.0])
+            self._snap_records.append({
+                "kind": "surface",
+                "object": str(source.name) if source is not None else "",
+                "cell_id": int(cell_id),
+                "local": [float(local4[i]) for i in range(3)],
+                "point": list(point),
+            })
+            return (point, "surface")
 
         return None
 
@@ -1832,6 +1864,27 @@ class Viewport3DWidget(QWidget):
         origin = self._custom_plane_origin if self._custom_plane_active else PLANE_ORIGIN.get(plane_name, (0.0, 0.0, 0.0))
         normal = self._custom_plane_normal if self._custom_plane_active else PLANE_NORMAL.get(plane_name, (0.0, 0.0, 1.0))
         obj.set_creation_plane(plane_name, origin, normal)
+        history_points = []
+        for point in self._draw_pts:
+            nearest = None
+            distance = float("inf")
+            for record in self._snap_records:
+                candidate = record.get("point", [])
+                if len(candidate) != 3:
+                    continue
+                current_distance = sum((float(point[i]) - float(candidate[i])) ** 2 for i in range(3))
+                if current_distance < distance:
+                    nearest = record
+                    distance = current_distance
+            history_points.append({
+                "value": [float(point[i]) for i in range(3)],
+                "snap": dict(nearest) if nearest is not None and distance < 1e-8 else {"kind": "grid"},
+            })
+        obj.creation_history = {
+            "mode": str(self._draw_mode or ""),
+            "plane": plane_name,
+            "points": history_points,
+        }
         self.scene.add_object(obj)
         self.scene.select(obj)
         self.object_selected.emit(obj)
@@ -1843,6 +1896,7 @@ class Viewport3DWidget(QWidget):
         self._draw_mode  = None
         self._draw_state = 0
         self._draw_pts   = []
+        self._snap_records = []
         self.setCursor(Qt.ArrowCursor)
         self._render()
 
@@ -1857,6 +1911,7 @@ class Viewport3DWidget(QWidget):
         self._draw_mode  = None
         self._draw_state = 0
         self._draw_pts   = []
+        self._snap_records = []
         self.setCursor(Qt.ArrowCursor)
         self._render()
 

@@ -14,9 +14,10 @@ import math
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QGroupBox, QRadioButton,
-    QDoubleSpinBox, QLabel, QPushButton, QButtonGroup, QFormLayout,
+    QLabel, QPushButton, QButtonGroup, QFormLayout,
     QSizePolicy, QDialogButtonBox, QComboBox, QLineEdit,
 )
+from .formula_widgets import FormulaDoubleSpinBox as QDoubleSpinBox
 from PySide6.QtCore import Qt, Signal
 
 

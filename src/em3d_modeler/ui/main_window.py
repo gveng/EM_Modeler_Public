@@ -86,7 +86,7 @@ def _icon(name: str) -> "QIcon":
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QSplitter,
     QFileDialog, QMessageBox, QComboBox, QSpinBox,
-    QLabel, QDoubleSpinBox, QDialog, QInputDialog,
+    QLabel, QDialog, QInputDialog,
     QVBoxLayout, QFormLayout, QTextBrowser, QPlainTextEdit,
     QPushButton, QHBoxLayout, QGroupBox, QCheckBox,
     QProgressDialog, QApplication, QTabWidget, QDialogButtonBox, QGridLayout, QToolButton,
@@ -180,6 +180,8 @@ from .sketch_widget          import SketchDialog
 from .material_assign_dialog import MaterialAssignDialog
 from .material_library_dialog import MaterialLibraryDialog
 from .settings_dialog        import SettingsDialog
+from .parameters_dialog      import ParametersDialog
+from .formula_widgets        import FormulaDoubleSpinBox as QDoubleSpinBox
 from .project_tree_widget    import set_numeric_locale
 
 from ..emerge.project_file    import ProjectFile
@@ -1105,6 +1107,7 @@ class MainWindow(QMainWindow):
             "params": obj.get_parameters() if hasattr(obj, "get_parameters") else {},
             "visible": bool(obj.is_visible()) if hasattr(obj, "is_visible") else True,
             "is_model": bool(getattr(obj, "is_model", True)),
+            "creation_history": dict(getattr(obj, "creation_history", {}) or {}),
         }
         if type(obj).__name__ == "MeshObject":
             mesh_poly = None
@@ -1165,6 +1168,8 @@ class MainWindow(QMainWindow):
 
             obj.set_visible(bool(item.get("visible", True)))
             obj.is_model = bool(item.get("is_model", True))
+            history = item.get("creation_history", {})
+            obj.creation_history = dict(history) if isinstance(history, dict) else {}
             obj.refresh_appearance()
             transform = item.get("actor_transform", {})
             if isinstance(transform, dict) and obj.actor is not None:
@@ -1601,24 +1606,30 @@ class MainWindow(QMainWindow):
                     existing_names.add(str(getattr(source_obj, "name", "")))
                     added_this_result += 1
 
-            # Use snapshot data as fallback when live references produced no results
-            # (e.g. after project reload where source_objects is empty).
-            if added_this_result == 0 and source_data:
-                for item in source_data:
-                    rebuilt = self._rebuild_object_from_snapshot(item)
-                    if rebuilt is None:
-                        continue
-                    if rebuilt.name in existing_names:
-                        # Object already in scene under the same name – select it
-                        for o in scene.objects:
-                            if getattr(o, "name", "") == rebuilt.name and o not in restored:
-                                restored.append(o)
-                                break
-                        continue
-                    scene.add_object(rebuilt)
-                    restored.append(rebuilt)
-                    restored_ids.add(id(rebuilt))
-                    existing_names.add(str(rebuilt.name))
+            # Rebuild each missing source from its snapshot. After reopening a
+            # project, retained tools may be live while the removed base is not.
+            live_names = {
+                str(getattr(source_obj, "name", ""))
+                for source_obj in sources
+                if source_obj is not result_obj
+            }
+            for item in source_data:
+                if not isinstance(item, dict):
+                    continue
+                source_name = str(item.get("name", "")).strip()
+                if source_name in live_names or source_name in existing_names:
+                    for existing_obj in scene.objects:
+                        if getattr(existing_obj, "name", "") == source_name and existing_obj not in restored:
+                            restored.append(existing_obj)
+                            break
+                    continue
+                rebuilt = self._rebuild_object_from_snapshot(item)
+                if rebuilt is None:
+                    continue
+                scene.add_object(rebuilt)
+                restored.append(rebuilt)
+                restored_ids.add(id(rebuilt))
+                existing_names.add(str(rebuilt.name))
 
         # Rebuild the tree FIRST so that highlight() can find the restored objects.
         self._viewport.scene_changed.emit()
@@ -1660,8 +1671,14 @@ class MainWindow(QMainWindow):
         self._recompute_parametric_objects()
 
     def _open_project_parameters(self) -> None:
-        self._project_properties_active = True
-        self._body_props.set_project_parameters(self._project_tree.get_settings().get("parameters", []))
+        settings = self._project_tree.get_settings()
+        dialog = ParametersDialog(settings.get("parameters", []), self)
+        if dialog.exec() != QDialog.Accepted:
+            return
+        settings["parameters"] = dialog.result_parameters()
+        self._project_tree.load_settings(settings)
+        self._project_tree.settings_changed.emit()
+        self._recompute_parametric_objects()
 
     def _parameter_values(self) -> dict[str, float]:
         values = {}
@@ -1681,9 +1698,67 @@ class MainWindow(QMainWindow):
     def _resolve_formula_text(self, text: str) -> float:
         return evaluate_expression(text, self._parameter_values())
 
+    def _resolve_creation_snap(self, snap: dict, objects_by_name: dict) -> list[float] | None:
+        source = objects_by_name.get(str(snap.get("object", "")))
+        if source is None or source.actor is None:
+            return None
+        mapper = source.actor.GetMapper()
+        dataset = mapper.GetInput() if mapper is not None else None
+        if dataset is None:
+            return None
+        kind = str(snap.get("kind", "")).lower()
+        if kind == "vertex":
+            point_id = snap.get("point_id")
+            if not isinstance(point_id, int) or not (0 <= point_id < dataset.GetNumberOfPoints()):
+                return None
+            local = dataset.GetPoint(point_id)
+        else:
+            local = snap.get("local")
+            if not isinstance(local, (list, tuple)) or len(local) != 3:
+                return None
+        world = source.actor.GetMatrix().MultiplyPoint([float(local[0]), float(local[1]), float(local[2]), 1.0])
+        return [float(world[i]) for i in range(3)]
+
+    def _regenerate_snap_dependent_objects(self, objects: list) -> None:
+        objects_by_name = {str(obj.name): obj for obj in objects}
+        for obj in objects:
+            history = getattr(obj, "creation_history", {})
+            raw_points = history.get("points", []) if isinstance(history, dict) else []
+            if not raw_points:
+                continue
+            points = []
+            for item in raw_points:
+                if not isinstance(item, dict):
+                    continue
+                point = item.get("value")
+                snap = item.get("snap", {})
+                resolved = self._resolve_creation_snap(snap, objects_by_name) if isinstance(snap, dict) else None
+                points.append(resolved or point)
+            points = [point for point in points if isinstance(point, (list, tuple)) and len(point) == 3]
+            if not points:
+                continue
+            params = obj.get_parameters()
+            mode = str(history.get("mode", "")).lower()
+            if type(obj).__name__ in {"BoxObject", "PlateObject"} and len(points) >= 2:
+                first, second = points[0], points[1]
+                for key, value in zip(("X1", "Y1", "Z1"), first):
+                    params[key] = float(value)
+                for key, value in zip(("X2", "Y2", "Z2"), second):
+                    params[key] = float(value)
+            elif mode in {"cylinder", "cone", "sphere", "ellipsoid", "torus"}:
+                first = points[0]
+                for key, value in zip(("CenterX", "CenterY", "CenterZ"), first):
+                    if key in params:
+                        params[key] = float(value)
+            else:
+                continue
+            obj.set_parameters(params)
+            obj.refresh_appearance()
+
     def _recompute_parametric_objects(self) -> None:
         values = self._parameter_values()
-        for obj in list(self._viewport.scene.objects):
+        objects = list(self._viewport.scene.objects)
+        for obj in objects:
             formulas = getattr(obj, "param_formulas", {}) or {}
             if not formulas:
                 continue
@@ -1695,6 +1770,7 @@ class MainWindow(QMainWindow):
                 obj.refresh_appearance()
             except Exception as exc:
                 self._info_bar.set_info(f"{obj.name}: {exc}")
+        self._regenerate_snap_dependent_objects(objects)
         self._viewport._render()
 
     def _on_object_selected(self, obj) -> None:

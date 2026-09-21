@@ -328,6 +328,7 @@ class SceneManager:
                 "visible": obj.is_visible(),
                 "is_model": bool(getattr(obj, "is_model", True)),
                 "param_formulas": dict(getattr(obj, "param_formulas", {}) or {}),
+                "creation_history": dict(getattr(obj, "creation_history", {}) or {}),
                 **obj.to_json_state(),
             }
             if obj.actor is not None:
@@ -442,6 +443,8 @@ class SceneManager:
                 obj.is_model = bool(item.get("is_model", True))
                 formulas = item.get("param_formulas", {})
                 obj.param_formulas = dict(formulas) if isinstance(formulas, dict) else {}
+                history = item.get("creation_history", {})
+                obj.creation_history = dict(history) if isinstance(history, dict) else {}
                 self.add_object(obj)
                 transform = item.get("actor_transform", {})
                 if isinstance(transform, dict) and obj.actor is not None:
