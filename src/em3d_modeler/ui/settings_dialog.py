@@ -111,9 +111,7 @@ class SettingsDialog(QDialog):
 
         self._solver_combo = QComboBox(self._simulation_tab)
         self._solver_combo.addItems([
-            "PARDISO", "CUDSS", "SUPERLU", "UMFPACK", "LAPACK", "ARPACK",
-            "SMART_ARPACK_BMA", "MUMPS", "AASDS", "BICGSTAB", "CG",
-            "CHOLMOD", "RSLAB", "SPARTA", "TEST",
+            "PARDISO", "SUPERLU", "UMFPACK", "CUDSS", "AASDS", "MUMPS",
         ])
         sim_form.addRow("Solver", self._solver_combo)
 

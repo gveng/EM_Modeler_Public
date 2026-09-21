@@ -9,7 +9,7 @@ Structure
   │   ├── Ymin / Ymax
   │   └── Zmin / Zmax
   ├── Ports
-  │   └── [Port items, double-click to add/edit]
+    │   └── [Port items; use the section context menu to add]
   ├── Simulation
   │   ├── Fmin  [GHz]
   │   ├── Fmax  [GHz]
@@ -437,10 +437,6 @@ class ProjectTreeWidget(QWidget):
                 row.setForeground(1, warn_brush)
             row.setData(0, Qt.UserRole, ("__port_idx__", i))
             self._p_node.addChild(row)
-        # Add-port hint
-        hint = QTreeWidgetItem(["[+ double-click to add port]", ""])
-        hint.setData(0, Qt.UserRole, "__add_port__")
-        self._p_node.addChild(hint)
 
     def _refresh_simulations(self) -> None:
         self._s_node.takeChildren()
@@ -476,10 +472,6 @@ class ProjectTreeWidget(QWidget):
             row.setFont(0, font)
             row.setFont(1, font)
             self._s_node.addChild(row)
-
-        hint = QTreeWidgetItem(["Add Simulation... (double-click)", ""])
-        hint.setData(0, Qt.UserRole, "__add_sim__")
-        self._s_node.addChild(hint)
 
     def _simulation_names(self) -> list[str]:
         sims = self._settings.get("simulations", [])
@@ -523,11 +515,6 @@ class ProjectTreeWidget(QWidget):
             sim_node.setData(0, Qt.UserRole, ("__out_sim__", sim_name))
             sim_node.setExpanded(sim_name in expanded_simulations)
             rows = grouped.get(sim_name, [])
-            if not rows:
-                hint = QTreeWidgetItem(["[double-click to add plot]", ""])
-                hint.setData(0, Qt.UserRole, ("__add_out__", sim_name))
-                sim_node.addChild(hint)
-                continue
             for out_idx, output in rows:
                 name = str(output.get("name", f"Output_{out_idx+1}")).strip() or f"Output_{out_idx+1}"
                 plot_type = str(output.get("plot_type", "plot_sp")).strip()
@@ -550,10 +537,6 @@ class ProjectTreeWidget(QWidget):
                 row.setForeground(1, warn_brush)
                 unknown_node.addChild(row)
 
-        add_hint = QTreeWidgetItem(["Add Output Plot... (double-click)", ""])
-        add_hint.setData(0, Qt.UserRole, "__add_out_global__")
-        node.addChild(add_hint)
-
     def _refresh_object_boundaries(self) -> None:
         self._b_obj_node.takeChildren()
         for i, bc in enumerate(self._settings.get("object_boundaries", [])):
@@ -563,10 +546,6 @@ class ProjectTreeWidget(QWidget):
             row = QTreeWidgetItem([txt, ""])
             row.setData(0, Qt.UserRole, ("__bc_idx__", i))
             self._b_obj_node.addChild(row)
-
-        hint = QTreeWidgetItem(["[assign from Object/Materials right-click]", ""])
-        hint.setData(0, Qt.UserRole, "__bc_hint__")
-        self._b_obj_node.addChild(hint)
 
     def _refresh_object_mesh_assignments(self) -> None:
         node = getattr(self, "_m_obj_node", None)
@@ -604,10 +583,6 @@ class ProjectTreeWidget(QWidget):
                 row.setForeground(1, warn_brush)
             node.addChild(row)
 
-        hint = QTreeWidgetItem(["[assign from Object/Materials right-click]", ""])
-        hint.setData(0, Qt.UserRole, "__mesh_hint__")
-        node.addChild(hint)
-
     # ─────────────────────────────────────────────────── editing
     def _on_double_click(self, item: QTreeWidgetItem, col: int) -> None:
         parent = item.parent()
@@ -615,17 +590,6 @@ class ProjectTreeWidget(QWidget):
             return
 
         role = item.data(0, Qt.UserRole)
-
-        # Add-port action
-        if role == "__add_port__":
-            self._add_port_dialog()
-            return
-        if role == "__add_sim__":
-            self._add_simulation_dialog()
-            return
-        if role == "__add_out_global__":
-            self._add_output_dialog(None)
-            return
 
         if isinstance(role, tuple) and len(role) == 2:
             tag, idx = role
@@ -640,9 +604,6 @@ class ProjectTreeWidget(QWidget):
                 return
             if tag == "__out_idx__":
                 self._run_output_plot(int(idx))
-                return
-            if tag == "__add_out__":
-                self._add_output_dialog(str(idx))
                 return
             if tag == "__mesh_default__":
                 self._edit_default_mesh_resolution()
@@ -664,6 +625,26 @@ class ProjectTreeWidget(QWidget):
     def _on_context_menu(self, pos) -> None:
         item = self._tree.itemAt(pos)
         if item is None:
+            return
+
+        menu = QMenu(self._tree)
+        if item is self._p_node:
+            action = QAction("Add Port…", menu)
+            action.triggered.connect(self._add_port_dialog)
+            menu.addAction(action)
+        elif item is self._s_node:
+            action = QAction("Add Simulation…", menu)
+            action.triggered.connect(self._add_simulation_dialog)
+            menu.addAction(action)
+        elif item is self._o_node:
+            action = QAction("Add Output Plot…", menu)
+            action.triggered.connect(lambda: self._add_output_dialog(None))
+            menu.addAction(action)
+        else:
+            menu = None
+
+        if menu is not None:
+            menu.exec_(self._tree.viewport().mapToGlobal(pos))
             return
 
         role = item.data(0, Qt.UserRole)

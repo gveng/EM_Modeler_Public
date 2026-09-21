@@ -16,8 +16,10 @@ from datetime import datetime
 from pathlib import Path
 from copy import deepcopy
 import os
+import subprocess
 import traceback
 import sys
+import ctypes
 import vtk
 
 # Resolve resources from source, PyInstaller's internal directory, or the EXE folder.
@@ -31,6 +33,44 @@ _ICONS_DIR = next(
     (root / "Icons" for root in _RESOURCE_ROOTS if (root / "Icons").is_dir()),
     _APP_ROOT / "Icons",
 )
+
+
+_JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
+_JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
+_PROCESS_TERMINATE = 0x0001
+_PROCESS_SET_QUOTA = 0x0100
+
+
+class _JobObjectBasicLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("PerProcessUserTimeLimit", ctypes.c_int64),
+        ("PerJobUserTimeLimit", ctypes.c_int64),
+        ("LimitFlags", ctypes.c_uint32),
+        ("MinimumWorkingSetSize", ctypes.c_size_t),
+        ("MaximumWorkingSetSize", ctypes.c_size_t),
+        ("ActiveProcessLimit", ctypes.c_uint32),
+        ("Affinity", ctypes.c_size_t),
+        ("PriorityClass", ctypes.c_uint32),
+        ("SchedulingClass", ctypes.c_uint32),
+    ]
+
+
+class _IoCounters(ctypes.Structure):
+    _fields_ = [(field, ctypes.c_uint64) for field in (
+        "ReadOperationCount", "WriteOperationCount", "OtherOperationCount",
+        "ReadTransferCount", "WriteTransferCount", "OtherTransferCount",
+    )]
+
+
+class _JobObjectExtendedLimitInformation(ctypes.Structure):
+    _fields_ = [
+        ("BasicLimitInformation", _JobObjectBasicLimitInformation),
+        ("IoInfo", _IoCounters),
+        ("ProcessMemoryLimit", ctypes.c_size_t),
+        ("JobMemoryLimit", ctypes.c_size_t),
+        ("PeakProcessMemoryUsed", ctypes.c_size_t),
+        ("PeakJobMemoryUsed", ctypes.c_size_t),
+    ]
 
 
 def _icon(name: str) -> "QIcon":
@@ -155,9 +195,7 @@ from .. import __version__, __release_date__
 # ������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������
 _UNITS  = ["mm", "um", "cm", "m", "mil", "inch"]
 _EMERGE_SOLVERS = frozenset({
-    "PARDISO", "CUDSS", "SUPERLU", "UMFPACK", "LAPACK", "ARPACK",
-    "SMART_ARPACK_BMA", "MUMPS", "AASDS", "BICGSTAB", "CG", "CHOLMOD",
-    "RSLAB", "SPARTA", "TEST",
+    "PARDISO", "SUPERLU", "UMFPACK", "CUDSS", "AASDS", "MUMPS",
 })
 _DOCS_ROOT = _APP_ROOT / "docs"
 _DOCS_HELP = _DOCS_ROOT / "HELP.md"
@@ -1380,20 +1418,43 @@ class MainWindow(QMainWindow):
         if len(tools) > 8:
             names += f", ... (+{len(tools)-8} more)"
 
-        reply = QMessageBox.question(
-            self,
-            f"Confirm Boolean {label}",
-            f"Perform Boolean {label}?\n\n"
-            f"Base : {base.name}\n"
-            f"Tools: {len(tools)} object(s)\n"
-            f"{names}\n\n"
-            "All source objects will be removed and replaced by one result.",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.Yes,
-        )
-        if reply != QMessageBox.Yes:
-            self._info_bar.set_info(f"Boolean {label} cancelled.")
-            return
+        keep_tools = False
+        if op == "cut":
+            confirm = QMessageBox(self)
+            confirm.setIcon(QMessageBox.Question)
+            confirm.setWindowTitle(f"Confirm Boolean {label}")
+            confirm.setText(
+                f"Perform Boolean {label}?\n\n"
+                f"Base : {base.name}\n"
+                f"Tools: {len(tools)} object(s)\n"
+                f"{names}\n\n"
+                "Choose whether the tool objects remain in the project."
+            )
+            keep_button = confirm.addButton("Keep Tools", QMessageBox.ActionRole)
+            remove_button = confirm.addButton("Remove Tools", QMessageBox.AcceptRole)
+            confirm.addButton(QMessageBox.Cancel)
+            confirm.setDefaultButton(remove_button)
+            confirm.exec_()
+            clicked = confirm.clickedButton()
+            if clicked not in {keep_button, remove_button}:
+                self._info_bar.set_info(f"Boolean {label} cancelled.")
+                return
+            keep_tools = clicked is keep_button
+        else:
+            reply = QMessageBox.question(
+                self,
+                f"Confirm Boolean {label}",
+                f"Perform Boolean {label}?\n\n"
+                f"Base : {base.name}\n"
+                f"Tools: {len(tools)} object(s)\n"
+                f"{names}\n\n"
+                "All source objects will be removed and replaced by one result.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.Yes,
+            )
+            if reply != QMessageBox.Yes:
+                self._info_bar.set_info(f"Boolean {label} cancelled.")
+                return
 
         current_poly = None
         try:
@@ -1419,7 +1480,8 @@ class MainWindow(QMainWindow):
 
         scene = self._viewport.scene
         scene.add_object(result)
-        for obj in [base] + tools:
+        objects_to_remove = [base] + ([] if keep_tools else tools)
+        for obj in objects_to_remove:
             scene.remove_object(obj)
         scene.select(result)
 
@@ -1430,6 +1492,7 @@ class MainWindow(QMainWindow):
         self._viewport._render()
         self._info_bar.set_info(
             f"Boolean {label}: created {result.name} from {len(sel)} objects"
+            + ("; tools retained" if keep_tools else "")
         )
 
     def _bool_cut(self) -> None:
@@ -2233,24 +2296,46 @@ class MainWindow(QMainWindow):
             "import os\n"
             "import sys\n"
             "import subprocess\n\n"
+            "import time\n\n"
             "STOP_ON_ERROR = True\n\n"
             "def _run_children() -> int:\n"
             "    script_dir = os.path.dirname(os.path.abspath(__file__))\n"
+            "    cancel_file = os.path.join(script_dir, '.em3d_simulation_cancel')\n"
+            "    active_pid_file = os.path.join(script_dir, '.em3d_simulation_active.pid')\n"
             "    jobs = [\n"
             f"{jobs_literal}\n"
             "    ]\n"
             "    for job in jobs:\n"
+            "        if os.path.exists(cancel_file):\n"
+            "            print('[master] Cancellation requested; remaining jobs will not start.')\n"
+            "            return 130\n"
             "        child = str(job.get('filename', ''))\n"
             "        child_path = os.path.join(script_dir, child)\n"
             "        env = os.environ.copy()\n"
             "        env.setdefault('PYTHONIOENCODING', 'utf-8')\n"
             "        env.setdefault('PYTHONUTF8', '1')\n"
             "        print(f\"[master] Running job '{job.get('name')}' from {child_path}\")\n"
-            "        result = subprocess.run([sys.executable, '-u', child_path], cwd=script_dir, env=env)\n"
-            "        if result.returncode != 0:\n"
-            "            print(f\"[master] Job failed ({result.returncode}): {job.get('name')}\")\n"
+            "        process = subprocess.Popen([sys.executable, '-u', child_path], cwd=script_dir, env=env)\n"
+            "        with open(active_pid_file, 'w', encoding='ascii') as pid_file:\n"
+            "            pid_file.write(str(process.pid))\n"
+            "        while process.poll() is None:\n"
+            "            if os.path.exists(cancel_file):\n"
+            "                print(f\"[master] Cancellation requested; stopping job '{job.get('name')}'.\")\n"
+            "                process.terminate()\n"
+            "                try:\n"
+            "                    process.wait(timeout=5)\n"
+            "                except subprocess.TimeoutExpired:\n"
+            "                    process.kill()\n"
+            "                return 130\n"
+            "            time.sleep(0.2)\n"
+            "        try:\n"
+            "            os.remove(active_pid_file)\n"
+            "        except FileNotFoundError:\n"
+            "            pass\n"
+            "        if process.returncode != 0:\n"
+            "            print(f\"[master] Job failed ({process.returncode}): {job.get('name')}\")\n"
             "            if STOP_ON_ERROR:\n"
-            "                return int(result.returncode)\n"
+            "                return int(process.returncode)\n"
             "    print('[master] All simulations completed successfully.')\n"
             "    return 0\n\n"
             "if __name__ == '__main__':\n"
@@ -2572,6 +2657,70 @@ class MainWindow(QMainWindow):
             child_path.write_text(str(item.get("content", "")), encoding="utf-8")
             self._append_sim_log(f"[info] Child script saved: {child_path}")
 
+    def _close_simulation_job(self) -> None:
+        job_handle = getattr(self, "_sim_job_handle", None)
+        if not job_handle:
+            return
+        try:
+            ctypes.windll.kernel32.CloseHandle(job_handle)
+        except (AttributeError, OSError):
+            pass
+        self._sim_job_handle = None
+
+    def _attach_simulation_job(self, process: QProcess) -> None:
+        """Place the simulation master and every descendant in one Windows job."""
+        if os.name != "nt" or process is not getattr(self, "_sim_process", None):
+            return
+        process_id = int(process.processId())
+        if process_id <= 0:
+            return
+
+        self._close_simulation_job()
+        kernel32 = ctypes.windll.kernel32
+        kernel32.CreateJobObjectW.restype = ctypes.c_void_p
+        kernel32.OpenProcess.restype = ctypes.c_void_p
+        job_handle = kernel32.CreateJobObjectW(None, None)
+        if not job_handle:
+            self._append_sim_log("[warn] Could not create the simulation process job.")
+            return
+
+        limits = _JobObjectExtendedLimitInformation()
+        limits.BasicLimitInformation.LimitFlags = _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE
+        configured = kernel32.SetInformationJobObject(
+            ctypes.c_void_p(job_handle),
+            _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION,
+            ctypes.byref(limits),
+            ctypes.sizeof(limits),
+        )
+        process_handle = kernel32.OpenProcess(
+            _PROCESS_TERMINATE | _PROCESS_SET_QUOTA,
+            False,
+            process_id,
+        )
+        assigned = bool(process_handle) and bool(
+            kernel32.AssignProcessToJobObject(ctypes.c_void_p(job_handle), ctypes.c_void_p(process_handle))
+        )
+        if process_handle:
+            kernel32.CloseHandle(ctypes.c_void_p(process_handle))
+        if configured and assigned:
+            self._sim_job_handle = job_handle
+            self._append_sim_log("[info] Simulation workers are tracked by a Windows process job.")
+            return
+
+        kernel32.CloseHandle(ctypes.c_void_p(job_handle))
+        self._append_sim_log("[warn] Could not assign simulation to a Windows process job; using PID fallback.")
+
+    def _terminate_simulation_job(self) -> bool:
+        job_handle = getattr(self, "_sim_job_handle", None)
+        if not job_handle:
+            return False
+        try:
+            terminated = bool(ctypes.windll.kernel32.TerminateJobObject(ctypes.c_void_p(job_handle), 130))
+        except (AttributeError, OSError):
+            terminated = False
+        self._close_simulation_job()
+        return terminated
+
     def _on_sim_run(self) -> None:
         try:
             master_script = self._generate_simulation_assets(show_progress=True, force_script=False)
@@ -2583,6 +2732,13 @@ class MainWindow(QMainWindow):
 
         bundle = self._sim_cached_script_bundle
         script_path = self._simulation_script_path()
+        cancel_file = script_path.parent / ".em3d_simulation_cancel"
+        active_pid_file = script_path.parent / ".em3d_simulation_active.pid"
+        for control_file in (cancel_file, active_pid_file):
+            try:
+                control_file.unlink(missing_ok=True)
+            except OSError as exc:
+                self._append_sim_log(f"[warn] Could not reset simulation control file {control_file.name}: {exc}")
         script_path.write_text(str(bundle.get("master", "")), encoding="utf-8")
         for item in bundle.get("scripts", []):
             child_name = str(item.get("filename", "simulation_emerge_run.py"))
@@ -2602,6 +2758,7 @@ class MainWindow(QMainWindow):
         self._sim_process.setProcessChannelMode(QProcess.MergedChannels)
         self._sim_process.readyReadStandardOutput.connect(self._on_sim_process_output)
         self._sim_process.finished.connect(self._on_sim_finished)
+        self._sim_process.started.connect(lambda process=self._sim_process: self._attach_simulation_job(process))
         self._sim_process.start()
 
         self._sim_btn_run.setEnabled(False)
@@ -2611,8 +2768,48 @@ class MainWindow(QMainWindow):
         proc = getattr(self, "_sim_process", None)
         if proc is None or proc.state() == QProcess.NotRunning:
             return
-        proc.kill()
-        self._append_sim_log("[info] Simulation process terminated by user.")
+
+        process_id = int(proc.processId())
+        script_path = self._simulation_script_path()
+        cancel_file = script_path.parent / ".em3d_simulation_cancel"
+        active_pid_file = script_path.parent / ".em3d_simulation_active.pid"
+        try:
+            cancel_file.write_text("cancelled\n", encoding="ascii")
+        except OSError as exc:
+            self._append_sim_log(f"[warn] Could not signal simulation cancellation: {exc}")
+
+        process_ids = {process_id} if process_id > 0 else set()
+        try:
+            active_pid = int(active_pid_file.read_text(encoding="ascii").strip())
+            if active_pid > 0:
+                process_ids.add(active_pid)
+        except (OSError, ValueError):
+            pass
+
+        stopped_tree = False
+        if self._terminate_simulation_job():
+            stopped_tree = True
+        if not stopped_tree and os.name == "nt" and process_ids:
+            for target_pid in process_ids:
+                try:
+                    result = subprocess.run(
+                        ["taskkill", "/PID", str(target_pid), "/T", "/F"],
+                        capture_output=True,
+                        text=True,
+                        check=False,
+                        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0),
+                    )
+                    stopped_tree = result.returncode == 0 or stopped_tree
+                    if result.returncode != 0:
+                        detail = (result.stderr or result.stdout).strip()
+                        self._append_sim_log(f"[warn] Could not stop simulation PID {target_pid}: {detail}")
+                except OSError as exc:
+                    self._append_sim_log(f"[warn] Process-tree stop failed for PID {target_pid}: {exc}")
+
+        if not stopped_tree and proc.state() != QProcess.NotRunning:
+            proc.kill()
+
+        self._append_sim_log("[info] Cancellation requested; active and queued simulation jobs were stopped.")
 
     def _on_sim_process_output(self) -> None:
         proc = getattr(self, "_sim_process", None)
@@ -2623,6 +2820,7 @@ class MainWindow(QMainWindow):
             self._append_sim_log(data.rstrip("\n"))
 
     def _on_sim_finished(self, exit_code: int, _status) -> None:
+        self._close_simulation_job()
         self._append_sim_log(f"[info] Simulation finished with exit code {exit_code}.")
         if hasattr(self, "_sim_btn_run"):
             self._sim_btn_run.setEnabled(True)
@@ -3323,6 +3521,62 @@ class MainWindow(QMainWindow):
         except Exception:
             return [1]
 
+    def _track_output_plot_windows(self, existing_figures: set[int]) -> None:
+        """Release result arrays retained by Matplotlib after a plot is closed."""
+        try:
+            import gc
+            import weakref
+            import matplotlib.pyplot as plt
+            from matplotlib._pylab_helpers import Gcf
+        except ImportError:
+            return
+
+        for manager in Gcf.get_all_fig_managers():
+            figure = getattr(getattr(manager, "canvas", None), "figure", None)
+            if figure is None or id(figure) in existing_figures:
+                continue
+
+            figure_ref = weakref.ref(figure)
+            def make_release(current_figure_ref):
+                released = False
+
+                def release(*_args):
+                    nonlocal released
+                    if released:
+                        return
+                    released = True
+                    plot_figure = current_figure_ref()
+                    if plot_figure is not None:
+                        try:
+                            plt.close(plot_figure)
+                            plot_figure.clear()
+                        except Exception:
+                            pass
+                    gc.collect()
+
+                return release
+
+            release = make_release(figure_ref)
+            figure.canvas.mpl_connect("close_event", release)
+            window = getattr(manager, "window", None)
+            destroyed = getattr(window, "destroyed", None)
+            if destroyed is not None:
+                destroyed.connect(release)
+
+    def _run_output_plot(self, callback) -> None:
+        """Generate one plot and register deterministic cleanup for its window."""
+        try:
+            from matplotlib._pylab_helpers import Gcf
+            existing_figures = {
+                id(manager.canvas.figure)
+                for manager in Gcf.get_all_fig_managers()
+                if getattr(getattr(manager, "canvas", None), "figure", None) is not None
+            }
+        except ImportError:
+            existing_figures = set()
+        callback()
+        self._track_output_plot_windows(existing_figures)
+
     def _on_output_plot_requested(self, payload: dict) -> None:
         name = str(payload.get("name", "Output")).strip() or "Output"
         sim_name = str(payload.get("simulation", "")).strip()
@@ -3477,11 +3731,11 @@ class MainWindow(QMainWindow):
                 if plot_type == "plot_ff":
                     if plot_ff is None:
                         raise RuntimeError("EMERGE does not expose plot_ff in this installation.")
-                    plot_ff(theta_arr, values_arr, dB=True, labels=[name], xlabel="Theta (rad)", ylabel="Magnitude (dB)", title=f"{name} - {plane} plane")
+                    self._run_output_plot(lambda: plot_ff(theta_arr, values_arr, dB=True, labels=[name], xlabel="Theta (rad)", ylabel="Magnitude (dB)", title=f"{name} - {plane} plane"))
                 else:
                     if plot_ff_polar is None:
                         raise RuntimeError("EMERGE does not expose plot_ff_polar in this installation.")
-                    plot_ff_polar(theta_arr, values_arr, dB=True, dBfloor=-80, labels=[name], title=f"{name} - {plane} plane", zero_location="N", clockwise=False)
+                    self._run_output_plot(lambda: plot_ff_polar(theta_arr, values_arr, dB=True, dBfloor=-80, labels=[name], title=f"{name} - {plane} plane", zero_location="N", clockwise=False))
             self._info_bar.set_info(f"Output plotted: {name} ({plot_type}) from {simdata_path}")
             self._append_sim_log(f"[info] Output plotted: {name} ({plot_type}) from {simdata_path}")
             return
@@ -3522,14 +3776,14 @@ class MainWindow(QMainWindow):
 
         try:
             if plot_type == "plot_sp":
-                plot_sp(freq, curves, labels=labels)
+                self._run_output_plot(lambda: plot_sp(freq, curves, labels=labels))
             elif plot_type == "plot_vswr":
-                plot_vswr(freq, curves, labels=[f"VSWR{label[1:]}" for label in labels])
+                self._run_output_plot(lambda: plot_vswr(freq, curves, labels=[f"VSWR{label[1:]}" for label in labels]))
             elif plot_type == "smith":
-                smith(curves, f=freq, labels=labels)
+                self._run_output_plot(lambda: smith(curves, f=freq, labels=labels))
             elif plot_type == "plot":
                 magnitude_curves = [20.0 * np.log10(np.maximum(np.abs(curve), 1e-12)) for curve in curves]
-                plot(freq, magnitude_curves, labels=[f"|{label}| dB" for label in labels], xlabel="Frequency (Hz)", ylabel="Magnitude (dB)")
+                self._run_output_plot(lambda: plot(freq, magnitude_curves, labels=[f"|{label}| dB" for label in labels], xlabel="Frequency (Hz)", ylabel="Magnitude (dB)"))
             else:
                 QMessageBox.warning(self, "Output", f"Unsupported plot type: {plot_type}")
                 return
