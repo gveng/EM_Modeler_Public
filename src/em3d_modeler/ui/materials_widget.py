@@ -427,7 +427,7 @@ class MaterialsWidget(QWidget):
             QDialog, QFormLayout, QLineEdit, QSpinBox,
             QDialogButtonBox, QLabel,
         )
-        dlg = QDialog(self)
+        dlg = QDialog(self.window())
         dlg.setWindowTitle(f"Bulk Rename ({len(objs)} objects)")
         form = QFormLayout(dlg)
 

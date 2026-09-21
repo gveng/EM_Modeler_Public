@@ -23,6 +23,9 @@ class FormulaDoubleSpinBox(QDoubleSpinBox):
 
     def value(self) -> float:  # type: ignore[override]
         text = self.lineEdit().text().strip()
+        suffix = self.suffix().strip()
+        if suffix and text.lower().endswith(suffix.lower()):
+            text = text[: -len(suffix)].strip()
         try:
             return float(text.replace(",", "."))
         except ValueError:

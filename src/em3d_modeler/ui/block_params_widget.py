@@ -115,10 +115,22 @@ class BlockParamsWidget(QWidget):
     def _collect_params(self) -> Dict[str, Any]:
         """Read all rows from table + material + opacity."""
         params: Dict[str, Any] = {}
+        metadata_keys = {
+            "StepSourcePath",
+            "StepSolidName",
+            "StepGeometryModified",
+            "StepExportOffset",
+            "BooleanOperation",
+            "BooleanSourceNames",
+            "BooleanSourcesData",
+        }
         for row in range(self._table.rowCount()):
             k = self._table.item(row, 0)
             v = self._table.item(row, 1)
             if k and v:
+                if k.text() in metadata_keys:
+                    params[k.text()] = self._obj.get_parameters().get(k.text(), v.text())
+                    continue
                 try:
                     params[k.text()] = float(v.text())
                 except ValueError:

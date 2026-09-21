@@ -18,6 +18,7 @@ Structure
       └── Assigned To Objects (resolution 1/λ)
 """
 from __future__ import annotations
+import re
 from typing import Any, Dict
 
 from PySide6.QtWidgets import (
@@ -82,6 +83,7 @@ def _default_simulation_item() -> Dict[str, Any]:
         "Fmin_GHz": 0.1,
         "Fmax_GHz": 10.0,
         "Fstep_GHz": 0.1,
+        "NumberOfPoints": 100,
         "EigenmodeCount": 5,
         "ParamName": "",
         "ParamValues": "",
@@ -102,7 +104,7 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
     "boundaries": {k: "PML" for k in _BOUNDARY_KEYS},
     "ports":      [],
     "object_boundaries": [],
-    "simulation": {"Fmin_GHz": 0.1, "Fmax_GHz": 10.0, "Fstep_GHz": 0.1, "LogVerbosity": "Info"},
+    "simulation": {"Fmin_GHz": 0.1, "Fmax_GHz": 10.0, "Fstep_GHz": 0.1, "NumberOfPoints": 100, "LogVerbosity": "Info"},
     "simulations": [_default_simulation_item()],
     "outputs": [],
     "mesh":       {"default_fraction": 0.3, "object_resolutions": {}},
@@ -313,9 +315,18 @@ class ProjectTreeWidget(QWidget):
             sim["Fmin_GHz"] = float(legacy_sim.get("Fmin_GHz", sim["Fmin_GHz"]))
             sim["Fmax_GHz"] = float(legacy_sim.get("Fmax_GHz", sim["Fmax_GHz"]))
             sim["Fstep_GHz"] = float(legacy_sim.get("Fstep_GHz", sim["Fstep_GHz"]))
+            sim["NumberOfPoints"] = max(2, int(legacy_sim.get("NumberOfPoints", round((sim["Fmax_GHz"] - sim["Fmin_GHz"]) / max(sim["Fstep_GHz"], 1e-9)) + 1)))
             lv = str(legacy_sim.get("LogVerbosity", "Info")).strip().title()
             sim["LogVerbosity"] = lv if lv in _LOG_VERBOSITY_LEVELS else "Info"
             merged["simulations"] = [sim]
+
+        for sim in merged["simulations"]:
+            if not isinstance(sim, dict):
+                continue
+            try:
+                sim["NumberOfPoints"] = max(2, int(sim.get("NumberOfPoints", round((float(sim.get("Fmax_GHz", 10.0)) - float(sim.get("Fmin_GHz", 0.1))) / max(float(sim.get("Fstep_GHz", 0.1)), 1e-9)) + 1)))
+            except (TypeError, ValueError, ZeroDivisionError):
+                sim["NumberOfPoints"] = 100
 
         valid_sim_names = {
             str(item.get("name", "")).strip()
@@ -375,6 +386,7 @@ class ProjectTreeWidget(QWidget):
                 "Fmin_GHz": float(chosen.get("Fmin_GHz", 0.1)),
                 "Fmax_GHz": float(chosen.get("Fmax_GHz", 10.0)),
                 "Fstep_GHz": float(chosen.get("Fstep_GHz", 0.1)),
+                "NumberOfPoints": max(2, int(chosen.get("NumberOfPoints", 100))),
                 "LogVerbosity": str(chosen.get("LogVerbosity", "Info")).strip().title(),
             }
         )
@@ -1181,12 +1193,32 @@ class ProjectTreeWidget(QWidget):
         cb_enabled.addItems(["Enabled", "Disabled"])
         cb_enabled.setCurrentText("Enabled" if bool(initial.get("enabled", True)) else "Disabled")
 
-        le_fmin = QLineEdit(_format_locale_number(float(initial.get("Fmin_GHz", 0.1))))
-        le_fmax = QLineEdit(_format_locale_number(float(initial.get("Fmax_GHz", 10.0))))
-        le_fstep = QLineEdit(_format_locale_number(float(initial.get("Fstep_GHz", 0.1))))
+        le_fmin = QLineEdit(str(initial.get("FminFormula", _format_locale_number(float(initial.get("Fmin_GHz", 0.1))))))
+        le_fmax = QLineEdit(str(initial.get("FmaxFormula", _format_locale_number(float(initial.get("Fmax_GHz", 10.0))))))
+        le_fstep = QLineEdit(str(initial.get("FstepFormula", _format_locale_number(float(initial.get("Fstep_GHz", 0.1))))))
+        initial_points = max(2, int(initial.get("NumberOfPoints", round((float(initial.get("Fmax_GHz", 10.0)) - float(initial.get("Fmin_GHz", 0.1))) / max(float(initial.get("Fstep_GHz", 0.1)), 1e-9)) + 1)))
+        le_points = QLineEdit(str(initial.get("NumberOfPointsFormula", initial_points)))
         le_modes = QLineEdit(str(int(initial.get("EigenmodeCount", 5))))
         le_param_name = QLineEdit(str(initial.get("ParamName", "")))
         le_param_values = QLineEdit(str(initial.get("ParamValues", "")))
+        variables = [
+            str(entry.get("name", "")).strip()
+            for entry in self._settings.get("parameters", [])
+            if isinstance(entry, dict) and str(entry.get("name", "")).strip()
+        ]
+        active_variable = QComboBox(dlg)
+        active_variable.addItem("None", "")
+        active_variable.addItems(variables)
+        active_variable.setCurrentText(str(initial.get("ActiveVariable", "")) or "None")
+        active_value = QLabel("-")
+
+        def update_active_value(_text: str = "") -> None:
+            name = str(active_variable.currentData() or "").strip()
+            entry = next((item for item in self._settings.get("parameters", []) if isinstance(item, dict) and str(item.get("name", "")).strip() == name), None)
+            active_value.setText(str(entry.get("value", "-")) if entry is not None else "-")
+
+        active_variable.currentTextChanged.connect(update_active_value)
+        update_active_value()
         fit_config = initial.get("sparam_fitting", {}) if isinstance(initial.get("sparam_fitting", {}), dict) else {}
         fit_check = QCheckBox("Enable S-parameter line fitting", dlg)
         fit_check.setChecked(bool(fit_config.get("enabled", False)))
@@ -1206,9 +1238,12 @@ class ProjectTreeWidget(QWidget):
         form.addRow("Fmin [GHz]", le_fmin)
         form.addRow("Fmax [GHz]", le_fmax)
         form.addRow("Fstep [GHz]", le_fstep)
+        form.addRow("Number of points", le_points)
         form.addRow("Eigenmode count", le_modes)
         form.addRow("Parametric name", le_param_name)
         form.addRow("Parametric values (CSV)", le_param_values)
+        form.addRow("Active variable", active_variable)
+        form.addRow("Variable value", active_value)
         form.addRow("S-parameter fitting", fit_check)
         form.addRow("Fitting points", fit_points)
         form.addRow("Log verbosity", cb_log)
@@ -1217,7 +1252,7 @@ class ProjectTreeWidget(QWidget):
             is_sweep = sim_type == "Sweep"
             is_eigen = sim_type == "Eigenmode"
             is_param = sim_type == "Parametric"
-            for w in (le_fmin, le_fmax, le_fstep):
+            for w in (le_fmin, le_fmax, le_fstep, le_points):
                 w.setVisible(is_sweep or is_param)
             le_modes.setVisible(is_eigen)
             le_param_name.setVisible(is_param)
@@ -1229,6 +1264,43 @@ class ProjectTreeWidget(QWidget):
         _update_visibility(current_type)
         cb_type.currentTextChanged.connect(_update_visibility)
         fit_check.toggled.connect(lambda checked: fit_points.setEnabled(bool(checked)))
+
+        syncing_points = {"active": False}
+
+        def update_points_from_step() -> None:
+            if syncing_points["active"]:
+                return
+            try:
+                fmin_value = self._parse_formula_float(le_fmin.text())
+                fmax_value = self._parse_formula_float(le_fmax.text())
+                step_value = self._parse_formula_float(le_fstep.text())
+                if step_value <= 0 or fmax_value <= fmin_value:
+                    return
+                syncing_points["active"] = True
+                le_points.setText(str(max(2, round((fmax_value - fmin_value) / step_value) + 1)))
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+            finally:
+                syncing_points["active"] = False
+
+        def update_step_from_points() -> None:
+            if syncing_points["active"]:
+                return
+            try:
+                fmin_value = self._parse_formula_float(le_fmin.text())
+                fmax_value = self._parse_formula_float(le_fmax.text())
+                points_value = max(2, int(round(self._parse_formula_float(le_points.text()))))
+                if fmax_value <= fmin_value:
+                    return
+                syncing_points["active"] = True
+                le_fstep.setText(_format_locale_number((fmax_value - fmin_value) / (points_value - 1)))
+            except (TypeError, ValueError, ZeroDivisionError):
+                pass
+            finally:
+                syncing_points["active"] = False
+
+        le_fstep.editingFinished.connect(update_points_from_step)
+        le_points.editingFinished.connect(update_step_from_points)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(dlg.accept)
@@ -1245,6 +1317,7 @@ class ProjectTreeWidget(QWidget):
             fmin = self._parse_formula_float(le_fmin.text())
             fmax = self._parse_formula_float(le_fmax.text())
             fstep = self._parse_formula_float(le_fstep.text())
+            points = max(2, int(round(self._parse_formula_float(le_points.text()))))
             modes = max(1, _parse_locale_int(le_modes.text()))
             name = le_name.text().strip() or "Simulation"
             log_v = cb_log.currentText().strip().title()
@@ -1257,6 +1330,12 @@ class ProjectTreeWidget(QWidget):
                 "Fmin_GHz": float(fmin),
                 "Fmax_GHz": float(fmax),
                 "Fstep_GHz": float(fstep),
+                "FminFormula": le_fmin.text().strip() if re.search(r"[A-Za-z_]", le_fmin.text()) else "",
+                "FmaxFormula": le_fmax.text().strip() if re.search(r"[A-Za-z_]", le_fmax.text()) else "",
+                "FstepFormula": le_fstep.text().strip() if re.search(r"[A-Za-z_]", le_fstep.text()) else "",
+                "NumberOfPoints": int(points),
+                "NumberOfPointsFormula": le_points.text().strip() if re.search(r"[A-Za-z_]", le_points.text()) else "",
+                "ActiveVariable": str(active_variable.currentData() or ""),
                 "EigenmodeCount": int(modes),
                 "ParamName": le_param_name.text().strip(),
                 "ParamValues": le_param_values.text().strip(),

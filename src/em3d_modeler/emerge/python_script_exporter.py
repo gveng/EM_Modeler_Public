@@ -247,7 +247,12 @@ def export_emerge_python_script(
         fmin = 1e-6
     if fmax <= fmin:
         fmax = fmin + max(fstep, 1e-6)
-    npoints = int(max(2, round((fmax - fmin) / max(fstep, 1e-9)) + 1))
+    configured_points = sim.get("NumberOfPoints")
+    if configured_points is None:
+        npoints = int(max(2, round((fmax - fmin) / max(fstep, 1e-9)) + 1))
+    else:
+        npoints = max(2, _to_int(configured_points, round((fmax - fmin) / max(fstep, 1e-9)) + 1))
+    fstep = (fmax - fmin) / (npoints - 1)
     fit_cfg = sim.get("sparam_fitting", {}) if isinstance(sim.get("sparam_fitting", {}), dict) else {}
     fit_enabled = _to_bool(fit_cfg.get("enabled", False))
     fit_points = max(8, _to_int(fit_cfg.get("points", 1001), 1001))
@@ -306,6 +311,9 @@ def export_emerge_python_script(
     eff_pardiso_threads = max(1, int(pardiso_threads if parallel_enabled else 1))
     eff_acc_threads = max(1, int(acc_threads if parallel_enabled else 1))
     used_materials = sorted({str(e.get("material", "PEC")) for e in [*step_entries, *plates]})
+    if ports and "PEC" not in used_materials:
+        used_materials.append("PEC")
+        used_materials.sort()
     detected_emerge_version = _detect_emerge_version()
     output_configs = []
     raw_outputs = settings.get("outputs", []) if isinstance(settings, dict) else []
@@ -602,11 +610,14 @@ def export_emerge_python_script(
             lines += [
                 f"port[{idx}] = {{}}",
                 f"port[{idx}]['name'] = {_q(name)}",
+                f"port[{idx}]['type'] = {_q(str(p.get('type', 'LumpedPort')))}",
                 f"port[{idx}]['w'] = {width}",
                 f"port[{idx}]['h'] = {height}",
                 f"port[{idx}]['portR'] = {z0}",
                 f"port[{idx}]['portDirection'] = ({direction[0]}, {direction[1]}, {direction[2]})",
                 f"port[{idx}]['portExcitationAmplitude'] = {power}",
+                f"port[{idx}]['mode'] = ({int((p.get('mode') or (1, 0))[0])}, {int((p.get('mode') or (1, 0))[1])})",
+                f"port[{idx}]['modeType'] = {_q(str(p.get('mode_type', 'TE')))}",
                 f"_port_{idx}_origin = ({_q(origin[0])}, {_q(origin[1])}, {_q(origin[2])})",
                 f"_port_{idx}_u = ({_q(u[0])}, {_q(u[1])}, {_q(u[2])})",
                 f"_port_{idx}_v = ({_q(v[0])}, {_q(v[1])}, {_q(v[2])})",
@@ -652,22 +663,32 @@ def export_emerge_python_script(
     ]
 
     if ports:
-        lines += [
-            "# Assign LumpedPort excitations to the already-created and committed Plates",
-        ]
+        lines += ["# Assign port excitations to the committed port Plates"]
         for p in ports:
             idx = int(p.get("index", 1))
-            lines += [
-                f"simulationObj.mw.bc.LumpedPort(",
-                f"    port[{idx}]['object'],",
-                f"    {idx},",
-                f"    width=port[{idx}]['w'],",
-                f"    height=port[{idx}]['h'],",
-                f"    direction=port[{idx}]['portDirection'],",
-                f"    Z0=port[{idx}]['portR'],",
-                f"    power=port[{idx}]['portExcitationAmplitude'],",
-                ")",
-            ]
+            if str(p.get("type", "LumpedPort")) == "WaveguidePort":
+                lines += [
+                    f"port[{idx}]['bc'] = simulationObj.mw.bc.RectangularWaveguide(",
+                    f"    port[{idx}]['object'],",
+                    f"    {idx},",
+                    f"    mode=port[{idx}]['mode'],",
+                    f"    mode_type=port[{idx}]['modeType'],",
+                    f"    dims=(port[{idx}]['w'], port[{idx}]['h']),",
+                    f"    power=port[{idx}]['portExcitationAmplitude'],",
+                    ")",
+                ]
+            else:
+                lines += [
+                    f"port[{idx}]['bc'] = simulationObj.mw.bc.LumpedPort(",
+                    f"    port[{idx}]['object'],",
+                    f"    {idx},",
+                    f"    width=port[{idx}]['w'],",
+                    f"    height=port[{idx}]['h'],",
+                    f"    direction=port[{idx}]['portDirection'],",
+                    f"    Z0=port[{idx}]['portR'],",
+                    f"    power=port[{idx}]['portExcitationAmplitude'],",
+                    ")",
+                ]
         lines += [
         "",
         ]

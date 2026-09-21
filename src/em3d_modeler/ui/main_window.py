@@ -1107,6 +1107,7 @@ class MainWindow(QMainWindow):
             "params": obj.get_parameters() if hasattr(obj, "get_parameters") else {},
             "visible": bool(obj.is_visible()) if hasattr(obj, "is_visible") else True,
             "is_model": bool(getattr(obj, "is_model", True)),
+            "param_formulas": dict(getattr(obj, "param_formulas", {}) or {}),
             "creation_history": dict(getattr(obj, "creation_history", {}) or {}),
         }
         if type(obj).__name__ == "MeshObject":
@@ -1168,6 +1169,8 @@ class MainWindow(QMainWindow):
 
             obj.set_visible(bool(item.get("visible", True)))
             obj.is_model = bool(item.get("is_model", True))
+            formulas = item.get("param_formulas", {})
+            obj.param_formulas = dict(formulas) if isinstance(formulas, dict) else {}
             history = item.get("creation_history", {})
             obj.creation_history = dict(history) if isinstance(history, dict) else {}
             obj.refresh_appearance()
@@ -1668,7 +1671,37 @@ class MainWindow(QMainWindow):
         settings["parameters"] = parameters
         self._project_tree.load_settings(settings)
         self._project_tree.settings_changed.emit()
+        self._recompute_simulation_parameters(settings)
         self._recompute_parametric_objects()
+
+    def _recompute_simulation_parameters(self, settings: dict | None = None) -> None:
+        settings = settings if isinstance(settings, dict) else self._project_tree.get_settings()
+        simulations = settings.get("simulations", [])
+        if not isinstance(simulations, list):
+            return
+        for simulation in simulations:
+            if not isinstance(simulation, dict):
+                continue
+            for formula_key, value_key in (
+                ("FminFormula", "Fmin_GHz"),
+                ("FmaxFormula", "Fmax_GHz"),
+                ("FstepFormula", "Fstep_GHz"),
+                ("NumberOfPointsFormula", "NumberOfPoints"),
+            ):
+                formula = str(simulation.get(formula_key, "")).strip()
+                if not formula:
+                    continue
+                try:
+                    value = self._resolve_formula_text(formula)
+                    simulation[value_key] = max(2, int(round(value))) if value_key == "NumberOfPoints" else float(value)
+                except Exception as exc:
+                    self._info_bar.set_info(f"{simulation.get('name', 'Simulation')}: {exc}")
+            if "NumberOfPointsFormula" in simulation and simulation.get("NumberOfPointsFormula"):
+                points = max(2, int(simulation.get("NumberOfPoints", 2)))
+                fmin = float(simulation.get("Fmin_GHz", 0.1))
+                fmax = float(simulation.get("Fmax_GHz", 10.0))
+                simulation["Fstep_GHz"] = (fmax - fmin) / (points - 1)
+        self._project_tree.load_settings(settings)
 
     def _open_project_parameters(self) -> None:
         settings = self._project_tree.get_settings()
@@ -1738,39 +1771,170 @@ class MainWindow(QMainWindow):
             if not points:
                 continue
             params = obj.get_parameters()
+            formulas = getattr(obj, "param_formulas", {}) or {}
             mode = str(history.get("mode", "")).lower()
             if type(obj).__name__ in {"BoxObject", "PlateObject"} and len(points) >= 2:
                 first, second = points[0], points[1]
                 for key, value in zip(("X1", "Y1", "Z1"), first):
-                    params[key] = float(value)
+                    if key not in formulas:
+                        params[key] = float(value)
                 for key, value in zip(("X2", "Y2", "Z2"), second):
-                    params[key] = float(value)
+                    if key not in formulas:
+                        params[key] = float(value)
             elif mode in {"cylinder", "cone", "sphere", "ellipsoid", "torus"}:
                 first = points[0]
                 for key, value in zip(("CenterX", "CenterY", "CenterZ"), first):
-                    if key in params:
+                    if key in params and key not in formulas:
                         params[key] = float(value)
             else:
                 continue
             obj.set_parameters(params)
             obj.refresh_appearance()
 
+    def _sync_boolean_provenance(self) -> None:
+        for result in list(self._viewport.scene.objects):
+            if str(getattr(result, "boolean_op", "") or "").strip().lower() not in {"fuse", "cut", "common"}:
+                continue
+            live_sources = {
+                str(getattr(source, "name", "")): source
+                for source in list(getattr(result, "source_objects", []) or [])
+            }
+            snapshots = list(getattr(result, "boolean_sources_data", []) or [])
+            for index, snapshot in enumerate(snapshots):
+                if not isinstance(snapshot, dict):
+                    continue
+                source = live_sources.get(str(snapshot.get("name", "")).strip())
+                if source is not None:
+                    snapshots[index] = self._serialize_object_snapshot(source)
+            result.boolean_sources_data = snapshots
+
+    def _replace_boolean_result_geometry(self, result, polydata) -> None:
+        """Replace a boolean result's VTK pipeline after a CSG recomputation."""
+        import vtk
+
+        result._polydata = polydata
+        actor = getattr(result, "actor", None)
+        if actor is None:
+            return
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(polydata)
+        mapper.ScalarVisibilityOff()
+        mapper.Update()
+        actor.SetMapper(mapper)
+        actor.Modified()
+        result.refresh_appearance()
+
+    def _replace_boolean_result_object(self, result, polydata, sources):
+        """Recreate a boolean result object while preserving its project identity."""
+        from ..scene.em_objects import MeshObject
+
+        scene = self._viewport.scene
+        if result not in scene.objects:
+            self._replace_boolean_result_geometry(result, polydata)
+            return result
+
+        index = scene.objects.index(result)
+        was_selected = result in scene.selection
+        visible = result.is_visible()
+        replacement = MeshObject(
+            name=result.name,
+            polydata=polydata,
+            material=result.material,
+            boolean_op=getattr(result, "boolean_op", None),
+            boolean_source_names=list(getattr(result, "boolean_source_names", []) or []),
+            boolean_sources_data=[self._serialize_object_snapshot(source) for source in sources],
+        )
+        replacement.opacity = result.opacity
+        replacement.is_model = bool(getattr(result, "is_model", True))
+        replacement.custom_color = getattr(result, "custom_color", None)
+        replacement.source_objects = list(sources)
+        replacement.creation_plane = result.creation_plane
+        replacement.creation_plane_origin = result.creation_plane_origin
+        replacement.creation_plane_normal = result.creation_plane_normal
+        replacement.param_formulas = dict(getattr(result, "param_formulas", {}) or {})
+        replacement.creation_history = dict(getattr(result, "creation_history", {}) or {})
+        replacement.set_visible(visible)
+        replacement.refresh_appearance()
+
+        scene.remove_object(result)
+        scene.objects.insert(min(index, len(scene.objects)), replacement)
+        for actor in replacement.all_actors:
+            scene.renderer.AddActor(actor)
+        if was_selected:
+            scene.select(replacement)
+        return replacement
+
     def _recompute_parametric_objects(self) -> None:
+        from ..scene.boolean_ops import boolean_many, fuse_many
+
         values = self._parameter_values()
-        objects = list(self._viewport.scene.objects)
-        for obj in objects:
+        self._sync_boolean_provenance()
+        objects = []
+        seen = set()
+
+        def collect(obj) -> None:
+            if obj is None or id(obj) in seen:
+                return
+            seen.add(id(obj))
+            objects.append(obj)
+            for source in list(getattr(obj, "source_objects", []) or []):
+                collect(source)
+
+        for scene_obj in list(self._viewport.scene.objects):
+            collect(scene_obj)
+
+        def apply_formulas(obj) -> None:
             formulas = getattr(obj, "param_formulas", {}) or {}
             if not formulas:
-                continue
+                return
             params = obj.get_parameters()
+            for key, formula in formulas.items():
+                params[key] = evaluate_expression(formula, values)
+            obj.set_parameters(params)
+            obj.refresh_appearance()
+
+        for obj in objects:
             try:
-                for key, formula in formulas.items():
-                    params[key] = evaluate_expression(formula, values)
-                obj.set_parameters(params)
-                obj.refresh_appearance()
+                apply_formulas(obj)
             except Exception as exc:
                 self._info_bar.set_info(f"{obj.name}: {exc}")
         self._regenerate_snap_dependent_objects(objects)
+
+        # A retained boolean result can have only some live sources after reload.
+        # Rebuild missing sources from their snapshots before recomputing the CSG.
+        for result in list(objects):
+            operation = str(getattr(result, "boolean_op", "") or "").strip().lower()
+            if operation not in {"fuse", "cut", "common"}:
+                continue
+            source_by_name = {
+                str(getattr(source, "name", "")): source
+                for source in list(getattr(result, "source_objects", []) or [])
+            }
+            for snapshot in list(getattr(result, "boolean_sources_data", []) or []):
+                name = str(snapshot.get("name", "")).strip() if isinstance(snapshot, dict) else ""
+                if not name or name in source_by_name:
+                    continue
+                rebuilt = self._rebuild_object_from_snapshot(snapshot)
+                if rebuilt is None:
+                    continue
+                try:
+                    apply_formulas(rebuilt)
+                except Exception as exc:
+                    self._info_bar.set_info(f"{rebuilt.name}: {exc}")
+                source_by_name[name] = rebuilt
+                objects.append(rebuilt)
+            source_names = list(getattr(result, "boolean_source_names", []) or [])
+            ordered_sources = [source_by_name[name] for name in source_names if name in source_by_name]
+            if len(ordered_sources) < 2:
+                continue
+            result.source_objects = ordered_sources
+            try:
+                polydata = fuse_many(ordered_sources) if operation == "fuse" else boolean_many(operation, ordered_sources)
+                replacement = self._replace_boolean_result_object(result, polydata, ordered_sources)
+                if result in objects:
+                    objects[objects.index(result)] = replacement
+            except Exception as exc:
+                self._info_bar.set_info(f"{result.name}: boolean recompute failed: {exc}")
         self._viewport._render()
 
     def _on_object_selected(self, obj) -> None:
@@ -1801,6 +1965,7 @@ class MainWindow(QMainWindow):
             self._info_bar.set_info(f"{len(objects)} objects selected (Ctrl+click to extend)")
 
     def _on_params_changed(self, obj, _params) -> None:
+        self._sync_boolean_provenance()
         self._viewport._render()
         self._refresh_materials()
         self._mark_simulation_dirty(steps=True, script=True)
@@ -2266,7 +2431,8 @@ class MainWindow(QMainWindow):
         for port in settings_ports:
             if not isinstance(port, dict):
                 continue
-            if str(port.get("type", "")).strip() != "LumpedPort":
+            port_type = str(port.get("type", "")).strip()
+            if port_type not in {"LumpedPort", "WaveguidePort"}:
                 continue
 
             obj_name = str(port.get("object", "")).strip()
@@ -2329,15 +2495,28 @@ class MainWindow(QMainWindow):
                     if normal_length > 1e-12
                     else [0.0, 0.0, 1.0]
                 )
-            z0 = float(params.get("Resistance_Ohm", 50.0))
-            power = float(params.get("Voltage_V", 1.0))
-            entries.append(
-                {
+            if port_type == "WaveguidePort":
+                mode_text = str(params.get("Mode", "TE10")).strip().upper()
+                mode_type = "TM" if mode_text.startswith("TM") else "TE"
+                digits = mode_text[2:] if mode_text.startswith(("TE", "TM")) else "10"
+                try:
+                    mode = (int(digits[0]), int(digits[1]))
+                except (ValueError, IndexError):
+                    mode = (1, 0)
+                z0 = float(params.get("Impedance_Ohm", 50.0))
+                power = float(params.get("Excitation", 1.0))
+            else:
+                mode_type = "TE"
+                mode = (1, 0)
+                z0 = float(params.get("Resistance_Ohm", 50.0))
+                power = float(params.get("Voltage_V", 1.0))
+            entry = {
                     # EMERGE requires contiguous technical port IDs (1..N).
                     # The user-selected number remains available as metadata/display.
                     "index": port_index,
                     "display_number": port.get("number", port_index),
                     "name": str(port.get("name", f"Port_{port_index}")),
+                    "type": port_type,
                     "plate_name": obj_name,
                     "origin": origin,
                     "u": u,
@@ -2348,7 +2527,9 @@ class MainWindow(QMainWindow):
                     "z0": z0,
                     "power": power,
                 }
-            )
+            entry["mode_type"] = mode_type
+            entry["mode"] = mode
+            entries.append(entry)
             port_index += 1
         return entries
 
@@ -2400,6 +2581,12 @@ class MainWindow(QMainWindow):
                     "Fmin_GHz": item.get("Fmin_GHz", 0.1),
                     "Fmax_GHz": item.get("Fmax_GHz", 10.0),
                     "Fstep_GHz": item.get("Fstep_GHz", 0.1),
+                    "NumberOfPoints": item.get("NumberOfPoints", 100),
+                    "FminFormula": item.get("FminFormula", ""),
+                    "FmaxFormula": item.get("FmaxFormula", ""),
+                    "FstepFormula": item.get("FstepFormula", ""),
+                    "NumberOfPointsFormula": item.get("NumberOfPointsFormula", ""),
+                    "ActiveVariable": item.get("ActiveVariable", ""),
                     "EigenmodeCount": item.get("EigenmodeCount", 5),
                     "ParamName": item.get("ParamName", ""),
                     "ParamValues": item.get("ParamValues", ""),
@@ -2420,6 +2607,12 @@ class MainWindow(QMainWindow):
             "Fmin_GHz": legacy.get("Fmin_GHz", 0.1),
             "Fmax_GHz": legacy.get("Fmax_GHz", 10.0),
             "Fstep_GHz": legacy.get("Fstep_GHz", 0.1),
+            "NumberOfPoints": legacy.get("NumberOfPoints", 100),
+            "FminFormula": legacy.get("FminFormula", ""),
+            "FmaxFormula": legacy.get("FmaxFormula", ""),
+            "FstepFormula": legacy.get("FstepFormula", ""),
+            "NumberOfPointsFormula": legacy.get("NumberOfPointsFormula", ""),
+            "ActiveVariable": legacy.get("ActiveVariable", ""),
             "EigenmodeCount": legacy.get("EigenmodeCount", 5),
             "ParamName": legacy.get("ParamName", ""),
             "ParamValues": legacy.get("ParamValues", ""),
@@ -4037,6 +4230,7 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(f"EM 3D Modeler - {self._project_name}")
             self._project_tree.set_project_name(self._project_name)
             self._project_tree.load_settings(data.get("emerge_settings", {}))
+            self._recompute_simulation_parameters()
             self._sync_log_verbosity_from_settings()
             self._viewport.scene.from_json(data.get("objects", []))
             self._viewport.scene.reference_planes_from_json(

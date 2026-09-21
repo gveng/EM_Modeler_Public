@@ -403,12 +403,25 @@ class BodyPropertiesWidget(QWidget):
     def _collect_params(self) -> Dict[str, Any]:
         params: Dict[str, Any] = {}
         formulas: Dict[str, str] = {}
+        metadata_keys = {
+            "StepSourcePath",
+            "StepSolidName",
+            "StepGeometryModified",
+            "StepExportOffset",
+            "BooleanOperation",
+            "BooleanSourceNames",
+            "BooleanSourcesData",
+        }
+        original_params = self._obj.get_parameters() if self._obj is not None else {}
         for row in range(self._table.rowCount()):
             k = self._table.item(row, 0)
             v = self._table.item(row, 1)
             if k and v:
                 if k.text() == "Color":
                     params[k.text()] = v.text()
+                    continue
+                if k.text() in metadata_keys:
+                    params[k.text()] = original_params.get(k.text(), v.text())
                     continue
                 try:
                     params[k.text()] = float(v.text())
