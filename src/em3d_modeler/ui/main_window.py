@@ -528,7 +528,10 @@ class MainWindow(QMainWindow):
         act_planar = QAction(_icon("Std_Plane"), "Planar", self)
         act_planar.setToolTip("Define planar structure: pick start/end (vertex/edge/face snap) on active plane")
         act_planar.triggered.connect(lambda: self._start_draw("planar"))
-        add_group("2D", [act_sketch, act_planar], columns=2)
+        act_plate_face = QAction(_icon("Part_Box"), "Plate from Face", self)
+        act_plate_face.setToolTip("Create a thin plate from the last selected face")
+        act_plate_face.triggered.connect(self._create_plate_from_face)
+        add_group("2D", [act_sketch, act_planar, act_plate_face], columns=3)
 
         # ������ Boolean operations ������������������������������������������������������������������������������������������������������������
         act_cut = QAction(_icon("Part_Cut"), "Cut", self)
@@ -715,6 +718,9 @@ class MainWindow(QMainWindow):
         plane    = self._active_draw_plane_name()
         material = self._draw_material
         self._viewport.start_draw(mode, plane, material)
+
+    def _create_plate_from_face(self) -> None:
+        self._viewport.create_plate_from_face(self._draw_material)
 
     def _delete_selected(self) -> None:
         objects = list(self._viewport.scene.selection)
@@ -1048,6 +1054,8 @@ class MainWindow(QMainWindow):
 
         pick_button = QPushButton("Pick reference point on object", dlg)
         form.addRow(pick_button)
+        pick_target_button = QPushButton("Pick target point in viewport", dlg)
+        form.addRow(pick_target_button)
         form.addRow("Reference X", ref_fields[0])
         form.addRow("Reference Y", ref_fields[1])
         form.addRow("Reference Z", ref_fields[2])
@@ -1064,6 +1072,14 @@ class MainWindow(QMainWindow):
 
         pick_button.clicked.connect(
             lambda: self._viewport.request_pick("point", set_reference)
+        )
+
+        def set_target(point: tuple[float, float, float]) -> None:
+            for field, value in zip(target_fields, point):
+                field.setValue(float(value))
+
+        pick_target_button.clicked.connect(
+            lambda: self._viewport.request_pick("point", set_target)
         )
 
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
@@ -1109,6 +1125,7 @@ class MainWindow(QMainWindow):
             "is_model": bool(getattr(obj, "is_model", True)),
             "param_formulas": dict(getattr(obj, "param_formulas", {}) or {}),
             "creation_history": dict(getattr(obj, "creation_history", {}) or {}),
+            "creation_reference_error": str(getattr(obj, "creation_reference_error", "")),
         }
         if type(obj).__name__ == "MeshObject":
             mesh_poly = None
@@ -1121,6 +1138,7 @@ class MainWindow(QMainWindow):
                 "origin": list(actor.GetOrigin()),
                 "position": list(actor.GetPosition()),
                 "orientation": list(actor.GetOrientation()),
+                "scale": list(actor.GetScale()),
             }
         return item
 
@@ -1173,18 +1191,22 @@ class MainWindow(QMainWindow):
             obj.param_formulas = dict(formulas) if isinstance(formulas, dict) else {}
             history = item.get("creation_history", {})
             obj.creation_history = dict(history) if isinstance(history, dict) else {}
+            obj.creation_reference_error = str(item.get("creation_reference_error", ""))
             obj.refresh_appearance()
             transform = item.get("actor_transform", {})
             if isinstance(transform, dict) and obj.actor is not None:
                 origin = transform.get("origin")
                 position = transform.get("position")
                 orientation = transform.get("orientation")
+                scale = transform.get("scale")
                 if isinstance(origin, (list, tuple)) and len(origin) == 3:
                     obj.actor.SetOrigin(*[float(value) for value in origin])
                 if isinstance(position, (list, tuple)) and len(position) == 3:
                     obj.actor.SetPosition(*[float(value) for value in position])
                 if isinstance(orientation, (list, tuple)) and len(orientation) == 3:
                     obj.actor.SetOrientation(*[float(value) for value in orientation])
+                if isinstance(scale, (list, tuple)) and len(scale) == 3:
+                    obj.actor.SetScale(*[float(value) for value in scale])
             return obj
         except Exception:
             return None
@@ -1576,6 +1598,11 @@ class MainWindow(QMainWindow):
             return
 
         scene = self._viewport.scene
+        dissolved_names = {
+            str(getattr(result_obj, "name", "")).strip()
+            for result_obj, _sources, _source_data in candidates
+            if str(getattr(result_obj, "name", "")).strip()
+        }
         restored = []
         restored_ids = {id(obj) for obj in scene.objects}
 
@@ -1649,12 +1676,41 @@ class MainWindow(QMainWindow):
             self._viewport.object_selected.emit(None)
             self._viewport.selection_changed.emit([])
 
+        self._mark_broken_creation_references(dissolved_names)
+        self._viewport.scene_changed.emit()
+        self._refresh_materials()
         self._viewport._render()
 
         message = f"Dissolved {len(candidates)} boolean result(s); restored {len(restored)} source object(s)"
         if unavailable:
             message += f". Skipped: {', '.join(unavailable)}"
         self._info_bar.set_info(message)
+
+    def _mark_broken_creation_references(self, removed_names: set[str] | None = None) -> None:
+        """Mark objects whose vertex/edge/surface creation references no longer resolve."""
+        removed_names = {str(name).strip() for name in (removed_names or set()) if str(name).strip()}
+        existing_names = {str(getattr(obj, "name", "")).strip() for obj in self._viewport.scene.objects}
+        for obj in self._viewport.scene.objects:
+            obj.creation_reference_error = ""
+            history = getattr(obj, "creation_history", {})
+            points = history.get("points", []) if isinstance(history, dict) else []
+            broken = []
+            for item in points if isinstance(points, list) else []:
+                if not isinstance(item, dict):
+                    continue
+                snap = item.get("snap", {})
+                if not isinstance(snap, dict):
+                    continue
+                source_name = str(snap.get("object", "")).strip()
+                if not source_name:
+                    continue
+                if source_name in removed_names or source_name not in existing_names:
+                    broken.append(source_name)
+            if broken:
+                obj.creation_reference_error = (
+                    "Creation reference lost after Dissolve Boolean: "
+                    + ", ".join(sorted(set(broken)))
+                )
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� object selection
     def _on_project_selected(self) -> None:
@@ -2425,6 +2481,16 @@ class MainWindow(QMainWindow):
             for obj in self._viewport.scene.objects
             if type(obj).__name__ == "PlateObject" and bool(getattr(obj, "is_model", True))
         }
+        air_objects = [
+            obj for obj in self._viewport.scene.objects
+            if str(getattr(obj, "material", "")).strip().upper() == "AIR"
+            and getattr(obj, "actor", None) is not None
+        ]
+        air_min = air_max = None
+        if air_objects:
+            bounds = [obj.actor.GetBounds() for obj in air_objects]
+            air_min = [min(float(item[axis * 2]) for item in bounds) for axis in range(3)]
+            air_max = [max(float(item[axis * 2 + 1]) for item in bounds) for axis in range(3)]
 
         entries: list[dict] = []
         port_index = 1
@@ -2529,6 +2595,18 @@ class MainWindow(QMainWindow):
                 }
             entry["mode_type"] = mode_type
             entry["mode"] = mode
+            if port_type == "WaveguidePort" and air_min is not None and air_max is not None:
+                center = [
+                    origin[axis] + 0.5 * u[axis] + 0.5 * v[axis]
+                    for axis in range(3)
+                ]
+                normal_axis = max(range(3), key=lambda axis: abs(float(direction[axis])))
+                distance_to_min = abs(center[normal_axis] - air_min[normal_axis])
+                distance_to_max = abs(air_max[normal_axis] - center[normal_axis])
+                axis_name = ("x", "y", "z")[normal_axis]
+                entry["face_name"] = (
+                    f"-{axis_name}" if distance_to_min <= distance_to_max else f"+{axis_name}"
+                )
             entries.append(entry)
             port_index += 1
         return entries

@@ -368,7 +368,7 @@ def _shape_bounds_center(shape: Any) -> tuple[float, float, float] | None:
                 from OCP.BRepBndLib import BRepBndLib
 
                 box = Bnd_Box()
-                BRepBndLib.Add(shape, box)
+                BRepBndLib.Add_s(shape, box)
                 xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
                 return (
                     0.5 * (float(xmin) + float(xmax)),
@@ -392,6 +392,86 @@ def _shape_bounds_center(shape: Any) -> tuple[float, float, float] | None:
         except Exception:
             return None
     return None
+
+
+def _shape_bounds(shape: Any) -> tuple[float, float, float, float, float, float] | None:
+    for pkg in ("OCP", "OCC.Core"):
+        try:
+            if pkg == "OCP":
+                from OCP.Bnd import Bnd_Box
+                from OCP.BRepBndLib import BRepBndLib
+                box = Bnd_Box()
+                BRepBndLib.Add_s(shape, box)
+            else:
+                from OCC.Core.Bnd import Bnd_Box
+                from OCC.Core.BRepBndLib import brepbndlib
+                box = Bnd_Box()
+                brepbndlib.Add(shape, box)
+            xmin, ymin, zmin, xmax, ymax, zmax = (float(value) for value in box.Get())
+            return (xmin, xmax, ymin, ymax, zmin, zmax)
+        except ImportError:
+            continue
+        except Exception:
+            return None
+    return None
+
+
+def _world_poly_bounds_from_actor(obj: Any) -> tuple[float, float, float, float, float, float] | None:
+    actor = getattr(obj, "actor", None)
+    if actor is None or actor.GetMapper() is None or actor.GetMapper().GetInput() is None:
+        return None
+    source = vtk.vtkPolyData()
+    source.DeepCopy(actor.GetMapper().GetInput())
+    transform = vtk.vtkTransform()
+    transform.SetMatrix(actor.GetMatrix())
+    filter_ = vtk.vtkTransformPolyDataFilter()
+    filter_.SetTransform(transform)
+    filter_.SetInputData(source)
+    filter_.Update()
+    bounds = filter_.GetOutput().GetBounds()
+    return tuple(float(value) for value in bounds) if bounds is not None else None
+
+
+def _align_occ_shape_to_actor_bounds(shape: Any, obj: Any) -> Any:
+    """Apply axis-aligned scale/translation from current viewer geometry to OCC shape."""
+    source_bounds = _shape_bounds(shape)
+    target_bounds = _world_poly_bounds_from_actor(obj)
+    if source_bounds is None or target_bounds is None:
+        return shape
+    scales = []
+    for axis in range(3):
+        source_span = source_bounds[axis * 2 + 1] - source_bounds[axis * 2]
+        target_span = target_bounds[axis * 2 + 1] - target_bounds[axis * 2]
+        if abs(source_span) < 1e-12:
+            return shape
+        scales.append(target_span / source_span)
+    translation = [
+        target_bounds[axis * 2] - scales[axis] * source_bounds[axis * 2]
+        for axis in range(3)
+    ]
+    if max(abs(scale - 1.0) for scale in scales) < 1e-9 and max(abs(value) for value in translation) < 1e-9:
+        return shape
+
+    for pkg in ("OCP", "OCC.Core"):
+        try:
+            if pkg == "OCP":
+                from OCP.gp import gp_Trsf
+                from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+            else:
+                from OCC.Core.gp import gp_Trsf
+                from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Transform
+            transform = gp_Trsf()
+            transform.SetValues(
+                scales[0], 0.0, 0.0, translation[0],
+                0.0, scales[1], 0.0, translation[1],
+                0.0, 0.0, scales[2], translation[2],
+            )
+            return BRepBuilderAPI_Transform(shape, transform, True).Shape()
+        except ImportError:
+            continue
+        except Exception:
+            return shape
+    return shape
 
 
 def _world_poly_center_from_actor(obj: Any) -> tuple[float, float, float] | None:
@@ -704,8 +784,15 @@ def build_occ_shape_for_export(obj: Any, cache: Dict[str, Any] | None = None, de
 
     selected = _select_shape_for_mesh_object(obj, root_shape)
     transformed = _apply_actor_transform(selected, obj)
-    transformed, recovered = _recover_legacy_export_offset(transformed, obj)
-    transformed = _apply_export_offset(transformed, obj)
+    target_bounds = _world_poly_bounds_from_actor(obj)
+    transformed = _align_occ_shape_to_actor_bounds(transformed, obj)
+    if target_bounds is not None:
+        # Bounds alignment already includes the current scale and translation;
+        # do not apply stale offsets persisted by the legacy exporter.
+        recovered = None
+    else:
+        transformed, recovered = _recover_legacy_export_offset(transformed, obj)
+        transformed = _apply_export_offset(transformed, obj)
     if recovered is not None:
         setattr(obj, "_step_export_offset_recovered", recovered)
     cache[oid] = transformed

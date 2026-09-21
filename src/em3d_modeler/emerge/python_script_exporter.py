@@ -295,6 +295,15 @@ def export_emerge_python_script(
         for plate in plates
         if str(plate.get("object_name", "")).strip()
     }
+    air_volume_name = next(
+        (
+            str(entry.get("object_name", "")).strip()
+            for entry in step_entries
+            if str(entry.get("material", "")).strip().upper() == "AIR"
+            and str(entry.get("object_name", "")).strip()
+        ),
+        "",
+    )
     valid_boundary_names = exported_object_names | port_surface_names | plate_names
     boundary_assignments = [
         {
@@ -352,6 +361,7 @@ def export_emerge_python_script(
         "from datetime import datetime",
         "import os",
         "import re",
+        "import math",
         "",
         "try:",
         "    import importlib.metadata as _importlib_metadata",
@@ -419,6 +429,33 @@ def export_emerge_python_script(
         "    t = ''.join(ch if (ch.isalnum() or ch in ('-', '_')) else '_' for ch in str(v))",
         "    t = t.strip('_')",
         "    return t or 'simulation'",
+        "",
+        "def _select_single_port_face(volume, face_name, origin, u, v):",
+        "    candidates = list(volume.face(face_name).tags)",
+        "    if len(candidates) == 1:",
+        "        return em.FaceSelection([int(candidates[0])])",
+        "    target_center = tuple(origin[i] + 0.5 * u[i] + 0.5 * v[i] for i in range(3))",
+        "    target_sizes = (math.sqrt(sum(value * value for value in u)), math.sqrt(sum(value * value for value in v)))",
+        "    best = None",
+        "    best_score = float('inf')",
+        "    for tag in candidates:",
+        "        selection = em.FaceSelection([int(tag)])",
+        "        points = selection.points",
+        "        if points is None or len(points) == 0:",
+        "            continue",
+        "        bounds_min = [min(float(point[i]) for point in points) for i in range(3)]",
+        "        bounds_max = [max(float(point[i]) for point in points) for i in range(3)]",
+        "        center = tuple(0.5 * (bounds_min[i] + bounds_max[i]) for i in range(3))",
+        "        spans = sorted((bounds_max[i] - bounds_min[i] for i in range(3)), reverse=True)",
+        "        size_error = (spans[0] - max(target_sizes)) ** 2 + (spans[1] - min(target_sizes)) ** 2",
+        "        center_error = sum((center[i] - target_center[i]) ** 2 for i in range(3))",
+        "        score = center_error + size_error",
+        "        if score < best_score:",
+        "            best_score = score",
+        "            best = selection",
+        "    if best is None:",
+        "        raise ValueError(f'Unable to resolve single face for port on {face_name}')",
+        "    return best",
         "",
         "def _number_of_ports(grid):",
         "    smat = grid.Smat",
@@ -598,6 +635,7 @@ def export_emerge_python_script(
         for p in ports:
             idx = int(p.get("index", 1))
             name = str(p.get("name", f"Port_{idx}"))
+            port_type = str(p.get("type", "LumpedPort"))
             origin = [_to_float(v, 0.0) * 0.001 for v in p.get("origin", [0.0, 0.0, 0.0])]
             u = [_to_float(v, 0.0) * 0.001 for v in p.get("u", [0.0, 0.0, 0.0])]
             v = [_to_float(v, 0.0) * 0.001 for v in p.get("v", [0.0, 0.0, 0.0])]
@@ -621,17 +659,31 @@ def export_emerge_python_script(
                 f"_port_{idx}_origin = ({_q(origin[0])}, {_q(origin[1])}, {_q(origin[2])})",
                 f"_port_{idx}_u = ({_q(u[0])}, {_q(u[1])}, {_q(u[2])})",
                 f"_port_{idx}_v = ({_q(v[0])}, {_q(v[1])}, {_q(v[2])})",
-                f"port_surfaces[{_q(str(p.get('plate_name', name)))}] = em.geo.Plate(",
-                f"    name={_q(name)},",
-                f"    origin=_port_{idx}_origin,",
-                f"    u=_port_{idx}_u,",
-                f"    v=_port_{idx}_v,",
-                ")",
-                f"port_surfaces[{_q(str(p.get('plate_name', name)))}].set_material(materials['PEC'])",
-                f"geometry_groups[{_q(str(p.get('plate_name', name)))}] = port_surfaces[{_q(str(p.get('plate_name', name)))}]",
-                f"port[{idx}]['object'] = port_surfaces[{_q(str(p.get('plate_name', name)))}]",
                 "",
             ]
+            if port_type == "WaveguidePort" and air_volume_name:
+                face_name = str(p.get("face_name", "")).strip()
+                if not face_name:
+                    face_name = "+y" if float(origin[1]) > 0.0 else "-y"
+                lines += [
+                    f"_port_{idx}_volume = geometry_groups[{_q(air_volume_name)}].as_volume()",
+                    f"_port_{idx}_face_name = {_q(face_name)}",
+                    "",
+                ]
+            else:
+                plate_key = str(p.get("plate_name", name))
+                lines += [
+                    f"port_surfaces[{_q(plate_key)}] = em.geo.Plate(",
+                    f"    name={_q(name)},",
+                    f"    origin=_port_{idx}_origin,",
+                    f"    u=_port_{idx}_u,",
+                    f"    v=_port_{idx}_v,",
+                    ")",
+                    f"port_surfaces[{_q(plate_key)}].set_material(materials['PEC'])",
+                    f"geometry_groups[{_q(plate_key)}] = port_surfaces[{_q(plate_key)}]",
+                    f"port[{idx}]['object'] = port_surfaces[{_q(plate_key)}]",
+                    "",
+                ]
 
     lines += [
         "# =============================================================================",
@@ -649,6 +701,13 @@ def export_emerge_python_script(
         lines += [
             "simulationObj.commit_geometry()",
         ]
+    for p in ports:
+        idx = int(p.get("index", 1))
+        if str(p.get("type", "LumpedPort")) == "WaveguidePort" and air_volume_name:
+            lines += [
+                f"port[{idx}]['object'] = _select_single_port_face(_port_{idx}_volume, _port_{idx}_face_name, _port_{idx}_origin, _port_{idx}_u, _port_{idx}_v)",
+                "",
+            ]
     lines += [
         "simulationObj.mw.set_frequency_range(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, NPOINTS)",
         "simulationObj.mw.set_resolution(MESH_RESOLUTION)",
@@ -673,7 +732,6 @@ def export_emerge_python_script(
                     f"    {idx},",
                     f"    mode=port[{idx}]['mode'],",
                     f"    mode_type=port[{idx}]['modeType'],",
-                    f"    dims=(port[{idx}]['w'], port[{idx}]['h']),",
                     f"    power=port[{idx}]['portExcitationAmplitude'],",
                     ")",
                 ]

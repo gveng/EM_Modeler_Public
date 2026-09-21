@@ -47,6 +47,7 @@ class EMObject:
         self.creation_plane_normal: tuple[float, float, float] = (0.0, 0.0, 1.0)
         self.param_formulas: Dict[str, str] = {}
         self.creation_history: Dict[str, Any] = {}
+        self.creation_reference_error: str = ""
         self._actor: vtk.vtkActor | None = None
         self._build()
 

@@ -176,6 +176,7 @@ class Viewport3DWidget(QWidget):
         # Selection mode: 'object' | 'face' | 'edge' | 'vertex'
         self._selection_mode: str = "object"
         self._sub_pick_actor: Optional[vtk.vtkActor] = None
+        self._last_face_pick: dict | None = None
         self._last_drawing_snap_kind: str = "grid"
 
         # One-shot pick request from external dialogs
@@ -989,6 +990,18 @@ class Viewport3DWidget(QWidget):
 
         if mode == "face":
             marker = self._build_face_region_marker(ds, cell_id, actor)
+            cell = ds.GetCell(cell_id)
+            face_points = []
+            if cell is not None:
+                for point_index in range(cell.GetNumberOfPoints()):
+                    local_point = cell.GetPoints().GetPoint(point_index)
+                    world_point = actor.GetMatrix().MultiplyPoint([*local_point, 1.0])
+                    face_points.append(tuple(float(world_point[i]) for i in range(3)))
+            self._last_face_pick = {
+                "owner": owner,
+                "points": face_points,
+                "cell_id": int(cell_id),
+            }
             self.picked_coords.emit(float(pos[0]), float(pos[1]), float(pos[2]), self._units)
             self.status_message.emit(
                 f"Face picked  cell={cell_id}  on {owner.name if owner else '?'}  "
@@ -1031,6 +1044,45 @@ class Viewport3DWidget(QWidget):
             self._renderer.AddActor(marker)
             self._sub_pick_actor = marker
         self._render()
+
+    def create_plate_from_face(self, material: str = "PEC") -> Optional[EMObject]:
+        """Create an axis-aligned thin plate from the last selected face."""
+        pick = self._last_face_pick
+        points = pick.get("points", []) if isinstance(pick, dict) else []
+        if len(points) < 3:
+            self.status_message.emit("Select a face first, then create Plate from Face.")
+            return None
+
+        from ..scene.em_objects import PlateObject
+
+        bounds = [
+            min(point[axis] for point in points)
+            for axis in range(3)
+        ] + [
+            max(point[axis] for point in points)
+            for axis in range(3)
+        ]
+        spans = [bounds[axis + 3] - bounds[axis] for axis in range(3)]
+        normal_axis = min(range(3), key=lambda axis: spans[axis])
+        thickness = max(self._grid_spacing * 0.01, 1e-6)
+        bounds[normal_axis + 3] = bounds[normal_axis] + thickness
+        obj = PlateObject(
+            material=material,
+            x1=bounds[0], y1=bounds[1], z1=bounds[2],
+            x2=bounds[3], y2=bounds[4], z2=bounds[5],
+        )
+        owner = pick.get("owner") if isinstance(pick, dict) else None
+        obj.creation_history = {
+            "mode": "face",
+            "source_face": {
+                "object": str(getattr(owner, "name", "")),
+                "cell_id": int(pick.get("cell_id", -1)),
+                "points": [list(point) for point in points],
+            },
+        }
+        self._finish_object(obj)
+        self.status_message.emit(f"Created Plate from selected face: {obj.name}")
+        return obj
 
     def _build_face_marker(self, dataset, cell_id: int, ref_actor) -> Optional[vtk.vtkActor]:
         ids = vtk.vtkIdTypeArray()

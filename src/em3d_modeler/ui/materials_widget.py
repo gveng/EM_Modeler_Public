@@ -163,8 +163,14 @@ class MaterialsWidget(QWidget):
                     label += "  [NON MODEL]"
                 if not obj.is_visible():
                     label += "  [hidden]"
+                reference_error = str(getattr(obj, "creation_reference_error", "")).strip()
+                if reference_error:
+                    label += "  [BROKEN REFERENCE]"
                 child = QTreeWidgetItem([label])
                 child.setData(0, _ROLE_OBJ_ID, id(obj))
+                if reference_error:
+                    child.setForeground(0, QBrush(QColor(220, 40, 40)))
+                    child.setToolTip(0, reference_error)
                 mat_item.addChild(child)
                 self._obj_map[id(obj)] = obj
                 actor = getattr(obj, "actor", None)

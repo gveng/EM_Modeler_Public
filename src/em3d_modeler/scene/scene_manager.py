@@ -329,6 +329,7 @@ class SceneManager:
                 "is_model": bool(getattr(obj, "is_model", True)),
                 "param_formulas": dict(getattr(obj, "param_formulas", {}) or {}),
                 "creation_history": dict(getattr(obj, "creation_history", {}) or {}),
+                "creation_reference_error": str(getattr(obj, "creation_reference_error", "")),
                 **obj.to_json_state(),
             }
             if obj.actor is not None:
@@ -336,6 +337,7 @@ class SceneManager:
                     "origin": list(obj.actor.GetOrigin()),
                     "position": list(obj.actor.GetPosition()),
                     "orientation": list(obj.actor.GetOrientation()),
+                    "scale": list(obj.actor.GetScale()),
                 }
             if isinstance(obj, MeshObject):
                 mesh_poly = None
@@ -445,18 +447,22 @@ class SceneManager:
                 obj.param_formulas = dict(formulas) if isinstance(formulas, dict) else {}
                 history = item.get("creation_history", {})
                 obj.creation_history = dict(history) if isinstance(history, dict) else {}
+                obj.creation_reference_error = str(item.get("creation_reference_error", ""))
                 self.add_object(obj)
                 transform = item.get("actor_transform", {})
                 if isinstance(transform, dict) and obj.actor is not None:
                     origin = transform.get("origin")
                     position = transform.get("position")
                     orientation = transform.get("orientation")
+                    scale = transform.get("scale")
                     if isinstance(origin, (list, tuple)) and len(origin) == 3:
                         obj.actor.SetOrigin(*[float(value) for value in origin])
                     if isinstance(position, (list, tuple)) and len(position) == 3:
                         obj.actor.SetPosition(*[float(value) for value in position])
                     if isinstance(orientation, (list, tuple)) and len(orientation) == 3:
                         obj.actor.SetOrientation(*[float(value) for value in orientation])
+                    if isinstance(scale, (list, tuple)) and len(scale) == 3:
+                        obj.actor.SetScale(*[float(value) for value in scale])
 
                 if isinstance(obj, MeshObject) and obj.boolean_source_names:
                     pending_boolean_sources.append((obj, list(obj.boolean_source_names)))
