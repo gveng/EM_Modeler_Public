@@ -45,6 +45,7 @@ class EMObject:
         self.creation_plane: str = "XY"
         self.creation_plane_origin: tuple[float, float, float] = (0.0, 0.0, 0.0)
         self.creation_plane_normal: tuple[float, float, float] = (0.0, 0.0, 1.0)
+        self.param_formulas: Dict[str, str] = {}
         self._actor: vtk.vtkActor | None = None
         self._build()
 

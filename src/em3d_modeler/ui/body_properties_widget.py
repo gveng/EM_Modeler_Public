@@ -10,12 +10,13 @@ from typing import Any, Dict, List, Optional
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
-    QSlider, QPushButton, QFrame, QInputDialog, QColorDialog, QCheckBox,
+    QSlider, QPushButton, QFrame, QInputDialog, QColorDialog, QCheckBox, QMessageBox,
 )
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QColor
 
 from ..scene.em_objects import EMObject
+from ..scene.param_expr import evaluate_expression
 
 
 class BodyPropertiesWidget(QWidget):
@@ -27,12 +28,15 @@ class BodyPropertiesWidget(QWidget):
     model_role_changed = Signal(object, bool)      # (EMObject, is_model)
     material_added = Signal(str)
     material_picker_requested = Signal(str, list)
+    project_parameters_changed = Signal(list)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._obj: Optional[EMObject] = None
         self._selection: List[EMObject] = []
         self._blocked = False
+        self._project_mode = False
+        self._formula_resolver = None
         self._materials: List[str] = ["PEC"]
         self._color_hex: str = "#bebee6"
 
@@ -147,6 +151,7 @@ class BodyPropertiesWidget(QWidget):
     # ─────────────────────────────────────────────────── public API
     def set_object(self, obj: Optional[EMObject]) -> None:
         """Single-object mode."""
+        self._project_mode = False
         self._selection = [obj] if obj else []
         self._obj = obj
         self._blocked = True
@@ -160,6 +165,7 @@ class BodyPropertiesWidget(QWidget):
 
     def set_selection(self, objects: List[EMObject]) -> None:
         """Multi-selection mode."""
+        self._project_mode = False
         self._selection = [o for o in objects if o is not None]
         if len(self._selection) == 0:
             self._obj = None
@@ -178,6 +184,61 @@ class BodyPropertiesWidget(QWidget):
                 self._refresh_multi(self._selection)
             finally:
                 self._blocked = False
+
+    def set_project_parameters(self, parameters: List[Dict[str, Any]] | None) -> None:
+        """Show project-scoped parameters in an editable table."""
+        self._project_mode = True
+        self._set_content_visible(False)
+        self._title.setVisible(True)
+        self._table.setVisible(True)
+        self._selection = []
+        self._obj = None
+        self._blocked = True
+        try:
+            self._title.setText("Project Variables")
+            self._name_widget.setVisible(False)
+            self._mat_combo.setEnabled(False)
+            self._model_role_combo.setEnabled(False)
+            self._opacity_slider.setEnabled(False)
+            self._pick_color_btn.setEnabled(False)
+            self._apply_color_bulk_chk.setVisible(False)
+            self._apply_btn.setVisible(False)
+            self._table.setColumnCount(3)
+            self._table.setHorizontalHeaderLabels(["Name", "Value", "Unit"])
+            rows = []
+            for entry in parameters if isinstance(parameters, list) else []:
+                if not isinstance(entry, dict):
+                    continue
+                name = str(entry.get("name", "")).strip()
+                if name:
+                    rows.append((name, str(entry.get("value", 0)), str(entry.get("unit", ""))))
+            self._table.setRowCount(len(rows) or 1)
+            if not rows:
+                rows = [("", "", "")]
+            for row, values in enumerate(rows):
+                for column, value in enumerate(values):
+                    self._table.setItem(row, column, QTableWidgetItem(value))
+            self._table.setVisible(True)
+        finally:
+            self._blocked = False
+
+    def set_formula_resolver(self, resolver) -> None:
+        self._formula_resolver = resolver
+
+    def _project_parameters_from_table(self) -> List[Dict[str, Any]]:
+        entries = []
+        for row in range(self._table.rowCount()):
+            name_item = self._table.item(row, 0)
+            if name_item is None or not name_item.text().strip():
+                continue
+            value_text = (self._table.item(row, 1).text() if self._table.item(row, 1) else "0").strip()
+            try:
+                value = float(value_text.replace(",", "."))
+            except ValueError:
+                value = 0.0
+            unit = self._table.item(row, 2).text().strip() if self._table.item(row, 2) else ""
+            entries.append({"name": name_item.text().strip(), "value": value, "unit": unit})
+        return entries
 
     def set_materials(self, materials: List[str]) -> None:
         """Update material combo values while preserving current text when possible."""
@@ -212,7 +273,14 @@ class BodyPropertiesWidget(QWidget):
             self._mat_combo.setCurrentIndex(idx)
 
     # ─────────────────────────────────────────────────── display modes
+    def _set_content_visible(self, visible: bool) -> None:
+        for child in self.children():
+            if isinstance(child, QWidget):
+                child.setVisible(visible)
+
     def _set_no_selection(self) -> None:
+        self._project_mode = False
+        self._set_content_visible(False)
         self._title.setText("Properties")
         self._name_widget.setVisible(False)
         self._name_edit.setText("")
@@ -227,6 +295,7 @@ class BodyPropertiesWidget(QWidget):
         self._apply_btn.setVisible(False)
 
     def _refresh_single(self, obj: EMObject) -> None:
+        self._set_content_visible(True)
         self._title.setText("Properties")
         self._name_widget.setVisible(True)
         self._name_edit.setText(obj.name)
@@ -263,7 +332,12 @@ class BodyPropertiesWidget(QWidget):
         for row, (k, v) in enumerate(rows):
             key_item = QTableWidgetItem(k)
             key_item.setFlags(Qt.ItemIsEnabled)
-            val_item = QTableWidgetItem(str(v))
+            formulas = getattr(obj, "param_formulas", {}) or {}
+            formula = formulas.get(k)
+            val_item = QTableWidgetItem(str(formula if formula is not None else v))
+            if formula is not None:
+                val_item.setForeground(QColor("#3a7bd5"))
+                val_item.setToolTip(f"Formula: {formula}\nResolved value: {v}")
             if k == "Color":
                 # For Color parameter, add a color preview button
                 val_item.setFlags(Qt.ItemIsEnabled | Qt.ItemIsSelectable)
@@ -274,6 +348,7 @@ class BodyPropertiesWidget(QWidget):
             self._table.setItem(row, 1, val_item)
 
     def _refresh_multi(self, objects: List[EMObject]) -> None:
+        self._set_content_visible(True)
         self._title.setText("Properties")
         self._name_widget.setVisible(False)
         self._table.setRowCount(0)
@@ -311,20 +386,33 @@ class BodyPropertiesWidget(QWidget):
 
     def _collect_params(self) -> Dict[str, Any]:
         params: Dict[str, Any] = {}
+        formulas: Dict[str, str] = {}
         for row in range(self._table.rowCount()):
             k = self._table.item(row, 0)
             v = self._table.item(row, 1)
             if k and v:
+                if k.text() == "Color":
+                    params[k.text()] = v.text()
+                    continue
                 try:
                     params[k.text()] = float(v.text())
                 except ValueError:
-                    params[k.text()] = v.text()
+                    if self._formula_resolver is None:
+                        params[k.text()] = v.text()
+                    else:
+                        params[k.text()] = self._formula_resolver(v.text())
+                        formulas[k.text()] = v.text()
         params["Material"] = self._mat_combo.currentText()
         params["Opacity"]  = self._opacity_slider.value() / 100.0
         params["Color"] = self._color_hex
-        return params
+        return params, formulas
 
     def _table_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._blocked:
+            return
+        if self._project_mode:
+            self.project_parameters_changed.emit(self._project_parameters_from_table())
+            return
         if self._blocked or self._obj is None or item.column() != 1:
             return
         # Skip color cells – they are handled by double-click
@@ -407,8 +495,13 @@ class BodyPropertiesWidget(QWidget):
     def _apply_single(self) -> None:
         if self._obj is None:
             return
-        params = self._collect_params()
+        try:
+            params, formulas = self._collect_params()
+        except Exception as exc:
+            QMessageBox.warning(self, "Invalid Formula", str(exc))
+            return
         self._obj.set_parameters(params)
+        self._obj.param_formulas = formulas
         self.params_changed.emit(self._obj, params)
 
     def _apply_bulk(self) -> None:

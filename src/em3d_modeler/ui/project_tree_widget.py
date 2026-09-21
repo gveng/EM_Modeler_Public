@@ -149,6 +149,7 @@ class ProjectTreeWidget(QWidget):
 
     settings_changed = Signal()
     output_plot_requested = Signal(dict)
+    project_selected = Signal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -175,12 +176,22 @@ class ProjectTreeWidget(QWidget):
         
         self._tree.setAlternatingRowColors(True)
         self._tree.setIndentation(10)  # Reduce indentation (default is 20)
+        self._tree.currentItemChanged.connect(self._on_current_item_changed)
+        self._tree.itemClicked.connect(self._on_item_clicked)
         self._tree.itemDoubleClicked.connect(self._on_double_click)
         self._tree.setContextMenuPolicy(Qt.CustomContextMenu)
         self._tree.customContextMenuRequested.connect(self._on_context_menu)
         layout.addWidget(self._tree)
 
         self._populate()
+
+    def _on_current_item_changed(self, current, _previous) -> None:
+        if current is self._tree.topLevelItem(0):
+            self.project_selected.emit()
+
+    def _on_item_clicked(self, item, _column) -> None:
+        if item is self._tree.topLevelItem(0):
+            self.project_selected.emit()
 
     # ─────────────────────────────────────────────────── public API
     def set_project_name(self, name: str) -> None:

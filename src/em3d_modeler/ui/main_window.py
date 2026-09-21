@@ -89,7 +89,7 @@ from PySide6.QtWidgets import (
     QLabel, QDoubleSpinBox, QDialog, QInputDialog,
     QVBoxLayout, QFormLayout, QTextBrowser, QPlainTextEdit,
     QPushButton, QHBoxLayout, QGroupBox, QCheckBox,
-    QProgressDialog, QApplication, QTabWidget, QDialogButtonBox,
+    QProgressDialog, QApplication, QTabWidget, QDialogButtonBox, QGridLayout, QToolButton,
     QRadioButton,
 )
 from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize, QUrl
@@ -189,6 +189,7 @@ from ..emerge.step_bundle_exporter import export_objects_to_step_bundle
 from ..emerge.step_importer   import import_step
 from ..emerge.material_store  import MaterialStore
 from ..scene.em_objects       import set_selection_color
+from ..scene.param_expr       import evaluate_expression
 from .. import __version__, __release_date__
 
 
@@ -223,6 +224,7 @@ class MainWindow(QMainWindow):
         self.resize(1400, 860)
 
         self._project_name  = "Untitled"
+        self._project_properties_active = False
         self._project_path  = None
         self._units         = "mm"
         self._workspace_size = 200.0
@@ -375,6 +377,7 @@ class MainWindow(QMainWindow):
         tools_menu = mb.addMenu("&Tools")
         tools_menu.addAction("&Settings", self._open_settings_dialog)
         tools_menu.addAction("Material &Library...", self._open_material_library_dialog)
+        tools_menu.addAction("&Parameters...", self._open_project_parameters)
 
         # Help
         help_menu = mb.addMenu("&Help")
@@ -470,93 +473,107 @@ class MainWindow(QMainWindow):
         tb.setIconSize(QSize(22, 22))
         tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
 
+        def add_group(title: str, actions: list, columns: int = 3) -> None:
+            group = QWidget(tb)
+            group.setFixedWidth(122)
+            layout = QVBoxLayout(group)
+            layout.setContentsMargins(10, 0, 10, 0)
+            layout.setSpacing(2)
+            caption = QLabel(title, group)
+            caption.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+            caption.setStyleSheet("font-size: 9px; font-weight: bold; padding-top: 1px;")
+            layout.addWidget(caption)
+            grid = QGridLayout()
+            grid.setContentsMargins(0, 0, 0, 0)
+            grid.setHorizontalSpacing(4)
+            grid.setVerticalSpacing(2)
+            columns = min(3, max(1, columns))
+            for index, action in enumerate(actions):
+                if isinstance(action, QAction):
+                    button = QToolButton(group)
+                    button.setDefaultAction(action)
+                    button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+                    button.setFixedSize(30, 27)
+                    widget = button
+                else:
+                    widget = action
+                grid.addWidget(widget, index // columns, index % columns)
+            layout.addLayout(grid)
+            group_action = tb.addWidget(group)
+            tb.layout().setAlignment(tb.widgetForAction(group_action), Qt.AlignTop)
+            tb.addSeparator()
+
         # ������ Primitive shapes ������������������������������������������������������������������������������������������������������������������������
         _DRAW_ICONS = [
             ("Box",       "box",       "Part_Box"),
-            ("Plate",     "plate",     "Part_Box"),
             ("Cylinder",  "cylinder",  "Part_Cylinder"),
             ("Cone",      "cone",      "Part_Cone"),
             ("Sphere",    "sphere",    "Part_Sphere"),
         ]
+        primitive_actions = []
         for label, mode, icon_name in _DRAW_ICONS:
             act = QAction(_icon(icon_name), label, self)
             act.setToolTip(f"Draw {label}  [click base on viewport to start]")
             act.triggered.connect(lambda checked, m=mode: self._start_draw(m))
-            tb.addAction(act)
+            primitive_actions.append(act)
+        add_group("3D", primitive_actions, columns=3)
 
         # Sketch tool
         act_sketch = QAction(_icon("Part_Sketch"), "Sketch", self)
         act_sketch.setToolTip("Open parametric sketch canvas (extrude or revolve)")
         act_sketch.triggered.connect(self._open_sketch)
-        tb.addAction(act_sketch)
 
         act_planar = QAction(_icon("Std_Plane"), "Planar", self)
         act_planar.setToolTip("Define planar structure: pick start/end (vertex/edge/face snap) on active plane")
         act_planar.triggered.connect(lambda: self._start_draw("planar"))
-        tb.addAction(act_planar)
-
-
-
-        tb.addSeparator()
+        add_group("2D", [act_sketch, act_planar], columns=2)
 
         # ������ Boolean operations ������������������������������������������������������������������������������������������������������������
         act_cut = QAction(_icon("Part_Cut"), "Cut", self)
         act_cut.setToolTip("Boolean Cut: subtract Tool shape from Base shape")
         act_cut.triggered.connect(self._bool_cut)
-        tb.addAction(act_cut)
 
         act_fuse = QAction(_icon("Part_Fuse"), "Fuse", self)
         act_fuse.setToolTip("Boolean Fuse (Union): merge two selected shapes")
         act_fuse.triggered.connect(self._bool_fuse)
-        tb.addAction(act_fuse)
-
-        # Dynamic Fuse selection counter
-        self._fuse_label = QLabel(" Fuse (0) ")
-        self._fuse_label.setStyleSheet("font-size: 10px; color: #666;")
-        tb.addWidget(self._fuse_label)
 
         act_common = QAction(_icon("Part_Common"), "Common", self)
         act_common.setToolTip("Boolean Common (Intersection): keep overlapping volume")
         act_common.triggered.connect(self._bool_common)
-        tb.addAction(act_common)
+        add_group("Boolean", [act_cut, act_fuse, act_common])
+        self._fuse_label = QLabel("Fuse: 0 selected")
+        self._fuse_label.setToolTip("Number of objects currently selected for Boolean Fuse")
+        self._fuse_label.setStyleSheet("font-size: 10px; color: #666; padding: 0 6px;")
+        tb.addWidget(self._fuse_label)
 
         act_scale = QAction(_icon("image-scaling"), "Scale", self)
         act_scale.setToolTip("Scale selected object(s) by a user-defined factor")
         act_scale.triggered.connect(self._scale_selected_objects)
-        tb.addAction(act_scale)
 
         act_move_plane = QAction(_icon("Std_TransformManip"), "Move/Rotate", self)
         act_move_plane.setToolTip("Move and rotate the selected object around a reference point")
         act_move_plane.triggered.connect(self._move_selection_to_plane_origin)
-        tb.addAction(act_move_plane)
 
         act_pattern = QAction(_icon("Std_Tool4"), "Pattern", self)
         act_pattern.setToolTip("Create linear or circular instances of the selected object")
         act_pattern.triggered.connect(self._create_object_pattern)
-        tb.addAction(act_pattern)
 
-        act_dissolve_boolean = QAction(QIcon(), "Dissolve Boolean", self)
+        act_dissolve_boolean = QAction(_icon("edit-delete"), "Dissolve Boolean", self)
         act_dissolve_boolean.setToolTip("Restore source objects from selected boolean result(s)")
         act_dissolve_boolean.triggered.connect(self._bool_dissolve)
-        tb.addAction(act_dissolve_boolean)
-
-        tb.addSeparator()
+        add_group("Transform", [act_scale, act_move_plane, act_pattern, act_dissolve_boolean], columns=3)
 
         # ������ STEP import ������������������������������������������������������������������������������������������������������������������������������������������
         act_step = QAction(_icon("Part_STEP"), "Import STEP", self)
         act_step.setToolTip("Import a STEP file (.step / .stp)")
         act_step.triggered.connect(self._import_step)
-        tb.addAction(act_step)
 
         act_play = QAction(_icon("media-playback-start"), "Play", self)
         act_play.setToolTip("Open simulation panel (EMERGE Python script + verbose output)")
         act_play.triggered.connect(self._open_simulation_window)
-        tb.addAction(act_play)
-
-        tb.addSeparator()
+        add_group("Simulation", [act_step, act_play], columns=2)
 
         # ������ Selection mode ���������������������������������������������������������������������������������������������������������������������������
-        tb.addWidget(QLabel(" Select: "))
         self._sel_mode_combo = QComboBox()
         self._sel_mode_combo.addItems(["All", "Surface", "Edge", "Vertex"])
         self._sel_mode_combo.setToolTip(
@@ -567,7 +584,7 @@ class MainWindow(QMainWindow):
             "  Vertex - pick a single vertex"
         )
         self._sel_mode_combo.currentTextChanged.connect(self._on_selection_mode_changed)
-        tb.addWidget(self._sel_mode_combo)
+        add_group("Select", [self._sel_mode_combo], columns=1)
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� signal wiring
     def _connect_signals(self) -> None:
@@ -586,6 +603,8 @@ class MainWindow(QMainWindow):
         self._body_props.model_role_changed.connect(self._on_model_role_changed)
         self._body_props.material_added.connect(self._on_material_added)
         self._body_props.material_picker_requested.connect(self._open_material_picker)
+        self._body_props.project_parameters_changed.connect(self._on_project_parameters_changed)
+        self._body_props.set_formula_resolver(self._resolve_formula_text)
 
         # Materials tree ��� selection (single + multi)
         self._materials.object_selected.connect(self._on_material_tree_select)
@@ -610,6 +629,7 @@ class MainWindow(QMainWindow):
 
         # EMERGE settings changed
         self._project_tree.settings_changed.connect(self._on_settings_changed)
+        self._project_tree.project_selected.connect(self._on_project_selected)
         self._project_tree.output_plot_requested.connect(self._on_output_plot_requested)
 
     def _reset_simulation_cache(self) -> None:
@@ -1623,24 +1643,83 @@ class MainWindow(QMainWindow):
         self._info_bar.set_info(message)
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� object selection
+    def _on_project_selected(self) -> None:
+        self._project_properties_active = True
+        self._body_props.set_project_parameters(self._project_tree.get_settings().get("parameters", []))
+        self._materials.highlight([])
+        if hasattr(self._viewport.scene, "deselect_all"):
+            self._viewport.scene.deselect_all()
+        self._body_props.set_project_parameters(self._project_tree.get_settings().get("parameters", []))
+        self._info_bar.set_info(f"Project: {self._project_name}")
+
+    def _on_project_parameters_changed(self, parameters: list) -> None:
+        settings = self._project_tree.get_settings()
+        settings["parameters"] = parameters
+        self._project_tree.load_settings(settings)
+        self._project_tree.settings_changed.emit()
+        self._recompute_parametric_objects()
+
+    def _open_project_parameters(self) -> None:
+        self._project_properties_active = True
+        self._body_props.set_project_parameters(self._project_tree.get_settings().get("parameters", []))
+
+    def _parameter_values(self) -> dict[str, float]:
+        values = {}
+        parameters = self._project_tree.get_settings().get("parameters", [])
+        for entry in parameters if isinstance(parameters, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", "")).strip()
+            if not name:
+                continue
+            try:
+                values[name] = float(entry.get("value", 0.0))
+            except (TypeError, ValueError):
+                continue
+        return values
+
+    def _resolve_formula_text(self, text: str) -> float:
+        return evaluate_expression(text, self._parameter_values())
+
+    def _recompute_parametric_objects(self) -> None:
+        values = self._parameter_values()
+        for obj in list(self._viewport.scene.objects):
+            formulas = getattr(obj, "param_formulas", {}) or {}
+            if not formulas:
+                continue
+            params = obj.get_parameters()
+            try:
+                for key, formula in formulas.items():
+                    params[key] = evaluate_expression(formula, values)
+                obj.set_parameters(params)
+                obj.refresh_appearance()
+            except Exception as exc:
+                self._info_bar.set_info(f"{obj.name}: {exc}")
+        self._viewport._render()
+
     def _on_object_selected(self, obj) -> None:
+        self._project_properties_active = False
         self._body_props.set_object(obj)
         self._materials.highlight(obj)
         # Update Fuse counter when single object selected
-        self._fuse_label.setText(" Fuse (1) ")
+        self._fuse_label.setText("Fuse: 1 selected")
         self._fuse_label.setStyleSheet("font-size: 10px; color: #666;")
         if obj:
             self._info_bar.set_info(f"Selected: {obj.name}  [{type(obj).__name__}]")
 
     def _on_selection_changed(self, objects: list) -> None:
+        if self._project_properties_active:
+            self._body_props.set_project_parameters(self._project_tree.get_settings().get("parameters", []))
+            self._materials.highlight([])
+            return
         self._body_props.set_selection(objects)
         self._materials.highlight(objects)
         # Update Fuse counter in toolbar
         if len(objects) >= 2:
-            self._fuse_label.setText(f" Fuse ({len(objects)}) ")
+            self._fuse_label.setText(f"Fuse: {len(objects)} selected")
             self._fuse_label.setStyleSheet("font-size: 10px; color: #0a0; font-weight: bold;")
         else:
-            self._fuse_label.setText(" Fuse (0) ")
+            self._fuse_label.setText("Fuse: 0 selected")
             self._fuse_label.setStyleSheet("font-size: 10px; color: #666;")
         if len(objects) > 1:
             self._info_bar.set_info(f"{len(objects)} objects selected (Ctrl+click to extend)")
