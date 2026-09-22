@@ -549,6 +549,25 @@ def _polydata_from_json(data: Any) -> vtk.vtkPolyData:
     return poly
 
 
+def _restore_actor_transform_from_snapshot(obj: Any, item: Dict[str, Any]) -> Any:
+    transform = item.get("actor_transform", {})
+    actor = getattr(obj, "actor", None)
+    if not isinstance(transform, dict) or actor is None:
+        return obj
+
+    setters = (
+        ("origin", actor.SetOrigin),
+        ("position", actor.SetPosition),
+        ("orientation", actor.SetOrientation),
+        ("scale", actor.SetScale),
+    )
+    for key, setter in setters:
+        values = transform.get(key)
+        if isinstance(values, (list, tuple)) and len(values) == 3:
+            setter(*[float(value) for value in values])
+    return obj
+
+
 def _rebuild_object_from_snapshot(item: Any) -> Any | None:
     if not isinstance(item, dict):
         return None
@@ -582,7 +601,7 @@ def _rebuild_object_from_snapshot(item: Any) -> Any | None:
                 and str(params.get("StepSourcePath", "") or "").strip()
             ):
                 obj.step_geometry_modified = True
-            return obj
+            return _restore_actor_transform_from_snapshot(obj, item)
 
         if obj_type == "BoxObject":
             obj = emo.BoxObject(
@@ -592,7 +611,7 @@ def _rebuild_object_from_snapshot(item: Any) -> Any | None:
                 params.get("Material", "PEC"),
             )
             obj.set_parameters(params)
-            return obj
+            return _restore_actor_transform_from_snapshot(obj, item)
     except Exception:
         return None
 

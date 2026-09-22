@@ -85,7 +85,7 @@ def _icon(name: str) -> "QIcon":
 
 from PySide6.QtWidgets import (
     QMainWindow, QWidget, QSplitter,
-    QFileDialog, QMessageBox, QComboBox, QSpinBox,
+    QFileDialog, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit,
     QLabel, QDialog, QInputDialog,
     QVBoxLayout, QFormLayout, QTextBrowser, QPlainTextEdit,
     QPushButton, QHBoxLayout, QGroupBox, QCheckBox,
@@ -251,6 +251,11 @@ class MainWindow(QMainWindow):
         self._sim_pardiso_threads = 8
         self._sim_acc_threads = 10
         self._mesh_resolution = 0.3  # 1/3 wavelength, ~3.3 lines/wavelength
+        self._curved_boundary_resolution = 20
+        self._refinement_boundary_size_mm = 0.25
+        self._refinement_face_size_mm = 0.1
+        self._refinement_growth_rate = 3.0
+        self._refinement_max_size_mm = 0.0
         self._sim_plot_sparams_after_sim = True
         self._sim_export_sparams_after_sim = True
         self._history_limit = 10
@@ -518,6 +523,10 @@ class MainWindow(QMainWindow):
             act.setToolTip(f"Draw {label}  [click base on viewport to start]")
             act.triggered.connect(lambda checked, m=mode: self._start_draw(m))
             primitive_actions.append(act)
+        act_open_region = QAction(_icon("open-region-pml"), "Open Region / PML", self)
+        act_open_region.setToolTip("Generate an air region, PML shell, and open/radiation boundaries")
+        act_open_region.triggered.connect(self._open_region_pml_wizard)
+        primitive_actions.append(act_open_region)
         add_group("3D", primitive_actions, columns=3)
 
         # Sketch tool
@@ -528,8 +537,8 @@ class MainWindow(QMainWindow):
         act_planar = QAction(_icon("Std_Plane"), "Planar", self)
         act_planar.setToolTip("Define planar structure: pick start/end (vertex/edge/face snap) on active plane")
         act_planar.triggered.connect(lambda: self._start_draw("planar"))
-        act_plate_face = QAction(_icon("Part_Box"), "Plate from Face", self)
-        act_plate_face.setToolTip("Create a thin plate from the last selected face")
+        act_plate_face = QAction(_icon("Part_Box"), "Plate from Face/Edge", self)
+        act_plate_face.setToolTip("Create a thin plate from the last selected face or axis-aligned edge")
         act_plate_face.triggered.connect(self._create_plate_from_face)
         add_group("2D", [act_sketch, act_planar, act_plate_face], columns=3)
 
@@ -630,6 +639,8 @@ class MainWindow(QMainWindow):
         self._materials.assign_port_requested.connect(self._on_assign_port_requested)
         self._materials.assign_boundary_requested.connect(self._on_assign_boundary_requested)
         self._materials.assign_mesh_resolution_requested.connect(self._on_assign_mesh_resolution_requested)
+        self._materials.assign_mesh_refinement_requested.connect(self._on_assign_mesh_refinement_requested)
+        self._materials.set_open_region_requested.connect(self._on_set_open_region_requested)
         self._materials.material_priority_changed.connect(self._on_material_priority_changed)
 
         # EMERGE settings changed
@@ -721,6 +732,79 @@ class MainWindow(QMainWindow):
 
     def _create_plate_from_face(self) -> None:
         self._viewport.create_plate_from_face(self._draw_material)
+
+    def _open_region_pml_wizard(self) -> None:
+        from PySide6.QtWidgets import QDoubleSpinBox, QComboBox
+        from ..scene.em_objects import BoxObject
+
+        models = [
+            obj for obj in self._viewport.scene.objects
+            if bool(getattr(obj, "is_model", True))
+            and str(getattr(obj, "material", "")).strip().upper() not in {"AIR", "PML"}
+            and getattr(obj, "actor", None) is not None
+        ]
+        if not models:
+            QMessageBox.information(self, "Open Region / PML", "Create or import a model object first.")
+            return
+
+        bounds = [obj.actor.GetBounds() for obj in models]
+        model_bounds = (
+            min(item[0] for item in bounds), max(item[1] for item in bounds),
+            min(item[2] for item in bounds), max(item[3] for item in bounds),
+            min(item[4] for item in bounds), max(item[5] for item in bounds),
+        )
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Open Region / PML Wizard")
+        form = QFormLayout(dlg)
+        distance = QDoubleSpinBox(dlg); distance.setRange(0.001, 1e6); distance.setDecimals(4); distance.setValue(10.0)
+        thickness = QDoubleSpinBox(dlg); thickness.setRange(0.001, 1e6); thickness.setDecimals(4); thickness.setValue(10.0)
+        boundary = QComboBox(dlg); boundary.addItems(["Open", "Radiation"])
+        form.addRow("Air distance", distance)
+        form.addRow("PML thickness", thickness)
+        form.addRow("Outer boundary", boundary)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
+        buttons.accepted.connect(dlg.accept); buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        gap = float(distance.value())
+        pml = float(thickness.value())
+        inner = [
+            model_bounds[0] - gap, model_bounds[1] + gap,
+            model_bounds[2] - gap, model_bounds[3] + gap,
+            model_bounds[4] - gap, model_bounds[5] + gap,
+        ]
+        outer = [
+            inner[0] - pml, inner[1] + pml,
+            inner[2] - pml, inner[3] + pml,
+            inner[4] - pml, inner[5] + pml,
+        ]
+        existing = {str(obj.name) for obj in self._viewport.scene.objects}
+        air_name = "Air_Region"
+        pml_name = "PML_Region"
+        index = 2
+        while air_name in existing or pml_name in existing:
+            air_name = f"Air_Region_{index}"
+            pml_name = f"PML_Region_{index}"
+            index += 1
+        air = BoxObject(air_name, inner[0], inner[2], inner[4], inner[1], inner[3], inner[5], "AIR")
+        pml_obj = BoxObject(pml_name, outer[0], outer[2], outer[4], outer[1], outer[3], outer[5], "PML")
+        air.is_model = True
+        pml_obj.is_model = True
+        self._viewport.scene.add_object(air)
+        self._viewport.scene.add_object(pml_obj)
+        settings = self._project_tree.get_settings()
+        settings.setdefault("boundaries", {})
+        for key in ("Xmin", "Xmax", "Ymin", "Ymax", "Zmin", "Zmax"):
+            settings["boundaries"][key] = boundary.currentText()
+        settings["open_region"] = {"enabled": True, "object": air_name}
+        self._project_tree.load_settings(settings)
+        self._project_tree.settings_changed.emit()
+        self._viewport.scene_changed.emit()
+        self._refresh_materials()
+        self._viewport._render()
+        self._info_bar.set_info(f"Created {air_name} and {pml_name} with {boundary.currentText()} boundaries")
 
     def _delete_selected(self) -> None:
         objects = list(self._viewport.scene.selection)
@@ -2153,6 +2237,19 @@ class MainWindow(QMainWindow):
         self._info_bar.set_info(f"Set {len(objects)} object(s) as {role_txt}")
         self._mark_simulation_dirty(steps=True, script=True)
 
+    def _on_set_open_region_requested(self, obj) -> None:
+        if obj is None or str(getattr(obj, "material", "")).strip().upper() != "AIR":
+            return
+        settings = self._project_tree.get_settings()
+        settings["open_region"] = {
+            "enabled": True,
+            "object": str(getattr(obj, "name", "")).strip(),
+        }
+        self._project_tree.load_settings(settings)
+        self._project_tree.settings_changed.emit()
+        self._mark_simulation_dirty(steps=False, script=True)
+        self._info_bar.set_info(f"Simulation region set to: {obj.name}")
+
     def _on_model_role_changed(self, obj, is_model: bool) -> None:
         if obj is None:
             return
@@ -2262,6 +2359,142 @@ class MainWindow(QMainWindow):
             self._info_bar.set_info(f"Mesh 1/λ set to {value:.4g} for {names[0]}")
         else:
             self._info_bar.set_info(f"Mesh 1/λ set to {value:.4g} for {len(names)} objects")
+
+    def _on_assign_mesh_refinement_requested(self, objects: list) -> None:
+        objects = [obj for obj in objects if obj is not None and str(getattr(obj, "name", "")).strip()]
+        if not objects:
+            return
+
+        settings = self._project_tree.get_settings()
+        mesh_cfg = settings.setdefault("mesh", {})
+        if not isinstance(mesh_cfg, dict):
+            mesh_cfg = {}
+            settings["mesh"] = mesh_cfg
+        refinements = mesh_cfg.get("local_refinements", [])
+        if not isinstance(refinements, list):
+            refinements = []
+
+        names = [str(obj.name).strip() for obj in objects]
+        existing = next(
+            (
+                item for item in refinements
+                if isinstance(item, dict) and str(item.get("object", "")).strip() == names[0]
+            ),
+            None,
+        ) if len(names) == 1 else None
+        all_plates = all(type(obj).__name__ == "PlateObject" for obj in objects)
+        initial_mode = str((existing or {}).get("mode", "face" if all_plates else "boundary"))
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Assign Mesh Refinement ({len(names)} object{'s' if len(names) != 1 else ''})")
+        form = QFormLayout(dlg)
+
+        enabled = QCheckBox("Enabled", dlg)
+        enabled.setChecked(bool((existing or {}).get("enabled", True)))
+        form.addRow("", enabled)
+
+        mode = QComboBox(dlg)
+        mode.addItem("Boundary edges", "boundary")
+        mode.addItem("Face", "face")
+        mode_index = mode.findData(initial_mode)
+        mode.setCurrentIndex(max(0, mode_index))
+        form.addRow("Mode", mode)
+
+        faces = QLineEdit(dlg)
+        default_faces = "" if all_plates and initial_mode == "face" else "-z,+z"
+        faces.setText(",".join((existing or {}).get("faces", [])) or default_faces)
+        faces.setPlaceholderText("-z,+z (empty = whole Plate for Face mode)")
+        form.addRow("Faces", faces)
+
+        size = QDoubleSpinBox(dlg)
+        size.setDecimals(6)
+        size.setRange(0.000001, 1e6)
+        default_size = self._refinement_face_size_mm if initial_mode == "face" else self._refinement_boundary_size_mm
+        size.setValue(float((existing or {}).get("size_mm", default_size)))
+        size.setSuffix(" mm")
+        form.addRow("Minimum size", size)
+
+        growth = QDoubleSpinBox(dlg)
+        growth.setDecimals(3)
+        growth.setRange(1.001, 100.0)
+        growth.setValue(float((existing or {}).get("growth_rate", self._refinement_growth_rate)))
+        form.addRow("Growth rate", growth)
+
+        max_size = QDoubleSpinBox(dlg)
+        max_size.setDecimals(6)
+        max_size.setRange(0.0, 1e6)
+        max_size.setSpecialValueText("Automatic")
+        max_size.setSuffix(" mm")
+        existing_max = (existing or {}).get("max_size_mm", self._refinement_max_size_mm)
+        max_size.setValue(float(existing_max or 0.0))
+        form.addRow("Maximum size", max_size)
+
+        if existing is None:
+            def _use_mode_default(_index: int) -> None:
+                selected_mode = str(mode.currentData())
+                size.setValue(
+                    self._refinement_face_size_mm
+                    if selected_mode == "face"
+                    else self._refinement_boundary_size_mm
+                )
+                if selected_mode == "face" and all_plates:
+                    faces.clear()
+                elif not faces.text().strip():
+                    faces.setText("-z,+z")
+
+            mode.currentIndexChanged.connect(_use_mode_default)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        if dlg.exec() != QDialog.Accepted:
+            return
+
+        valid_faces = {"-x", "+x", "-y", "+y", "-z", "+z"}
+        selected_faces = [part.strip().lower() for part in faces.text().split(",") if part.strip()]
+        invalid_faces = [part for part in selected_faces if part not in valid_faces]
+        selected_mode = str(mode.currentData())
+        if invalid_faces:
+            QMessageBox.warning(self, "Mesh Refinement", f"Invalid face selector(s): {', '.join(invalid_faces)}")
+            return
+        if selected_mode == "boundary" and not selected_faces:
+            QMessageBox.warning(self, "Mesh Refinement", "Boundary edges mode requires at least one face selector.")
+            return
+        if selected_mode == "face" and not selected_faces and not all_plates:
+            QMessageBox.warning(self, "Mesh Refinement", "Face mode requires face selectors for non-Plate objects.")
+            return
+
+        assigned_refinements = []
+        for name in names:
+            assigned_refinements.append({
+                "object": name,
+                "enabled": bool(enabled.isChecked()),
+                "mode": selected_mode,
+                "faces": list(selected_faces),
+                "size_mm": float(size.value()),
+                "growth_rate": float(growth.value()),
+                "max_size_mm": float(max_size.value()) if max_size.value() > 0.0 else None,
+            })
+        self._project_tree.assign_local_mesh_refinements(assigned_refinements)
+        saved_refinements = self._project_tree.get_settings().get("mesh", {}).get("local_refinements", [])
+        saved_names = {
+            str(item.get("object", "")).strip()
+            for item in saved_refinements
+            if isinstance(item, dict)
+        }
+        missing_names = [name for name in names if name not in saved_names]
+        if missing_names:
+            QMessageBox.critical(
+                self,
+                "Mesh Refinement",
+                f"The refinement assignment was not retained for: {', '.join(missing_names)}",
+            )
+            return
+        self._mark_simulation_dirty(steps=False, script=True)
+        self._info_bar.set_info(
+            f"Local mesh refinement assigned to {len(names)} object(s): {', '.join(names)}"
+        )
 
     def _on_material_priority_changed(self, material_name: str, delta: int) -> None:
         """Handle material priority change: delta is 1 for higher, -1 for lower."""
@@ -2384,8 +2617,8 @@ class MainWindow(QMainWindow):
 
             self._sim_chk_run_sweep = QCheckBox("Run Sweep")
             self._sim_chk_run_sweep.setChecked(True)
-            self._sim_chk_run_sweep.setEnabled(False)
-            self._sim_chk_run_sweep.setToolTip("Simulation execution is always enabled")
+            self._sim_chk_run_sweep.setToolTip("Run the configured solver after mesh generation")
+            self._sim_chk_run_sweep.toggled.connect(self._on_sim_option_changed)
             btn_row.addWidget(self._sim_chk_run_sweep)
 
             self._sim_chk_boolean_debug = QCheckBox("Boolean Debug")
@@ -2771,6 +3004,17 @@ class MainWindow(QMainWindow):
     def _build_simulation_script_bundle(self, step_entries: list[dict], show_model: bool, show_mesh: bool, run_sweep: bool, preview_only: bool = False) -> dict:
         settings = self._project_tree.get_settings()
         mesh_cfg = settings.get("mesh", {}) if isinstance(settings, dict) else {}
+        runtime_cfg = settings.get("runtime", {}) if isinstance(settings, dict) else {}
+        if not isinstance(runtime_cfg, dict):
+            runtime_cfg = {}
+        runtime_solver = str(runtime_cfg.get("solver", self._sim_solver)).strip().upper()
+        if runtime_solver not in _EMERGE_SOLVERS:
+            runtime_solver = self._sim_solver
+        runtime_parallel = bool(runtime_cfg.get("parallel_enabled", self._sim_parallel_enabled))
+        runtime_pardiso_threads = max(1, int(runtime_cfg.get("pardiso_threads", self._sim_pardiso_threads)))
+        runtime_acc_threads = max(1, int(runtime_cfg.get("acc_threads", self._sim_acc_threads)))
+        runtime_plot_sparams = bool(runtime_cfg.get("plot_sparams_after_sim", self._sim_plot_sparams_after_sim))
+        runtime_export_sparams = bool(runtime_cfg.get("export_sparams_after_sim", self._sim_export_sparams_after_sim))
         mesh_fraction = self._mesh_resolution
         if isinstance(mesh_cfg, dict):
             try:
@@ -2783,6 +3027,9 @@ class MainWindow(QMainWindow):
         for idx, sim_cfg in enumerate(enabled_sims, start=1):
             sim_name = str(sim_cfg.get("name", f"Simulation_{idx}")).strip() or f"Simulation_{idx}"
             child_settings = dict(settings)
+            child_mesh_cfg = dict(mesh_cfg) if isinstance(mesh_cfg, dict) else {}
+            child_mesh_cfg["curved_boundary_resolution"] = self._curved_boundary_resolution
+            child_settings["mesh"] = child_mesh_cfg
             child_settings["simulations"] = [dict(sim_cfg)]
             child_settings["simulation"] = {
                 "Fmin_GHz": sim_cfg.get("Fmin_GHz", 0.1),
@@ -2805,13 +3052,13 @@ class MainWindow(QMainWindow):
                 run_sweep=run_sweep,
                 lumped_ports=self._collect_plate_lumped_ports(),
                 plate_entries=self._collect_emerge_plates(),
-                solver=self._sim_solver,
-                parallel_enabled=self._sim_parallel_enabled,
-                pardiso_threads=self._sim_pardiso_threads,
-                acc_threads=self._sim_acc_threads,
+                solver=runtime_solver,
+                parallel_enabled=runtime_parallel,
+                pardiso_threads=runtime_pardiso_threads,
+                acc_threads=runtime_acc_threads,
                 mesh_resolution_fraction=mesh_fraction,
-                plot_sparams_after_sim=self._sim_plot_sparams_after_sim,
-                export_sparams_after_sim=self._sim_export_sparams_after_sim,
+                plot_sparams_after_sim=runtime_plot_sparams,
+                export_sparams_after_sim=runtime_export_sparams,
                 simulation_override=sim_cfg,
             )
             scripts.append(
@@ -3550,6 +3797,19 @@ class MainWindow(QMainWindow):
             pass
 
         try:
+            self._curved_boundary_resolution = max(3, int(settings.value("mesh/curved_boundary_resolution", 20)))
+        except Exception:
+            pass
+
+        try:
+            self._refinement_boundary_size_mm = max(1e-6, float(settings.value("mesh/refinement_boundary_size_mm", 0.25)))
+            self._refinement_face_size_mm = max(1e-6, float(settings.value("mesh/refinement_face_size_mm", 0.1)))
+            self._refinement_growth_rate = max(1.001, float(settings.value("mesh/refinement_growth_rate", 3.0)))
+            self._refinement_max_size_mm = max(0.0, float(settings.value("mesh/refinement_max_size_mm", 0.0)))
+        except Exception:
+            pass
+
+        try:
             self._sim_plot_sparams_after_sim = bool(int(settings.value("simulation/plot_sparams_after_sim", 1)))
         except Exception:
             pass
@@ -3577,6 +3837,11 @@ class MainWindow(QMainWindow):
         settings.setValue("simulation/pardiso_threads", int(self._sim_pardiso_threads))
         settings.setValue("simulation/acc_threads", int(self._sim_acc_threads))
         settings.setValue("mesh/resolution", float(self._mesh_resolution))
+        settings.setValue("mesh/curved_boundary_resolution", int(self._curved_boundary_resolution))
+        settings.setValue("mesh/refinement_boundary_size_mm", float(self._refinement_boundary_size_mm))
+        settings.setValue("mesh/refinement_face_size_mm", float(self._refinement_face_size_mm))
+        settings.setValue("mesh/refinement_growth_rate", float(self._refinement_growth_rate))
+        settings.setValue("mesh/refinement_max_size_mm", float(self._refinement_max_size_mm))
         settings.setValue("simulation/plot_sparams_after_sim", int(self._sim_plot_sparams_after_sim))
         settings.setValue("simulation/export_sparams_after_sim", int(self._sim_export_sparams_after_sim))
         settings.sync()
@@ -3598,6 +3863,11 @@ class MainWindow(QMainWindow):
             pardiso_threads=self._sim_pardiso_threads,
             acc_threads=self._sim_acc_threads,
             mesh_resolution=self._mesh_resolution,
+            curved_boundary_resolution=self._curved_boundary_resolution,
+            refinement_boundary_size_mm=self._refinement_boundary_size_mm,
+            refinement_face_size_mm=self._refinement_face_size_mm,
+            refinement_growth_rate=self._refinement_growth_rate,
+            refinement_max_size_mm=self._refinement_max_size_mm,
             plot_sparams_after_sim=self._sim_plot_sparams_after_sim,
             export_sparams_after_sim=self._sim_export_sparams_after_sim,
         )
@@ -3612,6 +3882,8 @@ class MainWindow(QMainWindow):
 
         old_units = self._units
         old_locale = self._ui_locale
+        old_mesh_resolution = self._mesh_resolution
+        old_curved_boundary_resolution = self._curved_boundary_resolution
 
         self._units = units
         self._decimal_separator = decimal_separator
@@ -3631,8 +3903,26 @@ class MainWindow(QMainWindow):
         self._sim_pardiso_threads = max(1, int(values.get("pardiso_threads", self._sim_pardiso_threads)))
         self._sim_acc_threads = max(1, int(values.get("acc_threads", self._sim_acc_threads)))
         self._mesh_resolution = max(0.01, min(1.0, float(values.get("mesh_resolution", self._mesh_resolution))))
+        self._curved_boundary_resolution = max(3, int(values.get("curved_boundary_resolution", self._curved_boundary_resolution)))
+        self._refinement_boundary_size_mm = max(1e-6, float(values.get("refinement_boundary_size_mm", self._refinement_boundary_size_mm)))
+        self._refinement_face_size_mm = max(1e-6, float(values.get("refinement_face_size_mm", self._refinement_face_size_mm)))
+        self._refinement_growth_rate = max(1.001, float(values.get("refinement_growth_rate", self._refinement_growth_rate)))
+        self._refinement_max_size_mm = max(0.0, float(values.get("refinement_max_size_mm", self._refinement_max_size_mm)))
         self._sim_plot_sparams_after_sim = bool(values.get("plot_sparams_after_sim", self._sim_plot_sparams_after_sim))
         self._sim_export_sparams_after_sim = bool(values.get("export_sparams_after_sim", self._sim_export_sparams_after_sim))
+        self._project_tree.set_runtime_settings({
+            "solver": self._sim_solver,
+            "parallel_enabled": self._sim_parallel_enabled,
+            "pardiso_threads": self._sim_pardiso_threads,
+            "acc_threads": self._sim_acc_threads,
+            "plot_sparams_after_sim": self._sim_plot_sparams_after_sim,
+            "export_sparams_after_sim": self._sim_export_sparams_after_sim,
+        })
+        if (
+            self._mesh_resolution != old_mesh_resolution
+            or self._curved_boundary_resolution != old_curved_boundary_resolution
+        ):
+            self._mark_simulation_dirty(script=True)
 
         if selection_color != self._selection_color:
             self._selection_color = selection_color
@@ -4264,6 +4554,14 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"EM 3D Modeler - {self._project_name}")
         self._project_tree.set_project_name(self._project_name)
         self._project_tree.reset_settings()
+        self._project_tree.set_runtime_settings({
+            "solver": self._sim_solver,
+            "parallel_enabled": self._sim_parallel_enabled,
+            "pardiso_threads": self._sim_pardiso_threads,
+            "acc_threads": self._sim_acc_threads,
+            "plot_sparams_after_sim": self._sim_plot_sparams_after_sim,
+            "export_sparams_after_sim": self._sim_export_sparams_after_sim,
+        })
         self._sync_log_verbosity_from_settings()
         self._viewport.scene.clear()
         self._sync_active_reference_plane_to_viewport()
@@ -4307,7 +4605,29 @@ class MainWindow(QMainWindow):
             self._reset_simulation_cache()
             self.setWindowTitle(f"EM 3D Modeler - {self._project_name}")
             self._project_tree.set_project_name(self._project_name)
-            self._project_tree.load_settings(data.get("emerge_settings", {}))
+            project_settings = data.get("emerge_settings", {})
+            if not isinstance(project_settings, dict):
+                project_settings = {}
+            if not isinstance(project_settings.get("runtime"), dict):
+                project_settings = dict(project_settings)
+                project_settings["runtime"] = {
+                    "solver": self._sim_solver,
+                    "parallel_enabled": self._sim_parallel_enabled,
+                    "pardiso_threads": self._sim_pardiso_threads,
+                    "acc_threads": self._sim_acc_threads,
+                    "plot_sparams_after_sim": self._sim_plot_sparams_after_sim,
+                    "export_sparams_after_sim": self._sim_export_sparams_after_sim,
+                }
+            self._project_tree.load_settings(project_settings)
+            runtime = self._project_tree.get_settings().get("runtime", {})
+            solver = str(runtime.get("solver", self._sim_solver)).strip().upper()
+            if solver in _EMERGE_SOLVERS:
+                self._sim_solver = solver
+            self._sim_parallel_enabled = bool(runtime.get("parallel_enabled", self._sim_parallel_enabled))
+            self._sim_pardiso_threads = max(1, int(runtime.get("pardiso_threads", self._sim_pardiso_threads)))
+            self._sim_acc_threads = max(1, int(runtime.get("acc_threads", self._sim_acc_threads)))
+            self._sim_plot_sparams_after_sim = bool(runtime.get("plot_sparams_after_sim", self._sim_plot_sparams_after_sim))
+            self._sim_export_sparams_after_sim = bool(runtime.get("export_sparams_after_sim", self._sim_export_sparams_after_sim))
             self._recompute_simulation_parameters()
             self._sync_log_verbosity_from_settings()
             self._viewport.scene.from_json(data.get("objects", []))
@@ -4480,16 +4800,27 @@ class MainWindow(QMainWindow):
             self._draw_material = names[0]
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� close
+    def _shutdown_simulation_process(self) -> None:
+        proc = getattr(self, "_sim_process", None)
+        if proc is None or proc.state() == QProcess.NotRunning:
+            return
+        self._on_sim_stop()
+        if not proc.waitForFinished(3000) and proc.state() != QProcess.NotRunning:
+            proc.kill()
+            proc.waitForFinished(1000)
+
     def closeEvent(self, event) -> None:
         reply = QMessageBox.question(
             self, "Quit", "Save project before closing?",
             QMessageBox.Save | QMessageBox.Discard | QMessageBox.Cancel
         )
         if reply == QMessageBox.Save:
+            self._shutdown_simulation_process()
             self._save_project()
             self._save_app_settings()
             event.accept()
         elif reply == QMessageBox.Discard:
+            self._shutdown_simulation_process()
             self._save_app_settings()
             event.accept()
         else:

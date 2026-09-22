@@ -36,7 +36,7 @@ from ..scene.param_expr import evaluate_expression
 
 
 # ──────────────────────────────────────────────────────────────────── constants
-_BOUNDARY_TYPES = ["PML", "PEC", "PMC", "Open", "Periodic"]
+_BOUNDARY_TYPES = ["PML", "PEC", "PMC", "Open", "Radiation", "Periodic"]
 _BOUNDARY_KEYS  = ["Xmin", "Xmax", "Ymin", "Ymax", "Zmin", "Zmax"]
 _PORT_TYPES = ["WaveguidePort", "LumpedPort", "PlaneWave"]
 
@@ -102,12 +102,21 @@ def _default_output_item(simulation_name: str, idx: int) -> Dict[str, Any]:
 
 _DEFAULT_SETTINGS: Dict[str, Any] = {
     "boundaries": {k: "PML" for k in _BOUNDARY_KEYS},
+    "open_region": {"enabled": False, "object": ""},
     "ports":      [],
     "object_boundaries": [],
     "simulation": {"Fmin_GHz": 0.1, "Fmax_GHz": 10.0, "Fstep_GHz": 0.1, "NumberOfPoints": 100, "LogVerbosity": "Info"},
     "simulations": [_default_simulation_item()],
     "outputs": [],
-    "mesh":       {"default_fraction": 0.3, "object_resolutions": {}},
+    "mesh":       {"default_fraction": 0.3, "object_resolutions": {}, "local_refinements": []},
+    "runtime": {
+        "solver": "PARDISO",
+        "parallel_enabled": True,
+        "pardiso_threads": 8,
+        "acc_threads": 10,
+        "plot_sparams_after_sim": True,
+        "export_sparams_after_sim": True,
+    },
     "material_priorities": {},  # Maps material_name -> priority_value
 }
 
@@ -206,6 +215,40 @@ class ProjectTreeWidget(QWidget):
     def get_settings(self) -> Dict[str, Any]:
         return _deep_copy(self._settings)
 
+    def assign_local_mesh_refinements(self, refinements: list[Dict[str, Any]]) -> None:
+        mesh_cfg = self._settings.setdefault("mesh", {})
+        if not isinstance(mesh_cfg, dict):
+            mesh_cfg = {}
+            self._settings["mesh"] = mesh_cfg
+        current = mesh_cfg.get("local_refinements", [])
+        if not isinstance(current, list):
+            current = []
+
+        object_names = {
+            str(item.get("object", "")).strip()
+            for item in refinements
+            if isinstance(item, dict) and str(item.get("object", "")).strip()
+        }
+        current = [
+            item for item in current
+            if not isinstance(item, dict) or str(item.get("object", "")).strip() not in object_names
+        ]
+        current.extend(_deep_copy(refinements))
+        mesh_cfg["local_refinements"] = current
+        self._populate()
+        local_node = getattr(self, "_m_local_node", None)
+        if local_node is not None:
+            local_node.setExpanded(True)
+        self.settings_changed.emit()
+
+    def set_runtime_settings(self, runtime: Dict[str, Any]) -> None:
+        current = self._settings.setdefault("runtime", {})
+        if not isinstance(current, dict):
+            current = {}
+            self._settings["runtime"] = current
+        current.update(_deep_copy(runtime))
+        self.settings_changed.emit()
+
     def _parse_formula_float(self, text: str) -> float:
         raw = str(text).strip()
         try:
@@ -273,6 +316,23 @@ class ProjectTreeWidget(QWidget):
             merged["ports"] = []
         if not isinstance(merged.get("object_boundaries"), list):
             merged["object_boundaries"] = []
+        if not isinstance(merged.get("open_region"), dict):
+            merged["open_region"] = {"enabled": False, "object": ""}
+        runtime = merged.get("runtime")
+        if not isinstance(runtime, dict):
+            runtime = {}
+            merged["runtime"] = runtime
+        solver = str(runtime.get("solver", "PARDISO")).strip().upper()
+        runtime["solver"] = solver if solver in {"PARDISO", "SUPERLU", "UMFPACK", "CUDSS", "AASDS", "MUMPS"} else "PARDISO"
+        runtime["parallel_enabled"] = bool(runtime.get("parallel_enabled", True))
+        try:
+            runtime["pardiso_threads"] = max(1, int(runtime.get("pardiso_threads", 8)))
+            runtime["acc_threads"] = max(1, int(runtime.get("acc_threads", 10)))
+        except (TypeError, ValueError):
+            runtime["pardiso_threads"] = 8
+            runtime["acc_threads"] = 10
+        runtime["plot_sparams_after_sim"] = bool(runtime.get("plot_sparams_after_sim", True))
+        runtime["export_sparams_after_sim"] = bool(runtime.get("export_sparams_after_sim", True))
 
         if not isinstance(merged.get("simulations"), list):
             merged["simulations"] = []
@@ -302,6 +362,41 @@ class ProjectTreeWidget(QWidget):
             except Exception:
                 continue
         mesh_cfg["object_resolutions"] = normalized_obj_res
+
+        raw_refinements = mesh_cfg.get("local_refinements", [])
+        if not isinstance(raw_refinements, list):
+            raw_refinements = []
+        normalized_refinements = []
+        valid_faces = {"-x", "+x", "-y", "+y", "-z", "+z"}
+        for item in raw_refinements:
+            if not isinstance(item, dict):
+                continue
+            object_name = str(item.get("object", "")).strip()
+            mode = str(item.get("mode", "boundary")).strip().lower()
+            if not object_name or mode not in {"boundary", "face"}:
+                continue
+            faces = [
+                str(face).strip().lower()
+                for face in item.get("faces", [])
+                if str(face).strip().lower() in valid_faces
+            ] if isinstance(item.get("faces", []), list) else []
+            try:
+                size_mm = max(1e-6, float(item.get("size_mm", 0.25 if mode == "boundary" else 0.1)))
+                growth_rate = max(1.001, float(item.get("growth_rate", 3.0)))
+                raw_max_size = item.get("max_size_mm")
+                max_size_mm = max(1e-6, float(raw_max_size)) if raw_max_size not in (None, "", 0, 0.0) else None
+            except (TypeError, ValueError):
+                continue
+            normalized_refinements.append({
+                "object": object_name,
+                "enabled": bool(item.get("enabled", True)),
+                "mode": mode,
+                "faces": faces,
+                "size_mm": size_mm,
+                "growth_rate": growth_rate,
+                "max_size_mm": max_size_mm,
+            })
+        mesh_cfg["local_refinements"] = normalized_refinements
 
         # Backward compatibility: lift legacy single simulation dict into the new list model.
         if not merged["simulations"]:
@@ -405,6 +500,14 @@ class ProjectTreeWidget(QWidget):
         self._m_node   = self._make_section(root, "Mesh")
 
         # Boundaries
+        open_region = self._settings.get("open_region", {})
+        domain_name = str(open_region.get("object", "")).strip() if isinstance(open_region, dict) else ""
+        domain_item = self._make_leaf(self._b_node, "Domain", domain_name or "Auto-detect AIR", editable=True)
+        domain_item.setData(0, Qt.UserRole, ("__open_region__", 0))
+        if domain_name and self._scene_object_names and domain_name not in self._scene_object_names:
+            warn_brush = QBrush(QColor(220, 40, 40))
+            domain_item.setForeground(0, warn_brush)
+            domain_item.setForeground(1, warn_brush)
         for k in _BOUNDARY_KEYS:
             v = self._settings["boundaries"].get(k, "PML")
             self._make_leaf(self._b_node, k, v, editable=True)
@@ -423,6 +526,8 @@ class ProjectTreeWidget(QWidget):
 
         # Mesh
         self._m_obj_node = self._make_section(self._m_node, "Assigned To Objects")
+        self._m_local_node = self._make_section(self._m_node, "Local Refinements")
+        self._m_local_node.setExpanded(True)
         self._refresh_object_mesh_assignments()
 
         self._tree.expandAll()
@@ -594,6 +699,9 @@ class ProjectTreeWidget(QWidget):
         if node is None:
             return
         node.takeChildren()
+        local_node = getattr(self, "_m_local_node", None)
+        if local_node is not None:
+            local_node.takeChildren()
 
         mesh_cfg = self._settings.get("mesh", {})
         if not isinstance(mesh_cfg, dict):
@@ -625,6 +733,41 @@ class ProjectTreeWidget(QWidget):
                 row.setForeground(1, warn_brush)
             node.addChild(row)
 
+        if local_node is None:
+            return
+        refinements = mesh_cfg.get("local_refinements", [])
+        if not isinstance(refinements, list):
+            return
+        for index, refinement in enumerate(refinements):
+            if not isinstance(refinement, dict):
+                continue
+            object_name = str(refinement.get("object", "?")).strip() or "?"
+            mode = str(refinement.get("mode", "boundary")).strip().title()
+            faces = ",".join(str(face) for face in refinement.get("faces", []))
+            size_mm = float(refinement.get("size_mm", 0.0))
+            state = "On" if bool(refinement.get("enabled", True)) else "Off"
+            target = f" [{faces}]" if faces else ""
+            row = QTreeWidgetItem([
+                f"{object_name}: {mode}{target}",
+                f"{size_mm:g} mm ({state})",
+            ])
+            row.setData(0, Qt.UserRole, ("__mesh_refinement__", index))
+            max_size = refinement.get("max_size_mm")
+            row.setToolTip(
+                0,
+                f"Object: {object_name}\nMode: {mode}\nFaces: {faces or 'Whole object'}\n"
+                f"Size: {size_mm:g} mm\nGrowth rate: {float(refinement.get('growth_rate', 3.0)):g}\n"
+                f"Maximum size: {float(max_size):g} mm" if max_size is not None else
+                f"Object: {object_name}\nMode: {mode}\nFaces: {faces or 'Whole object'}\n"
+                f"Size: {size_mm:g} mm\nGrowth rate: {float(refinement.get('growth_rate', 3.0)):g}\n"
+                "Maximum size: Automatic"
+            )
+            if self._scene_object_names and object_name not in self._scene_object_names:
+                warn_brush = QBrush(QColor(220, 40, 40))
+                row.setForeground(0, warn_brush)
+                row.setForeground(1, warn_brush)
+            local_node.addChild(row)
+
     # ─────────────────────────────────────────────────── editing
     def _on_double_click(self, item: QTreeWidgetItem, col: int) -> None:
         parent = item.parent()
@@ -649,6 +792,12 @@ class ProjectTreeWidget(QWidget):
                 return
             if tag == "__mesh_default__":
                 self._edit_default_mesh_resolution()
+                return
+            if tag == "__open_region__":
+                self._edit_open_region_domain()
+                return
+            if tag == "__mesh_refinement__":
+                self._edit_local_mesh_refinement(int(idx))
                 return
 
         key = item.text(0)
@@ -737,6 +886,28 @@ class ProjectTreeWidget(QWidget):
             act_edit = QAction("Edit Default Mesh Resolution…", menu)
             act_edit.triggered.connect(self._edit_default_mesh_resolution)
             menu.addAction(act_edit)
+        elif tag == "__mesh_refinement__":
+            refinement_index = int(idx)
+            refinements = self._settings.get("mesh", {}).get("local_refinements", [])
+            enabled = False
+            if (
+                isinstance(refinements, list)
+                and 0 <= refinement_index < len(refinements)
+                and isinstance(refinements[refinement_index], dict)
+            ):
+                enabled = bool(refinements[refinement_index].get("enabled", True))
+
+            act_edit = QAction("Edit Refinement…", menu)
+            act_edit.triggered.connect(lambda: self._edit_local_mesh_refinement(refinement_index))
+            menu.addAction(act_edit)
+
+            act_toggle = QAction("Disable" if enabled else "Enable", menu)
+            act_toggle.triggered.connect(lambda: self._toggle_local_mesh_refinement(refinement_index))
+            menu.addAction(act_toggle)
+
+            act_remove = QAction("Remove Refinement", menu)
+            act_remove.triggered.connect(lambda: self._remove_local_mesh_refinement(refinement_index))
+            menu.addAction(act_remove)
         elif tag == "__out_idx__":
             act_plot = QAction("Generate Plot", menu)
             act_plot.triggered.connect(lambda: self._run_output_plot(int(idx)))
@@ -825,6 +996,119 @@ class ProjectTreeWidget(QWidget):
             return
         obj_res.pop(name, None)
         self._refresh_object_mesh_assignments()
+        self.settings_changed.emit()
+
+    def _local_mesh_refinements(self) -> list:
+        mesh_cfg = self._settings.get("mesh", {})
+        if not isinstance(mesh_cfg, dict):
+            return []
+        refinements = mesh_cfg.get("local_refinements", [])
+        return refinements if isinstance(refinements, list) else []
+
+    def _edit_local_mesh_refinement(self, index: int) -> None:
+        refinements = self._local_mesh_refinements()
+        if not (0 <= index < len(refinements)) or not isinstance(refinements[index], dict):
+            return
+        current = _deep_copy(refinements[index])
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Edit Mesh Refinement - {current.get('object', '')}")
+        form = QFormLayout(dlg)
+
+        enabled = QCheckBox("Enabled", dlg)
+        enabled.setChecked(bool(current.get("enabled", True)))
+        form.addRow("", enabled)
+
+        mode = QComboBox(dlg)
+        mode.addItem("Boundary edges", "boundary")
+        mode.addItem("Face", "face")
+        mode_index = mode.findData(str(current.get("mode", "boundary")).lower())
+        mode.setCurrentIndex(max(0, mode_index))
+        form.addRow("Mode", mode)
+
+        faces = QLineEdit(dlg)
+        faces.setText(",".join(str(face) for face in current.get("faces", [])))
+        faces.setPlaceholderText("-z,+z (empty = whole Plate for Face mode)")
+        form.addRow("Faces", faces)
+
+        size = QDoubleSpinBox(dlg)
+        size.setDecimals(6)
+        size.setRange(0.000001, 1e6)
+        size.setValue(float(current.get("size_mm", 0.25)))
+        size.setSuffix(" mm")
+        form.addRow("Minimum size", size)
+
+        growth = QDoubleSpinBox(dlg)
+        growth.setDecimals(3)
+        growth.setRange(1.001, 100.0)
+        growth.setValue(float(current.get("growth_rate", 3.0)))
+        form.addRow("Growth rate", growth)
+
+        max_size = QDoubleSpinBox(dlg)
+        max_size.setDecimals(6)
+        max_size.setRange(0.0, 1e6)
+        max_size.setSpecialValueText("Automatic")
+        max_size.setSuffix(" mm")
+        max_size.setValue(float(current.get("max_size_mm") or 0.0))
+        form.addRow("Maximum size", max_size)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        valid_faces = {"-x", "+x", "-y", "+y", "-z", "+z"}
+        selected_faces = [part.strip().lower() for part in faces.text().split(",") if part.strip()]
+        invalid_faces = [part for part in selected_faces if part not in valid_faces]
+        selected_mode = str(mode.currentData())
+        if invalid_faces:
+            QMessageBox.warning(self, "Mesh Refinement", f"Invalid face selector(s): {', '.join(invalid_faces)}")
+            return
+        if selected_mode == "boundary" and not selected_faces:
+            QMessageBox.warning(self, "Mesh Refinement", "Boundary edges mode requires at least one face selector.")
+            return
+
+        refinements[index] = {
+            "object": str(current.get("object", "")).strip(),
+            "enabled": bool(enabled.isChecked()),
+            "mode": selected_mode,
+            "faces": selected_faces,
+            "size_mm": float(size.value()),
+            "growth_rate": float(growth.value()),
+            "max_size_mm": float(max_size.value()) if max_size.value() > 0.0 else None,
+        }
+        self._refresh_object_mesh_assignments()
+        self._m_local_node.setExpanded(True)
+        self.settings_changed.emit()
+
+    def _toggle_local_mesh_refinement(self, index: int) -> None:
+        refinements = self._local_mesh_refinements()
+        if not (0 <= index < len(refinements)) or not isinstance(refinements[index], dict):
+            return
+        refinements[index]["enabled"] = not bool(refinements[index].get("enabled", True))
+        self._refresh_object_mesh_assignments()
+        self._m_local_node.setExpanded(True)
+        self.settings_changed.emit()
+
+    def _remove_local_mesh_refinement(self, index: int) -> None:
+        refinements = self._local_mesh_refinements()
+        if not (0 <= index < len(refinements)) or not isinstance(refinements[index], dict):
+            return
+        object_name = str(refinements[index].get("object", f"Refinement {index + 1}"))
+        reply = QMessageBox.question(
+            self,
+            "Remove Mesh Refinement",
+            f"Remove local mesh refinement for '{object_name}'?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        refinements.pop(index)
+        self._refresh_object_mesh_assignments()
+        self._m_local_node.setExpanded(True)
         self.settings_changed.emit()
 
     def _edit_default_mesh_resolution(self) -> None:
@@ -1367,6 +1651,33 @@ class ProjectTreeWidget(QWidget):
             item.setText(1, new_val)
             self.settings_changed.emit()
 
+    def _edit_open_region_domain(self) -> None:
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Select open-region domain")
+        form = QFormLayout(dlg)
+        combo = QComboBox(dlg)
+        combo.addItem("Auto-detect AIR", "")
+        for object_name in sorted(self._scene_object_names, key=str.casefold):
+            combo.addItem(object_name, object_name)
+        current = self._settings.get("open_region", {})
+        current_name = str(current.get("object", "")).strip() if isinstance(current, dict) else ""
+        current_index = combo.findData(current_name)
+        combo.setCurrentIndex(max(0, current_index))
+        form.addRow("Domain", combo)
+        btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
+        btns.accepted.connect(dlg.accept)
+        btns.rejected.connect(dlg.reject)
+        form.addRow(btns)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+        selected_name = str(combo.currentData() or "")
+        self._settings["open_region"] = {
+            "enabled": True,
+            "object": selected_name,
+        }
+        self._populate()
+        self.settings_changed.emit()
+
     def _edit_numeric(self, item: QTreeWidgetItem, key: str,
                       current_val: str, target_dict: dict) -> None:
         new_val, ok = QInputDialog.getText(
@@ -1732,6 +2043,10 @@ class ProjectTreeWidget(QWidget):
 
     def rename_object_references(self, old_name: str, new_name: str) -> None:
         changed = False
+        open_region = self._settings.get("open_region", {})
+        if isinstance(open_region, dict) and str(open_region.get("object", "")) == old_name:
+            open_region["object"] = new_name
+            changed = True
         for port in self._settings.get("ports", []):
             if str(port.get("object", "")) == old_name:
                 port["object"] = new_name
@@ -1746,6 +2061,12 @@ class ProjectTreeWidget(QWidget):
             if isinstance(obj_res, dict) and old_name in obj_res:
                 obj_res[new_name] = obj_res.pop(old_name)
                 changed = True
+            refinements = mesh_cfg.get("local_refinements", [])
+            if isinstance(refinements, list):
+                for refinement in refinements:
+                    if isinstance(refinement, dict) and str(refinement.get("object", "")) == old_name:
+                        refinement["object"] = new_name
+                        changed = True
         if changed:
             self._refresh_ports()
             self._refresh_object_boundaries()

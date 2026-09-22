@@ -1,7 +1,7 @@
 # EM 3D Modeler Help
 
-Version: 1.1.3
-Release Date: 2026-05-18
+Version: 1.2.4
+Release Date: 2026-09-22
 
 ## 1. Overview
 EM 3D Modeler is a 3D CAD/EM environment for creating geometries, assigning materials, importing STEP files, performing boolean operations, and generating EMERGE scripts.
@@ -63,7 +63,24 @@ Note on complex STEP geometry:
 - Save Project / Save Project As: saves project in .em3d format.
 - Export EMERGE Script: generates an .em script compatible with EMERGE.
 
-## 10. View and Navigation
+## 10. Simulation Settings
+
+![Simulation Settings](snapshots/window-settings.svg)
+
+- **Solver**: selects the sparse linear solver emitted as `simulationObj.set_solver(...)`. PARDISO is the usual CPU/MKL direct solver. CUDSS uses an NVIDIA GPU and requires a working CUDA/cuDSS installation. SUPERLU, UMFPACK, AASDS and MUMPS require the corresponding backend support in the installed EMerge environment.
+- **Enable parallel computation**: enables the configured PARDISO and ACC thread counts. When disabled, the exporter writes one thread for both settings. This option controls shared-memory work inside one simulation; frequency-job parallelism is configured separately by the sweep API.
+- **PARDISO threads**: writes `config.set_pardiso_threads(n)`. It controls the MKL-heavy PARDISO solve. More threads can reduce solve time but increase CPU and memory pressure.
+- **ACC threads**: writes `config.set_acc_threads(n)`. ACC is the OpenMP-heavy accelerated assembly phase that builds the FEM system before the linear solve. It is not a GPU count.
+- **Plot S-parameters after simulation**: after a Sweep or Parametric job, opens `plot_sp` for the complete available S-parameter matrix. Disable it for unattended or batch runs. Output definitions in the Project Tree remain separate plot requests.
+- **Export S-parameters Touchstone after simulation**: writes all available S-parameters to a Touchstone `.sNp` file in real/imaginary format with a 50 ohm reference. It applies to Sweep and Parametric results; Eigenmode jobs do not produce this export.
+
+Thread recommendations:
+
+- Start with physical CPU cores rather than the maximum value.
+- Avoid assigning all logical cores to both PARDISO and ACC when several simulations run concurrently.
+- For CUDSS, ACC threads still affect CPU assembly even though the sparse solve runs on the GPU.
+
+## 11. View and Navigation
 - View Menu:
   - Reset Camera
   - Top (XY)
@@ -71,7 +88,39 @@ Note on complex STEP geometry:
   - Right (YZ)
   - Isometric
 
-## 11. Troubleshooting
+## 12. Local Mesh Refinement
+
+![Local Mesh Refinement](snapshots/window-mesh-refinement.svg)
+
+Use **Object / Materials -> right-click -> Assign Mesh Refinement...** to refine selected objects. The values in **Settings -> Mesh -> Local Refinement Defaults** initialize this dialog; values confirmed in the assignment are stored in the project and exported to EMERGE.
+
+- **Enabled**: includes or excludes the assignment from the generated script without deleting it.
+- **Mode - Boundary edges**: applies `set_boundary_size()` to the perimeter curves of the selected faces. Use this for conductor traces where fields concentrate near edges.
+- **Mode - Face**: applies `set_face_size()` to the selected faces. With a Plate, an empty Faces field refines the complete Plate; this is suitable for lumped-port Plates.
+- **Faces**: comma-separated axis selectors relative to the exported object: `-x`, `+x`, `-y`, `+y`, `-z`, `+z`. Example: `-z,+z` selects the bottom and top trace faces.
+- **Minimum size**: finest requested mesh edge length, in millimetres. It is converted to metres in the EMERGE script.
+- **Growth rate**: controls how quickly the mesh becomes coarser away from a refined boundary. A value near `1` produces a longer, smoother transition; a larger value reaches the coarse mesh sooner. Default: `3`.
+- **Maximum size**: coarse-size limit outside the refined zone. **Automatic** lets EMERGE use its global mesh size; an explicit value caps the transition. Normally it should be greater than the minimum size.
+
+Recommended CrossTalk setup:
+
+```text
+Fuse_T1, Fuse_T2: Boundary edges, Faces -z,+z, 0.25 mm, Growth 3, Maximum Automatic
+Port Plates:       Face, Faces empty, 0.10 mm
+```
+
+Equivalent EMERGE output:
+
+```python
+simulationObj.mesher.set_boundary_size(
+    trace.face("-z"), size=0.25e-3, growth_rate=3.0
+)
+simulationObj.mesher.set_face_size(port_plate, size=0.10e-3)
+```
+
+Assignments appear under **Project Tree -> Mesh -> Local Refinements**. Right-click an assignment to **Edit**, **Enable/Disable**, or **Remove** it. Double-click opens Edit directly.
+
+## 13. Troubleshooting
 - Boolean operation failed:
   - Verify that objects are valid with non-empty geometry.
   - For complex STEP files, use smaller and progressive selections.
@@ -81,13 +130,13 @@ Note on complex STEP geometry:
 - Material not visible in project:
   - Reload the Global DB and check for duplicate names.
 
-## 12. Quick Commands
+## 14. Quick Commands
 - New Project: Ctrl+N
 - Open Project: Ctrl+O
 - Save Project: Ctrl+S
 - Quit: system shortcut (e.g., Alt+F4 on Windows)
 
-## 13. About
+## 15. About
 In the Help -> About menu, you will find:
 - Program name
 - Version

@@ -45,6 +45,8 @@ class MaterialsWidget(QWidget):
     assign_port_requested = Signal(object)   # EMObject
     assign_boundary_requested = Signal(list)  # List[EMObject]
     assign_mesh_resolution_requested = Signal(list)  # List[EMObject]
+    assign_mesh_refinement_requested = Signal(list)  # List[EMObject]
+    set_open_region_requested = Signal(object)  # AIR EMObject
     material_priority_changed = Signal(str, int)  # material_name, delta (1 for higher, -1 for lower)
     transform_edit_requested = Signal(list)  # List[EMObject]
 
@@ -142,11 +144,56 @@ class MaterialsWidget(QWidget):
 
         # ── Materials sections (sorted by priority desc, then name) ───────
         priorities = material_priorities or {}
+        non_model_objects: List[EMObject] = []
+
+        def add_object_row(parent: QTreeWidgetItem, obj: EMObject) -> None:
+            label = obj.name
+            if not obj.is_visible():
+                label += "  [hidden]"
+            reference_error = str(getattr(obj, "creation_reference_error", "")).strip()
+            if reference_error:
+                label += "  [BROKEN REFERENCE]"
+            child = QTreeWidgetItem([label])
+            child.setData(0, _ROLE_OBJ_ID, id(obj))
+            if reference_error:
+                child.setForeground(0, QBrush(QColor(220, 40, 40)))
+                child.setToolTip(0, reference_error)
+            parent.addChild(child)
+            self._obj_map[id(obj)] = obj
+            actor = getattr(obj, "actor", None)
+            if actor is not None:
+                position = actor.GetPosition()
+                rotation = actor.GetOrientation()
+                pivot = actor.GetOrigin()
+                transform = QTreeWidgetItem([
+                    "Transform: "
+                    f"P({position[0]:.3g}, {position[1]:.3g}, {position[2]:.3g}) "
+                    f"R({rotation[0]:.3g}, {rotation[1]:.3g}, {rotation[2]:.3g})"
+                ])
+                transform.setData(0, _ROLE_TRANSFORM_ID, id(obj))
+                transform.setToolTip(
+                    0,
+                    f"Pivot: ({pivot[0]:.6g}, {pivot[1]:.6g}, {pivot[2]:.6g})\n"
+                    "Double-click to edit the reference point, position and rotation.",
+                )
+                transform.setForeground(0, QBrush(QColor(150, 170, 190)))
+                child.addChild(transform)
+            if id(obj) in prev_selected_ids:
+                child.setSelected(True)
+
         ordered_materials = sorted(
             by_material.items(),
             key=lambda kv: (-int(priorities.get(str(kv[0]), 0)), str(kv[0]).lower()),
         )
         for material, objects in ordered_materials:
+            model_objects = []
+            for obj in objects:
+                if bool(getattr(obj, "is_model", True)):
+                    model_objects.append(obj)
+                else:
+                    non_model_objects.append(obj)
+            if not model_objects:
+                continue
             prio = int(priorities.get(str(material), 0))
             prio_tag = f"  (P={prio:+d})" if prio != 0 else ""
             mat_item = QTreeWidgetItem([f"[{material}]{prio_tag}"])
@@ -157,42 +204,19 @@ class MaterialsWidget(QWidget):
             self._tree.addTopLevelItem(mat_item)
             # Always keep expanded (user can manually close)
             mat_item.setExpanded(True)
-            for obj in objects:
-                label = obj.name
-                if not bool(getattr(obj, "is_model", True)):
-                    label += "  [NON MODEL]"
-                if not obj.is_visible():
-                    label += "  [hidden]"
-                reference_error = str(getattr(obj, "creation_reference_error", "")).strip()
-                if reference_error:
-                    label += "  [BROKEN REFERENCE]"
-                child = QTreeWidgetItem([label])
-                child.setData(0, _ROLE_OBJ_ID, id(obj))
-                if reference_error:
-                    child.setForeground(0, QBrush(QColor(220, 40, 40)))
-                    child.setToolTip(0, reference_error)
-                mat_item.addChild(child)
-                self._obj_map[id(obj)] = obj
-                actor = getattr(obj, "actor", None)
-                if actor is not None:
-                    position = actor.GetPosition()
-                    rotation = actor.GetOrientation()
-                    pivot = actor.GetOrigin()
-                    transform = QTreeWidgetItem([
-                        "Transform: "
-                        f"P({position[0]:.3g}, {position[1]:.3g}, {position[2]:.3g}) "
-                        f"R({rotation[0]:.3g}, {rotation[1]:.3g}, {rotation[2]:.3g})"
-                    ])
-                    transform.setData(0, _ROLE_TRANSFORM_ID, id(obj))
-                    transform.setToolTip(
-                        0,
-                        f"Pivot: ({pivot[0]:.6g}, {pivot[1]:.6g}, {pivot[2]:.6g})\n"
-                        "Double-click to edit the reference point, position and rotation.",
-                    )
-                    transform.setForeground(0, QBrush(QColor(150, 170, 190)))
-                    child.addChild(transform)
-                if id(obj) in prev_selected_ids:
-                    child.setSelected(True)
+            for obj in model_objects:
+                add_object_row(mat_item, obj)
+
+        if non_model_objects:
+            non_model_item = QTreeWidgetItem([f"NON MODEL ({len(non_model_objects)})"])
+            font = non_model_item.font(0)
+            font.setBold(True)
+            non_model_item.setFont(0, font)
+            non_model_item.setForeground(0, QBrush(QColor(150, 160, 175)))
+            self._tree.addTopLevelItem(non_model_item)
+            for obj in sorted(non_model_objects, key=lambda item: str(item.name).casefold()):
+                add_object_row(non_model_item, obj)
+            non_model_item.setExpanded(False)
 
         self._tree.blockSignals(False)
 
@@ -390,6 +414,11 @@ class MaterialsWidget(QWidget):
             act_assign_port.triggered.connect(lambda: self.assign_port_requested.emit(objs[0]))
             menu.addAction(act_assign_port)
 
+            if str(getattr(objs[0], "material", "")).strip().upper() == "AIR":
+                act_open_region = QAction("Set as Simulation Region", menu)
+                act_open_region.triggered.connect(lambda: self.set_open_region_requested.emit(objs[0]))
+                menu.addAction(act_open_region)
+
             menu.addSeparator()
 
         act_assign_bc = QAction("Assign Boundary Condition…", menu)
@@ -405,6 +434,10 @@ class MaterialsWidget(QWidget):
         act_assign_mesh = QAction("Assign Mesh Resolution (1/λ)…", menu)
         act_assign_mesh.triggered.connect(lambda: self.assign_mesh_resolution_requested.emit(list(objs)))
         menu.addAction(act_assign_mesh)
+
+        act_assign_refinement = QAction("Assign Mesh Refinement…", menu)
+        act_assign_refinement.triggered.connect(lambda: self.assign_mesh_refinement_requested.emit(list(objs)))
+        menu.addAction(act_assign_refinement)
 
         menu.addSeparator()
 
@@ -433,7 +466,7 @@ class MaterialsWidget(QWidget):
             QDialog, QFormLayout, QLineEdit, QSpinBox,
             QDialogButtonBox, QLabel,
         )
-        dlg = QDialog(self.window())
+        dlg = QDialog(None)
         dlg.setWindowTitle(f"Bulk Rename ({len(objs)} objects)")
         form = QFormLayout(dlg)
 

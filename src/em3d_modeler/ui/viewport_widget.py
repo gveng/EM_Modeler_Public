@@ -177,6 +177,7 @@ class Viewport3DWidget(QWidget):
         self._selection_mode: str = "object"
         self._sub_pick_actor: Optional[vtk.vtkActor] = None
         self._last_face_pick: dict | None = None
+        self._last_edge_pick: dict | None = None
         self._last_drawing_snap_kind: str = "grid"
 
         # One-shot pick request from external dialogs
@@ -989,6 +990,7 @@ class Viewport3DWidget(QWidget):
         mode = self._selection_mode
 
         if mode == "face":
+            self._last_edge_pick = None
             marker = self._build_face_region_marker(ds, cell_id, actor)
             cell = ds.GetCell(cell_id)
             face_points = []
@@ -1008,12 +1010,24 @@ class Viewport3DWidget(QWidget):
                 f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})"
             )
         elif mode == "edge":
+            self._last_face_pick = None
+            self._last_edge_pick = None
             edge_pick = self._pick_edge_segment_local(ds, cell_id, actor, pos)
             marker = None
             edge_world = pos
             if edge_pick is not None:
                 edge_points, closest_local = edge_pick
                 marker = self._build_edge_marker(edge_points, actor)
+                edge_points_world = []
+                for edge_point in edge_points:
+                    point4 = actor.GetMatrix().MultiplyPoint([*edge_point, 1.0])
+                    point_w = point4[3] if abs(point4[3]) > 1e-12 else 1.0
+                    edge_points_world.append(tuple(float(point4[index] / point_w) for index in range(3)))
+                self._last_edge_pick = {
+                    "owner": owner,
+                    "points": edge_points_world,
+                    "cell_id": int(cell_id),
+                }
                 w = actor.GetMatrix().MultiplyPoint([closest_local[0], closest_local[1], closest_local[2], 1.0])
                 ww = w[3] if abs(w[3]) > 1e-12 else 1.0
                 edge_world = (w[0] / ww, w[1] / ww, w[2] / ww)
@@ -1046,12 +1060,11 @@ class Viewport3DWidget(QWidget):
         self._render()
 
     def create_plate_from_face(self, material: str = "PEC") -> Optional[EMObject]:
-        """Create an axis-aligned thin plate from the last selected face."""
+        """Create an axis-aligned thin plate from the last selected face or edge."""
         pick = self._last_face_pick
         points = pick.get("points", []) if isinstance(pick, dict) else []
         if len(points) < 3:
-            self.status_message.emit("Select a face first, then create Plate from Face.")
-            return None
+            return self._create_plate_from_edge(material)
 
         from ..scene.em_objects import PlateObject
 
@@ -1082,6 +1095,69 @@ class Viewport3DWidget(QWidget):
         }
         self._finish_object(obj)
         self.status_message.emit(f"Created Plate from selected face: {obj.name}")
+        return obj
+
+    def _create_plate_from_edge(self, material: str) -> Optional[EMObject]:
+        pick = self._last_edge_pick
+        points = pick.get("points", []) if isinstance(pick, dict) else []
+        owner = pick.get("owner") if isinstance(pick, dict) else None
+        actor = getattr(owner, "actor", None)
+        if len(points) < 2 or actor is None:
+            self.status_message.emit("Select a face or edge first, then create Plate from Face/Edge.")
+            return None
+
+        edge_min = [min(point[axis] for point in points) for axis in range(3)]
+        edge_max = [max(point[axis] for point in points) for axis in range(3)]
+        edge_spans = [edge_max[axis] - edge_min[axis] for axis in range(3)]
+        edge_axis = max(range(3), key=lambda axis: edge_spans[axis])
+        edge_length = edge_spans[edge_axis]
+        alignment_tolerance = max(edge_length * 1e-4, 1e-6)
+        if edge_length <= 1e-9 or any(
+            edge_spans[axis] > alignment_tolerance
+            for axis in range(3)
+            if axis != edge_axis
+        ):
+            self.status_message.emit("Plate from Edge currently requires a straight axis-aligned edge.")
+            return None
+
+        owner_bounds = actor.GetBounds()
+        owner_spans = [
+            float(owner_bounds[axis * 2 + 1]) - float(owner_bounds[axis * 2])
+            for axis in range(3)
+        ]
+        remaining_axes = [axis for axis in range(3) if axis != edge_axis]
+        thickness_axis = min(remaining_axes, key=lambda axis: owner_spans[axis])
+        normal_axis = next(axis for axis in remaining_axes if axis != thickness_axis)
+        if owner_spans[thickness_axis] <= 1e-9:
+            self.status_message.emit("The selected edge owner has no measurable thickness for a port Plate.")
+            return None
+
+        bounds_min = list(edge_min)
+        bounds_max = list(edge_max)
+        bounds_min[thickness_axis] = float(owner_bounds[thickness_axis * 2])
+        bounds_max[thickness_axis] = float(owner_bounds[thickness_axis * 2 + 1])
+        bounds_min[normal_axis] = edge_min[normal_axis]
+        bounds_max[normal_axis] = edge_min[normal_axis] + max(self._grid_spacing * 0.01, 1e-6)
+
+        from ..scene.em_objects import PlateObject
+
+        obj = PlateObject(
+            material=material,
+            x1=bounds_min[0], y1=bounds_min[1], z1=bounds_min[2],
+            x2=bounds_max[0], y2=bounds_max[1], z2=bounds_max[2],
+        )
+        obj.creation_history = {
+            "mode": "edge",
+            "source_edge": {
+                "object": str(getattr(owner, "name", "")),
+                "cell_id": int(pick.get("cell_id", -1)),
+                "points": [list(point) for point in points],
+                "edge_axis": int(edge_axis),
+                "thickness_axis": int(thickness_axis),
+            },
+        }
+        self._finish_object(obj)
+        self.status_message.emit(f"Created Plate from selected edge: {obj.name}")
         return obj
 
     def _build_face_marker(self, dataset, cell_id: int, ref_actor) -> Optional[vtk.vtkActor]:
@@ -1243,10 +1319,14 @@ class Viewport3DWidget(QWidget):
             adjacency.setdefault(first, []).append(second)
             adjacency.setdefault(second, []).append(first)
 
-        def extend(previous_id, current_id):
+        def extend(previous_id, current_id, visited_ids):
             chain = []
-            while True:
-                candidates = [item for item in adjacency.get(current_id, []) if item != previous_id]
+            max_steps = max(edge_poly.GetNumberOfPoints(), 1)
+            for _ in range(max_steps):
+                candidates = [
+                    item for item in adjacency.get(current_id, [])
+                    if item != previous_id and item not in visited_ids
+                ]
                 if not candidates:
                     break
                 previous = edge_poly.GetPoint(previous_id)
@@ -1271,11 +1351,13 @@ class Viewport3DWidget(QWidget):
                 if alignment < 0.75:
                     break
                 chain.append(next_id)
+                visited_ids.add(next_id)
                 previous_id, current_id = current_id, next_id
             return chain
 
-        left = extend(end_id, start_id)
-        right = extend(start_id, end_id)
+        visited_ids = {start_id, end_id}
+        left = extend(end_id, start_id, visited_ids)
+        right = extend(start_id, end_id, visited_ids)
         point_ids = list(reversed(left)) + [start_id, end_id] + right
         return [edge_poly.GetPoint(point_id) for point_id in point_ids]
 

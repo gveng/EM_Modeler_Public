@@ -1,1 +1,37 @@
-<svg xmlns="http://www.w3.org/2000/svg" width="900" height="560" viewBox="0 0 900 560"><rect width="900" height="560" fill="#17191f"/><rect x="40" y="28" width="820" height="504" rx="8" fill="#242730" stroke="#566176"/><text x="70" y="70" fill="#e8edf5" font-family="Segoe UI" font-size="21">Settings</text><rect x="70" y="96" width="165" height="390" fill="#1d2027"/><g fill="#b8c2d1" font-family="Segoe UI" font-size="16"><text x="94" y="140">Display</text><text x="94" y="185" fill="#80c8f2">Simulation</text><text x="94" y="230">Mesh</text></g><rect x="265" y="96" width="555" height="390" fill="#303547"/><g fill="#b8c2d1" font-family="Segoe UI" font-size="16"><text x="295" y="140">Solver</text><rect x="440" y="118" width="280" height="30" fill="#1d2027"/><text x="455" y="140" fill="#e8edf5">CUDSS</text><text x="295" y="200">Parallel computation</text><text x="295" y="250">PARDISO threads</text><text x="295" y="300">ACC threads</text><text x="295" y="350">Plot S-parameters</text><text x="295" y="400">Export Touchstone</text></g></svg>
+<svg xmlns="http://www.w3.org/2000/svg" width="900" height="620" viewBox="0 0 900 620">
+	<rect width="900" height="620" fill="#17191f"/>
+	<rect x="34" y="26" width="832" height="568" rx="9" fill="#242730" stroke="#566176"/>
+	<text x="62" y="66" fill="#e8edf5" font-family="Segoe UI" font-size="22">Settings</text>
+	<g font-family="Segoe UI" font-size="16">
+		<rect x="62" y="88" width="118" height="38" rx="5" fill="#1d2027" stroke="#464d5b"/>
+		<text x="87" y="113" fill="#b8c2d1">Display</text>
+		<rect x="184" y="88" width="145" height="38" rx="5" fill="#303547" stroke="#80c8f2"/>
+		<text x="210" y="113" fill="#e8edf5">Simulation</text>
+		<rect x="333" y="88" width="96" height="38" rx="5" fill="#1d2027" stroke="#464d5b"/>
+		<text x="356" y="113" fill="#b8c2d1">Mesh</text>
+	</g>
+	<rect x="62" y="138" width="776" height="370" rx="5" fill="#303334" stroke="#464d5b"/>
+	<g fill="#e8edf5" font-family="Segoe UI" font-size="16">
+		<text x="86" y="184">Solver</text>
+		<rect x="250" y="158" width="540" height="38" rx="5" fill="#3b3d3f" stroke="#566176"/>
+		<text x="266" y="183">PARDISO</text>
+		<rect x="252" y="218" width="22" height="22" rx="4" fill="#b8c2d1"/>
+		<path d="M257 228l5 5 9-12" fill="none" stroke="#17191f" stroke-width="3"/>
+		<text x="286" y="235">Enable parallel computation</text>
+		<text x="86" y="292">PARDISO threads</text>
+		<rect x="250" y="265" width="540" height="38" rx="5" fill="#3b3d3f" stroke="#566176"/>
+		<text x="266" y="290">4</text>
+		<text x="86" y="348">ACC threads</text>
+		<rect x="250" y="321" width="540" height="38" rx="5" fill="#3b3d3f" stroke="#566176"/>
+		<text x="266" y="346">16</text>
+		<rect x="252" y="386" width="22" height="22" rx="4" fill="#242730" stroke="#8d96a5"/>
+		<text x="286" y="403">Plot S-parameters after simulation</text>
+		<rect x="252" y="438" width="22" height="22" rx="4" fill="#b8c2d1"/>
+		<path d="M257 448l5 5 9-12" fill="none" stroke="#17191f" stroke-width="3"/>
+		<text x="286" y="455">Export S-parameters Touchstone after simulation</text>
+	</g>
+	<rect x="584" y="530" width="118" height="40" rx="5" fill="#31506a" stroke="#80c8f2"/>
+	<text x="628" y="556" fill="#e8edf5" font-family="Segoe UI" font-size="16">OK</text>
+	<rect x="716" y="530" width="122" height="40" rx="5" fill="#303547" stroke="#566176"/>
+	<text x="749" y="556" fill="#e8edf5" font-family="Segoe UI" font-size="16">Cancel</text>
+</svg>

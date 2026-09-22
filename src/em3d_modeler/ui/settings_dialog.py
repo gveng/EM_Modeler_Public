@@ -154,7 +154,43 @@ class SettingsDialog(QDialog):
         self._mesh_resolution_spin.setSingleStep(0.05)
         mesh_form.addRow("Resolution (1/λ)", self._mesh_resolution_spin)
 
+        self._curved_boundary_resolution_spin = QSpinBox(self._mesh_tab)
+        self._curved_boundary_resolution_spin.setRange(3, 1000)
+        self._curved_boundary_resolution_spin.setValue(20)
+        mesh_form.addRow("Curved boundary segments", self._curved_boundary_resolution_spin)
+
         mesh_form.addRow(QLabel("Note: 0.3 = 3.3 lines/wavelength (fine mesh)"))
+
+        mesh_form.addRow(QLabel("Local Refinement Defaults"))
+        mesh_form.addRow(QLabel("Applied only through Object > Assign Mesh Refinement..."))
+
+        self._refinement_boundary_size_spin = QDoubleSpinBox(self._mesh_tab)
+        self._refinement_boundary_size_spin.setDecimals(6)
+        self._refinement_boundary_size_spin.setRange(0.000001, 1e6)
+        self._refinement_boundary_size_spin.setValue(0.25)
+        self._refinement_boundary_size_spin.setSuffix(" mm")
+        mesh_form.addRow("Boundary size", self._refinement_boundary_size_spin)
+
+        self._refinement_face_size_spin = QDoubleSpinBox(self._mesh_tab)
+        self._refinement_face_size_spin.setDecimals(6)
+        self._refinement_face_size_spin.setRange(0.000001, 1e6)
+        self._refinement_face_size_spin.setValue(0.1)
+        self._refinement_face_size_spin.setSuffix(" mm")
+        mesh_form.addRow("Face / port size", self._refinement_face_size_spin)
+
+        self._refinement_growth_rate_spin = QDoubleSpinBox(self._mesh_tab)
+        self._refinement_growth_rate_spin.setDecimals(3)
+        self._refinement_growth_rate_spin.setRange(1.001, 100.0)
+        self._refinement_growth_rate_spin.setValue(3.0)
+        mesh_form.addRow("Growth rate", self._refinement_growth_rate_spin)
+
+        self._refinement_max_size_spin = QDoubleSpinBox(self._mesh_tab)
+        self._refinement_max_size_spin.setDecimals(6)
+        self._refinement_max_size_spin.setRange(0.0, 1e6)
+        self._refinement_max_size_spin.setValue(0.0)
+        self._refinement_max_size_spin.setSpecialValueText("Automatic")
+        self._refinement_max_size_spin.setSuffix(" mm")
+        mesh_form.addRow("Maximum size", self._refinement_max_size_spin)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
         btns.accepted.connect(self.accept)
@@ -231,6 +267,11 @@ class SettingsDialog(QDialog):
         pardiso_threads: int = 8,
         acc_threads: int = 10,
         mesh_resolution: float = 0.3,
+        curved_boundary_resolution: int = 20,
+        refinement_boundary_size_mm: float = 0.25,
+        refinement_face_size_mm: float = 0.1,
+        refinement_growth_rate: float = 3.0,
+        refinement_max_size_mm: float = 0.0,
         plot_sparams_after_sim: bool = True,
         export_sparams_after_sim: bool = True,
     ) -> None:
@@ -266,6 +307,11 @@ class SettingsDialog(QDialog):
 
         # Mesh settings
         self._mesh_resolution_spin.setValue(float(mesh_resolution))
+        self._curved_boundary_resolution_spin.setValue(int(curved_boundary_resolution))
+        self._refinement_boundary_size_spin.setValue(float(refinement_boundary_size_mm))
+        self._refinement_face_size_spin.setValue(float(refinement_face_size_mm))
+        self._refinement_growth_rate_spin.setValue(float(refinement_growth_rate))
+        self._refinement_max_size_spin.setValue(float(refinement_max_size_mm))
 
     def values(self) -> dict:
         color_name = self._selection_color_combo.currentText()
@@ -282,6 +328,11 @@ class SettingsDialog(QDialog):
             "pardiso_threads": int(self._pardiso_threads_spin.value()),
             "acc_threads": int(self._acc_threads_spin.value()),
             "mesh_resolution": float(self._mesh_resolution_spin.value()),
+            "curved_boundary_resolution": int(self._curved_boundary_resolution_spin.value()),
+            "refinement_boundary_size_mm": float(self._refinement_boundary_size_spin.value()),
+            "refinement_face_size_mm": float(self._refinement_face_size_spin.value()),
+            "refinement_growth_rate": float(self._refinement_growth_rate_spin.value()),
+            "refinement_max_size_mm": float(self._refinement_max_size_spin.value()),
             "plot_sparams_after_sim": bool(self._plot_sparams_check.isChecked()),
             "export_sparams_after_sim": bool(self._export_sparams_check.isChecked()),
         }

@@ -263,6 +263,10 @@ def export_emerge_python_script(
 
     mesh_resolution = max(0.01, min(1.0, float(mesh_resolution_fraction)))
     mesh_cfg = settings.get("mesh", {}) if isinstance(settings, dict) else {}
+    curved_boundary_resolution = max(
+        3,
+        _to_int(mesh_cfg.get("curved_boundary_resolution", 20), 20),
+    ) if isinstance(mesh_cfg, dict) else 20
     object_mesh_fractions = mesh_cfg.get("object_resolutions", {}) if isinstance(mesh_cfg, dict) else {}
     if not isinstance(object_mesh_fractions, dict):
         object_mesh_fractions = {}
@@ -275,6 +279,9 @@ def export_emerge_python_script(
             continue
         fraction_value = max(0.01, min(1.0, _to_float(fraction, mesh_resolution)))
         object_mesh_sizes[object_name] = fraction_value * wavelength_at_fmax
+    raw_local_refinements = mesh_cfg.get("local_refinements", []) if isinstance(mesh_cfg, dict) else []
+    if not isinstance(raw_local_refinements, list):
+        raw_local_refinements = []
     ports = lumped_ports or []
     plates = plate_entries or []
     port_surface_names = {
@@ -295,16 +302,71 @@ def export_emerge_python_script(
         for plate in plates
         if str(plate.get("object_name", "")).strip()
     }
-    air_volume_name = next(
-        (
-            str(entry.get("object_name", "")).strip()
-            for entry in step_entries
-            if str(entry.get("material", "")).strip().upper() == "AIR"
-            and str(entry.get("object_name", "")).strip()
-        ),
-        "",
+    air_volume_names = [
+        str(entry.get("object_name", "")).strip()
+        for entry in step_entries
+        if str(entry.get("material", "")).strip().upper() == "AIR"
+        and str(entry.get("object_name", "")).strip()
+    ]
+    open_region_cfg = settings.get("open_region", {}) if isinstance(settings, dict) else {}
+    configured_air_name = (
+        str(open_region_cfg.get("object", "")).strip()
+        if isinstance(open_region_cfg, dict)
+        else ""
     )
+    if configured_air_name in air_volume_names:
+        air_volume_name = configured_air_name
+    elif len(air_volume_names) == 1:
+        air_volume_name = air_volume_names[0]
+    else:
+        air_volume_name = ""
+    global_boundaries = settings.get("boundaries", {}) if isinstance(settings, dict) else {}
+    if not isinstance(global_boundaries, dict):
+        global_boundaries = {}
+    face_selectors = {
+        "Xmin": "-x",
+        "Xmax": "+x",
+        "Ymin": "-y",
+        "Ymax": "+y",
+        "Zmin": "-z",
+        "Zmax": "+z",
+    }
+    domain_boundaries = [
+        (key, face_selectors[key], str(global_boundaries.get(key, "")).strip().title())
+        for key in face_selectors
+        if str(global_boundaries.get(key, "")).strip()
+    ] if air_volume_name else []
     valid_boundary_names = exported_object_names | port_surface_names | plate_names
+    local_mesh_refinements = []
+    valid_face_selectors = {"-x", "+x", "-y", "+y", "-z", "+z"}
+    for item in raw_local_refinements:
+        if not isinstance(item, dict) or not _to_bool(item.get("enabled", True)):
+            continue
+        object_name = str(item.get("object", "")).strip()
+        mode = str(item.get("mode", "boundary")).strip().lower()
+        if object_name not in valid_boundary_names or mode not in {"boundary", "face"}:
+            continue
+        faces = [
+            str(face).strip().lower()
+            for face in item.get("faces", [])
+            if str(face).strip().lower() in valid_face_selectors
+        ] if isinstance(item.get("faces", []), list) else []
+        if mode == "boundary" and not faces:
+            continue
+        size_m = max(1e-9, _to_float(item.get("size_mm", 0.25 if mode == "boundary" else 0.1), 0.25)) * 0.001
+        growth_rate = max(1.001, _to_float(item.get("growth_rate", 3.0), 3.0))
+        raw_max_size = item.get("max_size_mm")
+        max_size_m = None
+        if raw_max_size not in (None, "", 0, 0.0):
+            max_size_m = max(1e-9, _to_float(raw_max_size, 0.0) * 0.001)
+        local_mesh_refinements.append({
+            "object": object_name,
+            "mode": mode,
+            "faces": faces,
+            "size_m": size_m,
+            "growth_rate": growth_rate,
+            "max_size_m": max_size_m,
+        })
     boundary_assignments = [
         {
             "object": str(item.get("object", "")).strip(),
@@ -315,6 +377,7 @@ def export_emerge_python_script(
             isinstance(item, dict)
             and str(item.get("object", "")).strip() in valid_boundary_names
             and str(item.get("object", "")).strip() not in port_surface_names
+            and str(item.get("object", "")).strip() != air_volume_name
         )
     ]
     eff_pardiso_threads = max(1, int(pardiso_threads if parallel_enabled else 1))
@@ -407,12 +470,13 @@ def export_emerge_python_script(
         f"FSTEP_GHZ = {fstep}",
         f"NPOINTS = {npoints}",
         f"MESH_RESOLUTION = {mesh_resolution:.6f}",
+        f"CURVED_BOUNDARY_RESOLUTION = {curved_boundary_resolution}",
         f"OBJECT_MESH_SIZES_M = {repr(object_mesh_sizes)}",
         f"EIGENMODE_COUNT = {mode_count}",
         f"PARAM_NAME = {_q(param_name)}",
         f"PARAM_VALUES = {_q(param_values)}",
         f"PLOT_SPARAMS_AFTER_SIM = {bool(plot_sparams_after_sim)}",
-        "EXPORT_SPARAMS_AFTER_SIM = True",
+        f"EXPORT_SPARAMS_AFTER_SIM = {bool(export_sparams_after_sim)}",
         f"SPARAM_FIT_ENABLED = {fit_enabled}",
         f"SPARAM_FIT_POINTS = {fit_points}",
         f"OUTPUT_CONFIGS = {repr(output_configs)}",
@@ -721,6 +785,35 @@ def export_emerge_python_script(
         "",
     ]
 
+    if local_mesh_refinements:
+        lines += [
+            "# Local mesh refinements assigned in EM 3D Modeler.",
+        ]
+        for refinement_index, refinement in enumerate(local_mesh_refinements, start=1):
+            object_name = refinement["object"]
+            mode = refinement["mode"]
+            faces = refinement["faces"]
+            size_m = refinement["size_m"]
+            growth_rate = refinement["growth_rate"]
+            max_size_m = refinement["max_size_m"]
+            target_var = f"_mesh_refinement_target_{refinement_index}"
+            object_var = f"_mesh_refinement_object_{refinement_index}"
+            lines.append(f"{target_var} = geometry_groups[{_q(object_name)}]")
+            if mode == "face" and not faces:
+                lines.append(f"simulationObj.mesher.set_face_size({target_var}, size={size_m!r})")
+                continue
+            lines.append(f"for {object_var} in list(getattr({target_var}, 'objects', [{target_var}])):")
+            for face_selector in faces:
+                face_expr = f"{object_var}.face({_q(face_selector)})"
+                if mode == "boundary":
+                    max_size_arg = f", max_size={max_size_m!r}" if max_size_m is not None else ""
+                    lines.append(
+                        f"    simulationObj.mesher.set_boundary_size({face_expr}, size={size_m!r}, growth_rate={growth_rate!r}{max_size_arg})"
+                    )
+                else:
+                    lines.append(f"    simulationObj.mesher.set_face_size({face_expr}, size={size_m!r})")
+        lines.append("")
+
     if ports:
         lines += ["# Assign port excitations to the committed port Plates"]
         for p in ports:
@@ -751,6 +844,35 @@ def export_emerge_python_script(
         "",
         ]
 
+    if domain_boundaries:
+        lines += [
+            "# Assign global boundary settings to the six outer faces of the open-region domain.",
+            f"_open_region_objects = list(geometry_groups[{_q(air_volume_name)}].objects)",
+            "if len(_open_region_objects) != 1:",
+            f"    raise RuntimeError('Open-region domain {_q(air_volume_name)} must contain exactly one geometry object')",
+            "_open_region_object = _open_region_objects[0]",
+        ]
+        boundary_groups: Dict[str, List[str]] = {}
+        for boundary_key, face_selector, boundary_type in domain_boundaries:
+            if boundary_type in {"Open", "Radiation", "Pec", "Pmc"}:
+                var_name = f"_open_face_{boundary_key.lower()}"
+                lines.append(f"{var_name} = _open_region_object.face({_q(face_selector)})")
+                group_type = "Absorbing" if boundary_type in {"Open", "Radiation"} else boundary_type
+                boundary_groups.setdefault(group_type, []).append(var_name)
+            elif boundary_type in {"Pml", "Periodic"}:
+                lines.append(
+                    f"print({_q(f'[warn] Global boundary {boundary_key}={boundary_type} is not a surface AbsorbingBoundary and was not exported')})"
+                )
+        for boundary_type, face_vars in boundary_groups.items():
+            selection_expression = " + ".join(face_vars)
+            if boundary_type == "Absorbing":
+                lines.append(f"simulationObj.mw.bc.AbsorbingBoundary({selection_expression})")
+            elif boundary_type == "Pec":
+                lines.append(f"simulationObj.mw.bc.PEC({selection_expression})")
+            elif boundary_type == "Pmc":
+                lines.append(f"simulationObj.mw.bc.PMC({selection_expression})")
+        lines.append("")
+
     if show_model:
         lines += [
             "# Show the committed geometry after port plates and LumpedPorts are defined.",
@@ -762,6 +884,7 @@ def export_emerge_python_script(
         "# =============================================================================",
         "# [8] MESH GENERATION",
         "# =============================================================================",
+        "simulationObj.mesher.set_curved_boundary_meshing(CURVED_BOUNDARY_RESOLUTION)",
         "simulationObj.generate_mesh()",
         "",
     ]
@@ -794,37 +917,46 @@ def export_emerge_python_script(
                 lines.append(f"simulationObj.mw.bc.AbsorbingBoundary({boundary_target})")
         lines.append("")
 
-    lines += [
-        "# =============================================================================",
-        "# [10] RUN SIMULATION",
-        "# =============================================================================",
-        "simulationResult = None",
-        "if JOB_TYPE == 'sweep':",
-        "    simulationResult = simulationObj.mw.run_sweep()",
-        "    print(f\"[job] Sweep completed: {JOB_NAME}\")",
-        "elif JOB_TYPE == 'eigenmode':",
-        "    simulationResult = simulationObj.mw.run_eigenmode(EIGENMODE_COUNT)",
-        "    print(f\"[job] Eigenmode completed: {JOB_NAME}\")",
-        "elif JOB_TYPE == 'parametric':",
-        "    values = [v.strip() for v in PARAM_VALUES.split(',') if v.strip()]",
-        "    if not values:",
-        "        values = ['default']",
-        "    for _value in values:",
-        "        if PARAM_NAME:",
-        "            setattr(simulationObj, PARAM_NAME, _value)",
-        "        simulationResult = simulationObj.mw.run_sweep()",
-        "        print(f\"[job] Parametric sweep value={_value} completed\")",
-        "else:",
-        "    raise ValueError(f\"Unsupported job type: {JOB_TYPE}\")",
-        "",
-        "# =============================================================================",
-        "# [11] RESULTS AND SAVE",
-        "# =============================================================================",
-        "simulationObj.save()",
-        "print(f\"[job] Saved project for {JOB_NAME}\")",
-        "",
-        "# Plotting and derived result processing are intentionally last.",
-        "_postprocess_sparams(simulationObj, simulationResult)",
-    ]
+    if run_sweep:
+        lines += [
+            "# =============================================================================",
+            "# [10] RUN SIMULATION",
+            "# =============================================================================",
+            "simulationResult = None",
+            "if JOB_TYPE == 'sweep':",
+            "    simulationResult = simulationObj.mw.run_sweep()",
+            "    print(f\"[job] Sweep completed: {JOB_NAME}\")",
+            "elif JOB_TYPE == 'eigenmode':",
+            "    simulationResult = simulationObj.mw.run_eigenmode(EIGENMODE_COUNT)",
+            "    print(f\"[job] Eigenmode completed: {JOB_NAME}\")",
+            "elif JOB_TYPE == 'parametric':",
+            "    values = [v.strip() for v in PARAM_VALUES.split(',') if v.strip()]",
+            "    if not values:",
+            "        values = ['default']",
+            "    for _value in values:",
+            "        if PARAM_NAME:",
+            "            setattr(simulationObj, PARAM_NAME, _value)",
+            "        simulationResult = simulationObj.mw.run_sweep()",
+            "        print(f\"[job] Parametric sweep value={_value} completed\")",
+            "else:",
+            "    raise ValueError(f\"Unsupported job type: {JOB_TYPE}\")",
+            "",
+            "# =============================================================================",
+            "# [11] RESULTS AND SAVE",
+            "# =============================================================================",
+            "simulationObj.save()",
+            "print(f\"[job] Saved project for {JOB_NAME}\")",
+            "",
+            "# Plotting and derived result processing are intentionally last.",
+            "_postprocess_sparams(simulationObj, simulationResult)",
+        ]
+    else:
+        lines += [
+            "# =============================================================================",
+            "# [10] SAVE WITHOUT RUNNING SOLVER",
+            "# =============================================================================",
+            "simulationObj.save()",
+            "print(f\"[job] Saved meshed project without running solver: {JOB_NAME}\")",
+        ]
 
     return "\n".join(lines) + "\n"

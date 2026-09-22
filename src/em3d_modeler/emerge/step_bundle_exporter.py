@@ -68,32 +68,6 @@ def _count_solids_in_shape(shape: Any) -> int:
     return -1
 
 
-def _shape_bounds(shape: Any) -> tuple[float, float, float, float, float, float] | None:
-    for pkg in ("OCP", "OCC.Core"):
-        try:
-            if pkg == "OCP":
-                from OCP.Bnd import Bnd_Box
-                from OCP.BRepBndLib import BRepBndLib
-
-                box = Bnd_Box()
-                BRepBndLib.Add(shape, box)
-                xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
-                return float(xmin), float(xmax), float(ymin), float(ymax), float(zmin), float(zmax)
-
-            from OCC.Core.Bnd import Bnd_Box
-            from OCC.Core.BRepBndLib import brepbndlib
-
-            box = Bnd_Box()
-            brepbndlib.Add(shape, box)
-            xmin, ymin, zmin, xmax, ymax, zmax = box.Get()
-            return float(xmin), float(xmax), float(ymin), float(ymax), float(zmin), float(zmax)
-        except ImportError:
-            continue
-        except Exception:
-            return None
-    return None
-
-
 def _translate_shape(shape: Any, dx: float, dy: float, dz: float) -> Any:
     for pkg in ("OCP", "OCC.Core"):
         try:
@@ -116,42 +90,6 @@ def _translate_shape(shape: Any, dx: float, dy: float, dz: float) -> Any:
         except Exception:
             return shape
     return shape
-
-
-def _align_occ_shape_to_poly_center(
-    shape: Any,
-    poly: vtk.vtkPolyData,
-    obj_name: str,
-    log_callback: Callable[[str, str], None] | None = None,
-) -> Any:
-    pb = poly.GetBounds() if poly is not None else None
-    if pb is None:
-        return shape
-
-    sb = _shape_bounds(shape)
-    if sb is None:
-        return shape
-
-    pcx = 0.5 * (float(pb[0]) + float(pb[1]))
-    pcy = 0.5 * (float(pb[2]) + float(pb[3]))
-    pcz = 0.5 * (float(pb[4]) + float(pb[5]))
-
-    scx = 0.5 * (sb[0] + sb[1])
-    scy = 0.5 * (sb[2] + sb[3])
-    scz = 0.5 * (sb[4] + sb[5])
-
-    dx = pcx - scx
-    dy = pcy - scy
-    dz = pcz - scz
-    if abs(dx) < 1e-9 and abs(dy) < 1e-9 and abs(dz) < 1e-9:
-        return shape
-
-    if log_callback is not None:
-        log_callback(
-            "DEBUG",
-            f"occ_center_align name={obj_name} d=({dx:.6g},{dy:.6g},{dz:.6g})",
-        )
-    return _translate_shape(shape, dx, dy, dz)
 
 
 def _count_open_or_nonmanifold_edges(poly: vtk.vtkPolyData) -> int:
@@ -684,8 +622,6 @@ def export_objects_to_step_bundle(
                         delattr(export_obj, "_step_export_offset_recovered")
                     except Exception:
                         pass
-                if obj_type == "MeshObject":
-                    shape = _align_occ_shape_to_poly_center(shape, poly, export_name, log_callback=log_callback)
                 solid_count = _count_solids_in_shape(shape)
                 if log_callback is not None:
                     log_callback("DEBUG", f"occ_candidate name={export_name} solids={solid_count}")
