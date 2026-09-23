@@ -715,7 +715,7 @@ class Viewport3DWidget(QWidget):
             if point_actor is not None and point_id >= 0 and point_picker.GetDataSet() is not None:
                 local = point_picker.GetDataSet().GetPoint(point_id)
                 world = point_actor.GetMatrix().MultiplyPoint([local[0], local[1], local[2], 1.0])
-                point = tuple(self._project_point_to_draw_plane((world[0], world[1], world[2])))
+                point = (world[0], world[1], world[2])
                 source = next((obj for obj in self.scene.objects if obj.actor is point_actor), None)
                 self._snap_records.append({
                     "kind": "vertex",
@@ -747,7 +747,7 @@ class Viewport3DWidget(QWidget):
                 world4 = m.MultiplyPoint([closest_local[0], closest_local[1], closest_local[2], 1.0])
                 w = world4[3] if abs(world4[3]) > 1e-12 else 1.0
                 world = (world4[0] / w, world4[1] / w, world4[2] / w)
-                point = tuple(self._project_point_to_draw_plane(world))
+                point = tuple(world)
                 source = next((obj for obj in self.scene.objects if obj.actor is actor), None)
                 self._snap_records.append({
                     "kind": "edge",
@@ -761,7 +761,7 @@ class Viewport3DWidget(QWidget):
                 return None
 
         if mode in {"all", "face"}:
-            point = tuple(self._project_point_to_draw_plane(pos))
+            point = tuple(pos)
             source = next((obj for obj in self.scene.objects if obj.actor is actor), None)
             inverse = vtk.vtkMatrix4x4()
             vtk.vtkMatrix4x4.Invert(actor.GetMatrix(), inverse)

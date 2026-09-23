@@ -864,6 +864,42 @@ class ProjectTreeWidget(QWidget):
             menu.exec_(self._tree.viewport().mapToGlobal(pos))
             return
 
+        if isinstance(role, tuple) and len(role) == 2 and role[0] == "__mesh_obj__":
+            selected_items = self._tree.selectedItems()
+            context_items = selected_items if item in selected_items else [item]
+            object_names = sorted({
+                str(selected.data(0, Qt.UserRole)[1])
+                for selected in context_items
+                if isinstance(selected.data(0, Qt.UserRole), tuple)
+                and len(selected.data(0, Qt.UserRole)) == 2
+                and selected.data(0, Qt.UserRole)[0] == "__mesh_obj__"
+            }, key=str.casefold)
+            if str(role[1]) not in object_names:
+                object_names.append(str(role[1]))
+
+            menu = QMenu(self._tree)
+            edit_label = (
+                "Set mesh resolution…" if len(object_names) == 1
+                else f"Set resolution for {len(object_names)} objects…"
+            )
+            act_edit = QAction(edit_label, menu)
+            act_edit.triggered.connect(
+                lambda: self._edit_object_mesh_assignments(object_names)
+            )
+            menu.addAction(act_edit)
+
+            remove_label = (
+                "Remove Mesh Assignment" if len(object_names) == 1
+                else f"Remove {len(object_names)} Mesh Assignments"
+            )
+            act_remove = QAction(remove_label, menu)
+            act_remove.triggered.connect(
+                lambda: self._remove_object_mesh_assignments(object_names)
+            )
+            menu.addAction(act_remove)
+            menu.exec_(self._tree.viewport().mapToGlobal(pos))
+            return
+
         menu = QMenu(self._tree)
         if item is self._p_node:
             action = QAction("Add Port…", menu)
@@ -915,10 +951,6 @@ class ProjectTreeWidget(QWidget):
 
             act_remove = QAction("Remove Simulation", menu)
             act_remove.triggered.connect(lambda: self._remove_simulation(int(idx)))
-            menu.addAction(act_remove)
-        elif tag == "__mesh_obj__":
-            act_remove = QAction("Remove Mesh Assignment", menu)
-            act_remove.triggered.connect(lambda: self._remove_object_mesh_assignment(str(idx)))
             menu.addAction(act_remove)
         elif tag == "__mesh_default__":
             act_edit = QAction("Edit Default Mesh Resolution…", menu)
@@ -1105,26 +1137,74 @@ class ProjectTreeWidget(QWidget):
         self._refresh_object_boundaries()
         self.settings_changed.emit()
 
-    def _remove_object_mesh_assignment(self, obj_name: str) -> None:
+    def _edit_object_mesh_assignments(self, object_names: list[str]) -> None:
         mesh_cfg = self._settings.get("mesh", {})
         if not isinstance(mesh_cfg, dict):
             return
         obj_res = mesh_cfg.get("object_resolutions", {})
         if not isinstance(obj_res, dict):
             return
-        name = str(obj_name).strip()
-        if not name or name not in obj_res:
+        names = [name for name in object_names if name in obj_res]
+        if not names:
             return
+
+        try:
+            current = float(obj_res[names[0]])
+        except Exception:
+            current = 0.3
+        value, ok = QInputDialog.getDouble(
+            self,
+            "Object Mesh Resolution",
+            "Resolution (1/λ):",
+            max(0.01, min(1.0, current)),
+            0.01,
+            1.0,
+            4,
+        )
+        if not ok:
+            return
+        self._apply_object_mesh_resolution(names, float(value))
+
+    def _apply_object_mesh_resolution(self, object_names: list[str], value: float) -> None:
+        mesh_cfg = self._settings.get("mesh", {})
+        if not isinstance(mesh_cfg, dict):
+            return
+        obj_res = mesh_cfg.get("object_resolutions", {})
+        if not isinstance(obj_res, dict):
+            return
+        fraction = max(0.01, min(1.0, float(value)))
+        changed = False
+        for name in object_names:
+            if name in obj_res:
+                obj_res[name] = fraction
+                changed = True
+        if changed:
+            self._refresh_object_mesh_assignments()
+            self.settings_changed.emit()
+
+    def _remove_object_mesh_assignments(self, object_names: list[str]) -> None:
+        mesh_cfg = self._settings.get("mesh", {})
+        if not isinstance(mesh_cfg, dict):
+            return
+        obj_res = mesh_cfg.get("object_resolutions", {})
+        if not isinstance(obj_res, dict):
+            return
+        names = [str(name).strip() for name in object_names]
+        names = [name for name in names if name and name in obj_res]
+        if not names:
+            return
+        target = f"'{names[0]}'" if len(names) == 1 else f"{len(names)} selected objects"
         reply = QMessageBox.question(
             self,
             "Remove Mesh Assignment",
-            f"Remove mesh assignment for '{name}'?",
+            f"Remove mesh assignment for {target}?",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
-        obj_res.pop(name, None)
+        for name in names:
+            obj_res.pop(name, None)
         self._refresh_object_mesh_assignments()
         self.settings_changed.emit()
 

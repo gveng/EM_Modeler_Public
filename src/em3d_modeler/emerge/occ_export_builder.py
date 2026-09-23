@@ -675,11 +675,9 @@ def _boolean_from_sources(obj: Any, cache: Dict[str, Any], depth: int) -> Any | 
             return None
         shapes.append(shp)
 
-    result = shapes[0]
-    for tool in shapes[1:]:
-        result = _apply_boolean(result, tool, op)
-        if result is None:
-            return None
+    result = _combine_boolean_shapes(shapes, op)
+    if result is None:
+        return None
     return _apply_actor_transform(result, obj)
 
 
@@ -689,22 +687,78 @@ def _boolean_from_source_data(obj: Any, cache: Dict[str, Any], depth: int) -> An
     if op not in {"fuse", "cut", "common"} or len(source_data) < 2:
         return None
 
+    sources = [_rebuild_object_from_snapshot(item) for item in source_data]
+    if any(src is None for src in sources):
+        return None
+
+    source_cache = {
+        key: value
+        for key, value in cache.items()
+        if isinstance(key, str) and key.startswith("root::")
+    }
     shapes: List[Any] = []
-    for item in source_data:
-        src = _rebuild_object_from_snapshot(item)
-        if src is None:
-            return None
-        shp = build_occ_shape_for_export(src, cache=cache, depth=depth + 1)
+    for src in sources:
+        shp = build_occ_shape_for_export(src, cache=source_cache, depth=depth + 1)
         if shp is None:
             return None
         shapes.append(shp)
+
+    cache.update(
+        (key, value)
+        for key, value in source_cache.items()
+        if isinstance(key, str) and key.startswith("root::")
+    )
+
+    result = _combine_boolean_shapes(shapes, op)
+    if result is None:
+        return None
+    return _apply_actor_transform(result, obj)
+
+
+def _combine_boolean_shapes(shapes: List[Any], op: str) -> Any | None:
+    if not shapes:
+        return None
+    if op == "fuse" and len(shapes) > 1:
+        for package in ("OCP", "OCC.Core"):
+            try:
+                if package == "OCP":
+                    from OCP.BOPAlgo import BOPAlgo_BOP, BOPAlgo_FUSE
+                    from OCP.TopTools import TopTools_ListOfShape
+                else:
+                    from OCC.Core.BOPAlgo import BOPAlgo_BOP, BOPAlgo_FUSE
+                    from OCC.Core.TopTools import TopTools_ListOfShape
+
+                arguments = TopTools_ListOfShape()
+                arguments.Append(shapes[0])
+                tools = TopTools_ListOfShape()
+                for shape in shapes[1:]:
+                    tools.Append(shape)
+                operation = BOPAlgo_BOP()
+                operation.SetArguments(arguments)
+                operation.SetTools(tools)
+                operation.SetOperation(BOPAlgo_FUSE)
+                try:
+                    operation.SetRunParallel(True)
+                except AttributeError:
+                    pass
+                operation.Perform()
+                if operation.HasErrors():
+                    break
+                result = operation.Shape()
+                if result.IsNull():
+                    break
+                return result
+            except ImportError:
+                continue
+            except Exception:
+                break
 
     result = shapes[0]
     for tool in shapes[1:]:
         result = _apply_boolean(result, tool, op)
         if result is None:
             return None
-    return _apply_actor_transform(result, obj)
+    return result
 
 
 def _apply_boolean(a: Any, b: Any, op: str) -> Any | None:

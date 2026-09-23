@@ -188,7 +188,7 @@ from .project_tree_widget    import set_numeric_locale
 from ..emerge.project_file    import ProjectFile
 from ..emerge.script_exporter import export_emerge_script
 from ..emerge.python_script_exporter import export_emerge_python_script
-from ..emerge.step_bundle_exporter import export_objects_to_step_bundle
+from ..emerge.step_bundle_exporter import export_debug_scene_step, export_objects_to_step_bundle
 from ..emerge.step_importer   import import_step
 from ..emerge.material_store  import MaterialStore
 from ..emerge.simulation_validator import validate_simulation
@@ -224,6 +224,7 @@ class MainWindow(QMainWindow):
 
     def __init__(self):
         super().__init__()
+        self.setWindowIcon(QApplication.windowIcon())
         self.setWindowTitle("EM 3D Modeler - EMERGE Design Environment")
         self.resize(1400, 860)
 
@@ -3331,6 +3332,27 @@ class MainWindow(QMainWindow):
                     self._info_bar.set_info(f"STEP export done: {exported} object(s)")
             else:
                 bundle = self._sim_step_bundle_cache
+
+            safe_project_name = "".join(
+                char if char.isalnum() or char in ("-", "_") else "_"
+                for char in self._project_name
+            ) or "Project"
+            debug_step_path = self._simulation_bundle_dir() / f"{safe_project_name}_Debug_All.step"
+            try:
+                debug_result = export_debug_scene_step(
+                    objects=sim_objects,
+                    step_path=debug_step_path,
+                    log_callback=lambda level, message: self._append_step_export_log(
+                        f"[{level.lower()}] {message}", level=self._normalize_log_level(level)
+                    ),
+                )
+                self._append_sim_log(
+                    f"[info] Debug STEP exported: {debug_result['exported']} object(s) to {debug_step_path}"
+                )
+            except Exception as exc:
+                warning = f"[warn] Debug STEP export failed: {exc}"
+                self._append_sim_log(warning)
+                self._append_step_export_log(warning, level="WARNING")
 
             need_script = force_script or self._sim_script_dirty or (not self._sim_cached_script_bundle.get("master", ""))
 

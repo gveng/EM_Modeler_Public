@@ -319,6 +319,109 @@ def _debug_boolean_source_shift(poly: vtk.vtkPolyData, source_index: int) -> tup
     return float(source_index + 1) * step, 0.0, 0.0
 
 
+def export_debug_scene_step(
+    objects: Iterable[Any],
+    step_path: Path,
+    log_callback: Callable[[str, str], None] | None = None,
+) -> Dict[str, Any]:
+    """Export simulation objects as one colored, named STEP assembly for inspection."""
+    candidates = [obj for obj in objects if bool(getattr(obj, "is_model", True))]
+    if not candidates:
+        raise RuntimeError("No simulation model objects are available for the debug STEP export")
+
+    last_error: Exception | None = None
+    for package in ("OCP", "OCC.Core"):
+        document = None
+        application = None
+        try:
+            if package == "OCP":
+                from OCP.STEPControl import STEPControl_AsIs
+                from OCP.STEPCAFControl import STEPCAFControl_Writer
+                from OCP.TCollection import TCollection_ExtendedString
+                from OCP.TDataStd import TDataStd_Name
+                from OCP.TDocStd import TDocStd_Document
+                from OCP.XCAFApp import XCAFApp_Application
+                from OCP.XCAFDoc import XCAFDoc_ColorType, XCAFDoc_DocumentTool
+                from OCP.Quantity import Quantity_Color, Quantity_TOC_RGB
+            else:
+                from OCC.Core.STEPControl import STEPControl_AsIs
+                from OCC.Core.STEPCAFControl import STEPCAFControl_Writer
+                from OCC.Core.TCollection import TCollection_ExtendedString
+                from OCC.Core.TDataStd import TDataStd_Name
+                from OCC.Core.TDocStd import TDocStd_Document
+                from OCC.Core.XCAFApp import XCAFApp_Application
+                from OCC.Core.XCAFDoc import XCAFDoc_ColorType, XCAFDoc_DocumentTool
+                from OCC.Core.Quantity import Quantity_Color, Quantity_TOC_RGB
+
+            application = XCAFApp_Application.GetApplication_s()
+            document = TDocStd_Document(TCollection_ExtendedString("MDTV-XCAF"))
+            application.NewDocument(TCollection_ExtendedString("MDTV-XCAF"), document)
+            shape_tool = XCAFDoc_DocumentTool.ShapeTool_s(document.Main())
+            color_tool = XCAFDoc_DocumentTool.ColorTool_s(document.Main())
+            skipped: list[str] = []
+            exported = 0
+            occ_cache: Dict[str, Any] = {}
+
+            for obj in candidates:
+                object_name = str(getattr(obj, "name", "Object"))
+                shape = build_occ_shape_for_export(obj, cache=occ_cache)
+                if shape is None:
+                    actor = getattr(obj, "actor", None)
+                    poly = _world_polydata_from_actor(actor) if actor is not None else vtk.vtkPolyData()
+                    shape = _build_occ_faceted_shape_from_polydata(poly)
+                if shape is None:
+                    skipped.append(object_name)
+                    continue
+
+                component = shape_tool.AddShape(shape, False)
+                TDataStd_Name.Set_s(component, TCollection_ExtendedString(object_name))
+                try:
+                    rgb = tuple(float(value) for value in obj._base_color())
+                except Exception:
+                    custom_color = getattr(obj, "custom_color", None)
+                    if custom_color is not None and len(custom_color) == 3:
+                        rgb = tuple(float(value) for value in custom_color)
+                    else:
+                        rgb = tuple(float(value) for value in obj.actor.GetProperty().GetColor())
+                color = Quantity_Color(*rgb, Quantity_TOC_RGB)
+                color_tool.SetColor(component, color, XCAFDoc_ColorType.XCAFDoc_ColorGen)
+                color_tool.SetColor(component, color, XCAFDoc_ColorType.XCAFDoc_ColorSurf)
+                exported += 1
+
+            if exported == 0:
+                raise RuntimeError("No simulation object geometry could be converted to STEP")
+
+            writer = STEPCAFControl_Writer()
+            writer.SetColorMode(True)
+            writer.SetNameMode(True)
+            if not writer.Transfer(document, STEPControl_AsIs):
+                raise RuntimeError("XCAF STEP transfer failed")
+            step_path.parent.mkdir(parents=True, exist_ok=True)
+            status = int(writer.Write(str(step_path)))
+            if not _step_write_succeeded(step_path, status):
+                raise RuntimeError(f"XCAF STEP writer failed with status={status}")
+
+            result = {"step_file": step_path.name, "exported": exported, "skipped": skipped}
+            if log_callback is not None:
+                log_callback("INFO", f"debug_scene_step file={step_path.name} exported={exported} skipped={len(skipped)}")
+            return result
+        except ImportError as exc:
+            last_error = exc
+            continue
+        except Exception as exc:
+            last_error = exc
+            if package == "OCC.Core":
+                break
+        finally:
+            if document is not None and application is not None:
+                try:
+                    application.Close(document)
+                except Exception:
+                    pass
+
+    raise RuntimeError(f"Colored debug STEP export failed: {last_error}") from last_error
+
+
 def _write_step_from_polydata(
     poly: vtk.vtkPolyData,
     step_path: Path,

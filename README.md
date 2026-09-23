@@ -5,7 +5,7 @@ geometries and exporting them to the EMERGE simulation workflow. It combines a
 VTK viewport, parametric primitives, CAD import, material assignment, boolean
 modeling, and EMERGE-oriented project export in one application.
 
-Current version: `1.2.6`
+Current version: `1.2.7`
 
 ## What You Can Do
 
@@ -107,7 +107,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
 The generated portable folder is placed under `dist/`, for example:
 
 ```text
-dist/EM3D_Modeler_1.2.6/
+dist/EM3D_Modeler_1.2.7/
 ```
 
 Run the executable inside that folder without installing the package into the
