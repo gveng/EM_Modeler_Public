@@ -254,6 +254,52 @@ class Viewport3DWidget(QWidget):
         cam = self._renderer.GetActiveCamera()
         cam.SetPosition(100, -150, 120)
         cam.SetFocalPoint(0, 0, 0)
+    def fit_all(self) -> None:
+        self._fit_camera_to_objects(self.scene.objects)
+
+    def fit_selection(self) -> None:
+        self._fit_camera_to_objects(self.scene.selection)
+
+    def isometric_view(self) -> None:
+        objects = [obj for obj in self.scene.objects if obj.is_visible()]
+        bounds = self._visible_objects_bounds(objects)
+        if bounds is None:
+            return
+        center = ((bounds[0] + bounds[1]) * 0.5,
+                  (bounds[2] + bounds[3]) * 0.5,
+                  (bounds[4] + bounds[5]) * 0.5)
+        extent = max(bounds[1] - bounds[0], bounds[3] - bounds[2], bounds[5] - bounds[4], 1.0)
+        camera = self._renderer.GetActiveCamera()
+        camera.SetFocalPoint(*center)
+        camera.SetPosition(center[0] + extent, center[1] - extent, center[2] + extent)
+        camera.SetViewUp(0.0, 0.0, 1.0)
+        self._renderer.ResetCamera(*bounds)
+        self._renderer.ResetCameraClippingRange()
+        self._render()
+
+    def _fit_camera_to_objects(self, objects) -> None:
+        bounds = self._visible_objects_bounds(objects)
+        if bounds is None:
+            return
+        self._renderer.ResetCamera(*bounds)
+        self._renderer.ResetCameraClippingRange()
+        self._render()
+
+    @staticmethod
+    def _visible_objects_bounds(objects) -> tuple | None:
+        object_bounds = [
+            obj.actor.GetBounds()
+            for obj in objects
+            if obj.actor is not None and obj.is_visible()
+        ]
+        if not object_bounds:
+            return None
+        return (
+            min(bounds[0] for bounds in object_bounds), max(bounds[1] for bounds in object_bounds),
+            min(bounds[2] for bounds in object_bounds), max(bounds[3] for bounds in object_bounds),
+            min(bounds[4] for bounds in object_bounds), max(bounds[5] for bounds in object_bounds),
+        )
+
         cam.SetViewUp(0, 0, 1)
         self._renderer.ResetCamera()
         self._renderer.ResetCameraClippingRange()
@@ -1998,26 +2044,10 @@ class Viewport3DWidget(QWidget):
         origin = self._custom_plane_origin if self._custom_plane_active else PLANE_ORIGIN.get(plane_name, (0.0, 0.0, 0.0))
         normal = self._custom_plane_normal if self._custom_plane_active else PLANE_NORMAL.get(plane_name, (0.0, 0.0, 1.0))
         obj.set_creation_plane(plane_name, origin, normal)
-        history_points = []
-        for point in self._draw_pts:
-            nearest = None
-            distance = float("inf")
-            for record in self._snap_records:
-                candidate = record.get("point", [])
-                if len(candidate) != 3:
-                    continue
-                current_distance = sum((float(point[i]) - float(candidate[i])) ** 2 for i in range(3))
-                if current_distance < distance:
-                    nearest = record
-                    distance = current_distance
-            history_points.append({
-                "value": [float(point[i]) for i in range(3)],
-                "snap": dict(nearest) if nearest is not None and distance < 1e-8 else {"kind": "grid"},
-            })
         obj.creation_history = {
             "mode": str(self._draw_mode or ""),
             "plane": plane_name,
-            "points": history_points,
+            "points": self._creation_history_points(self._draw_pts, self._snap_records),
         }
         self.scene.add_object(obj)
         self.scene.select(obj)
@@ -2033,6 +2063,28 @@ class Viewport3DWidget(QWidget):
         self._snap_records = []
         self.setCursor(Qt.ArrowCursor)
         self._render()
+
+    @staticmethod
+    def _creation_history_points(draw_points: list, snap_records: list[dict]) -> list[dict]:
+        history_points = []
+        for point in draw_points:
+            if not isinstance(point, (tuple, list)) or len(point) != 3:
+                continue
+            nearest = None
+            distance = float("inf")
+            for record in snap_records:
+                candidate = record.get("point", [])
+                if len(candidate) != 3:
+                    continue
+                current_distance = sum((float(point[i]) - float(candidate[i])) ** 2 for i in range(3))
+                if current_distance < distance:
+                    nearest = record
+                    distance = current_distance
+            history_points.append({
+                "value": [float(point[i]) for i in range(3)],
+                "snap": dict(nearest) if nearest is not None and distance < 1e-8 else {"kind": "grid"},
+            })
+        return history_points
 
     def _cancel_draw(self) -> None:
         was_planar = (self._draw_mode == "planar")

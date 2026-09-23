@@ -13,6 +13,7 @@ Layout
 """
 from __future__ import annotations
 from datetime import datetime
+from html import escape
 from pathlib import Path
 from copy import deepcopy
 import os
@@ -190,6 +191,7 @@ from ..emerge.python_script_exporter import export_emerge_python_script
 from ..emerge.step_bundle_exporter import export_objects_to_step_bundle
 from ..emerge.step_importer   import import_step
 from ..emerge.material_store  import MaterialStore
+from ..emerge.simulation_validator import validate_simulation
 from ..scene.em_objects       import set_selection_color
 from ..scene.param_expr       import evaluate_expression
 from .. import __version__, __release_date__
@@ -585,7 +587,25 @@ class MainWindow(QMainWindow):
         act_play = QAction(_icon("media-playback-start"), "Play", self)
         act_play.setToolTip("Open simulation panel (EMERGE Python script + verbose output)")
         act_play.triggered.connect(self._open_simulation_window)
-        add_group("Simulation", [act_step, act_play], columns=2)
+
+        act_check_simulation = QAction(_icon("dagViewPass"), "Check Simulation", self)
+        act_check_simulation.setToolTip("Validate geometry, solver, boundaries, ports and port connectivity")
+        act_check_simulation.triggered.connect(self._on_check_simulation)
+        add_group("Simulation", [act_step, act_check_simulation, act_play], columns=3)
+
+        act_fit_all = QAction(_icon("zoom-all"), "Fit All", self)
+        act_fit_all.setToolTip("Fit all visible objects while preserving the current view orientation")
+        act_fit_all.triggered.connect(self._viewport.fit_all)
+
+        act_fit_selection = QAction(_icon("zoom-selection"), "Fit Selection", self)
+        act_fit_selection.setToolTip("Fit selected object(s) while preserving the current view orientation")
+        act_fit_selection.triggered.connect(self._viewport.fit_selection)
+
+        act_isometric = QAction(_icon("view-isometric"), "Isometric View", self)
+        act_isometric.setToolTip("Set an isometric view and fit all visible objects")
+        act_isometric.triggered.connect(self._viewport.isometric_view)
+
+        add_group("Zoom", [act_fit_all, act_fit_selection, act_isometric], columns=3)
 
         # ������ Selection mode ���������������������������������������������������������������������������������������������������������������������������
         self._sel_mode_combo = QComboBox()
@@ -734,7 +754,7 @@ class MainWindow(QMainWindow):
         self._viewport.create_plate_from_face(self._draw_material)
 
     def _open_region_pml_wizard(self) -> None:
-        from PySide6.QtWidgets import QDoubleSpinBox, QComboBox
+        from PySide6.QtWidgets import QDoubleSpinBox, QComboBox, QSpinBox
         from ..scene.em_objects import BoxObject
 
         models = [
@@ -758,10 +778,25 @@ class MainWindow(QMainWindow):
         form = QFormLayout(dlg)
         distance = QDoubleSpinBox(dlg); distance.setRange(0.001, 1e6); distance.setDecimals(4); distance.setValue(10.0)
         thickness = QDoubleSpinBox(dlg); thickness.setRange(0.001, 1e6); thickness.setDecimals(4); thickness.setValue(10.0)
-        boundary = QComboBox(dlg); boundary.addItems(["Open", "Radiation"])
+        boundary = QComboBox(dlg); boundary.addItems(["Open", "Radiation", "PML"])
+        pml_layers = QSpinBox(dlg); pml_layers.setRange(1, 20); pml_layers.setValue(1)
+        pml_mesh_layers = QSpinBox(dlg); pml_mesh_layers.setRange(1, 50); pml_mesh_layers.setValue(5)
+        pml_exponent = QDoubleSpinBox(dlg); pml_exponent.setRange(0.1, 10.0); pml_exponent.setDecimals(3); pml_exponent.setValue(1.5)
+        pml_deltamax = QDoubleSpinBox(dlg); pml_deltamax.setRange(0.1, 100.0); pml_deltamax.setDecimals(3); pml_deltamax.setValue(8.0)
         form.addRow("Air distance", distance)
         form.addRow("PML thickness", thickness)
         form.addRow("Outer boundary", boundary)
+        form.addRow("PML geometrical layers", pml_layers)
+        form.addRow("PML mesh layers", pml_mesh_layers)
+        form.addRow("PML exponent", pml_exponent)
+        form.addRow("PML delta max", pml_deltamax)
+        pml_controls = (thickness, pml_layers, pml_mesh_layers, pml_exponent, pml_deltamax)
+        def _update_pml_controls(value: str) -> None:
+            enabled = value == "PML"
+            for control in pml_controls:
+                control.setEnabled(enabled)
+        boundary.currentTextChanged.connect(_update_pml_controls)
+        _update_pml_controls(boundary.currentText())
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
         buttons.accepted.connect(dlg.accept); buttons.rejected.connect(dlg.reject)
         form.addRow(buttons)
@@ -789,22 +824,35 @@ class MainWindow(QMainWindow):
             pml_name = f"PML_Region_{index}"
             index += 1
         air = BoxObject(air_name, inner[0], inner[2], inner[4], inner[1], inner[3], inner[5], "AIR")
-        pml_obj = BoxObject(pml_name, outer[0], outer[2], outer[4], outer[1], outer[3], outer[5], "PML")
         air.is_model = True
-        pml_obj.is_model = True
         self._viewport.scene.add_object(air)
-        self._viewport.scene.add_object(pml_obj)
+        pml_obj = None
+        if boundary.currentText() == "PML":
+            pml_obj = BoxObject(pml_name, outer[0], outer[2], outer[4], outer[1], outer[3], outer[5], "PML")
+            pml_obj.is_model = True
+            self._viewport.scene.add_object(pml_obj)
         settings = self._project_tree.get_settings()
         settings.setdefault("boundaries", {})
         for key in ("Xmin", "Xmax", "Ymin", "Ymax", "Zmin", "Zmax"):
             settings["boundaries"][key] = boundary.currentText()
         settings["open_region"] = {"enabled": True, "object": air_name}
+        settings["pml"] = {
+            "enabled": boundary.currentText() == "PML",
+            "air_object": air_name,
+            "outer_object": pml_name if pml_obj is not None else "",
+            "thickness_mm": pml,
+            "layers": int(pml_layers.value()),
+            "mesh_layers": int(pml_mesh_layers.value()),
+            "exponent": float(pml_exponent.value()),
+            "deltamax": float(pml_deltamax.value()),
+        }
         self._project_tree.load_settings(settings)
         self._project_tree.settings_changed.emit()
         self._viewport.scene_changed.emit()
         self._refresh_materials()
         self._viewport._render()
-        self._info_bar.set_info(f"Created {air_name} and {pml_name} with {boundary.currentText()} boundaries")
+        created_names = f"{air_name} and {pml_name}" if pml_obj is not None else air_name
+        self._info_bar.set_info(f"Created {created_names} with {boundary.currentText()} boundaries")
 
     def _delete_selected(self) -> None:
         objects = list(self._viewport.scene.selection)
@@ -1252,6 +1300,7 @@ class MainWindow(QMainWindow):
                     p.get("Material", "PEC"),
                     step_source_path=p.get("StepSourcePath"),
                     step_solid_name=p.get("StepSolidName"),
+                    plate_role=bool(p.get("PlateRole", False)),
                     boolean_op=p.get("BooleanOperation"),
                     boolean_source_names=p.get("BooleanSourceNames"),
                     boolean_sources_data=p.get("BooleanSourcesData"),
@@ -1605,6 +1654,7 @@ class MainWindow(QMainWindow):
             name=f"{label}_{base.name}",
             polydata=current_poly,
             material=base.material,
+            plate_role=(op == "cut" and self._is_plate_role_object(base)),
             boolean_op=op,
             boolean_source_names=[o.name for o in ([base] + tools)],
         )
@@ -1980,6 +2030,7 @@ class MainWindow(QMainWindow):
             name=result.name,
             polydata=polydata,
             material=result.material,
+            plate_role=bool(getattr(result, "plate_role", False)),
             boolean_op=getattr(result, "boolean_op", None),
             boolean_source_names=list(getattr(result, "boolean_source_names", []) or []),
             boolean_sources_data=[self._serialize_object_snapshot(source) for source in sources],
@@ -2382,7 +2433,7 @@ class MainWindow(QMainWindow):
             ),
             None,
         ) if len(names) == 1 else None
-        all_plates = all(type(obj).__name__ == "PlateObject" for obj in objects)
+        all_plates = all(self._is_plate_role_object(obj) for obj in objects)
         initial_mode = str((existing or {}).get("mode", "face" if all_plates else "boundary"))
 
         dlg = QDialog(self)
@@ -2464,6 +2515,8 @@ class MainWindow(QMainWindow):
         if selected_mode == "face" and not selected_faces and not all_plates:
             QMessageBox.warning(self, "Mesh Refinement", "Face mode requires face selectors for non-Plate objects.")
             return
+        if selected_mode == "face" and all_plates:
+            selected_faces = []
 
         assigned_refinements = []
         for name in names:
@@ -2638,6 +2691,10 @@ class MainWindow(QMainWindow):
             self._sim_btn_generate.clicked.connect(self._on_sim_generate)
             btn_row.addWidget(self._sim_btn_generate)
 
+            self._sim_btn_check = QPushButton("Check Simulation")
+            self._sim_btn_check.clicked.connect(self._on_check_simulation)
+            btn_row.addWidget(self._sim_btn_check)
+
             self._sim_btn_save = QPushButton("Save Script")
             self._sim_btn_save.clicked.connect(self._on_sim_save_script)
             btn_row.addWidget(self._sim_btn_save)
@@ -2659,12 +2716,16 @@ class MainWindow(QMainWindow):
 
             self._sim_dlg = dlg
 
+        self._sim_log_view.clear()
         try:
-            self._generate_simulation_assets(
+            master_script = self._generate_simulation_assets(
                 show_progress=True,
                 force_script=True,
                 force_step_export=True,
             )
+            if master_script:
+                script_path = self._write_cached_simulation_scripts()
+                self._append_sim_log(f"[info] Scripts regenerated and saved: {script_path.parent}")
         except Exception as exc:
             self._append_sim_log(f"[error] Failed to generate script: {exc}")
         dlg.show()
@@ -2674,6 +2735,57 @@ class MainWindow(QMainWindow):
     def _on_sim_option_changed(self, _checked: bool) -> None:
         self._mark_simulation_dirty(steps=False, script=True)
         self._on_sim_generate(show_progress=False, force_script=True)
+
+    def _on_check_simulation(self) -> None:
+        findings = validate_simulation(
+            self._viewport.scene.objects,
+            self._project_tree.get_settings(),
+            self._material_store.material_export_catalog(),
+        )
+        counts = {
+            severity: sum(1 for finding in findings if finding.severity == severity)
+            for severity in ("ERROR", "WARNING", "OK")
+        }
+        colors = {"ERROR": "#ef6b73", "WARNING": "#e8b45c", "OK": "#82d39b"}
+        symbols = {"ERROR": "ERROR", "WARNING": "WARNING", "OK": "OK"}
+        rows = []
+        for finding in findings:
+            color = colors.get(finding.severity, "#e8edf5")
+            symbol = symbols.get(finding.severity, finding.severity)
+            rows.append(
+                "<tr>"
+                f"<td style='color:{color};font-weight:600;padding:5px 10px'>{symbol}</td>"
+                f"<td style='padding:5px 10px'>{escape(finding.category)}</td>"
+                f"<td style='padding:5px 10px'>{escape(finding.message)}</td>"
+                "</tr>"
+            )
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Simulation Check")
+        dlg.resize(900, 560)
+        layout = QVBoxLayout(dlg)
+        summary = QLabel(
+            f"Errors: {counts['ERROR']}    Warnings: {counts['WARNING']}    Passed: {counts['OK']}",
+            dlg,
+        )
+        summary.setStyleSheet("font-weight: bold; padding: 6px;")
+        layout.addWidget(summary)
+        report = QTextBrowser(dlg)
+        report.setHtml(
+            "<table cellspacing='0' width='100%' style='color:#dce4ef'>"
+            "<tr><th align='left'>Status</th><th align='left'>Category</th><th align='left'>Check</th></tr>"
+            + "".join(rows)
+            + "</table>"
+        )
+        layout.addWidget(report)
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, dlg)
+        buttons.rejected.connect(dlg.reject)
+        layout.addWidget(buttons)
+        self._append_sim_log(
+            f"[check] Simulation validation: {counts['ERROR']} error(s), "
+            f"{counts['WARNING']} warning(s), {counts['OK']} passed."
+        )
+        dlg.exec()
 
     def _normalize_log_level(self, value: str) -> str:
         level = str(value or "").strip().upper()
@@ -2704,6 +2816,10 @@ class MainWindow(QMainWindow):
             pass
         self._append_sim_log(f"[info] STEP export log verbosity: {self._sim_log_verbosity}")
 
+    @staticmethod
+    def _is_plate_role_object(obj) -> bool:
+        return type(obj).__name__ == "PlateObject" or bool(getattr(obj, "plate_role", False))
+
     def _collect_plate_lumped_ports(self) -> list[dict]:
         settings_ports = self._project_tree.get_settings().get("ports", [])
         if not isinstance(settings_ports, list):
@@ -2712,7 +2828,7 @@ class MainWindow(QMainWindow):
         plate_by_name = {
             str(obj.name): obj
             for obj in self._viewport.scene.objects
-            if type(obj).__name__ == "PlateObject" and bool(getattr(obj, "is_model", True))
+            if self._is_plate_role_object(obj) and bool(getattr(obj, "is_model", True))
         }
         air_objects = [
             obj for obj in self._viewport.scene.objects
@@ -2741,10 +2857,16 @@ class MainWindow(QMainWindow):
             if plate is None:
                 continue
 
-            p = plate.get_parameters()
-            xmin, xmax = sorted([float(p.get("X1", 0.0)), float(p.get("X2", 0.0))])
-            ymin, ymax = sorted([float(p.get("Y1", 0.0)), float(p.get("Y2", 0.0))])
-            zmin, zmax = sorted([float(p.get("Z1", 0.0)), float(p.get("Z2", 0.0))])
+            if type(plate).__name__ == "PlateObject":
+                p = plate.get_parameters()
+                xmin, xmax = sorted([float(p.get("X1", 0.0)), float(p.get("X2", 0.0))])
+                ymin, ymax = sorted([float(p.get("Y1", 0.0)), float(p.get("Y2", 0.0))])
+                zmin, zmax = sorted([float(p.get("Z1", 0.0)), float(p.get("Z2", 0.0))])
+                points_are_world = False
+            else:
+                bounds = plate.actor.GetBounds()
+                xmin, xmax, ymin, ymax, zmin, zmax = [float(value) for value in bounds]
+                points_are_world = True
 
             spans = [xmax - xmin, ymax - ymin, zmax - zmin]
             normal_axis = min(range(3), key=lambda i: abs(spans[i]))
@@ -2758,7 +2880,7 @@ class MainWindow(QMainWindow):
                 2: ((xmin, ymin, zmin), (xmax, ymin, zmin), (xmax, ymax, zmin), (xmin, ymax, zmin)),
             }[normal_axis]
             matrix = plate.actor.GetMatrix()
-            world = [matrix.MultiplyPoint([*point, 1.0]) for point in corners]
+            world = [(*point, 1.0) for point in corners] if points_are_world else [matrix.MultiplyPoint([*point, 1.0]) for point in corners]
             origin = list(world[0][:3])
             u = [world[1][axis] - world[0][axis] for axis in range(3)]
             v = [world[3][axis] - world[0][axis] for axis in range(3)]
@@ -2769,8 +2891,8 @@ class MainWindow(QMainWindow):
                 origin_local + component
                 for origin_local, component in zip(corners[0], normal_local)
             ]
-            normal_origin_world = matrix.MultiplyPoint([*corners[0], 1.0])
-            normal_tip_world = matrix.MultiplyPoint([*normal_tip_local, 1.0])
+            normal_origin_world = (*corners[0], 1.0) if points_are_world else matrix.MultiplyPoint([*corners[0], 1.0])
+            normal_tip_world = (*normal_tip_local, 1.0) if points_are_world else matrix.MultiplyPoint([*normal_tip_local, 1.0])
             normal_vector = [
                 normal_tip_world[axis] - normal_origin_world[axis]
                 for axis in range(3)
@@ -2852,14 +2974,19 @@ class MainWindow(QMainWindow):
         }
         entries = []
         for obj in self._viewport.scene.objects:
-            if type(obj).__name__ != "PlateObject" or not bool(getattr(obj, "is_model", True)):
+            if not self._is_plate_role_object(obj) or not bool(getattr(obj, "is_model", True)):
                 continue
             if str(getattr(obj, "name", "")).strip() in port_names:
                 continue
-            params = obj.get_parameters()
-            x1, x2 = sorted((float(params.get("X1", 0.0)), float(params.get("X2", 0.0))))
-            y1, y2 = sorted((float(params.get("Y1", 0.0)), float(params.get("Y2", 0.0))))
-            z1, z2 = sorted((float(params.get("Z1", 0.0)), float(params.get("Z2", 0.0))))
+            if type(obj).__name__ == "PlateObject":
+                params = obj.get_parameters()
+                x1, x2 = sorted((float(params.get("X1", 0.0)), float(params.get("X2", 0.0))))
+                y1, y2 = sorted((float(params.get("Y1", 0.0)), float(params.get("Y2", 0.0))))
+                z1, z2 = sorted((float(params.get("Z1", 0.0)), float(params.get("Z2", 0.0))))
+                points_are_world = False
+            else:
+                x1, x2, y1, y2, z1, z2 = [float(value) for value in obj.actor.GetBounds()]
+                points_are_world = True
             spans = (x2 - x1, y2 - y1, z2 - z1)
             normal_axis = min(range(3), key=lambda index: abs(spans[index]))
             corners = {
@@ -2868,7 +2995,7 @@ class MainWindow(QMainWindow):
                 2: ((x1, y1, z1), (x2, y1, z1), (x2, y2, z1), (x1, y2, z1)),
             }[normal_axis]
             matrix = obj.actor.GetMatrix()
-            world = [matrix.MultiplyPoint([*point, 1.0]) for point in corners]
+            world = [(*point, 1.0) for point in corners] if points_are_world else [matrix.MultiplyPoint([*point, 1.0]) for point in corners]
             origin = world[0][:3]
             u = tuple(world[1][index] - world[0][index] for index in range(3))
             v = tuple(world[3][index] - world[0][index] for index in range(3))
@@ -3115,7 +3242,7 @@ class MainWindow(QMainWindow):
         plate_names = {
             str(obj.name).strip()
             for obj in sim_objects
-            if type(obj).__name__ == "PlateObject"
+            if self._is_plate_role_object(obj)
         }
         total_candidates = sum(
             1 for obj in sim_objects
@@ -3299,6 +3426,16 @@ class MainWindow(QMainWindow):
         safe_name = safe_name or "project"
         return out_dir / f"{safe_name}_master_emerge_run.py"
 
+    def _write_cached_simulation_scripts(self) -> Path:
+        bundle = self._sim_cached_script_bundle
+        script_path = self._simulation_script_path()
+        script_path.write_text(str(bundle.get("master", "")), encoding="utf-8")
+        for item in bundle.get("scripts", []):
+            child_name = str(item.get("filename", "simulation_emerge_run.py"))
+            child_path = script_path.parent / child_name
+            child_path.write_text(str(item.get("content", "")), encoding="utf-8")
+        return script_path
+
     def _on_sim_save_script(self) -> None:
         script_bundle = self._sim_cached_script_bundle
         if not str(script_bundle.get("master", "")).strip():
@@ -3403,8 +3540,7 @@ class MainWindow(QMainWindow):
         if not master_script:
             return
 
-        bundle = self._sim_cached_script_bundle
-        script_path = self._simulation_script_path()
+        script_path = self._write_cached_simulation_scripts()
         cancel_file = script_path.parent / ".em3d_simulation_cancel"
         active_pid_file = script_path.parent / ".em3d_simulation_active.pid"
         for control_file in (cancel_file, active_pid_file):
@@ -3412,11 +3548,6 @@ class MainWindow(QMainWindow):
                 control_file.unlink(missing_ok=True)
             except OSError as exc:
                 self._append_sim_log(f"[warn] Could not reset simulation control file {control_file.name}: {exc}")
-        script_path.write_text(str(bundle.get("master", "")), encoding="utf-8")
-        for item in bundle.get("scripts", []):
-            child_name = str(item.get("filename", "simulation_emerge_run.py"))
-            child_path = script_path.parent / child_name
-            child_path.write_text(str(item.get("content", "")), encoding="utf-8")
         self._append_sim_log(f"[info] Running master script: {script_path}")
 
         proc = getattr(self, "_sim_process", None)

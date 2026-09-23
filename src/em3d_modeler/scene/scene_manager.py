@@ -388,6 +388,7 @@ class SceneManager:
                               p.get("Material", "PEC"),
                               step_source_path=p.get("StepSourcePath"),
                               step_solid_name=p.get("StepSolidName"),
+                              plate_role=bool(p.get("PlateRole", False)),
                               boolean_op=p.get("BooleanOperation"),
                               boolean_source_names=p.get("BooleanSourceNames"),
                               boolean_sources_data=p.get("BooleanSourcesData"))

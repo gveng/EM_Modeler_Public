@@ -128,7 +128,6 @@ def _material_block(
             lines.append(f"materials[{_q(name)}] = em.lib.PMC")
             continue
         if up == "PML":
-            lines.append(f"materials[{_q(name)}] = em.lib.PML")
             continue
 
         rec = (materials_catalog or {}).get(name, {})
@@ -308,13 +307,21 @@ def export_emerge_python_script(
         if str(entry.get("material", "")).strip().upper() == "AIR"
         and str(entry.get("object_name", "")).strip()
     ]
+    has_open_region_cfg = isinstance(settings, dict) and "open_region" in settings
     open_region_cfg = settings.get("open_region", {}) if isinstance(settings, dict) else {}
+    open_region_enabled = _to_bool(open_region_cfg.get("enabled", False)) if isinstance(open_region_cfg, dict) else False
     configured_air_name = (
         str(open_region_cfg.get("object", "")).strip()
         if isinstance(open_region_cfg, dict)
         else ""
     )
-    if configured_air_name in air_volume_names:
+    has_waveguide_ports = any(
+        isinstance(port, dict) and str(port.get("type", "")).strip() == "WaveguidePort"
+        for port in ports
+    )
+    if has_open_region_cfg and not open_region_enabled and not has_waveguide_ports:
+        air_volume_name = ""
+    elif configured_air_name in air_volume_names:
         air_volume_name = configured_air_name
     elif len(air_volume_names) == 1:
         air_volume_name = air_volume_names[0]
@@ -334,8 +341,98 @@ def export_emerge_python_script(
     domain_boundaries = [
         (key, face_selectors[key], str(global_boundaries.get(key, "")).strip().title())
         for key in face_selectors
-        if str(global_boundaries.get(key, "")).strip()
+        if str(global_boundaries.get(key, "")).strip().title() not in {"", "None"}
     ] if air_volume_name else []
+    waveguide_face_selectors = {
+        str(port.get("face_name", "")).strip().lower()
+        for port in ports
+        if str(port.get("type", "")).strip() == "WaveguidePort"
+        and str(port.get("face_name", "")).strip()
+    }
+    pml_side_codes = {
+        "Xmin": "l",
+        "Xmax": "r",
+        "Ymin": "f",
+        "Ymax": "a",
+        "Zmin": "b",
+        "Zmax": "t",
+    }
+    requested_pml_boundaries = [
+        (key, face_selectors[key], pml_side_codes[key])
+        for key in face_selectors
+        if str(global_boundaries.get(key, "")).strip().title() == "Pml"
+        and face_selectors[key] not in waveguide_face_selectors
+    ]
+    pml_entry_names = {
+        str(entry.get("object_name", "")).strip()
+        for entry in step_entries
+        if str(entry.get("material", "")).strip().upper() == "PML"
+        and str(entry.get("object_name", "")).strip()
+    }
+    pml_cfg = settings.get("pml", {}) if isinstance(settings, dict) else {}
+    if not isinstance(pml_cfg, dict):
+        pml_cfg = {}
+    pml_enabled = _to_bool(pml_cfg.get("enabled", False))
+    configured_pml_air_name = str(pml_cfg.get("air_object", "")).strip()
+    configured_pml_name = str(pml_cfg.get("outer_object", "")).strip()
+    pml_name = configured_pml_name if configured_pml_name in pml_entry_names else (
+        next(iter(pml_entry_names)) if len(pml_entry_names) == 1 else "PML_Region"
+    )
+    pml_setup = None
+    explicit_pml_geometry = (
+        pml_enabled
+        and configured_pml_air_name == air_volume_name
+        and bool(configured_pml_name)
+        and configured_pml_name in pml_entry_names
+    )
+    if requested_pml_boundaries and explicit_pml_geometry:
+        air_entry = next(
+            (entry for entry in step_entries if str(entry.get("object_name", "")).strip() == air_volume_name),
+            None,
+        )
+        air_bounds = air_entry.get("bounds_mm") if isinstance(air_entry, dict) else None
+        if not isinstance(air_bounds, (list, tuple)) or len(air_bounds) != 6:
+            raise ValueError("PML export requires world-space bounds for the AIR simulation region; regenerate the STEP bundle")
+        air_bounds = tuple(float(value) for value in air_bounds)
+        thickness_mm = _to_float(pml_cfg.get("thickness_mm", 0.0), 0.0)
+        if thickness_mm <= 0.0:
+            pml_entry = next(
+                (entry for entry in step_entries if str(entry.get("object_name", "")).strip() == pml_name),
+                None,
+            )
+            outer_bounds = pml_entry.get("bounds_mm") if isinstance(pml_entry, dict) else None
+            if not isinstance(outer_bounds, (list, tuple)) or len(outer_bounds) != 6:
+                raise ValueError("PML export requires a positive thickness or bounds for the outer PML object")
+            outer_bounds = tuple(float(value) for value in outer_bounds)
+            side_thicknesses = {
+                "Xmin": air_bounds[0] - outer_bounds[0],
+                "Xmax": outer_bounds[1] - air_bounds[1],
+                "Ymin": air_bounds[2] - outer_bounds[2],
+                "Ymax": outer_bounds[3] - air_bounds[3],
+                "Zmin": air_bounds[4] - outer_bounds[4],
+                "Zmax": outer_bounds[5] - air_bounds[5],
+            }
+            selected_thicknesses = [side_thicknesses[key] for key, _, _ in requested_pml_boundaries]
+            if any(value <= 0.0 for value in selected_thicknesses):
+                raise ValueError("The outer PML object must extend beyond the AIR region on every selected PML side")
+            thickness_mm = sum(selected_thicknesses) / len(selected_thicknesses)
+            tolerance = max(thickness_mm * 1e-3, 1e-6)
+            if any(abs(value - thickness_mm) > tolerance for value in selected_thicknesses):
+                raise ValueError("EMerge pmlbox requires a uniform PML thickness on all selected sides")
+        pml_setup = {
+            "air_bounds_mm": air_bounds,
+            "thickness_m": thickness_mm * 0.001,
+            "sides": "".join(code for _, _, code in requested_pml_boundaries),
+            "layers": max(1, _to_int(pml_cfg.get("layers", 1), 1)),
+            "mesh_layers": max(1, _to_int(pml_cfg.get("mesh_layers", 5), 5)),
+            "exponent": max(0.1, _to_float(pml_cfg.get("exponent", 1.5), 1.5)),
+            "deltamax": max(0.1, _to_float(pml_cfg.get("deltamax", 8.0), 8.0)),
+        }
+    ignored_step_names = set(pml_entry_names)
+    if pml_setup is not None:
+        ignored_step_names.add(air_volume_name)
+    for ignored_name in ignored_step_names:
+        object_mesh_sizes.pop(ignored_name, None)
     valid_boundary_names = exported_object_names | port_surface_names | plate_names
     local_mesh_refinements = []
     valid_face_selectors = {"-x", "+x", "-y", "+y", "-z", "+z"}
@@ -345,6 +442,8 @@ def export_emerge_python_script(
         object_name = str(item.get("object", "")).strip()
         mode = str(item.get("mode", "boundary")).strip().lower()
         if object_name not in valid_boundary_names or mode not in {"boundary", "face"}:
+            continue
+        if object_name in pml_entry_names:
             continue
         faces = [
             str(face).strip().lower()
@@ -382,7 +481,11 @@ def export_emerge_python_script(
     ]
     eff_pardiso_threads = max(1, int(pardiso_threads if parallel_enabled else 1))
     eff_acc_threads = max(1, int(acc_threads if parallel_enabled else 1))
-    used_materials = sorted({str(e.get("material", "PEC")) for e in [*step_entries, *plates]})
+    used_materials = sorted({
+        str(e.get("material", "PEC"))
+        for e in [*step_entries, *plates]
+        if str(e.get("material", "PEC")).strip().upper() != "PML"
+    })
     if ports and "PEC" not in used_materials:
         used_materials.append("PEC")
         used_materials.sort()
@@ -493,6 +596,15 @@ def export_emerge_python_script(
         "    t = ''.join(ch if (ch.isalnum() or ch in ('-', '_')) else '_' for ch in str(v))",
         "    t = t.strip('_')",
         "    return t or 'simulation'",
+        "",
+        "class _GeneratedGeometryGroup:",
+        "    def __init__(self, objects):",
+        "        self.objects = list(objects)",
+        "",
+        "    def as_volume(self):",
+        "        if not self.objects:",
+        "            raise RuntimeError('Generated geometry group is empty')",
+        "        return self.objects[0]",
         "",
         "def _select_single_port_face(volume, face_name, origin, u, v):",
         "    candidates = list(volume.face(face_name).tags)",
@@ -648,10 +760,37 @@ def export_emerge_python_script(
         "plate_objects = {}",
         "",
     ]
+    if pml_setup is not None:
+        air_bounds = pml_setup["air_bounds_mm"]
+        air_width = (air_bounds[1] - air_bounds[0]) * 0.001
+        air_depth = (air_bounds[3] - air_bounds[2]) * 0.001
+        air_height = (air_bounds[5] - air_bounds[4]) * 0.001
+        air_position = (air_bounds[0] * 0.001, air_bounds[2] * 0.001, air_bounds[4] * 0.001)
+        lines += [
+            "# Native EMerge PML volumes; the visual AIR/PML STEP boxes are not imported.",
+            "_pml_geometry = em.geo.pmlbox(",
+            f"    width={air_width!r},",
+            f"    depth={air_depth!r},",
+            f"    height={air_height!r},",
+            f"    position={air_position!r},",
+            f"    material=materials[{_q(str(next((entry.get('material', 'AIR') for entry in step_entries if str(entry.get('object_name', '')).strip() == air_volume_name), 'AIR')))}],",
+            f"    thickness={pml_setup['thickness_m']!r},",
+            f"    Nlayers={pml_setup['layers']},",
+            f"    N_mesh_layers={pml_setup['mesh_layers']},",
+            f"    exponent={pml_setup['exponent']!r},",
+            f"    deltamax={pml_setup['deltamax']!r},",
+            f"    sides={_q(pml_setup['sides'])},",
+            ")",
+            f"geometry_groups[{_q(air_volume_name)}] = _GeneratedGeometryGroup([_pml_geometry[0]])",
+            f"geometry_groups[{_q(pml_name)}] = _GeneratedGeometryGroup(_pml_geometry[1:])",
+            "",
+        ]
 
     if step_entries:
         for entry in step_entries:
             obj_name = str(entry.get("object_name", "Object"))
+            if obj_name in ignored_step_names:
+                continue
             step_file = str(entry.get("step_file", ""))
             material = str(entry.get("material", "PEC"))
             priority = int(entry.get("priority", 5000))
@@ -799,7 +938,7 @@ def export_emerge_python_script(
             target_var = f"_mesh_refinement_target_{refinement_index}"
             object_var = f"_mesh_refinement_object_{refinement_index}"
             lines.append(f"{target_var} = geometry_groups[{_q(object_name)}]")
-            if mode == "face" and not faces:
+            if mode == "face" and (not faces or object_name in port_surface_names or object_name in plate_names):
                 lines.append(f"simulationObj.mesher.set_face_size({target_var}, size={size_m!r})")
                 continue
             lines.append(f"for {object_var} in list(getattr({target_var}, 'objects', [{target_var}])):")
@@ -854,12 +993,23 @@ def export_emerge_python_script(
         ]
         boundary_groups: Dict[str, List[str]] = {}
         for boundary_key, face_selector, boundary_type in domain_boundaries:
+            if face_selector in waveguide_face_selectors:
+                lines.append(
+                    f"print({_q(f'[info] Global boundary {boundary_key} skipped because the face is used by a WaveguidePort')})"
+                )
+                continue
             if boundary_type in {"Open", "Radiation", "Pec", "Pmc"}:
                 var_name = f"_open_face_{boundary_key.lower()}"
                 lines.append(f"{var_name} = _open_region_object.face({_q(face_selector)})")
                 group_type = "Absorbing" if boundary_type in {"Open", "Radiation"} else boundary_type
                 boundary_groups.setdefault(group_type, []).append(var_name)
-            elif boundary_type in {"Pml", "Periodic"}:
+            elif boundary_type == "Pml" and pml_setup is not None:
+                continue
+            elif boundary_type == "Pml":
+                lines.append(
+                    f"print({_q(f'[warn] Global boundary {boundary_key}=PML ignored because no enabled PML shell is configured; default exterior PEC remains active')})"
+                )
+            elif boundary_type == "Periodic":
                 lines.append(
                     f"print({_q(f'[warn] Global boundary {boundary_key}={boundary_type} is not a surface AbsorbingBoundary and was not exported')})"
                 )
@@ -873,13 +1023,6 @@ def export_emerge_python_script(
                 lines.append(f"simulationObj.mw.bc.PMC({selection_expression})")
         lines.append("")
 
-    if show_model:
-        lines += [
-            "# Show the committed geometry after port plates and LumpedPorts are defined.",
-            "simulationObj.view()",
-            "",
-        ]
-
     lines += [
         "# =============================================================================",
         "# [8] MESH GENERATION",
@@ -888,6 +1031,12 @@ def export_emerge_python_script(
         "simulationObj.generate_mesh()",
         "",
     ]
+    if show_model:
+        lines += [
+            "# Show geometry only after the configured mesh exists; this avoids EMerge quick_mesh().",
+            "simulationObj.view(plot_mesh=False)",
+            "",
+        ]
     if show_mesh:
         lines += [
             "simulationObj.view(plot_mesh=True)",
@@ -913,8 +1062,10 @@ def export_emerge_python_script(
                 lines.append(f"simulationObj.mw.bc.PEC({boundary_target})")
             elif boundary_type == "PMC":
                 lines.append(f"simulationObj.mw.bc.PMC({boundary_target})")
-            elif boundary_type in {"Open", "Radiation", "PML"}:
+            elif boundary_type in {"Open", "Radiation"}:
                 lines.append(f"simulationObj.mw.bc.AbsorbingBoundary({boundary_target})")
+            elif boundary_type == "PML":
+                lines.append(f"print({_q(f'[warn] Object boundary PML on {object_name} requires volumetric PML geometry and was not exported')})")
         lines.append("")
 
     if run_sweep:

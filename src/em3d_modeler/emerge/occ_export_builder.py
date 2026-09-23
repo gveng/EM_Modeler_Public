@@ -590,6 +590,7 @@ def _rebuild_object_from_snapshot(item: Any) -> Any | None:
                 params.get("Material", "PEC"),
                 step_source_path=params.get("StepSourcePath"),
                 step_solid_name=params.get("StepSolidName"),
+                plate_role=bool(params.get("PlateRole", False)),
                 boolean_op=params.get("BooleanOperation"),
                 boolean_source_names=params.get("BooleanSourceNames"),
                 boolean_sources_data=params.get("BooleanSourcesData"),

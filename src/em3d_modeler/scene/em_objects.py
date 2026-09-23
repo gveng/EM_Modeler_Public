@@ -1135,12 +1135,14 @@ class MeshObject(EMObject):
                  color: tuple | None = None,
                  step_source_path: str | None = None,
                  step_solid_name: str | None = None,
+                 plate_role: bool = False,
                  boolean_op: str | None = None,
                  boolean_source_names: List[str] | None = None,
                  boolean_sources_data: List[Dict[str, Any]] | None = None):
         self._polydata = polydata
         self.step_source_path = step_source_path
         self.step_solid_name = step_solid_name or (name or "")
+        self.plate_role = bool(plate_role)
         self.step_geometry_modified = False
         self.step_export_offset = (0.0, 0.0, 0.0)
         self.source_objects: List[EMObject] = []
@@ -1174,6 +1176,8 @@ class MeshObject(EMObject):
             p["StepSolidName"] = str(self.step_solid_name)
         if self.step_geometry_modified:
             p["StepGeometryModified"] = True
+        if self.plate_role:
+            p["PlateRole"] = True
         ox, oy, oz = self.step_export_offset
         if abs(float(ox)) > 1e-12 or abs(float(oy)) > 1e-12 or abs(float(oz)) > 1e-12:
             p["StepExportOffset"] = [float(ox), float(oy), float(oz)]
@@ -1193,6 +1197,8 @@ class MeshObject(EMObject):
         self.step_source_path = params.get("StepSourcePath", self.step_source_path)
         self.step_solid_name = params.get("StepSolidName", self.step_solid_name)
         self.step_geometry_modified = bool(params.get("StepGeometryModified", self.step_geometry_modified))
+        if "PlateRole" in params:
+            self.plate_role = bool(params.get("PlateRole"))
         off = params.get("StepExportOffset", self.step_export_offset)
         if isinstance(off, (list, tuple)) and len(off) == 3:
             try:
@@ -1206,6 +1212,13 @@ class MeshObject(EMObject):
         src_data = params.get("BooleanSourcesData", self.boolean_sources_data)
         if isinstance(src_data, list):
             self.boolean_sources_data = [x for x in src_data if isinstance(x, dict)]
+        if (
+            "PlateRole" not in params
+            and self.boolean_op == "cut"
+            and self.boolean_sources_data
+            and str(self.boolean_sources_data[0].get("type", "")) == "PlateObject"
+        ):
+            self.plate_role = True
         if "Color" in params:
             col = str(params["Color"]).strip()
             if col.startswith("#") and len(col) == 7:

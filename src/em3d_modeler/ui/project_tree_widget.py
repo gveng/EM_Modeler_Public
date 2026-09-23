@@ -176,16 +176,18 @@ class ProjectTreeWidget(QWidget):
 
         self._tree = QTreeWidget()
         self._tree.setColumnCount(2)
-        self._tree.setHeaderLabels(["", ""])
+        self._tree.setHeaderLabels(["Item", "Value"])
+        self._tree.setSelectionMode(QTreeWidget.ExtendedSelection)
         
         from PySide6.QtWidgets import QHeaderView
         header = self._tree.header()
         header.setDefaultSectionSize(180)
+        header.setMinimumSectionSize(70)
         header.setSectionResizeMode(0, QHeaderView.Interactive)
         header.setSectionResizeMode(1, QHeaderView.Interactive)
         header.setStretchLastSection(False)
         self._tree.setHeaderHidden(False)
-        header.setVisible(False)
+        header.setVisible(True)
         
         self._tree.setAlternatingRowColors(True)
         self._tree.setIndentation(10)  # Reduce indentation (default is 20)
@@ -510,7 +512,8 @@ class ProjectTreeWidget(QWidget):
             domain_item.setForeground(1, warn_brush)
         for k in _BOUNDARY_KEYS:
             v = self._settings["boundaries"].get(k, "PML")
-            self._make_leaf(self._b_node, k, v, editable=True)
+            boundary_item = self._make_leaf(self._b_node, k, v, editable=True)
+            boundary_item.setData(0, Qt.UserRole, ("__boundary_key__", k))
 
         self._b_obj_node = self._make_section(self._b_node, "Assigned To Objects")
         self._refresh_object_boundaries()
@@ -561,6 +564,14 @@ class ProjectTreeWidget(QWidget):
         parent.addChild(item)
         return item
 
+    @staticmethod
+    def _style_disabled_row(item: QTreeWidgetItem, enabled: bool) -> None:
+        if enabled:
+            return
+        muted = QBrush(QColor("#555555"))
+        for column in range(item.columnCount()):
+            item.setForeground(column, muted)
+
     def _refresh_ports(self) -> None:
         self._p_node.takeChildren()
         for i, port in enumerate(self._settings["ports"]):
@@ -597,8 +608,6 @@ class ProjectTreeWidget(QWidget):
             name = str(sim.get("name", f"Simulation_{i+1}")).strip() or f"Simulation_{i+1}"
             sim_type = str(sim.get("type", "Sweep")).strip().title()
             enabled = bool(sim.get("enabled", True))
-            status = "On" if enabled else "Off"
-
             if sim_type == "Eigenmode":
                 summary = f"modes={int(sim.get('EigenmodeCount', 5))}"
             elif sim_type == "Parametric":
@@ -612,12 +621,13 @@ class ProjectTreeWidget(QWidget):
                 summary = f"{fmin:g}..{fmax:g} GHz step {fstep:g}"
 
             label = f"{name} [{sim_type}] | {summary}"
-            row = QTreeWidgetItem([label, status])
+            row = QTreeWidgetItem([label, ""])
             row.setData(0, Qt.UserRole, ("__sim_idx__", i))
             font = row.font(0)
             font.setPointSize(max(8, font.pointSize() - 1))
             row.setFont(0, font)
             row.setFont(1, font)
+            self._style_disabled_row(row, enabled)
             self._s_node.addChild(row)
 
     def _simulation_names(self) -> list[str]:
@@ -666,8 +676,9 @@ class ProjectTreeWidget(QWidget):
                 name = str(output.get("name", f"Output_{out_idx+1}")).strip() or f"Output_{out_idx+1}"
                 plot_type = str(output.get("plot_type", "plot_sp")).strip()
                 enabled = bool(output.get("enabled", True))
-                row = QTreeWidgetItem([f"{name} [{plot_type}]", "On" if enabled else "Off"])
+                row = QTreeWidgetItem([f"{name} [{plot_type}]", ""])
                 row.setData(0, Qt.UserRole, ("__out_idx__", out_idx))
+                self._style_disabled_row(row, enabled)
                 sim_node.addChild(row)
 
         unknown_rows = grouped.get(unknown_key, [])
@@ -677,7 +688,7 @@ class ProjectTreeWidget(QWidget):
                 name = str(output.get("name", f"Output_{out_idx+1}")).strip() or f"Output_{out_idx+1}"
                 plot_type = str(output.get("plot_type", "plot_sp")).strip()
                 sim_name = str(output.get("simulation", "?")).strip() or "?"
-                row = QTreeWidgetItem([f"{name} [{plot_type}] -> {sim_name}", "Off"])
+                row = QTreeWidgetItem([f"{name} [{plot_type}] -> {sim_name}", ""])
                 row.setData(0, Qt.UserRole, ("__out_idx__", out_idx))
                 warn_brush = QBrush(QColor(220, 40, 40))
                 row.setForeground(0, warn_brush)
@@ -745,12 +756,13 @@ class ProjectTreeWidget(QWidget):
             mode = str(refinement.get("mode", "boundary")).strip().title()
             faces = ",".join(str(face) for face in refinement.get("faces", []))
             size_mm = float(refinement.get("size_mm", 0.0))
-            state = "On" if bool(refinement.get("enabled", True)) else "Off"
+            enabled = bool(refinement.get("enabled", True))
             target = f" [{faces}]" if faces else ""
             row = QTreeWidgetItem([
                 f"{object_name}: {mode}{target}",
-                f"{size_mm:g} mm ({state})",
+                f"{size_mm:g} mm",
             ])
+            self._style_disabled_row(row, enabled)
             row.setData(0, Qt.UserRole, ("__mesh_refinement__", index))
             max_size = refinement.get("max_size_mm")
             row.setToolTip(
@@ -818,6 +830,40 @@ class ProjectTreeWidget(QWidget):
         if item is None:
             return
 
+        role = item.data(0, Qt.UserRole)
+        if isinstance(role, tuple) and len(role) == 2 and role[0] in {"__bc_idx__", "__boundary_key__"}:
+            tag, value = role
+            selected_items = self._tree.selectedItems()
+            context_items = selected_items if item in selected_items else [item]
+            values = sorted({
+                selected.data(0, Qt.UserRole)[1]
+                for selected in context_items
+                if isinstance(selected.data(0, Qt.UserRole), tuple)
+                and len(selected.data(0, Qt.UserRole)) == 2
+                and selected.data(0, Qt.UserRole)[0] == tag
+            }, key=lambda entry: str(entry).casefold())
+            if value not in values:
+                values.append(value)
+            menu = QMenu(self._tree)
+            if tag == "__bc_idx__":
+                indices = sorted({int(index) for index in values})
+                edit_label = "Edit Assignment…" if len(indices) == 1 else f"Edit {len(indices)} Assignments…"
+                act_edit = QAction(edit_label, menu)
+                act_edit.triggered.connect(lambda: self._edit_object_boundary_assignments(indices))
+                menu.addAction(act_edit)
+                remove_label = "Remove Assignment" if len(indices) == 1 else f"Remove {len(indices)} Assignments"
+                act_remove = QAction(remove_label, menu)
+                act_remove.triggered.connect(lambda: self._remove_object_boundary_assignments(indices))
+                menu.addAction(act_remove)
+            else:
+                keys = [str(key) for key in values]
+                edit_label = "Edit Boundary…" if len(keys) == 1 else f"Set {len(keys)} Boundaries…"
+                act_edit = QAction(edit_label, menu)
+                act_edit.triggered.connect(lambda: self._edit_boundaries(keys))
+                menu.addAction(act_edit)
+            menu.exec_(self._tree.viewport().mapToGlobal(pos))
+            return
+
         menu = QMenu(self._tree)
         if item is self._p_node:
             action = QAction("Add Port…", menu)
@@ -854,14 +900,6 @@ class ProjectTreeWidget(QWidget):
             act_remove.triggered.connect(lambda: self._remove_port_assignment(int(idx)))
             menu.addAction(act_remove)
 
-        elif tag == "__bc_idx__":
-            act_edit = QAction("Edit Assignment…", menu)
-            act_edit.triggered.connect(lambda: self._edit_object_boundary_dialog(int(idx)))
-            menu.addAction(act_edit)
-
-            act_remove = QAction("Remove Assignment", menu)
-            act_remove.triggered.connect(lambda: self._remove_object_boundary_assignment(int(idx)))
-            menu.addAction(act_remove)
         elif tag == "__sim_idx__":
             act_edit = QAction("Edit Simulation…", menu)
             act_edit.triggered.connect(lambda: self._edit_simulation_dialog(int(idx)))
@@ -957,21 +995,113 @@ class ProjectTreeWidget(QWidget):
         self.settings_changed.emit()
 
     def _remove_object_boundary_assignment(self, index: int) -> None:
+        self._remove_object_boundary_assignments([index])
+
+    def _remove_object_boundary_assignments(self, indices: list[int]) -> None:
         rows = self._settings.get("object_boundaries", [])
-        if not (0 <= index < len(rows)):
+        valid_indices = sorted({int(index) for index in indices if 0 <= int(index) < len(rows)})
+        if not valid_indices:
             return
-        bc = rows[index]
-        name = str(bc.get("name", f"BC {index + 1}"))
+        names = [
+            str(rows[index].get("name", f"BC {index + 1}"))
+            for index in valid_indices
+        ]
+        if len(names) == 1:
+            prompt = f"Remove assignment '{names[0]}'?"
+        else:
+            prompt = f"Remove {len(names)} boundary assignments?\n\n" + "\n".join(names)
         reply = QMessageBox.question(
             self,
-            "Remove Boundary Assignment",
-            f"Remove assignment '{name}'?",
+            "Remove Boundary Assignment" if len(names) == 1 else "Remove Boundary Assignments",
+            prompt,
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
-        rows.pop(index)
+        for index in reversed(valid_indices):
+            rows.pop(index)
+        self._refresh_object_boundaries()
+        self.settings_changed.emit()
+
+    def _edit_object_boundary_assignments(self, indices: list[int]) -> None:
+        rows = self._settings.get("object_boundaries", [])
+        valid_indices = sorted({int(index) for index in indices if 0 <= int(index) < len(rows)})
+        if not valid_indices:
+            return
+        if len(valid_indices) == 1:
+            self._edit_object_boundary_dialog(valid_indices[0])
+            return
+
+        dlg = QDialog(self)
+        dlg.setWindowTitle(f"Edit {len(valid_indices)} Boundary Assignments")
+        form = QFormLayout(dlg)
+        boundary_type = QComboBox(dlg)
+        boundary_type.addItems(_OBJECT_BC_TYPES)
+        existing_types = {str(rows[index].get("type", "PML")) for index in valid_indices}
+        initial_type = next(iter(existing_types)) if len(existing_types) == 1 else "PML"
+        if initial_type in _OBJECT_BC_TYPES:
+            boundary_type.setCurrentText(initial_type)
+
+        params_container = QWidget(dlg)
+        params_form = QFormLayout(params_container)
+        param_edits: Dict[str, QLineEdit] = {}
+
+        def rebuild_params(bc_type: str) -> None:
+            while params_form.rowCount() > 0:
+                params_form.removeRow(0)
+            param_edits.clear()
+            for key, default_value in _OBJECT_BC_DEFAULT_PARAMS.get(bc_type, {}).items():
+                shared_values = [
+                    rows[index].get("params", {}).get(key, default_value)
+                    for index in valid_indices
+                    if str(rows[index].get("type", "PML")) == bc_type
+                    and isinstance(rows[index].get("params", {}), dict)
+                ]
+                value = default_value
+                if len(shared_values) == len(valid_indices) and all(item == shared_values[0] for item in shared_values):
+                    value = shared_values[0]
+                edit = QLineEdit(str(value), dlg)
+                params_form.addRow(key, edit)
+                param_edits[key] = edit
+
+        rebuild_params(boundary_type.currentText())
+        boundary_type.currentTextChanged.connect(rebuild_params)
+        form.addRow(QLabel(f"Applying changes to {len(valid_indices)} selected assignments", dlg))
+        form.addRow("Type", boundary_type)
+        form.addRow("Type Parameters", params_container)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        form.addRow(buttons)
+        if dlg.exec_() != QDialog.Accepted:
+            return
+
+        bc_type = boundary_type.currentText()
+        defaults = _OBJECT_BC_DEFAULT_PARAMS.get(bc_type, {})
+        try:
+            params: Dict[str, Any] = {}
+            for key, edit in param_edits.items():
+                raw = edit.text().strip()
+                default_value = defaults[key]
+                if isinstance(default_value, int) and not isinstance(default_value, bool):
+                    params[key] = int(round(self._parse_formula_float(raw)))
+                elif isinstance(default_value, float):
+                    params[key] = self._parse_formula_float(raw)
+                else:
+                    params[key] = raw
+        except ValueError as exc:
+            QMessageBox.warning(self, "Invalid Boundary Parameters", str(exc))
+            return
+
+        self._apply_object_boundary_update(valid_indices, bc_type, params)
+
+    def _apply_object_boundary_update(self, indices: list[int], bc_type: str, params: dict) -> None:
+        rows = self._settings.get("object_boundaries", [])
+        for index in indices:
+            if 0 <= index < len(rows):
+                rows[index]["type"] = bc_type
+                rows[index]["params"] = _deep_copy(params)
         self._refresh_object_boundaries()
         self.settings_changed.emit()
 
@@ -1633,22 +1763,35 @@ class ProjectTreeWidget(QWidget):
             return None
 
     def _edit_boundary(self, item: QTreeWidgetItem, key: str) -> None:
+        self._edit_boundaries([key])
+
+    def _edit_boundaries(self, keys: list[str]) -> None:
+        keys = [key for key in keys if key in self._settings.get("boundaries", {})]
+        if not keys:
+            return
         dlg = QDialog(self)
-        dlg.setWindowTitle(f"Edit boundary – {key}")
+        dlg.setWindowTitle("Edit Boundary" if len(keys) == 1 else f"Edit {len(keys)} Boundaries")
         form = QFormLayout(dlg)
         combo = QComboBox()
         combo.addItems(_BOUNDARY_TYPES)
-        current = self._settings["boundaries"].get(key, "PML")
-        combo.setCurrentText(current)
-        form.addRow(key, combo)
+        existing_types = {self._settings["boundaries"].get(key, "PML") for key in keys}
+        current = next(iter(existing_types)) if len(existing_types) == 1 else "PML"
+        if current in _BOUNDARY_TYPES:
+            combo.setCurrentText(current)
+        form.addRow(", ".join(keys), combo)
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(dlg.accept)
         btns.rejected.connect(dlg.reject)
         form.addRow(btns)
         if dlg.exec_() == QDialog.Accepted:
             new_val = combo.currentText()
-            self._settings["boundaries"][key] = new_val
-            item.setText(1, new_val)
+            for key in keys:
+                self._settings["boundaries"][key] = new_val
+            for index in range(self._b_node.childCount()):
+                boundary_item = self._b_node.child(index)
+                role = boundary_item.data(0, Qt.UserRole)
+                if isinstance(role, tuple) and role[0] == "__boundary_key__" and role[1] in keys:
+                    boundary_item.setText(1, new_val)
             self.settings_changed.emit()
 
     def _edit_open_region_domain(self) -> None:
