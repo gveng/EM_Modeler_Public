@@ -12,6 +12,9 @@ env/
 build/
 develop-eggs/
 dist/
+!dist/
+dist/*
+!dist/Build-Portable.ps1
 downloads/
 eggs/
 .eggs/

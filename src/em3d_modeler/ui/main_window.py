@@ -1,3 +1,19 @@
+# Copyright (C) 2026 Gabriele Vittori
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+
 """Main window: wires all panels together according to the UI layout.
 
 Layout
@@ -194,7 +210,7 @@ from ..emerge.material_store  import MaterialStore
 from ..emerge.simulation_validator import validate_simulation
 from ..scene.em_objects       import set_selection_color
 from ..scene.param_expr       import evaluate_expression
-from .. import __version__, __release_date__
+from .. import __version__, __release_date__, __license__
 
 
 # ������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������
@@ -468,11 +484,12 @@ class MainWindow(QMainWindow):
         QMessageBox.about(
             self,
             "About EM 3D Modeler",
-            "EM 3D Modeler\n"
-            "Author: Gabriele Vittori\n"
-            f"Version: {__version__}\n"
-            f"Release Date: {__release_date__}\n"
-            f"Date: {today}",
+            "<h3>EM 3D Modeler</h3>"
+            "<p>Author: Gabriele Vittori<br>"
+            f"Version: {__version__}<br>"
+            f"Release Date: {__release_date__}<br>"
+            f"Date: {today}</p><hr>"
+            f"<pre style='font-family: monospace; font-size: 8pt'>{escape(__license__)}</pre>",
         )
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� toolbar

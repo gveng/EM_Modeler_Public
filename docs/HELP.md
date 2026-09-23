@@ -1,6 +1,6 @@
 # EM 3D Modeler Help
 
-Version: 1.2.7
+Version: 1.2.8
 Release Date: 2026-09-23
 
 ## 1. Overview
@@ -40,6 +40,8 @@ Tip:
 - Cut: subtracts Tool shapes from Base.
 - Fuse: merges multiple objects.
 - Common: keeps only the intersection.
+
+When the base of a **Cut** is a Plate, the result keeps a persistent Plate simulation role even though its exact cut geometry is stored as a mesh. It remains assignable to a port, survives project reload/undo, and is exported as a Plate-compatible port surface. Existing legacy Cut-Plate results are migrated automatically.
 
 Recommended workflow:
 1. Select Base + Tool (or multiple Tools).
@@ -81,6 +83,10 @@ Thread recommendations:
 - For CUDSS, ACC threads still affect CPU assembly even though the sparse solve runs on the GPU.
 
 ## 11. View and Navigation
+- Toolbar **Zoom** group:
+  - **Fit All**: fits every visible scene object without changing the current view orientation.
+  - **Fit Selection**: fits only the selected visible objects; if nothing is selected, the view is unchanged.
+  - **Isometric View**: sets the standard isometric orientation and fits all visible objects.
 - View Menu:
   - Reset Camera
   - Top (XY)
@@ -120,7 +126,31 @@ simulationObj.mesher.set_face_size(port_plate, size=0.10e-3)
 
 Assignments appear under **Project Tree -> Mesh -> Local Refinements**. Right-click an assignment to **Edit**, **Enable/Disable**, or **Remove** it. Double-click opens Edit directly.
 
-## 13. Troubleshooting
+## 13. Check Simulation
+
+Use **Check Simulation** in the top Simulation toolbar group or in the EMERGE Simulation window. The check runs locally without starting EMERGE and reports errors, warnings, and passed checks.
+
+It validates MODEL geometry, materials, enabled frequency jobs, solver configuration, AIR/open boundaries, port assignments, Plate dimensions, LumpedPort direction and resistance, containment inside the AIR region, and physical contact with conductive geometry. A LumpedPort must touch at least two distinct conductive objects representing signal and reference; zero or one contact is a blocking error.
+
+Each click on the top toolbar **Play** button clears the visible simulation log and `StepExport.log`, regenerates the STEP bundle and every enabled simulation script, and saves the master and child scripts automatically in the project `_EmergeSim` directory before opening the Simulation window.
+
+### PML boundaries
+
+Select **PML** in the Open Region wizard to export native EMerge volumetric PML geometry through `em.geo.pmlbox()`. The visual `Air_Region` and `PML_Region` boxes define the inner domain and thickness; their STEP files are replaced in the generated script by the native anisotropic PML volumes.
+
+- **PML thickness**: physical thickness outside the AIR region.
+- **Geometrical layers**: number of PML sub-volumes used through the thickness.
+- **Mesh layers**: target element layers through the PML; EMerge sets the PML maximum mesh size from thickness divided by this value.
+- **Exponent**: polynomial growth of the complex coordinate stretching. Default: `1.5`.
+- **Delta max**: maximum matching/attenuation coefficient. Default: `8.0`.
+
+PML is assigned independently on `Xmin`, `Xmax`, `Ymin`, `Ymax`, `Zmin`, and `Zmax`. A face occupied by a WaveguidePort is automatically excluded from global PML, Open, PEC, or PMC assignment so the port excitation is preserved.
+
+For a closed internal waveguide, remove all six global boundaries from the Project Tree (right-click a face -> **Remove Boundary**). The value becomes **None**: EMerge keeps its default exterior PEC walls, while WaveguidePort faces remain the only openings. New projects use None by default.
+
+Set **Boundaries -> Domain** to **None** as well (double-click or right-click -> **Set Domain to None**) when the AIR object is the internal waveguide volume rather than an exterior open region. The AIR geometry remains a MODEL object and is still exported, but it is not treated as an enclosing global-boundary domain and PML is disabled.
+
+## 14. Troubleshooting
 - Boolean operation failed:
   - Verify that objects are valid with non-empty geometry.
   - For complex STEP files, use smaller and progressive selections.
@@ -130,13 +160,13 @@ Assignments appear under **Project Tree -> Mesh -> Local Refinements**. Right-cl
 - Material not visible in project:
   - Reload the Global DB and check for duplicate names.
 
-## 14. Quick Commands
+## 15. Quick Commands
 - New Project: Ctrl+N
 - Open Project: Ctrl+O
 - Save Project: Ctrl+S
 - Quit: system shortcut (e.g., Alt+F4 on Windows)
 
-## 15. About
+## 16. About
 In the Help -> About menu, you will find:
 - Program name
 - Version

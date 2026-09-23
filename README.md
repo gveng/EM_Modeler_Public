@@ -5,7 +5,7 @@ geometries and exporting them to the EMERGE simulation workflow. It combines a
 VTK viewport, parametric primitives, CAD import, material assignment, boolean
 modeling, and EMERGE-oriented project export in one application.
 
-Current version: `1.2.7`
+Current version: `1.2.8`
 
 ## What You Can Do
 
@@ -100,14 +100,13 @@ em3d-modeler
 The repository includes a PyInstaller build script for Windows:
 
 ```powershell
-Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
-.\scripts\build_portable.ps1
+powershell -ExecutionPolicy Bypass -File .\Dist\Build-Portable.ps1
 ```
 
-The generated portable folder is placed under `dist/`, for example:
+The generated portable folder is placed under `Dist/`, for example:
 
 ```text
-dist/EM3D_Modeler_1.2.7/
+Dist/EM3D_Modeler_1.2.8/
 ```
 
 Run the executable inside that folder without installing the package into the

@@ -1,3 +1,19 @@
+# Copyright (C) 2026 Gabriele Vittori
+#
+# This program is free software; you can redistribute it and/or modify
+# it under the terms of the GNU General Public License as published by
+# the Free Software Foundation; either version 2 of the License, or
+# (at your option) any later version.
+#
+# This program is distributed in the hope that it will be useful,
+# but WITHOUT ANY WARRANTY; without even the implied warranty of
+# MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE. See the
+# GNU General Public License for more details.
+#
+# You should have received a copy of the GNU General Public License
+# along with this program; if not, write to the Free Software
+# Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
+
 """Entry point for EM 3D Modeler."""
 import sys
 import os
@@ -26,19 +42,14 @@ def _resource_path(relative_path: str) -> Path:
 
 def _splash_pixmap(pixmap):
     from PySide6.QtCore import Qt
-    from PySide6.QtGui import QPainter, QPixmap
+    from PySide6.QtGui import QPixmap
 
-    canvas = QPixmap(640, 480)
-    canvas.fill(pixmap.toImage().pixelColor(0, 0))
-    image = pixmap.scaled(
-        canvas.size(),
-        Qt.AspectRatioMode.KeepAspectRatio,
+    return pixmap.scaled(
+        640,
+        480,
+        Qt.AspectRatioMode.IgnoreAspectRatio,
         Qt.TransformationMode.SmoothTransformation,
     )
-    painter = QPainter(canvas)
-    painter.drawPixmap((canvas.width() - image.width()) // 2, (canvas.height() - image.height()) // 2, image)
-    painter.end()
-    return canvas
 
 
 def _ensure_standard_streams() -> None:
@@ -47,10 +58,22 @@ def _ensure_standard_streams() -> None:
     if sys.stderr is None:
         sys.stderr = io.StringIO()
 
+
+def _set_windows_app_user_model_id() -> None:
+    if sys.platform != "win32":
+        return
+    import ctypes
+
+    set_app_id = ctypes.windll.shell32.SetCurrentProcessExplicitAppUserModelID
+    set_app_id.argtypes = [ctypes.c_wchar_p]
+    set_app_id("GabrieleVittori.EM3DModeler")
+
+
 def main():
     # Must set this before importing VTK / Qt to avoid OpenGL conflicts on Windows
     os.environ.setdefault("QT_AUTO_SCREEN_SCALE_FACTOR", "1")
     _ensure_standard_streams()
+    _set_windows_app_user_model_id()
 
     from PySide6.QtWidgets import QApplication
     from PySide6.QtCore    import QEventLoop, QLocale, QTimer, Qt
@@ -68,11 +91,13 @@ def main():
     app.setApplicationName("EM 3D Modeler")
     app.setOrganizationName("EM3D")
 
-    logo_path = _resource_path("Icons/SplashScreen/EM_Logo.png")
+    logo_path = _resource_path("Icons/SplashScreen/EM_Logo.ico")
+    if not logo_path.is_file():
+        logo_path = _resource_path("Icons/SplashScreen/EM_Logo.png")
     logo_icon = QIcon(str(logo_path))
     app.setWindowIcon(logo_icon)
 
-    splash_path = _resource_path("Icons/SplashScreen/EM_Studio_Splash_Screen.png")
+    splash_path = _resource_path("Icons/SplashScreen/EM_3d_MODELER_Splash_Screen.png")
     splash_pixmap = QPixmap(str(splash_path))
     splash = None
     if not splash_pixmap.isNull():

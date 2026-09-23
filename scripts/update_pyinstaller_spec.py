@@ -44,7 +44,7 @@ import sys
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 _runtime_packages = [
-    "emerge", "emsutil", "scipy", "numpy", "matplotlib",
+    "emerge", "emsutil", "OCP", "scipy", "numpy", "matplotlib",
     "pyvista", "vtk", "trame", "gmsh",
 ]
 _runtime_datas = []
@@ -93,6 +93,7 @@ exe = EXE(
     [],
     exclude_binaries=True,
     name={name!r},
+    icon={esc_path(ROOT / 'Icons' / 'SplashScreen' / 'EM_Logo.ico')!r},
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
