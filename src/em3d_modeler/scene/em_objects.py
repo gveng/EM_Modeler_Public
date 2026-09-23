@@ -16,6 +16,7 @@
 
 """EM scene objects: Box, Cylinder, Cone, Sphere."""
 from __future__ import annotations
+from copy import deepcopy
 from typing import Any, Dict, List
 
 import vtk
@@ -63,6 +64,8 @@ class EMObject:
         self.creation_plane_normal: tuple[float, float, float] = (0.0, 0.0, 1.0)
         self.param_formulas: Dict[str, str] = {}
         self.creation_history: Dict[str, Any] = {}
+        self.pattern_definition: Dict[str, Any] | None = None
+        self.pattern_instance: Dict[str, Any] | None = None
         self.creation_reference_error: str = ""
         self._actor: vtk.vtkActor | None = None
         self._build()
@@ -179,6 +182,8 @@ class EMObject:
             "creation_plane_origin": list(self.creation_plane_origin),
             "creation_plane_normal": list(self.creation_plane_normal),
             "creation_history": dict(self.creation_history),
+            "pattern_definition": deepcopy(self.pattern_definition),
+            "pattern_instance": deepcopy(self.pattern_instance),
         }
 
     def from_json_state(self, data: Dict[str, Any]) -> None:
@@ -200,6 +205,10 @@ class EMObject:
         self.set_creation_plane(plane, origin_tuple, normal_tuple)
         history = data.get("creation_history", {})
         self.creation_history = dict(history) if isinstance(history, dict) else {}
+        pattern = data.get("pattern_definition")
+        self.pattern_definition = deepcopy(pattern) if isinstance(pattern, dict) else None
+        instance = data.get("pattern_instance")
+        self.pattern_instance = deepcopy(instance) if isinstance(instance, dict) else None
 
 
 # ═══════════════════════════════════════════════════════════════════════════════

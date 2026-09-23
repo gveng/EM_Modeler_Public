@@ -245,6 +245,10 @@ class Viewport3DWidget(QWidget):
         self._update_plane_triad_actor()
         self._render()
 
+    def set_adaptive_grid(self, enabled: bool, margin: float) -> None:
+        self.scene.set_adaptive_grid(enabled, margin)
+        self._render()
+
     def set_plane_triad_visible(self, visible: bool) -> None:
         self._plane_triad_visible = bool(visible)
         self._update_plane_triad_actor()

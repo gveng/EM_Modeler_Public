@@ -39,6 +39,8 @@ _ROLE_PLANE_TRIAD = Qt.UserRole + 3   # bool on the "Plane XYZ Triad" row
 _ROLE_GRID_VISIBLE = Qt.UserRole + 4  # bool on the "Grid" row
 _ROLE_MATERIAL     = Qt.UserRole + 5  # str(material_name) on material header row
 _ROLE_TRANSFORM_ID = Qt.UserRole + 6  # int(id(EMObject)) on transform child row
+_ROLE_GRID_ADAPTIVE = Qt.UserRole + 7  # bool on the Grid row
+_ROLE_PATTERN_EDIT = Qt.UserRole + 8  # int(id(EMObject)) on a pattern settings row
 
 
 class MaterialsWidget(QWidget):
@@ -53,6 +55,7 @@ class MaterialsWidget(QWidget):
     plane_add_requested = Signal()       # user wants to add a new reference plane
     plane_triad_visibility_changed = Signal(bool)  # show/hide plane XYZ triad
     grid_visibility_changed = Signal(bool)  # show/hide grid
+    grid_adaptive_changed = Signal(bool)  # fit grid to projected object bounds
     objects_hide      = Signal(list)     # List[EMObject]
     objects_show      = Signal(list)     # List[EMObject]
     objects_model_role_changed = Signal(list, bool)  # List[EMObject], is_model
@@ -65,6 +68,7 @@ class MaterialsWidget(QWidget):
     set_open_region_requested = Signal(object)  # AIR EMObject
     material_priority_changed = Signal(str, int)  # material_name, delta (1 for higher, -1 for lower)
     transform_edit_requested = Signal(list)  # List[EMObject]
+    pattern_edit_requested = Signal(object)  # EMObject whose pattern definition should be edited
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -99,6 +103,7 @@ class MaterialsWidget(QWidget):
                 active_plane=None,
                 plane_triad_visible: bool = True,
                 grid_visible: bool = True,
+                grid_adaptive: bool = False,
                 material_priorities: Optional[Dict[str, int]] = None) -> None:
         """Rebuild the tree.
 
@@ -139,6 +144,7 @@ class MaterialsWidget(QWidget):
             grid_marker = "\u2611" if grid_visible else "\u2610"
             grid_item = QTreeWidgetItem([f"{grid_marker} Grid"])
             grid_item.setData(0, _ROLE_GRID_VISIBLE, bool(grid_visible))
+            grid_item.setData(0, _ROLE_GRID_ADAPTIVE, bool(grid_adaptive))
             grid_item.setToolTip(0, "Show/Hide reference-plane grid.")
             planes_root.addChild(grid_item)
 
@@ -194,6 +200,15 @@ class MaterialsWidget(QWidget):
                 )
                 transform.setForeground(0, QBrush(QColor(150, 170, 190)))
                 child.addChild(transform)
+            pattern_definition = getattr(obj, "pattern_definition", None)
+            if isinstance(pattern_definition, dict):
+                pattern_settings = pattern_definition.get("settings", {})
+                pattern_mode = str(pattern_settings.get("mode", "Pattern")) if isinstance(pattern_settings, dict) else "Pattern"
+                pattern_item = QTreeWidgetItem([f"Pattern settings ({pattern_mode})"])
+                pattern_item.setData(0, _ROLE_PATTERN_EDIT, id(obj))
+                pattern_item.setToolTip(0, "Right-click to edit this object's pattern definition.")
+                pattern_item.setForeground(0, QBrush(QColor(120, 180, 220)))
+                child.addChild(pattern_item)
             if id(obj) in prev_selected_ids:
                 child.setSelected(True)
 
@@ -257,6 +272,8 @@ class MaterialsWidget(QWidget):
 
     # ─────────────────────────────────────────────────── events
     def _on_item_click(self, item: QTreeWidgetItem, _col: int) -> None:
+        if item.data(0, _ROLE_PATTERN_EDIT) is not None:
+            return
         transform_id = item.data(0, _ROLE_TRANSFORM_ID)
         if transform_id is not None:
             return
@@ -283,6 +300,12 @@ class MaterialsWidget(QWidget):
             self.object_selected.emit(obj)
 
     def _on_item_double_click(self, item: QTreeWidgetItem, _col: int) -> None:
+        pattern_obj_id = item.data(0, _ROLE_PATTERN_EDIT)
+        if pattern_obj_id is not None:
+            obj = self._obj_map.get(pattern_obj_id)
+            if obj is not None:
+                self.pattern_edit_requested.emit(obj)
+            return
         transform_id = item.data(0, _ROLE_TRANSFORM_ID)
         if transform_id is not None:
             obj = self._obj_map.get(transform_id)
@@ -302,6 +325,18 @@ class MaterialsWidget(QWidget):
     def _on_context_menu(self, pos) -> None:
         item = self._tree.itemAt(pos)
         if item is None:
+            return
+
+        pattern_obj_id = item.data(0, _ROLE_PATTERN_EDIT)
+        if pattern_obj_id is not None:
+            obj = self._obj_map.get(pattern_obj_id)
+            if obj is None:
+                return
+            menu = QMenu(self._tree)
+            act_edit = QAction("Edit Pattern Settings…", menu)
+            act_edit.triggered.connect(lambda: self.pattern_edit_requested.emit(obj))
+            menu.addAction(act_edit)
+            menu.exec_(self._tree.viewport().mapToGlobal(pos))
             return
 
         obj_id = item.data(0, _ROLE_OBJ_ID)
@@ -330,6 +365,13 @@ class MaterialsWidget(QWidget):
                 act_toggle = QAction("Show Grid", menu)
             act_toggle.triggered.connect(lambda: self.grid_visibility_changed.emit(not bool(grid_flag)))
             menu.addAction(act_toggle)
+            adaptive_flag = bool(item.data(0, _ROLE_GRID_ADAPTIVE))
+            menu.addSeparator()
+            act_adaptive = QAction("Fit Grid to Objects", menu)
+            act_adaptive.setCheckable(True)
+            act_adaptive.setChecked(adaptive_flag)
+            act_adaptive.toggled.connect(self.grid_adaptive_changed.emit)
+            menu.addAction(act_adaptive)
             menu.exec_(self._tree.viewport().mapToGlobal(pos))
             return
         # ── Material header row ───────────────────────────────────────────

@@ -198,7 +198,7 @@ from .material_assign_dialog import MaterialAssignDialog
 from .material_library_dialog import MaterialLibraryDialog
 from .settings_dialog        import SettingsDialog
 from .parameters_dialog      import ParametersDialog
-from .formula_widgets        import FormulaDoubleSpinBox as QDoubleSpinBox
+from .formula_widgets        import FormulaDoubleSpinBox as QDoubleSpinBox, FormulaIntSpinBox
 from .project_tree_widget    import set_numeric_locale
 
 from ..emerge.project_file    import ProjectFile
@@ -250,6 +250,8 @@ class MainWindow(QMainWindow):
         self._units         = "mm"
         self._workspace_size = 200.0
         self._grid_spacing = 10.0
+        self._adaptive_grid_enabled = False
+        self._adaptive_grid_margin = 20.0
         self._plane_triad_size = 25.0
         self._decimal_separator = "."
         self._selection_color = (0.62, 0.34, 0.85)
@@ -306,6 +308,7 @@ class MainWindow(QMainWindow):
         self._body_props     = BodyPropertiesWidget()
         self._viewport       = Viewport3DWidget()
         self._viewport.set_plane_triad_size(self._plane_triad_size)
+        self._viewport.set_adaptive_grid(self._adaptive_grid_enabled, self._adaptive_grid_margin)
         self._materials      = MaterialsWidget(self)
         self._info_bar       = InfoBarWidget()
 
@@ -668,9 +671,11 @@ class MainWindow(QMainWindow):
         self._materials.plane_add_requested.connect(self._open_reference_plane_dialog)
         self._materials.plane_triad_visibility_changed.connect(self._on_plane_triad_visibility_changed)
         self._materials.grid_visibility_changed.connect(self._on_grid_visibility_changed)
+        self._materials.grid_adaptive_changed.connect(self._on_grid_adaptive_changed)
         self._materials.objects_hide.connect(self._on_materials_hide)
         self._materials.objects_show.connect(self._on_materials_show)
         self._materials.transform_edit_requested.connect(self._on_transform_edit_requested)
+        self._materials.pattern_edit_requested.connect(self._create_object_pattern)
         self._materials.objects_model_role_changed.connect(self._on_materials_model_role_changed)
         self._materials.object_rename.connect(self._on_materials_rename)
         self._materials.objects_bulk_rename.connect(self._on_materials_bulk_rename)
@@ -704,6 +709,7 @@ class MainWindow(QMainWindow):
     def _on_scene_changed(self) -> None:
         if not self._history_restoring:
             self._history_record()
+        self._viewport.scene.refresh_adaptive_grid()
         self._refresh_materials()
         self._sync_port_reference_state()
         self._mark_simulation_dirty(steps=True, script=True)
@@ -1275,6 +1281,8 @@ class MainWindow(QMainWindow):
             "is_model": bool(getattr(obj, "is_model", True)),
             "param_formulas": dict(getattr(obj, "param_formulas", {}) or {}),
             "creation_history": dict(getattr(obj, "creation_history", {}) or {}),
+            "pattern_definition": deepcopy(getattr(obj, "pattern_definition", None)),
+            "pattern_instance": deepcopy(getattr(obj, "pattern_instance", None)),
             "creation_reference_error": str(getattr(obj, "creation_reference_error", "")),
         }
         if type(obj).__name__ == "MeshObject":
@@ -1342,6 +1350,10 @@ class MainWindow(QMainWindow):
             obj.param_formulas = dict(formulas) if isinstance(formulas, dict) else {}
             history = item.get("creation_history", {})
             obj.creation_history = dict(history) if isinstance(history, dict) else {}
+            pattern = item.get("pattern_definition")
+            obj.pattern_definition = deepcopy(pattern) if isinstance(pattern, dict) else None
+            pattern_instance = item.get("pattern_instance")
+            obj.pattern_instance = deepcopy(pattern_instance) if isinstance(pattern_instance, dict) else None
             obj.creation_reference_error = str(item.get("creation_reference_error", ""))
             obj.refresh_appearance()
             transform = item.get("actor_transform", {})
@@ -1363,10 +1375,19 @@ class MainWindow(QMainWindow):
             return None
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� boolean operations
-    def _create_object_pattern(self) -> None:
+    def _create_object_pattern(self, edit_object=None) -> None:
         import math
+        import uuid
 
-        selection = list(self._viewport.scene.selection)
+        existing_definition = deepcopy(getattr(edit_object, "pattern_definition", None)) if edit_object is not None else None
+        editing_pattern = isinstance(existing_definition, dict)
+        if editing_pattern:
+            stored_sources = existing_definition.get("sources", [])
+            selection = [self._rebuild_object_from_snapshot(snapshot) for snapshot in stored_sources]
+            selection = [source for source in selection if source is not None]
+        else:
+            stored_sources = []
+            selection = list(self._viewport.scene.selection)
         if not selection:
             QMessageBox.information(self, "Pattern", "Select one or more objects first.")
             return
@@ -1388,12 +1409,12 @@ class MainWindow(QMainWindow):
 
         pivot = tuple((float(bounds[i]) + float(bounds[i + 1])) * 0.5 for i in (0, 2, 4))
         dlg = QDialog(self)
-        dlg.setWindowTitle("Create Object Pattern")
+        dlg.setWindowTitle("Edit Object Pattern" if editing_pattern else "Create Object Pattern")
         form = QFormLayout(dlg)
         mode = QComboBox(dlg); mode.addItems(["Linear", "Circular"])
-        count = QSpinBox(dlg); count.setRange(1, 1000); count.setValue(2)
+        count = FormulaIntSpinBox(dlg); count.setRange(1, 1000); count.setValue(2)
         axis_checks = [QCheckBox(axis_name, dlg) for axis_name in ("X", "Y", "Z")]
-        axis_counts = [QSpinBox(dlg) for _ in range(3)]
+        axis_counts = [FormulaIntSpinBox(dlg) for _ in range(3)]
         for index, field in enumerate(axis_counts):
             field.setRange(1, 1000)
             field.setValue(2 if index == 0 else 1)
@@ -1414,6 +1435,45 @@ class MainWindow(QMainWindow):
         axis_end_fields[0].setValue(pivot[0]); axis_end_fields[1].setValue(pivot[1]); axis_end_fields[2].setValue(pivot[2] + 1.0)
         default_radius = max((sum((float(bounds[i + 1]) - float(bounds[i])) ** 2 for i in (0, 2, 4))) ** 0.5 * 0.5, 1.0)
         radius = QDoubleSpinBox(dlg); radius.setRange(0.0, 1e9); radius.setDecimals(6); radius.setValue(default_radius)
+        formula_restore_widgets = []
+        if editing_pattern:
+            stored_settings = existing_definition.get("settings", {})
+            instance_settings = getattr(edit_object, "pattern_instance", None)
+            if isinstance(instance_settings, dict) and isinstance(instance_settings.get("settings"), dict):
+                stored_settings = instance_settings["settings"]
+            mode.setCurrentText(str(stored_settings.get("mode", "Linear")))
+            axis.setCurrentText(str(stored_settings.get("axis", "X")))
+            for check, enabled in zip(axis_checks, stored_settings.get("axis_enabled", (True, False, False))):
+                check.setChecked(bool(enabled))
+            expressions = stored_settings.get("expressions", {})
+            numeric_widgets = {
+                "count": count,
+                "axis_count_x": axis_counts[0], "axis_count_y": axis_counts[1], "axis_count_z": axis_counts[2],
+                "offset_x": offsets[0], "offset_y": offsets[1], "offset_z": offsets[2],
+                "angle": angle, "center_x": center_fields[0], "center_y": center_fields[1], "center_z": center_fields[2],
+                "axis_start_x": axis_start_fields[0], "axis_start_y": axis_start_fields[1], "axis_start_z": axis_start_fields[2],
+                "axis_end_x": axis_end_fields[0], "axis_end_y": axis_end_fields[1], "axis_end_z": axis_end_fields[2],
+                "radius": radius,
+            }
+            inputs = stored_settings.get("inputs", {})
+            inputs = inputs if isinstance(inputs, dict) else {}
+            resolved_values = stored_settings.get("resolved", {})
+            resolved_values = resolved_values if isinstance(resolved_values, dict) else {}
+            for key, widget in numeric_widgets.items():
+                saved_input = inputs.get(key)
+                if isinstance(saved_input, dict):
+                    if saved_input.get("type") == "formula":
+                        widget.set_formula(str(saved_input.get("formula", "")))
+                        formula_restore_widgets.append(widget)
+                    elif "value" in saved_input:
+                        widget.setValue(float(saved_input["value"]))
+                    continue
+                raw = expressions.get(key)
+                if raw is not None:
+                    widget.set_formula(str(raw))
+                    formula_restore_widgets.append(widget)
+                elif key in resolved_values:
+                    widget.setValue(float(resolved_values[key]))
         pick_center = QPushButton("Pick center", dlg)
         pick_axis_start = QPushButton("Pick axis point 1", dlg)
         pick_axis_end = QPushButton("Pick axis point 2", dlg)
@@ -1465,29 +1525,100 @@ class MainWindow(QMainWindow):
                 field.setEnabled(not linear)
 
         def update_preview(*_args) -> None:
-            linear_count = 1
-            for check, field in zip(axis_checks, axis_counts):
-                if check.isChecked():
-                    linear_count *= field.value()
+            try:
+                resolved_counts = [field.value() for field in axis_counts]
+                resolved_offsets = [field.value() for field in offsets]
+                circular_count = count.value()
+                total_angle = angle.value()
+                linear_count = 1
+                for check, resolved_count in zip(axis_checks, resolved_counts):
+                    if check.isChecked():
+                        linear_count *= resolved_count
+            except (ArithmeticError, TypeError, ValueError):
+                return
             preview.set_pattern(
-                mode.currentText(), linear_count if mode.currentText() == "Linear" else count.value(), [field.value() for field in offsets],
-                axis.currentText(), angle.value(),
+                mode.currentText(), linear_count if mode.currentText() == "Linear" else circular_count, resolved_offsets,
+                axis.currentText(), total_angle,
                 [check.isChecked() for check in axis_checks],
-                [field.value() for field in axis_counts],
+                resolved_counts,
             )
         update_visibility(mode.currentText()); mode.currentTextChanged.connect(update_visibility)
         mode.currentTextChanged.connect(update_preview)
         count.valueChanged.connect(update_preview)
         for field in offsets: field.valueChanged.connect(update_preview)
+        count.lineEdit().textChanged.connect(update_preview)
+        for field in offsets: field.lineEdit().textChanged.connect(update_preview)
         for check in axis_checks: check.toggled.connect(lambda _checked: (update_visibility(mode.currentText()), update_preview()))
         for field in axis_counts: field.valueChanged.connect(update_preview)
+        for field in axis_counts: field.lineEdit().textChanged.connect(update_preview)
         axis.currentTextChanged.connect(update_preview)
         angle.valueChanged.connect(update_preview)
         update_preview()
         buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
         buttons.accepted.connect(dlg.accept); buttons.rejected.connect(dlg.reject); form.addRow(buttons)
+        if formula_restore_widgets:
+            from PySide6.QtCore import QTimer
+
+            QTimer.singleShot(
+                25,
+                lambda widgets=tuple(formula_restore_widgets): [widget._restore_formula_text() for widget in widgets],
+            )
         if dlg.exec_() != QDialog.Accepted:
             return
+
+        try:
+            instance_count = count.value()
+            linear_counts = [field.value() for field in axis_counts]
+            linear_steps = [field.value() for field in offsets]
+            total_angle = angle.value()
+            circular_center = tuple(field.value() for field in center_fields)
+            axis_start = tuple(field.value() for field in axis_start_fields)
+            axis_end = tuple(field.value() for field in axis_end_fields)
+            requested_radius = radius.value()
+        except Exception as exc:
+            QMessageBox.warning(dlg, "Invalid Formula", str(exc))
+            return
+
+        numeric_widgets = {
+            "count": count,
+            "axis_count_x": axis_counts[0], "axis_count_y": axis_counts[1], "axis_count_z": axis_counts[2],
+            "offset_x": offsets[0], "offset_y": offsets[1], "offset_z": offsets[2],
+            "angle": angle, "center_x": center_fields[0], "center_y": center_fields[1], "center_z": center_fields[2],
+            "axis_start_x": axis_start_fields[0], "axis_start_y": axis_start_fields[1], "axis_start_z": axis_start_fields[2],
+            "axis_end_x": axis_end_fields[0], "axis_end_y": axis_end_fields[1], "axis_end_z": axis_end_fields[2],
+            "radius": radius,
+        }
+        expressions = {
+            key: widget.formula_text() if hasattr(widget, "formula_text") else widget.lineEdit().text().strip()
+            for key, widget in numeric_widgets.items()
+        }
+        resolved = {key: float(widget.value()) for key, widget in numeric_widgets.items()}
+        inputs = {}
+        for key, raw in expressions.items():
+            numeric_text = raw
+            suffix = numeric_widgets[key].suffix().strip()
+            if suffix and numeric_text.lower().endswith(suffix.lower()):
+                numeric_text = numeric_text[:-len(suffix)].strip()
+            try:
+                float(numeric_text.replace(",", "."))
+                inputs[key] = {"type": "value", "value": resolved[key]}
+            except ValueError:
+                inputs[key] = {
+                    "type": "formula",
+                    "formula": raw,
+                    "value": resolved[key],
+                }
+        pattern_id = str(existing_definition.get("pattern_id")) if editing_pattern else str(uuid.uuid4())
+        definition = {
+            "pattern_id": pattern_id,
+            "sources": deepcopy(stored_sources) if editing_pattern else [self._serialize_object_snapshot(source) for source in selection],
+            "settings": {
+                "mode": mode.currentText(), "axis": axis.currentText(),
+                "axis_enabled": [check.isChecked() for check in axis_checks],
+                "expressions": expressions, "inputs": inputs, "resolved": resolved,
+                "parameter_values": self._parameter_values(),
+            },
+        }
 
         # Ensure Undo returns to the current original objects, even when the
         # pattern is the first operation after they were created.
@@ -1495,31 +1626,27 @@ class MainWindow(QMainWindow):
         source_data = [
             (
                 source,
-                self._serialize_object_snapshot(source),
+                deepcopy(stored_sources[index]) if editing_pattern else self._serialize_object_snapshot(source),
                 tuple((float(bounds[index]) + float(bounds[index + 1])) * 0.5 for index in (0, 2, 4)),
             )
-            for source, bounds in zip(selection, source_bounds)
+            for index, (source, bounds) in enumerate(zip(selection, source_bounds))
         ]
         created = []
-        instance_count = int(count.value())
         if mode.currentText() == "Linear":
             import itertools
             enabled_axes = [index for index, check in enumerate(axis_checks) if check.isChecked()]
             if not enabled_axes:
                 QMessageBox.warning(self, "Pattern", "Enable at least one linear axis.")
                 return
-            axis_ranges = [range(int(axis_counts[index].value())) if index in enabled_axes else range(1) for index in range(3)]
+            axis_ranges = [range(linear_counts[index]) if index in enabled_axes else range(1) for index in range(3)]
             linear_offsets = [
-                (float(offsets[0].value()) * ix, float(offsets[1].value()) * iy, float(offsets[2].value()) * iz)
+                (linear_steps[0] * ix, linear_steps[1] * iy, linear_steps[2] * iz)
                 for ix, iy, iz in itertools.product(*axis_ranges)
                 if (ix, iy, iz) != (0, 0, 0)
             ]
         else:
             linear_offsets = []
 
-        circular_center = tuple(field.value() for field in center_fields)
-        axis_start = tuple(field.value() for field in axis_start_fields)
-        axis_end = tuple(field.value() for field in axis_end_fields)
         axis_vector = tuple(axis_end[index] - axis_start[index] for index in range(3))
         axis_length = sum(value * value for value in axis_vector) ** 0.5
         if mode.currentText() == "Circular" and axis_length < 1e-12:
@@ -1531,7 +1658,6 @@ class MainWindow(QMainWindow):
         source_bounds_center = tuple((float(bounds[i]) + float(bounds[i + 1])) * 0.5 for i in (0, 2, 4))
         radial = tuple(source_bounds_center[index] - circular_center[index] for index in range(3))
         radial_length = sum(value * value for value in radial) ** 0.5
-        requested_radius = float(radius.value())
         if mode.currentText() == "Circular" and radial_length < 1e-12:
             radial = (1.0, 0.0, 0.0)
             radial_length = 1.0
@@ -1557,11 +1683,18 @@ class MainWindow(QMainWindow):
             else enumerate(range(1, instance_count), start=1)
         )
         for instance_index, linear_offset in instance_specs:
-            for source, snapshot, source_center in source_data:
+            for source_index, (source, snapshot, source_center) in enumerate(source_data):
                 clone_data = dict(snapshot); clone_data["params"] = dict(snapshot.get("params", {}))
                 source_name = str(getattr(source, "name", type(source).__name__))
                 clone_data["name"] = f"{source_name}_Pattern_{instance_index + 1}"
                 clone_data["params"]["Name"] = clone_data["name"]
+                clone_data["pattern_definition"] = deepcopy(definition)
+                clone_data["pattern_instance"] = {
+                    "instance_index": int(instance_index),
+                    "source_index": int(source_index),
+                    "source_name": source_name,
+                    "settings": deepcopy(definition["settings"]),
+                }
                 clone = self._rebuild_object_from_snapshot(clone_data)
                 if clone is None:
                     continue
@@ -1571,7 +1704,7 @@ class MainWindow(QMainWindow):
                 if mode.currentText() == "Linear":
                     clone_actor.AddPosition(*linear_offset)
                 else:
-                    step_angle = float(angle.value()) * instance_index / max(1, instance_count - 1)
+                    step_angle = total_angle * instance_index / max(1, instance_count - 1)
                     direction = tuple(value / radial_length for value in radial)
                     rotated_direction = rotate_vector(direction, axis_vector, step_angle)
                     group_target = tuple(
@@ -1586,11 +1719,20 @@ class MainWindow(QMainWindow):
                     clone_bounds = clone_actor.GetBounds()
                     clone_center = tuple((float(clone_bounds[index]) + float(clone_bounds[index + 1])) * 0.5 for index in (0, 2, 4))
                     clone_actor.AddPosition(*(target_center[index] - clone_center[index] for index in range(3)))
-                self._viewport.scene.add_object(clone); created.append(clone)
+                if not editing_pattern:
+                    self._viewport.scene.add_object(clone)
+                created.append(clone)
 
         if not created:
             QMessageBox.warning(self, "Pattern", "No pattern instances could be created.")
             return
+        if editing_pattern:
+            for obj in list(self._viewport.scene.objects):
+                obj_definition = getattr(obj, "pattern_definition", None)
+                if isinstance(obj_definition, dict) and obj_definition.get("pattern_id") == pattern_id:
+                    self._viewport.scene.remove_object(obj)
+            for clone in created:
+                self._viewport.scene.add_object(clone)
         self._viewport.scene.deselect_all()
         for clone in created: self._viewport.scene.select_add(clone)
         self._refresh_materials(); self._sync_port_reference_state(); self._viewport._render()
@@ -1983,12 +2125,18 @@ class MainWindow(QMainWindow):
             mode = str(history.get("mode", "")).lower()
             if type(obj).__name__ in {"BoxObject", "PlateObject"} and len(points) >= 2:
                 first, second = points[0], points[1]
-                for key, value in zip(("X1", "Y1", "Z1"), first):
-                    if key not in formulas:
-                        params[key] = float(value)
-                for key, value in zip(("X2", "Y2", "Z2"), second):
-                    if key not in formulas:
-                        params[key] = float(value)
+                plane = str(history.get("plane", getattr(obj, "creation_plane", "XY"))).upper()
+                in_plane_axes = {
+                    "XY": (0, 1),
+                    "XZ": (0, 2),
+                    "YZ": (1, 2),
+                }.get(plane, (0, 1, 2))
+                coordinate_keys = ("X1", "Y1", "Z1"), ("X2", "Y2", "Z2")
+                for keys, point in zip(coordinate_keys, (first, second)):
+                    for axis_index in in_plane_axes:
+                        key = keys[axis_index]
+                        if key not in formulas:
+                            params[key] = float(point[axis_index])
             elif mode in {"cylinder", "cone", "sphere", "ellipsoid", "torus"}:
                 first = points[0]
                 for key, value in zip(("CenterX", "CenterY", "CenterZ"), first):
@@ -2033,64 +2181,359 @@ class MainWindow(QMainWindow):
         result.refresh_appearance()
 
     def _replace_boolean_result_object(self, result, polydata, sources):
-        """Recreate a boolean result object while preserving its project identity."""
-        from ..scene.em_objects import MeshObject
+        """Update a boolean result without invalidating dependent source references."""
+        self._replace_boolean_result_geometry(result, polydata)
+        result.source_objects = list(sources)
+        result.boolean_source_names = [str(source.name) for source in sources]
+        result.boolean_sources_data = [self._serialize_object_snapshot(source) for source in sources]
+        return result
+
+    def _recompute_pattern_instances(self, values: dict[str, float]) -> bool:
+        import itertools
+        import math
 
         scene = self._viewport.scene
-        if result not in scene.objects:
-            self._replace_boolean_result_geometry(result, polydata)
-            return result
+        groups = {}
+        objects_by_name = {str(obj.name): obj for obj in scene.objects}
+        for obj in list(scene.objects):
+            definition = getattr(obj, "pattern_definition", None)
+            pattern_id = definition.get("pattern_id") if isinstance(definition, dict) else None
+            if pattern_id:
+                groups.setdefault(str(pattern_id), []).append(obj)
 
-        index = scene.objects.index(result)
-        was_selected = result in scene.selection
-        visible = result.is_visible()
-        replacement = MeshObject(
-            name=result.name,
-            polydata=polydata,
-            material=result.material,
-            plate_role=bool(getattr(result, "plate_role", False)),
-            boolean_op=getattr(result, "boolean_op", None),
-            boolean_source_names=list(getattr(result, "boolean_source_names", []) or []),
-            boolean_sources_data=[self._serialize_object_snapshot(source) for source in sources],
-        )
-        replacement.opacity = result.opacity
-        replacement.is_model = bool(getattr(result, "is_model", True))
-        replacement.custom_color = getattr(result, "custom_color", None)
-        replacement.source_objects = list(sources)
-        replacement.creation_plane = result.creation_plane
-        replacement.creation_plane_origin = result.creation_plane_origin
-        replacement.creation_plane_normal = result.creation_plane_normal
-        replacement.param_formulas = dict(getattr(result, "param_formulas", {}) or {})
-        replacement.creation_history = dict(getattr(result, "creation_history", {}) or {})
-        replacement.set_visible(visible)
-        replacement.refresh_appearance()
+        changed = False
+        for pattern_id, old_instances in groups.items():
+            definition = deepcopy(old_instances[0].pattern_definition)
+            settings = definition.get("settings", {})
+            source_snapshots = definition.get("sources", [])
+            if not isinstance(settings, dict) or not isinstance(source_snapshots, list):
+                continue
+            expressions = settings.get("expressions", {})
+            expressions = expressions if isinstance(expressions, dict) else {}
+            resolved = settings.get("resolved", {})
+            resolved = resolved if isinstance(resolved, dict) else {}
 
-        scene.remove_object(result)
-        scene.objects.insert(min(index, len(scene.objects)), replacement)
-        for actor in replacement.all_actors:
-            scene.renderer.AddActor(actor)
-        if was_selected:
-            scene.select(replacement)
-        return replacement
+            def resolve_setting(key: str, default: float) -> float:
+                raw = str(expressions.get(key, "")).strip()
+                if not raw:
+                    raw = str(resolved.get(key, default)).strip()
+                if key == "angle" and raw.lower().endswith("deg"):
+                    raw = raw[:-3].strip()
+                try:
+                    value = float(raw.replace(",", "."))
+                except ValueError:
+                    value = float(evaluate_expression(raw, values))
+                if not math.isfinite(value):
+                    raise ValueError(f"Pattern setting '{key}' must be finite")
+                return value
 
-    def _recompute_parametric_objects(self) -> None:
-        from ..scene.boolean_ops import boolean_many, fuse_many
+            try:
+                mode = str(settings.get("mode", "Linear"))
+                if mode not in {"Linear", "Circular"}:
+                    raise ValueError(f"Unknown pattern mode: {mode}")
+                count_value = resolve_setting("count", 2.0)
+                instance_count = int(round(count_value))
+                if abs(count_value - instance_count) > 1e-9 or not 1 <= instance_count <= 1000:
+                    raise ValueError("Circular instance count must be a whole number from 1 to 1000")
+                linear_counts = []
+                for key, default in zip(("axis_count_x", "axis_count_y", "axis_count_z"), (2, 1, 1)):
+                    value = resolve_setting(key, float(default))
+                    count = int(round(value))
+                    if abs(value - count) > 1e-9 or not 1 <= count <= 1000:
+                        raise ValueError("Linear instance counts must be whole numbers from 1 to 1000")
+                    linear_counts.append(count)
+                linear_steps = [
+                    resolve_setting(key, 0.0)
+                    for key in ("offset_x", "offset_y", "offset_z")
+                ]
+                total_angle = resolve_setting("angle", 360.0)
+                requested_radius = max(0.0, resolve_setting("radius", 1.0))
+                axis_enabled = settings.get("axis_enabled", [True, False, False])
+                axis_enabled = [bool(value) for value in axis_enabled[:3]]
+                axis_enabled += [False] * (3 - len(axis_enabled))
+                circular_center = tuple(
+                    resolve_setting(key, 0.0)
+                    for key in ("center_x", "center_y", "center_z")
+                )
+                axis_start = tuple(
+                    resolve_setting(key, 0.0)
+                    for key in ("axis_start_x", "axis_start_y", "axis_start_z")
+                )
+                axis_end = tuple(
+                    resolve_setting(key, default)
+                    for key, default in zip(
+                        ("axis_end_x", "axis_end_y", "axis_end_z"), (0.0, 0.0, 1.0)
+                    )
+                )
+                axis_name = str(settings.get("axis", "X"))
+                if mode == "Linear" and not any(axis_enabled):
+                    raise ValueError("At least one linear pattern axis must be enabled")
+                axis_vector = tuple(axis_end[i] - axis_start[i] for i in range(3))
+                axis_length = math.sqrt(sum(value * value for value in axis_vector))
+                if mode == "Circular" and axis_length < 1e-12:
+                    raise ValueError("Rotation axis points must be different")
+                if axis_length > 1e-12:
+                    axis_vector = tuple(value / axis_length for value in axis_vector)
+
+                source_data = []
+                for source_index, snapshot in enumerate(source_snapshots):
+                    if not isinstance(snapshot, dict):
+                        continue
+                    source_name = str(snapshot.get("name", "")).strip()
+                    source = objects_by_name.get(source_name)
+                    if source in old_instances:
+                        source = None
+                    if source is None:
+                        source = self._rebuild_object_from_snapshot(snapshot)
+                        if source is None:
+                            raise ValueError(f"Pattern source '{source_name}' could not be restored")
+                        params = source.get_parameters()
+                        for key, formula in (getattr(source, "param_formulas", {}) or {}).items():
+                            params[key] = evaluate_expression(str(formula), values)
+                        source.set_parameters(params)
+                    actor = getattr(source, "actor", None)
+                    if actor is None:
+                        raise ValueError(f"Pattern source '{source_name}' has no geometry")
+                    bounds = actor.GetBounds()
+                    center = tuple(
+                        (float(bounds[index]) + float(bounds[index + 1])) * 0.5
+                        for index in (0, 2, 4)
+                    )
+                    source_data.append((source_index, source, center))
+                if not source_data:
+                    raise ValueError("Pattern has no valid source objects")
+
+                source_bounds = [source.actor.GetBounds() for _, source, _ in source_data]
+                bounds = (
+                    min(float(item[0]) for item in source_bounds), max(float(item[1]) for item in source_bounds),
+                    min(float(item[2]) for item in source_bounds), max(float(item[3]) for item in source_bounds),
+                    min(float(item[4]) for item in source_bounds), max(float(item[5]) for item in source_bounds),
+                )
+                source_bounds_center = tuple(
+                    (float(bounds[index]) + float(bounds[index + 1])) * 0.5
+                    for index in (0, 2, 4)
+                )
+                radial = tuple(source_bounds_center[i] - circular_center[i] for i in range(3))
+                radial_length = math.sqrt(sum(value * value for value in radial))
+                if mode == "Circular" and radial_length < 1e-12:
+                    radial = (1.0, 0.0, 0.0)
+                    radial_length = 1.0
+
+                enabled_indices = [index for index, enabled in enumerate(axis_enabled) if enabled]
+                linear_offsets = [
+                    (linear_steps[0] * ix, linear_steps[1] * iy, linear_steps[2] * iz)
+                    for ix, iy, iz in itertools.product(*[
+                        range(linear_counts[index]) if axis_enabled[index] else range(1)
+                        for index in range(3)
+                    ])
+                    if (ix, iy, iz) != (0, 0, 0)
+                ] if mode == "Linear" else []
+                instance_specs = (
+                    enumerate(linear_offsets, start=1)
+                    if mode == "Linear"
+                    else enumerate(range(1, instance_count), start=1)
+                )
+                old_by_key = {
+                    (
+                        int(getattr(obj, "pattern_instance", {}).get("instance_index", -1)),
+                        int(getattr(obj, "pattern_instance", {}).get("source_index", -1)),
+                    ): obj
+                    for obj in old_instances
+                    if isinstance(getattr(obj, "pattern_instance", None), dict)
+                }
+                definition["sources"] = [
+                    self._serialize_object_snapshot(source)
+                    for _, source, _ in source_data
+                ]
+                settings["resolved"] = {
+                    key: resolve_setting(key, float(resolved.get(key, default)))
+                    for key, default in (
+                        ("count", 2.0), ("axis_count_x", 2.0), ("axis_count_y", 1.0), ("axis_count_z", 1.0),
+                        ("offset_x", 0.0), ("offset_y", 0.0), ("offset_z", 0.0), ("angle", 360.0),
+                        ("center_x", circular_center[0]), ("center_y", circular_center[1]), ("center_z", circular_center[2]),
+                        ("axis_start_x", axis_start[0]), ("axis_start_y", axis_start[1]), ("axis_start_z", axis_start[2]),
+                        ("axis_end_x", axis_end[0]), ("axis_end_y", axis_end[1]), ("axis_end_z", axis_end[2]),
+                        ("radius", requested_radius),
+                    )
+                }
+                typed_inputs = settings.get("inputs", {})
+                if not isinstance(typed_inputs, dict):
+                    typed_inputs = {}
+                for key, raw_value in expressions.items():
+                    input_data = typed_inputs.get(key)
+                    if not isinstance(input_data, dict):
+                        raw_text = str(raw_value).strip()
+                        try:
+                            float(raw_text.replace(",", "."))
+                            typed_inputs[key] = {
+                                "type": "value",
+                                "value": settings["resolved"].get(key, resolved.get(key)),
+                            }
+                        except ValueError:
+                            typed_inputs[key] = {
+                                "type": "formula",
+                                "formula": raw_text,
+                                "value": settings["resolved"].get(key, resolved.get(key)),
+                            }
+                            input_data = typed_inputs[key]
+                    if isinstance(input_data, dict) and key in settings["resolved"]:
+                        input_data["value"] = settings["resolved"][key]
+                settings["inputs"] = typed_inputs
+                settings["parameter_values"] = dict(values)
+                new_instances = []
+                for instance_index, linear_offset in instance_specs:
+                    for source_index, source, source_center in source_data:
+                        snapshot = self._serialize_object_snapshot(source)
+                        clone_data = dict(snapshot)
+                        clone_data["params"] = dict(snapshot.get("params", {}))
+                        old_instance = old_by_key.get((instance_index, source_index))
+                        source_name = str(source.name)
+                        clone_name = (
+                            str(old_instance.name) if old_instance is not None
+                            else f"{source_name}_Pattern_{instance_index + 1}"
+                        )
+                        clone_data["name"] = clone_name
+                        clone_data["params"]["Name"] = clone_name
+                        clone_data["pattern_definition"] = deepcopy(definition)
+                        clone_data["pattern_instance"] = {
+                            "instance_index": int(instance_index),
+                            "source_index": int(source_index),
+                            "source_name": source_name,
+                            "settings": deepcopy(settings),
+                        }
+                        clone = self._rebuild_object_from_snapshot(clone_data)
+                        if clone is None or clone.actor is None:
+                            raise ValueError(f"Pattern replica '{clone_name}' could not be rebuilt")
+                        if mode == "Linear":
+                            clone.actor.AddPosition(*linear_offset)
+                        else:
+                            step_angle = total_angle * instance_index / max(1, instance_count - 1)
+                            cosine = math.cos(math.radians(step_angle))
+                            sine = math.sin(math.radians(step_angle))
+
+                            def rotate(vector):
+                                cross = (
+                                    axis_vector[1] * vector[2] - axis_vector[2] * vector[1],
+                                    axis_vector[2] * vector[0] - axis_vector[0] * vector[2],
+                                    axis_vector[0] * vector[1] - axis_vector[1] * vector[0],
+                                )
+                                dot = sum(axis_vector[i] * vector[i] for i in range(3))
+                                return tuple(
+                                    vector[i] * cosine + cross[i] * sine + axis_vector[i] * dot * (1.0 - cosine)
+                                    for i in range(3)
+                                )
+
+                            direction = tuple(value / radial_length for value in radial)
+                            rotated_direction = rotate(direction)
+                            target_center = tuple(
+                                circular_center[i] + rotated_direction[i] * requested_radius
+                                + rotate(tuple(source_center[j] - source_bounds_center[j] for j in range(3)))[i]
+                                for i in range(3)
+                            )
+                            clone.actor.SetOrigin(*source_center)
+                            clone.actor.RotateWXYZ(step_angle, *axis_vector)
+                            clone_bounds = clone.actor.GetBounds()
+                            clone_center = tuple(
+                                (float(clone_bounds[index]) + float(clone_bounds[index + 1])) * 0.5
+                                for index in (0, 2, 4)
+                            )
+                            clone.actor.AddPosition(*(target_center[i] - clone_center[i] for i in range(3)))
+                        new_instances.append((instance_index, source_index, clone))
+                replacements = {
+                    old_by_key[key]: clone
+                    for instance_index, source_index, clone in new_instances
+                    if (key := (instance_index, source_index)) in old_by_key
+                }
+            except Exception as exc:
+                self._info_bar.set_info(f"Pattern {pattern_id}: recomputation failed: {exc}")
+                continue
+
+            for obj in old_instances:
+                scene.remove_object(obj)
+            for _, _, clone in new_instances:
+                scene.add_object(clone)
+                objects_by_name[clone.name] = clone
+            for obj in list(scene.objects):
+                sources = list(getattr(obj, "source_objects", []) or [])
+                if not sources:
+                    continue
+                updated_sources = [replacements.get(source, source) for source in sources]
+                if updated_sources != sources:
+                    obj.source_objects = updated_sources
+                    obj.boolean_source_names = [str(source.name) for source in updated_sources]
+                    obj.boolean_sources_data = [
+                        self._serialize_object_snapshot(source) for source in updated_sources
+                    ]
+            changed = True
+
+        if changed:
+            self._refresh_materials()
+        return changed
+
+    def _recompute_parametric_objects(self, *, _patterns_recomputed: bool = False) -> None:
+        from ..scene.boolean_ops import boolean_dependency_order, boolean_many, fuse_many
 
         values = self._parameter_values()
         self._sync_boolean_provenance()
+        scene_objects = list(self._viewport.scene.objects)
+        objects_by_name = {str(obj.name): obj for obj in scene_objects}
         objects = []
-        seen = set()
+        seen: set[int] = set()
+        visiting: set[int] = set()
 
         def collect(obj) -> None:
             if obj is None or id(obj) in seen:
                 return
-            seen.add(id(obj))
-            objects.append(obj)
-            for source in list(getattr(obj, "source_objects", []) or []):
-                collect(source)
+            if id(obj) in visiting:
+                raise ValueError(f"Boolean dependency cycle detected at {getattr(obj, 'name', 'object')}")
+            visiting.add(id(obj))
+            try:
+                operation = str(getattr(obj, "boolean_op", "") or "").strip().lower()
+                if operation in {"fuse", "cut", "common"}:
+                    live_sources = {
+                        str(getattr(source, "name", "")): source
+                        for source in list(getattr(obj, "source_objects", []) or [])
+                    }
+                    snapshots = {
+                        str(snapshot.get("name", "")).strip(): snapshot
+                        for snapshot in list(getattr(obj, "boolean_sources_data", []) or [])
+                        if isinstance(snapshot, dict) and str(snapshot.get("name", "")).strip()
+                    }
+                    source_names = list(getattr(obj, "boolean_source_names", []) or [])
+                    if not source_names:
+                        source_names = [str(source.name) for source in live_sources.values()]
+                        source_names.extend(name for name in snapshots if name not in source_names)
 
-        for scene_obj in list(self._viewport.scene.objects):
-            collect(scene_obj)
+                    ordered_sources = []
+                    for source_name in source_names:
+                        source = live_sources.get(source_name) or objects_by_name.get(source_name)
+                        if source is None and source_name in snapshots:
+                            source = self._rebuild_object_from_snapshot(snapshots[source_name])
+                            if source is not None:
+                                objects_by_name[source_name] = source
+                        if source is None:
+                            raise ValueError(
+                                f"{obj.name}: boolean source '{source_name}' could not be restored"
+                            )
+                        ordered_sources.append(source)
+
+                    if len(ordered_sources) < 2:
+                        raise ValueError(f"{obj.name}: at least two boolean sources are required")
+                    obj.source_objects = ordered_sources
+                    obj.boolean_source_names = [str(source.name) for source in ordered_sources]
+                    for source in ordered_sources:
+                        collect(source)
+
+                seen.add(id(obj))
+                objects.append(obj)
+            finally:
+                visiting.remove(id(obj))
+
+        for scene_obj in scene_objects:
+            try:
+                collect(scene_obj)
+            except Exception as exc:
+                self._info_bar.set_info(f"{getattr(scene_obj, 'name', 'Object')}: dependency restore failed: {exc}")
 
         def apply_formulas(obj) -> None:
             formulas = getattr(obj, "param_formulas", {}) or {}
@@ -2102,48 +2545,53 @@ class MainWindow(QMainWindow):
             obj.set_parameters(params)
             obj.refresh_appearance()
 
+        formula_failures: set[int] = set()
         for obj in objects:
             try:
                 apply_formulas(obj)
             except Exception as exc:
+                formula_failures.add(id(obj))
                 self._info_bar.set_info(f"{obj.name}: {exc}")
         self._regenerate_snap_dependent_objects(objects)
 
-        # A retained boolean result can have only some live sources after reload.
-        # Rebuild missing sources from their snapshots before recomputing the CSG.
-        for result in list(objects):
+        try:
+            ordered_booleans = boolean_dependency_order(objects)
+        except ValueError as exc:
+            self._info_bar.set_info(str(exc))
+            return
+
+        boolean_failures: set[int] = set()
+        for result in ordered_booleans:
             operation = str(getattr(result, "boolean_op", "") or "").strip().lower()
-            if operation not in {"fuse", "cut", "common"}:
-                continue
-            source_by_name = {
-                str(getattr(source, "name", "")): source
-                for source in list(getattr(result, "source_objects", []) or [])
-            }
-            for snapshot in list(getattr(result, "boolean_sources_data", []) or []):
-                name = str(snapshot.get("name", "")).strip() if isinstance(snapshot, dict) else ""
-                if not name or name in source_by_name:
-                    continue
-                rebuilt = self._rebuild_object_from_snapshot(snapshot)
-                if rebuilt is None:
-                    continue
-                try:
-                    apply_formulas(rebuilt)
-                except Exception as exc:
-                    self._info_bar.set_info(f"{rebuilt.name}: {exc}")
-                source_by_name[name] = rebuilt
-                objects.append(rebuilt)
-            source_names = list(getattr(result, "boolean_source_names", []) or [])
-            ordered_sources = [source_by_name[name] for name in source_names if name in source_by_name]
+            ordered_sources = list(getattr(result, "source_objects", []) or [])
             if len(ordered_sources) < 2:
+                self._info_bar.set_info(f"{result.name}: at least two boolean sources are required")
                 continue
-            result.source_objects = ordered_sources
+            failed_sources = [
+                source for source in ordered_sources
+                if id(source) in formula_failures or id(source) in boolean_failures
+            ]
+            if failed_sources:
+                boolean_failures.add(id(result))
+                self._info_bar.set_info(
+                    f"{result.name}: recomputation skipped because a source failed: "
+                    + ", ".join(str(source.name) for source in failed_sources)
+                )
+                continue
             try:
                 polydata = fuse_many(ordered_sources) if operation == "fuse" else boolean_many(operation, ordered_sources)
-                replacement = self._replace_boolean_result_object(result, polydata, ordered_sources)
-                if result in objects:
-                    objects[objects.index(result)] = replacement
+                self._replace_boolean_result_object(result, polydata, ordered_sources)
             except Exception as exc:
+                boolean_failures.add(id(result))
                 self._info_bar.set_info(f"{result.name}: boolean recompute failed: {exc}")
+        pattern_recompute = getattr(self, "_recompute_pattern_instances", None)
+        if (
+            not _patterns_recomputed
+            and callable(pattern_recompute)
+            and pattern_recompute(values)
+        ):
+            self._recompute_parametric_objects(_patterns_recomputed=True)
+            return
         self._viewport._render()
 
     def _on_object_selected(self, obj) -> None:
@@ -2175,6 +2623,7 @@ class MainWindow(QMainWindow):
 
     def _on_params_changed(self, obj, _params) -> None:
         self._sync_boolean_provenance()
+        self._viewport.scene.refresh_adaptive_grid()
         self._viewport._render()
         self._refresh_materials()
         self._mark_simulation_dirty(steps=True, script=True)
@@ -3835,6 +4284,17 @@ class MainWindow(QMainWindow):
         state = "shown" if visible else "hidden"
         self._info_bar.set_info(f"Reference-plane grid {state}.")
 
+    def _on_grid_adaptive_changed(self, enabled: bool) -> None:
+        self._adaptive_grid_enabled = bool(enabled)
+        self._viewport.set_adaptive_grid(
+            self._adaptive_grid_enabled,
+            self._adaptive_grid_margin,
+        )
+        self._save_app_settings()
+        self._refresh_materials()
+        state = "enabled" if enabled else "disabled"
+        self._info_bar.set_info(f"Adaptive grid {state}.")
+
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� grid / units / workspace
     @staticmethod
     def _axis_plane_from_normal(normal) -> str:
@@ -3922,6 +4382,19 @@ class MainWindow(QMainWindow):
             pass
 
         try:
+            self._adaptive_grid_enabled = bool(int(settings.value("display/adaptive_grid_enabled", 0)))
+        except Exception:
+            pass
+
+        try:
+            self._adaptive_grid_margin = max(
+                0.0,
+                float(settings.value("display/adaptive_grid_margin", self._adaptive_grid_margin)),
+            )
+        except Exception:
+            pass
+
+        try:
             self._plane_triad_size = float(settings.value("display/plane_triad_size", self._plane_triad_size))
         except Exception:
             pass
@@ -3995,6 +4468,8 @@ class MainWindow(QMainWindow):
         settings.setValue("display/decimal_separator", self._decimal_separator)
         settings.setValue("display/workspace_size", self._workspace_size)
         settings.setValue("display/grid_size", self._grid_spacing)
+        settings.setValue("display/adaptive_grid_enabled", int(self._adaptive_grid_enabled))
+        settings.setValue("display/adaptive_grid_margin", self._adaptive_grid_margin)
         settings.setValue("display/plane_triad_size", self._plane_triad_size)
         settings.setValue(
             "display/selection_color",
@@ -4025,6 +4500,7 @@ class MainWindow(QMainWindow):
             decimal_separator=self._decimal_separator,
             workspace_size=self._workspace_size,
             grid_size=self._grid_spacing,
+            adaptive_grid_margin=self._adaptive_grid_margin,
             plane_triad_size=self._plane_triad_size,
             selection_color=self._selection_color,
             locale=self._ui_locale,
@@ -4062,6 +4538,10 @@ class MainWindow(QMainWindow):
         set_numeric_locale(self._ui_locale)
 
         self._grid_spacing = float(values.get("grid_size", self._grid_spacing))
+        self._adaptive_grid_margin = max(
+            0.0,
+            float(values.get("adaptive_grid_margin", self._adaptive_grid_margin)),
+        )
         self._workspace_size = float(values.get("workspace_size", self._workspace_size))
         self._plane_triad_size = max(1e-6, float(values.get("plane_triad_size", self._plane_triad_size)))
 
@@ -4101,6 +4581,10 @@ class MainWindow(QMainWindow):
                 obj.refresh_appearance()
 
         self._viewport.set_grid(self._workspace_size, self._grid_spacing, self._active_draw_plane_name(), self._units)
+        self._viewport.set_adaptive_grid(
+            self._adaptive_grid_enabled,
+            self._adaptive_grid_margin,
+        )
         self._viewport.set_plane_triad_size(self._plane_triad_size)
         self._sync_settings_dialog_values()
         self._viewport._render()
@@ -4122,11 +4606,13 @@ class MainWindow(QMainWindow):
     def _on_units_changed(self, units: str) -> None:
         workspace_size = self._workspace_size
         grid_size = self._grid_spacing
+        adaptive_grid_margin = self._adaptive_grid_margin
         plane_triad_size = self._plane_triad_size
         if units != self._units and self._units in _MM_PER_UNIT and units in _MM_PER_UNIT:
             factor = _MM_PER_UNIT[self._units] / _MM_PER_UNIT[units]
             workspace_size *= factor
             grid_size *= factor
+            adaptive_grid_margin *= factor
             plane_triad_size *= factor
         self._apply_display_settings(
             {
@@ -4134,6 +4620,7 @@ class MainWindow(QMainWindow):
                 "decimal_separator": self._decimal_separator,
                 "workspace_size": workspace_size,
                 "grid_size": grid_size,
+                "adaptive_grid_margin": adaptive_grid_margin,
                 "plane_triad_size": plane_triad_size,
                 "selection_color": self._selection_color,
             }
@@ -4165,6 +4652,7 @@ class MainWindow(QMainWindow):
             active_plane=scene.active_plane,
             plane_triad_visible=self._viewport.is_plane_triad_visible(),
             grid_visible=self._viewport.is_grid_visible(),
+            grid_adaptive=self._adaptive_grid_enabled,
             material_priorities=material_priorities,
         )
 

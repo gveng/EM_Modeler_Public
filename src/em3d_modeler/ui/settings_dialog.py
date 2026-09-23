@@ -94,6 +94,12 @@ class SettingsDialog(QDialog):
         self._grid_spin.setRange(0.000001, 1000000.0)
         form.addRow("Grid size", self._grid_spin)
 
+        self._adaptive_grid_margin_spin = QDoubleSpinBox(self._display_tab)
+        self._adaptive_grid_margin_spin.setDecimals(3)
+        self._adaptive_grid_margin_spin.setRange(0.0, 1000000.0)
+        self._adaptive_grid_margin_spin.setSingleStep(10.0)
+        form.addRow("Adaptive grid margin", self._adaptive_grid_margin_spin)
+
         self._triad_size_spin = QDoubleSpinBox(self._display_tab)
         self._triad_size_spin.setDecimals(3)
         self._triad_size_spin.setRange(0.000001, 1000000.0)
@@ -237,12 +243,15 @@ class SettingsDialog(QDialog):
             factor = _MM_PER_UNIT[old_units] / _MM_PER_UNIT[units]
             self._workspace_spin.blockSignals(True)
             self._grid_spin.blockSignals(True)
+            self._adaptive_grid_margin_spin.blockSignals(True)
             self._triad_size_spin.blockSignals(True)
             self._workspace_spin.setValue(self._workspace_spin.value() * factor)
             self._grid_spin.setValue(self._grid_spin.value() * factor)
+            self._adaptive_grid_margin_spin.setValue(self._adaptive_grid_margin_spin.value() * factor)
             self._triad_size_spin.setValue(self._triad_size_spin.value() * factor)
             self._workspace_spin.blockSignals(False)
             self._grid_spin.blockSignals(False)
+            self._adaptive_grid_margin_spin.blockSignals(False)
             self._triad_size_spin.blockSignals(False)
         self._current_units = units
         self._update_suffixes(units)
@@ -251,11 +260,13 @@ class SettingsDialog(QDialog):
         locale = QLocale(QLocale.Italian, QLocale.Italy) if value.startswith("Comma") else QLocale.c()
         self._workspace_spin.setLocale(locale)
         self._grid_spin.setLocale(locale)
+        self._adaptive_grid_margin_spin.setLocale(locale)
         self._triad_size_spin.setLocale(locale)
 
     def _update_suffixes(self, units: str) -> None:
         self._workspace_spin.setSuffix(f" {units}")
         self._grid_spin.setSuffix(f" {units}")
+        self._adaptive_grid_margin_spin.setSuffix(f" {units}")
         self._triad_size_spin.setSuffix(f" {units}")
 
     def _update_color_preview(self, color: Tuple[float, float, float]) -> None:
@@ -276,6 +287,7 @@ class SettingsDialog(QDialog):
         workspace_size: float,
         grid_size: float,
         plane_triad_size: float,
+        adaptive_grid_margin: float = 20.0,
         selection_color: Tuple[float, float, float],
         locale: QLocale,
         solver: str = "PARDISO",
@@ -299,6 +311,7 @@ class SettingsDialog(QDialog):
         self._update_suffixes(units)
         self._workspace_spin.setValue(workspace_size)
         self._grid_spin.setValue(grid_size)
+        self._adaptive_grid_margin_spin.setValue(adaptive_grid_margin)
         self._triad_size_spin.setValue(plane_triad_size)
 
         chosen_name = None
@@ -337,6 +350,7 @@ class SettingsDialog(QDialog):
             "decimal_separator": "," if self._decimal_combo.currentText().startswith("Comma") else ".",
             "workspace_size": float(self._workspace_spin.value()),
             "grid_size": float(self._grid_spin.value()),
+            "adaptive_grid_margin": float(self._adaptive_grid_margin_spin.value()),
             "plane_triad_size": float(self._triad_size_spin.value()),
             "selection_color": color,
             "solver": self._solver_combo.currentText(),

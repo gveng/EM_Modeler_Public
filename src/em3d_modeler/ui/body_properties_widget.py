@@ -442,7 +442,8 @@ class BodyPropertiesWidget(QWidget):
                 try:
                     params[k.text()] = float(v.text())
                 except ValueError:
-                    if self._formula_resolver is None:
+                    original_value = original_params.get(k.text())
+                    if isinstance(original_value, str) or self._formula_resolver is None:
                         params[k.text()] = v.text()
                     else:
                         params[k.text()] = self._formula_resolver(v.text())

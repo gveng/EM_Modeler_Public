@@ -53,7 +53,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='EM3D_Modeler_1.2.8',
+    name='EM3D_Modeler_1.2.9',
     icon='D:\\\\Visual_Studio_Code\\\\EM_3D_Modeler\\\\Icons\\\\SplashScreen\\\\EM_Logo.ico',
     debug=False,
     bootloader_ignore_signals=False,
@@ -73,5 +73,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='EM3D_Modeler_1.2.8',
+    name='EM3D_Modeler_1.2.9',
 )

@@ -31,6 +31,34 @@ _OPS = {
     "fuse": vtk.vtkBooleanOperationPolyDataFilter.VTK_UNION,
     "common": vtk.vtkBooleanOperationPolyDataFilter.VTK_INTERSECTION,
 }
+_BOOLEAN_OPERATIONS = {"cut", "fuse", "common"}
+
+
+def boolean_dependency_order(objects: list["EMObject"]) -> list["EMObject"]:
+    """Return boolean results in source-first order, rejecting dependency cycles."""
+    ordered: list["EMObject"] = []
+    visited: set[int] = set()
+    visiting: set[int] = set()
+
+    def visit(obj: "EMObject") -> None:
+        object_id = id(obj)
+        if object_id in visited:
+            return
+        if object_id in visiting:
+            name = str(getattr(obj, "name", type(obj).__name__))
+            raise ValueError(f"Boolean dependency cycle detected at {name}")
+        visiting.add(object_id)
+        operation = str(getattr(obj, "boolean_op", "") or "").strip().lower()
+        if operation in _BOOLEAN_OPERATIONS:
+            for source in list(getattr(obj, "source_objects", []) or []):
+                visit(source)
+            ordered.append(obj)
+        visiting.remove(object_id)
+        visited.add(object_id)
+
+    for item in objects:
+        visit(item)
+    return ordered
 
 
 def _bounds_overlap(a: vtk.vtkPolyData, b: vtk.vtkPolyData, tol: float = 1e-6) -> bool:
@@ -335,6 +363,20 @@ def _postprocess(poly: vtk.vtkPolyData) -> vtk.vtkPolyData:
 def _boolean_polydata(op: str, pa: vtk.vtkPolyData, pb: vtk.vtkPolyData) -> vtk.vtkPolyData:
     if op not in _OPS:
         raise ValueError(f"Unknown boolean op: {op}")
+    for label, poly in (("base", pa), ("tool", pb)):
+        if poly is None or poly.GetNumberOfPoints() == 0 or poly.GetNumberOfCells() == 0:
+            raise RuntimeError(f"Boolean '{op}' {label} input has no points or cells")
+
+    if op == "cut" and not _bounds_have_volume_overlap(pa, pb):
+        return _postprocess(pa)
+    if op == "fuse" and not _bounds_overlap(pa, pb):
+        append = vtk.vtkAppendPolyData()
+        append.AddInputData(pa)
+        append.AddInputData(pb)
+        append.Update()
+        return _postprocess(append.GetOutput())
+    if op == "common" and not _bounds_have_volume_overlap(pa, pb):
+        raise RuntimeError("Boolean 'common' inputs have no overlapping volume")
 
     bf = vtk.vtkBooleanOperationPolyDataFilter()
     bf.SetOperation(_OPS[op])
@@ -436,9 +478,20 @@ def boolean(op: str, a: "EMObject", b: "EMObject") -> vtk.vtkPolyData:
     """Run a boolean operation on two objects; returns triangulated polydata."""
     pa = _world_polydata(a)
     pb = _world_polydata(b)
+    for label, poly in (("base", pa), ("tool", pb)):
+        if poly is None or poly.GetNumberOfPoints() == 0 or poly.GetNumberOfCells() == 0:
+            raise RuntimeError(f"Boolean '{op}' {label} object has no points or cells")
     if op == "cut":
         if not _bounds_have_volume_overlap(pa, pb):
             return _postprocess(pa)
+    elif op == "fuse" and not _bounds_overlap(pa, pb):
+        append = vtk.vtkAppendPolyData()
+        append.AddInputData(pa)
+        append.AddInputData(pb)
+        append.Update()
+        return _postprocess(append.GetOutput())
+    elif op == "common" and not _bounds_have_volume_overlap(pa, pb):
+        raise RuntimeError("Boolean 'common' inputs have no overlapping volume")
         exact_cut = _cut_axis_aligned_boxes(pa, pb)
         if exact_cut is not None:
             if exact_cut.GetNumberOfPoints() == 0:

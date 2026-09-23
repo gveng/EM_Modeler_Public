@@ -16,9 +16,66 @@
 
 """Grid actor builder for the 3D viewport."""
 from __future__ import annotations
+import math
 import vtk
 
 PLANES = ("XY", "XZ", "YZ")
+
+
+def plane_basis_from_normal(normal: tuple) -> tuple[tuple[float, ...], tuple[float, ...]]:
+    """Return stable orthonormal local X/Y axes for a plane normal."""
+    import math
+
+    nx, ny, nz = (float(value) for value in normal)
+    length = math.sqrt(nx * nx + ny * ny + nz * nz)
+    if length < 1e-12:
+        raise ValueError("Plane normal must be non-zero")
+    nx, ny, nz = nx / length, ny / length, nz / length
+    reference = (0.0, 0.0, 1.0) if abs(nz) < 0.99 else (0.0, 1.0, 0.0)
+    xx = reference[1] * nz - reference[2] * ny
+    xy = reference[2] * nx - reference[0] * nz
+    xz = reference[0] * ny - reference[1] * nx
+    x_length = math.sqrt(xx * xx + xy * xy + xz * xz)
+    x_axis = (xx / x_length, xy / x_length, xz / x_length)
+    y_axis = (
+        ny * x_axis[2] - nz * x_axis[1],
+        nz * x_axis[0] - nx * x_axis[2],
+        nx * x_axis[1] - ny * x_axis[0],
+    )
+    return x_axis, y_axis
+
+
+def project_bounds_to_plane(bounds: tuple, origin: tuple, normal: tuple,
+                            margin: float = 0.0) -> tuple[float, float, float, float] | None:
+    """Project world-axis-aligned bounds onto a plane and expand by *margin*."""
+    import math
+
+    if bounds is None or len(bounds) != 6:
+        return None
+    values = tuple(float(value) for value in bounds)
+    if not all(math.isfinite(value) for value in values):
+        return None
+    if values[0] > values[1] or values[2] > values[3] or values[4] > values[5]:
+        return None
+
+    x_axis, y_axis = plane_basis_from_normal(normal)
+    margin = max(0.0, float(margin))
+    origin = tuple(float(value) for value in origin)
+    projected_x = []
+    projected_y = []
+    for x in (values[0], values[1]):
+        for y in (values[2], values[3]):
+            for z in (values[4], values[5]):
+                point = (x - origin[0], y - origin[1], z - origin[2])
+                projected_x.append(sum(point[i] * x_axis[i] for i in range(3)))
+                projected_y.append(sum(point[i] * y_axis[i] for i in range(3)))
+
+    return (
+        min(projected_x) - margin,
+        max(projected_x) + margin,
+        min(projected_y) - margin,
+        max(projected_y) + margin,
+    )
 
 
 def build_grid_actor(
@@ -30,6 +87,7 @@ def build_grid_actor(
     opacity: float = 0.40,
     origin: tuple = (0.0, 0.0, 0.0),
     normal: tuple = None,
+    extents: tuple | None = None,
 ) -> vtk.vtkActor:
     """
     Return a VTK actor that draws a uniform grid on *plane* centred at origin.
@@ -49,7 +107,36 @@ def build_grid_actor(
         cell.GetPointIds().SetId(1, i2)
         lines.InsertNextCell(cell)
 
-    if normal is None:
+    if extents is not None:
+        x_min, x_max, y_min, y_max = (float(value) for value in extents)
+        x_min = math.floor(x_min / spacing) * spacing
+        x_max = math.ceil(x_max / spacing) * spacing
+        y_min = math.floor(y_min / spacing) * spacing
+        y_max = math.ceil(y_max / spacing) * spacing
+        x_axis, y_axis = plane_basis_from_normal(
+            normal if normal is not None else {
+                "XY": (0.0, 0.0, 1.0),
+                "XZ": (0.0, 1.0, 0.0),
+                "YZ": (1.0, 0.0, 0.0),
+            }.get(plane, (0.0, 0.0, 1.0))
+        )
+        o = np.asarray(origin, dtype=float)
+
+        def world_point(u, v):
+            point = o + u * np.asarray(x_axis) + v * np.asarray(y_axis)
+            return tuple(point)
+
+        first_x = math.ceil(x_min / spacing)
+        last_x = math.floor(x_max / spacing)
+        first_y = math.ceil(y_min / spacing)
+        last_y = math.floor(y_max / spacing)
+        for index in range(first_y, last_y + 1):
+            v = index * spacing
+            add_line(world_point(x_min, v), world_point(x_max, v))
+        for index in range(first_x, last_x + 1):
+            u = index * spacing
+            add_line(world_point(u, y_min), world_point(u, y_max))
+    elif normal is None:
         # Standard planes
         for i in range(-n, n + 1):
             c = i * spacing
@@ -71,16 +158,7 @@ def build_grid_actor(
         # Arbitrary plane
         # Build local axes
         o = np.array(origin)
-        nrm = np.array(normal)
-        nrm = nrm / np.linalg.norm(nrm)
-        # Find a vector not parallel to nrm
-        if abs(nrm[2]) < 0.99:
-            v = np.array([0,0,1])
-        else:
-            v = np.array([0,1,0])
-        x_axis = np.cross(v, nrm)
-        x_axis = x_axis / np.linalg.norm(x_axis)
-        y_axis = np.cross(nrm, x_axis)
+        x_axis, y_axis = (np.asarray(axis) for axis in plane_basis_from_normal(normal))
         # Build grid in local 2D, then map to 3D
         for i in range(-n, n + 1):
             c = i * spacing

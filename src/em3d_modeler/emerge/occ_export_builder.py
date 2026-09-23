@@ -49,11 +49,13 @@ def _build_occ_box_shape(obj: Any) -> Any | None:
             if pkg == "OCP":
                 from OCP.gp import gp_Pnt
                 from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
-                return BRepPrimAPI_MakeBox(gp_Pnt(xmin, ymin, zmin), gp_Pnt(xmax, ymax, zmax)).Shape()
+                shape = BRepPrimAPI_MakeBox(gp_Pnt(xmin, ymin, zmin), gp_Pnt(xmax, ymax, zmax)).Shape()
+                return _apply_actor_transform(shape, obj)
 
             from OCC.Core.gp import gp_Pnt
             from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeBox
-            return BRepPrimAPI_MakeBox(gp_Pnt(xmin, ymin, zmin), gp_Pnt(xmax, ymax, zmax)).Shape()
+            shape = BRepPrimAPI_MakeBox(gp_Pnt(xmin, ymin, zmin), gp_Pnt(xmax, ymax, zmax)).Shape()
+            return _apply_actor_transform(shape, obj)
         except ImportError:
             continue
         except Exception:
@@ -128,25 +130,10 @@ def _build_occ_cylinder_shape(obj: Any) -> Any | None:
     try:
         radius = abs(float(getattr(obj, "radius")))
         height = abs(float(getattr(obj, "height")))
-        center = (
-            float(getattr(obj, "cx")),
-            float(getattr(obj, "cy")),
-            float(getattr(obj, "cz")),
-        )
-        axis = str(getattr(obj, "axis", "Z")).upper()
     except Exception:
         return None
     if radius <= 0.0 or height <= 0.0:
         return None
-
-    direction = {
-        "X": (1.0, 0.0, 0.0),
-        "Y": (0.0, 1.0, 0.0),
-        "Z": (0.0, 0.0, 1.0),
-    }.get(axis)
-    if direction is None:
-        return None
-    base = tuple(center[index] - 0.5 * height * direction[index] for index in range(3))
 
     for pkg in ("OCP", "OCC.Core"):
         try:
@@ -154,18 +141,20 @@ def _build_occ_cylinder_shape(obj: Any) -> Any | None:
                 from OCP.gp import gp_Ax2, gp_Dir, gp_Pnt
                 from OCP.BRepPrimAPI import BRepPrimAPI_MakeCylinder
                 axis_frame = gp_Ax2(
-                    gp_Pnt(*base),
-                    gp_Dir(*direction),
+                        gp_Pnt(0.0, -0.5 * height, 0.0),
+                        gp_Dir(0.0, 1.0, 0.0),
                 )
-                return BRepPrimAPI_MakeCylinder(axis_frame, radius, height).Shape()
+                shape = BRepPrimAPI_MakeCylinder(axis_frame, radius, height).Shape()
+                return _apply_actor_transform(shape, obj)
 
             from OCC.Core.gp import gp_Ax2, gp_Dir, gp_Pnt
             from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeCylinder
             axis_frame = gp_Ax2(
-                gp_Pnt(*base),
-                gp_Dir(*direction),
+                gp_Pnt(0.0, -0.5 * height, 0.0),
+                gp_Dir(0.0, 1.0, 0.0),
             )
-            return BRepPrimAPI_MakeCylinder(axis_frame, radius, height).Shape()
+            shape = BRepPrimAPI_MakeCylinder(axis_frame, radius, height).Shape()
+            return _apply_actor_transform(shape, obj)
         except ImportError:
             continue
         except Exception:
@@ -206,7 +195,8 @@ def _build_occ_cone_shape(obj: Any) -> Any | None:
                     gp_Pnt(*base),
                     gp_Dir(*direction),
                 )
-                return BRepPrimAPI_MakeCone(axis_frame, radius, 0.0, height).Shape()
+                shape = BRepPrimAPI_MakeCone(axis_frame, radius, 0.0, height).Shape()
+                return _apply_actor_transform(shape, obj)
 
             from OCC.Core.gp import gp_Ax2, gp_Dir, gp_Pnt
             from OCC.Core.BRepPrimAPI import BRepPrimAPI_MakeCone
@@ -214,7 +204,8 @@ def _build_occ_cone_shape(obj: Any) -> Any | None:
                 gp_Pnt(*base),
                 gp_Dir(*direction),
             )
-            return BRepPrimAPI_MakeCone(axis_frame, radius, 0.0, height).Shape()
+            shape = BRepPrimAPI_MakeCone(axis_frame, radius, 0.0, height).Shape()
+            return _apply_actor_transform(shape, obj)
         except ImportError:
             continue
         except Exception:

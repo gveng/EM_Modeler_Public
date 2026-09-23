@@ -25,7 +25,7 @@ from .em_objects import (
     EMObject, BoxObject, CylinderObject, ConeObject, SphereObject, MeshObject,
     PlateObject, PyramidObject, WedgeObject, TorusObject, EllipsoidObject
 )
-from .grid_actor import build_grid_actor, build_axes_widget
+from .grid_actor import build_grid_actor, build_axes_widget, project_bounds_to_plane
 
 _OBJECT_CLASSES = {
     "BoxObject":      BoxObject,
@@ -71,6 +71,8 @@ class SceneManager:
         self._grid_size    = 200.0
         self._grid_spacing = 10.0
         self._grid_plane   = "XY"
+        self._adaptive_grid = False
+        self._adaptive_grid_margin = 20.0
         self._rebuild_grid()
 
         # Renderer background
@@ -80,6 +82,7 @@ class SceneManager:
 
     # ─────────────────────────────────────────────────── grid
     def _rebuild_grid(self) -> None:
+        grid_visible = bool(self._grid_actor.GetVisibility()) if self._grid_actor else True
         if self._grid_actor:
             self.renderer.RemoveActor(self._grid_actor)
         # Determina origine e normale dal piano attivo
@@ -96,11 +99,42 @@ class SceneManager:
                 normal = None
             elif plane == "YZ" and normal == (1.0, 0.0, 0.0) and origin == (0.0, 0.0, 0.0):
                 normal = None
+        extents = None
+        if self._adaptive_grid and self.active_plane is not None:
+            projected = [
+                project_bounds_to_plane(
+                    obj.actor.GetBounds(),
+                    self.active_plane.origin,
+                    self.active_plane.normal,
+                    self._adaptive_grid_margin,
+                )
+                for obj in self.objects
+                if obj.is_visible() and getattr(obj, "actor", None) is not None
+            ]
+            projected = [bounds for bounds in projected if bounds is not None]
+            if projected:
+                extents = (
+                    min(bounds[0] for bounds in projected),
+                    max(bounds[1] for bounds in projected),
+                    min(bounds[2] for bounds in projected),
+                    max(bounds[3] for bounds in projected),
+                )
         self._grid_actor = build_grid_actor(
             self._grid_size, self._grid_spacing, plane,
-            origin=origin, normal=normal
+            origin=origin, normal=normal, extents=extents,
         )
+        self._grid_actor.SetVisibility(grid_visible)
         self.renderer.AddActor(self._grid_actor)
+
+    def set_adaptive_grid(self, enabled: bool, margin: float | None = None) -> None:
+        self._adaptive_grid = bool(enabled)
+        if margin is not None:
+            self._adaptive_grid_margin = max(0.0, float(margin))
+        self._rebuild_grid()
+
+    def refresh_adaptive_grid(self) -> None:
+        if self._adaptive_grid:
+            self._rebuild_grid()
 
     def update_grid(self, size: float, spacing: float, plane: str) -> None:
         self._grid_size    = size
@@ -121,6 +155,7 @@ class SceneManager:
         self.objects.append(obj)
         for actor in obj.all_actors:
             self.renderer.AddActor(actor)
+        self.refresh_adaptive_grid()
 
     def remove_object(self, obj: EMObject) -> None:
         if obj in self.objects:
@@ -131,6 +166,7 @@ class SceneManager:
                 self.selected = None
             if obj in self.selection:
                 self.selection.remove(obj)
+            self.refresh_adaptive_grid()
 
     def select(self, obj: Optional[EMObject]) -> None:
         """Single-select: deselects all, selects one."""
@@ -176,6 +212,7 @@ class SceneManager:
     def set_visibility(self, objects: List[EMObject], visible: bool) -> None:
         for o in objects:
             o.set_visible(visible)
+        self.refresh_adaptive_grid()
 
     # ─────────────────────────────────────────────────── reference planes
     def add_reference_plane(self, name: str, origin, normal,
