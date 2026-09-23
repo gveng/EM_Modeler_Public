@@ -32,6 +32,7 @@ _gmsh_dll = Path(sys.prefix) / "Lib" / "gmsh-4.14.dll"
 if _gmsh_dll.exists():
     _runtime_binaries.append((str(_gmsh_dll), "bin"))
 
+
 a = Analysis(
     ['D:\\\\Visual_Studio_Code\\\\EM_3D_Modeler\\\\src\\\\em3d_modeler\\\\main.py'],
     pathex=['D:\\\\Visual_Studio_Code\\\\EM_3D_Modeler\\\\src'],
@@ -52,7 +53,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='EM3D_Modeler_1.2.1_Beta',
+    name='EM3D_Modeler_1.2.6',
     debug=False,
     bootloader_ignore_signals=False,
     strip=False,
@@ -71,5 +72,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='EM3D_Modeler_1.2.1_Beta',
+    name='EM3D_Modeler_1.2.6',
 )

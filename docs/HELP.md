@@ -1,6 +1,6 @@
 # EM 3D Modeler Help
 
-Version: 1.2.5
+Version: 1.2.6
 Release Date: 2026-09-23
 
 ## 1. Overview
