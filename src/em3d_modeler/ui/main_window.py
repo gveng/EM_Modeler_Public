@@ -3188,7 +3188,6 @@ class MainWindow(QMainWindow):
             master_script = self._generate_simulation_assets(
                 show_progress=True,
                 force_script=True,
-                force_step_export=True,
             )
             if master_script:
                 script_path = self._write_cached_simulation_scripts()

@@ -1,6 +1,6 @@
 # EM 3D Modeler Help
 
-**Version 1.2.10** · Release date 2026-09-24
+**Version 1.3.0b1** · Release date 2026-09-24
 
 The complete, illustrated user guide is [HELP.html](HELP.html). It contains a linked contents panel, workflow instructions, troubleshooting, and genuine screenshots captured from the application's PySide6 widgets.
 
