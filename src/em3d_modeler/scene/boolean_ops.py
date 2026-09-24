@@ -549,8 +549,16 @@ def _decimate_polydata(poly: vtk.vtkPolyData, target_reduction: float) -> vtk.vt
     if not 0.0 < reduction <= 0.8:
         raise ValueError("Mesh reduction must be greater than 0 and at most 0.8")
 
+    clean = vtk.vtkCleanPolyData()
+    clean.SetInputData(poly)
+    clean.SetToleranceIsAbsolute(True)
+    clean.SetAbsoluteTolerance(0.0)
+    clean.ConvertLinesToPointsOff()
+    clean.ConvertPolysToLinesOff()
+    clean.Update()
+
     triangles = vtk.vtkTriangleFilter()
-    triangles.SetInputData(poly)
+    triangles.SetInputConnection(clean.GetOutputPort())
     triangles.PassLinesOff()
     triangles.PassVertsOff()
     triangles.Update()

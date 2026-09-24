@@ -25,6 +25,21 @@ def test_decimation_reduces_triangle_count_and_keeps_surface():
     assert result.GetBounds() == pytest.approx(source.GetBounds(), abs=0.03)
 
 
+def test_decimation_welds_split_normal_vertices_before_reducing():
+    source = _sphere()
+    normals = vtk.vtkPolyDataNormals()
+    normals.SetInputData(source)
+    normals.SplittingOn()
+    normals.SetFeatureAngle(0.0)
+    normals.Update()
+    split_mesh = normals.GetOutput()
+
+    result = _decimate_polydata(split_mesh, 0.35)
+
+    assert result.GetNumberOfPolys() <= split_mesh.GetNumberOfPolys() * 0.65 + 1
+    assert result.GetBounds() == pytest.approx(source.GetBounds(), abs=0.03)
+
+
 def test_fuse_many_applies_requested_reduction():
     first = MeshObject("First", _sphere(24))
     second = MeshObject("Second", _sphere(24))
