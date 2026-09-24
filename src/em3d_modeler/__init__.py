@@ -15,8 +15,8 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
 """EM 3D Modeler – 3D design environment with EMERGE integration."""
-__version__ = "1.2.8"
-__release_date__ = "2026-09-23"
+__version__ = "1.2.10"
+__release_date__ = "2026-09-24"
 __license__ = """Copyright (C) 2026 Gabriele Vittori
 
 This program is free software; you can redistribute it and/or modify
