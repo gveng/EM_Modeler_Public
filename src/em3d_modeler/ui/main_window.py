@@ -1799,10 +1799,26 @@ class MainWindow(QMainWindow):
                 self._info_bar.set_info(f"Boolean {label} cancelled.")
                 return
 
+        mesh_reduction = 0.0
+        if op == "fuse":
+            reduction_options = [f"{value}%" for value in range(0, 81, 5)]
+            reduction_choice, accepted = QInputDialog.getItem(
+                self,
+                "Simplify Fuse Mesh",
+                "Reduce result triangles by this percentage (0 keeps full detail):",
+                reduction_options,
+                0,
+                False,
+            )
+            if not accepted:
+                self._info_bar.set_info(f"Boolean {label} cancelled.")
+                return
+            mesh_reduction = int(reduction_choice[:-1]) / 100.0
+
         current_poly = None
         try:
             if op == "fuse":
-                current_poly = fuse_many(sel)
+                current_poly = fuse_many(sel, target_reduction=mesh_reduction)
             else:
                 current_poly = boolean_many(op, sel)
         except Exception as exc:
@@ -1819,6 +1835,7 @@ class MainWindow(QMainWindow):
             boolean_source_names=[o.name for o in ([base] + tools)],
         )
         result.source_objects = list([base] + tools)
+        result.boolean_mesh_reduction = mesh_reduction
         result.boolean_sources_data = [self._serialize_object_snapshot(o) for o in ([base] + tools)]
         result.refresh_appearance()
 
@@ -2579,7 +2596,14 @@ class MainWindow(QMainWindow):
                 )
                 continue
             try:
-                polydata = fuse_many(ordered_sources) if operation == "fuse" else boolean_many(operation, ordered_sources)
+                reduction = float(getattr(result, "boolean_mesh_reduction", 0.0) or 0.0)
+                if operation == "fuse":
+                    polydata = (
+                        fuse_many(ordered_sources, target_reduction=reduction)
+                        if reduction > 0.0 else fuse_many(ordered_sources)
+                    )
+                else:
+                    polydata = boolean_many(operation, ordered_sources)
                 self._replace_boolean_result_object(result, polydata, ordered_sources)
             except Exception as exc:
                 boolean_failures.add(id(result))

@@ -544,7 +544,33 @@ def boolean_many(op: str, objects: list["EMObject"]) -> vtk.vtkPolyData:
     return result
 
 
-def fuse_many(objects: list["EMObject"]) -> vtk.vtkPolyData:
+def _decimate_polydata(poly: vtk.vtkPolyData, target_reduction: float) -> vtk.vtkPolyData:
+    reduction = float(target_reduction)
+    if not 0.0 < reduction <= 0.8:
+        raise ValueError("Mesh reduction must be greater than 0 and at most 0.8")
+
+    triangles = vtk.vtkTriangleFilter()
+    triangles.SetInputData(poly)
+    triangles.PassLinesOff()
+    triangles.PassVertsOff()
+    triangles.Update()
+
+    decimator = vtk.vtkDecimatePro()
+    decimator.SetInputConnection(triangles.GetOutputPort())
+    decimator.SetTargetReduction(reduction)
+    decimator.PreserveTopologyOn()
+    decimator.SplittingOff()
+    decimator.BoundaryVertexDeletionOff()
+    decimator.Update()
+
+    result = vtk.vtkPolyData()
+    result.DeepCopy(decimator.GetOutput())
+    if result.GetNumberOfPolys() == 0:
+        raise RuntimeError("Mesh decimation produced an empty result")
+    return _postprocess(result)
+
+
+def fuse_many(objects: list["EMObject"], target_reduction: float = 0.0) -> vtk.vtkPolyData:
     """Fuse 2..N objects into one polydata.
 
     Uses sequential boolean union first; if a step fails, falls back to
@@ -552,11 +578,17 @@ def fuse_many(objects: list["EMObject"]) -> vtk.vtkPolyData:
     """
     if len(objects) < 2:
         raise ValueError("Select at least 2 objects for fuse")
+    reduction = float(target_reduction)
+    if not 0.0 <= reduction <= 0.8:
+        raise ValueError("Mesh reduction must be between 0 and 0.8")
+
+    def finish(poly: vtk.vtkPolyData) -> vtk.vtkPolyData:
+        return _decimate_polydata(poly, reduction) if reduction > 0.0 else _postprocess(poly)
 
     if not all(type(obj).__name__ in {"BoxObject", "PlateObject"} for obj in objects):
         occ_result = _occ_boolean("fuse", objects)
         if occ_result is not None:
-            return _postprocess(occ_result)
+            return finish(occ_result)
 
     # Extract and validate all polydata upfront
     world_polys = []
@@ -573,7 +605,7 @@ def fuse_many(objects: list["EMObject"]) -> vtk.vtkPolyData:
 
     box_fuse = _fuse_axis_aligned_boxes(world_polys)
     if box_fuse is not None:
-        return _postprocess(box_fuse)
+        return finish(box_fuse)
 
     current = world_polys[0]
     for idx, nxt in enumerate(world_polys[1:], start=1):
@@ -601,6 +633,6 @@ def fuse_many(objects: list["EMObject"]) -> vtk.vtkPolyData:
                     f"Boolean fuse failed at step {idx} and append fallback also produced empty result. "
                     f"Original error: {str(e)}"
                 )
-            return _postprocess(result)
+                return finish(result)
 
-    return _postprocess(current)
+            return finish(current)

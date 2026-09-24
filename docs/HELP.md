@@ -23,3 +23,7 @@ The complete, illustrated user guide is [HELP.html](HELP.html). It contains a li
 - Far-field outputs save field data; use **Generate Plot** on saved results. They are not rendered by the ordinary automatic S-parameter plotting step.
 
 To regenerate genuine help screenshots, see [SNAPSHOT_CAPTURE.md](SNAPSHOT_CAPTURE.md).
+
+## Fuse mesh simplification
+
+When running **Fuse**, enter a target triangle reduction from 0% to 80% in 5% steps. The default, 0%, keeps full detail. A non-zero value simplifies only the resulting mesh, is saved with the Boolean result, and is reapplied when that result is recomputed. Its STEP export uses the simplified mesh rather than rebuilding the exact source BREP. Simplification can change dimensions and small features; inspect clearances, via connections, and port contact before simulation. The target is a reduction request, so topology-preserving decimation may achieve less on difficult meshes.

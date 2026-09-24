@@ -812,13 +812,16 @@ def build_occ_shape_for_export(obj: Any, cache: Dict[str, Any] | None = None, de
     if oid in cache:
         return cache[oid]
 
-    # Prefer reconstructing boolean outputs from their source objects.
-    boolean_shape = _boolean_from_sources(obj, cache=cache, depth=depth)
-    if boolean_shape is None:
-        boolean_shape = _boolean_from_source_data(obj, cache=cache, depth=depth)
-    if boolean_shape is not None:
-        cache[oid] = boolean_shape
-        return boolean_shape
+    # Reduced Boolean results must export their stored mesh, not rebuild the
+    # exact source BREP and silently discard the requested simplification.
+    reduced_boolean_mesh = float(getattr(obj, "boolean_mesh_reduction", 0.0) or 0.0) > 0.0
+    if not reduced_boolean_mesh:
+        boolean_shape = _boolean_from_sources(obj, cache=cache, depth=depth)
+        if boolean_shape is None:
+            boolean_shape = _boolean_from_source_data(obj, cache=cache, depth=depth)
+        if boolean_shape is not None:
+            cache[oid] = boolean_shape
+            return boolean_shape
 
     # Support direct OCC export for primitive solids without mesh roundtrip.
     obj_type = type(obj).__name__

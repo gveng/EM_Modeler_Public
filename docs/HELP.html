@@ -93,7 +93,7 @@
 <h3>Boolean</h3>
 <table><thead><tr><th class="toolbar-icon-column">Icon / control</th><th>Action</th></tr></thead><tbody>
 <tr><td><span class="toolbar-icon" role="img" aria-label="Cut icon" style="background-position:-267px -22px"></span></td><td><strong>Cut:</strong> subtract the later-selected tool object(s) from the first selected base.</td></tr>
-<tr><td><span class="toolbar-icon" role="img" aria-label="Fuse icon" style="background-position:-303px -22px"></span></td><td><strong>Fuse:</strong> union selected objects. The adjacent <strong>Fuse: n selected</strong> text reports the current selection count; it is a status label, not a command.</td></tr>
+<tr><td><span class="toolbar-icon" role="img" aria-label="Fuse icon" style="background-position:-303px -22px"></span></td><td><strong>Fuse:</strong> union selected objects, then choose an optional target triangle reduction from 0% to 80%. The adjacent <strong>Fuse: n selected</strong> text reports the current selection count; it is a status label, not a command.</td></tr>
 <tr><td><span class="toolbar-icon" role="img" aria-label="Common icon" style="background-position:-337px -22px"></span></td><td><strong>Common:</strong> keep the intersection shared by the selected objects.</td></tr>
 </tbody></table>
 <h3>Transform</h3>
@@ -154,7 +154,7 @@
 <section class="section" id="booleans">
 <div class="section-head"><h2>Boolean operations</h2><a class="top" href="#top">Back to contents ↑</a></div>
 <table><thead><tr><th>Operation</th><th>Result</th></tr></thead><tbody><tr><td><strong>Cut</strong></td><td>Subtracts each tool from the first selected object (the base).</td></tr><tr><td><strong>Fuse</strong></td><td>Combines selected bodies into one result.</td></tr><tr><td><strong>Common</strong></td><td>Keeps only the shared volume.</td></tr></tbody></table>
-<p>Select the base first, then one or more tools; selection order matters for Cut. Confirm whether tool objects should remain when prompted. The result replaces the base and is stored as a Boolean-derived mesh. <strong>Dissolve Boolean</strong> can restore its source objects when source data is available.</p>
+<p>Select the base first, then one or more tools; selection order matters for Cut. Confirm whether tool objects should remain when prompted. Fuse asks for a target triangle reduction from 0% to 80% in 5% steps; the default 0% preserves full detail. A non-zero reduction affects only the result mesh, is saved with the Boolean result, and is reapplied on recompute. Its STEP export uses that stored mesh instead of rebuilding the exact source BREP. Simplification can change dimensions and small features, so check clearances, via connections, and port contact before simulation. Topology-preserving decimation may achieve less than the requested reduction on difficult meshes. The result replaces the base and is stored as a Boolean-derived mesh. <strong>Dissolve Boolean</strong> can restore its source objects when source data is available.</p>
 <div class="callout"><strong>When a Boolean fails:</strong> confirm that the solids overlap as intended, use valid closed solids where possible, and try fewer tools at once. Imported STEP geometry that is non-manifold or coincident may need repair in the source CAD application.</div>
 </section>
 

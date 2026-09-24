@@ -1172,6 +1172,7 @@ class MeshObject(EMObject):
         self.step_export_offset = (0.0, 0.0, 0.0)
         self.source_objects: List[EMObject] = []
         self.boolean_op = str(boolean_op or "").strip().lower() or None
+        self.boolean_mesh_reduction = 0.0
         self.boolean_source_names = [str(x) for x in (boolean_source_names or []) if str(x)]
         self.boolean_sources_data = [x for x in (boolean_sources_data or []) if isinstance(x, dict)]
         super().__init__(name or _auto_name("Mesh"), material)
@@ -1208,6 +1209,8 @@ class MeshObject(EMObject):
             p["StepExportOffset"] = [float(ox), float(oy), float(oz)]
         if self.boolean_op:
             p["BooleanOperation"] = str(self.boolean_op)
+        if self.boolean_mesh_reduction > 0.0:
+            p["BooleanMeshReduction"] = float(self.boolean_mesh_reduction)
         if self.boolean_source_names:
             p["BooleanSourceNames"] = list(self.boolean_source_names)
         if self.boolean_sources_data:
@@ -1231,6 +1234,11 @@ class MeshObject(EMObject):
             except Exception:
                 pass
         self.boolean_op = str(params.get("BooleanOperation", self.boolean_op or "")).strip().lower() or None
+        try:
+            reduction = float(params.get("BooleanMeshReduction", self.boolean_mesh_reduction))
+            self.boolean_mesh_reduction = reduction if 0.0 <= reduction <= 0.8 else 0.0
+        except (TypeError, ValueError):
+            self.boolean_mesh_reduction = 0.0
         names = params.get("BooleanSourceNames", self.boolean_source_names)
         if isinstance(names, list):
             self.boolean_source_names = [str(x) for x in names if str(x)]
