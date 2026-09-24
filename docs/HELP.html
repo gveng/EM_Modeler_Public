@@ -22,7 +22,7 @@
   <div class="eyebrow">EM 3D Modeler · User documentation</div>
   <h1>Build the model.<br>Prepare the simulation.</h1>
   <p>A practical guide to the desktop workspace, geometry tools, project setup, EMERGE export and result plotting. UI screenshots below are genuine captures of the application's Qt widgets populated with reproducible example values.</p>
-  <div class="version">Version 1.3.0b1 · Release date 2026-09-24</div>
+  <div class="version">Version 1.3.0b2 · Release date 2026-09-24</div>
 </header>
 <div class="layout">
 <nav class="toc" aria-label="Contents">
@@ -93,7 +93,7 @@
 <h3>Boolean</h3>
 <table><thead><tr><th class="toolbar-icon-column">Icon / control</th><th>Action</th></tr></thead><tbody>
 <tr><td><span class="toolbar-icon" role="img" aria-label="Cut icon" style="background-position:-267px -22px"></span></td><td><strong>Cut:</strong> subtract the later-selected tool object(s) from the first selected base.</td></tr>
-<tr><td><span class="toolbar-icon" role="img" aria-label="Fuse icon" style="background-position:-303px -22px"></span></td><td><strong>Fuse:</strong> union selected objects, then choose an optional target triangle reduction from 0% to 80%. The adjacent <strong>Fuse: n selected</strong> text reports the current selection count; it is a status label, not a command.</td></tr>
+<tr><td><span class="toolbar-icon" role="img" aria-label="Fuse icon" style="background-position:-303px -22px"></span></td><td><strong>Fuse:</strong> union selected objects. When mesh decimation is enabled in <strong>Settings → Utility</strong>, choose an optional target triangle reduction from 0% to 80%. The adjacent <strong>Fuse: n selected</strong> text reports the current selection count; it is a status label, not a command.</td></tr>
 <tr><td><span class="toolbar-icon" role="img" aria-label="Common icon" style="background-position:-337px -22px"></span></td><td><strong>Common:</strong> keep the intersection shared by the selected objects.</td></tr>
 </tbody></table>
 <h3>Transform</h3>
@@ -154,7 +154,7 @@
 <section class="section" id="booleans">
 <div class="section-head"><h2>Boolean operations</h2><a class="top" href="#top">Back to contents ↑</a></div>
 <table><thead><tr><th>Operation</th><th>Result</th></tr></thead><tbody><tr><td><strong>Cut</strong></td><td>Subtracts each tool from the first selected object (the base).</td></tr><tr><td><strong>Fuse</strong></td><td>Combines selected bodies into one result.</td></tr><tr><td><strong>Common</strong></td><td>Keeps only the shared volume.</td></tr></tbody></table>
-<p>Select the base first, then one or more tools; selection order matters for Cut. Confirm whether tool objects should remain when prompted. Fuse asks for a target triangle reduction from 0% to 80% in 5% steps; the default 0% preserves full detail. A non-zero reduction affects only the result mesh, is saved with the Boolean result, and is reapplied on recompute. Its STEP export uses that stored mesh instead of rebuilding the exact source BREP. Simplification can change dimensions and small features, so check clearances, via connections, and port contact before simulation. Topology-preserving decimation may achieve less than the requested reduction on difficult meshes. The result replaces the base and is stored as a Boolean-derived mesh. <strong>Dissolve Boolean</strong> can restore its source objects when source data is available.</p>
+<p>Select the base first, then one or more tools; selection order matters for Cut. Confirm whether tool objects should remain when prompted. In <strong>Settings → Utility</strong>, enable <strong>Ask for mesh decimation on Fuse, Cut and Intersect</strong> to request a target triangle reduction from 0% to 80% in 5% steps for each command; when disabled, no prompt appears and reduction is 0%. A non-zero reduction affects only the result mesh, is saved with the Boolean result, and is reapplied on recompute. STEP export uses that stored mesh instead of rebuilding the exact source BREP. Simplification can change dimensions and small features, so check clearances, via connections, and port contact before simulation. Topology-preserving decimation may achieve less than the requested reduction on difficult meshes. The result replaces the base and is stored as a Boolean-derived mesh. <strong>Dissolve Boolean</strong> can restore its source objects when source data is available.</p>
 <div class="callout"><strong>When a Boolean fails:</strong> confirm that the solids overlap as intended, use valid closed solids where possible, and try fewer tools at once. Imported STEP geometry that is non-manifold or coincident may need repair in the source CAD application.</div>
 </section>
 
@@ -210,6 +210,7 @@
 <h3>Display</h3><p>Configure length units, decimal separator, workspace size, grid size, adaptive grid margin, plane-triad size and selection color. These settings affect drawing/display behavior, not the physical dimensions of saved geometry.</p>
 <h3>Simulation</h3><p>Choose a solver name, enable/disable parallel computation and set PARDISO and ACC thread counts. Optional post-run switches control automatic S-parameter plotting and Touchstone export where supported. A solver appearing in this list does not prove that its backend is installed; verify the EMERGE environment.</p>
 <h3>Mesh</h3><p>Set the global wavelength-fraction resolution and curved-boundary segmentation. Object-specific resolution and local refinement assignments are described in <a href="#mesh">Mesh and local refinement</a>.</p>
+<h3>Utility</h3><p><strong>Export complete scene STEP</strong> writes a separate STEP containing the complete scene when simulation assets are next prepared; it does not re-export the ordinary object bundle if unchanged. <strong>Ask for mesh decimation on Fuse, Cut and Intersect</strong> enables the per-operation triangle-reduction prompt. Both preferences are saved for future sessions.</p>
 </section>
 
 <section class="section" id="parameters">
@@ -283,7 +284,7 @@
 
 <section class="section" id="run">
 <div class="section-head"><h2>EMERGE Simulation window</h2><a class="top" href="#top">Back to contents ↑</a></div>
-<p>Click <strong>Play</strong> to prepare the EMERGE workflow and open the simulation window. Preparation regenerates the STEP bundle and enabled child scripts, saves the master and child scripts in the project <code>_EmergeSim</code> directory, and clears the visible run log.</p>
+<p>Click <strong>Play</strong> to prepare the EMERGE workflow and open the simulation window. Preparation reuses the STEP bundle when it is current, updates enabled child scripts, optionally exports the complete scene STEP when enabled in Settings → Utility, saves the master and child scripts in the project <code>_EmergeSim</code> directory, and clears the visible run log.</p>
 <table><thead><tr><th>Control</th><th>What it does</th></tr></thead><tbody>
 <tr><td><strong>Check Simulation</strong></td><td>Runs local validation only; it does not start a simulation.</td></tr>
 <tr><td><strong>Preview Export</strong></td><td>Previews meshing/export without committing a normal run.</td></tr>
@@ -307,10 +308,10 @@
 <table><thead><tr><th>Shortcut</th><th>Action</th></tr></thead><tbody><tr><td><kbd>Ctrl+N</kbd></td><td>New project</td></tr><tr><td><kbd>Ctrl+O</kbd></td><td>Open project</td></tr><tr><td><kbd>Ctrl+S</kbd></td><td>Save project</td></tr><tr><td><kbd>Ctrl+Z</kbd> / <kbd>Ctrl+Y</kbd></td><td>Undo / Redo</td></tr><tr><td><kbd>Delete</kbd></td><td>Delete selected objects</td></tr><tr><td><kbd>Esc</kbd></td><td>Cancel drawing or picking</td></tr><tr><td><kbd>Home</kbd></td><td>Reset camera</td></tr><tr><td><kbd>Ctrl+1</kbd>…<kbd>Ctrl+4</kbd></td><td>Standard camera views</td></tr><tr><td><kbd>Ctrl</kbd>-click</td><td>Multi-select in the Objects / Materials tree</td></tr></tbody></table>
 <h3>Common issues</h3><ul><li><strong>Boolean result is empty or wrong:</strong> verify selection order, solid overlap and valid closed geometry. Try a smaller operation.</li><li><strong>Preflight reports PML:</strong> configure an explicit PML shell, or choose supported PEC/PMC/Open/Radiation faces consistent with the domain.</li><li><strong>Port validation fails:</strong> confirm the assigned object is a suitable Plate; for a LumpedPort check two conductor contacts and a non-zero direction; for a WaveguidePort confirm the AIR end face.</li><li><strong>Plot is empty:</strong> confirm the job completed, the needed results/fields were saved and the chosen frequency is available.</li><li><strong>Solver cannot start:</strong> confirm the selected backend is installed and usable in the active EMERGE Python environment.</li></ul>
 <h3>Units at a glance</h3><p>Geometry inputs use the selected display length unit; exported geometry uses metres. Frequency inputs use GHz. Resistance uses ohms, conductivity uses S/m, angles use degrees, and local mesh sizes are entered in mm.</p>
-<p class="muted">This guide describes EM 3D Modeler 1.3.0b1. Optional solver behavior depends on the installed EMERGE environment. Genuine dialog and Project Tree screenshots are generated by <code>scripts/capture_help_screenshots.py</code>; see <a href="SNAPSHOT_CAPTURE.md">the capture instructions</a>.</p>
+<p class="muted">This guide describes EM 3D Modeler 1.3.0b2. Optional solver behavior depends on the installed EMERGE environment. Genuine dialog and Project Tree screenshots are generated by <code>scripts/capture_help_screenshots.py</code>; see <a href="SNAPSHOT_CAPTURE.md">the capture instructions</a>.</p>
 </section>
 </main>
 </div>
-<footer>EM 3D Modeler · Help version 1.3.0b1 · <a href="#top">Return to the top</a></footer>
+<footer>EM 3D Modeler · Help version 1.3.0b2 · <a href="#top">Return to the top</a></footer>
 </body>
 </html>

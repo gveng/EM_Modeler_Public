@@ -214,6 +214,21 @@ class SettingsDialog(QDialog):
         self._refinement_max_size_spin.setSuffix(" mm")
         mesh_form.addRow("Maximum size", self._refinement_max_size_spin)
 
+        self._utility_tab = QWidget(self)
+        self._tabs.addTab(self._utility_tab, "Utility")
+        utility_layout = QVBoxLayout(self._utility_tab)
+        self._export_full_scene_step_check = QCheckBox(
+            "Export complete scene STEP",
+            self._utility_tab,
+        )
+        utility_layout.addWidget(self._export_full_scene_step_check)
+        self._boolean_decimation_check = QCheckBox(
+            "Ask for mesh decimation on Fuse, Cut and Intersect",
+            self._utility_tab,
+        )
+        utility_layout.addWidget(self._boolean_decimation_check)
+        utility_layout.addStretch(1)
+
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
@@ -302,6 +317,8 @@ class SettingsDialog(QDialog):
         refinement_max_size_mm: float = 0.0,
         plot_sparams_after_sim: bool = True,
         export_sparams_after_sim: bool = True,
+        export_full_scene_step: bool = False,
+        boolean_decimation_enabled: bool = False,
     ) -> None:
         self._units_combo.setCurrentText(units)
         self._current_units = units
@@ -341,6 +358,8 @@ class SettingsDialog(QDialog):
         self._refinement_face_size_spin.setValue(float(refinement_face_size_mm))
         self._refinement_growth_rate_spin.setValue(float(refinement_growth_rate))
         self._refinement_max_size_spin.setValue(float(refinement_max_size_mm))
+        self._export_full_scene_step_check.setChecked(bool(export_full_scene_step))
+        self._boolean_decimation_check.setChecked(bool(boolean_decimation_enabled))
 
     def values(self) -> dict:
         color_name = self._selection_color_combo.currentText()
@@ -365,4 +384,6 @@ class SettingsDialog(QDialog):
             "refinement_max_size_mm": float(self._refinement_max_size_spin.value()),
             "plot_sparams_after_sim": bool(self._plot_sparams_check.isChecked()),
             "export_sparams_after_sim": bool(self._export_sparams_check.isChecked()),
+            "export_full_scene_step": bool(self._export_full_scene_step_check.isChecked()),
+            "boolean_decimation_enabled": bool(self._boolean_decimation_check.isChecked()),
         }

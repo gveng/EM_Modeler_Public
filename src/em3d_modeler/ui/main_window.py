@@ -261,6 +261,9 @@ class MainWindow(QMainWindow):
         self._sim_script_dirty = True
         self._sim_step_bundle_ready = False
         self._sim_step_bundle_cache: dict = {"entries": [], "skipped": []}
+        self._sim_full_scene_step_dirty = True
+        self._export_full_scene_step = False
+        self._boolean_decimation_enabled = False
         self._sim_cached_script = ""
         self._sim_cached_script_bundle: dict = {"master": "", "scripts": []}
         self._sim_log_verbosity = "INFO"
@@ -703,6 +706,7 @@ class MainWindow(QMainWindow):
         if steps:
             self._sim_steps_dirty = True
             self._sim_step_bundle_ready = False
+            self._sim_full_scene_step_dirty = True
         if script:
             self._sim_script_dirty = True
 
@@ -1800,11 +1804,11 @@ class MainWindow(QMainWindow):
                 return
 
         mesh_reduction = 0.0
-        if op == "fuse":
+        if self._boolean_decimation_enabled:
             reduction_options = [f"{value}%" for value in range(0, 81, 5)]
             reduction_choice, accepted = QInputDialog.getItem(
                 self,
-                "Simplify Fuse Mesh",
+            f"Simplify {label} Mesh",
                 "Reduce result triangles by this percentage (0 keeps full detail):",
                 reduction_options,
                 0,
@@ -1819,6 +1823,8 @@ class MainWindow(QMainWindow):
         try:
             if op == "fuse":
                 current_poly = fuse_many(sel, target_reduction=mesh_reduction)
+            elif mesh_reduction > 0.0:
+                current_poly = boolean_many(op, sel, target_reduction=mesh_reduction)
             else:
                 current_poly = boolean_many(op, sel)
         except Exception as exc:
@@ -2601,6 +2607,12 @@ class MainWindow(QMainWindow):
                     polydata = (
                         fuse_many(ordered_sources, target_reduction=reduction)
                         if reduction > 0.0 else fuse_many(ordered_sources)
+                    )
+                elif reduction > 0.0:
+                    polydata = boolean_many(
+                        operation,
+                        ordered_sources,
+                        target_reduction=reduction,
                     )
                 else:
                     polydata = boolean_many(operation, ordered_sources)
@@ -3740,6 +3752,10 @@ class MainWindow(QMainWindow):
         )
 
         need_step_export = force_step_export or self._sim_steps_dirty or (not self._sim_step_bundle_ready)
+        need_full_scene_step_export = bool(
+            getattr(self, "_export_full_scene_step", False)
+            and (getattr(self, "_sim_full_scene_step_dirty", True) or need_step_export)
+        )
 
         if show_progress and need_step_export and total_candidates > 0:
             progress = QProgressDialog("Exporting STEP objects...", "Cancel", 0, total_candidates, self)
@@ -3822,26 +3838,28 @@ class MainWindow(QMainWindow):
             else:
                 bundle = self._sim_step_bundle_cache
 
-            safe_project_name = "".join(
-                char if char.isalnum() or char in ("-", "_") else "_"
-                for char in self._project_name
-            ) or "Project"
-            debug_step_path = self._simulation_bundle_dir() / f"{safe_project_name}_Debug_All.step"
-            try:
-                debug_result = export_debug_scene_step(
-                    objects=sim_objects,
-                    step_path=debug_step_path,
-                    log_callback=lambda level, message: self._append_step_export_log(
-                        f"[{level.lower()}] {message}", level=self._normalize_log_level(level)
-                    ),
-                )
-                self._append_sim_log(
-                    f"[info] Debug STEP exported: {debug_result['exported']} object(s) to {debug_step_path}"
-                )
-            except Exception as exc:
-                warning = f"[warn] Debug STEP export failed: {exc}"
-                self._append_sim_log(warning)
-                self._append_step_export_log(warning, level="WARNING")
+            if need_full_scene_step_export:
+                safe_project_name = "".join(
+                    char if char.isalnum() or char in ("-", "_") else "_"
+                    for char in self._project_name
+                ) or "Project"
+                debug_step_path = self._simulation_bundle_dir() / f"{safe_project_name}_Debug_All.step"
+                try:
+                    debug_result = export_debug_scene_step(
+                        objects=sim_objects,
+                        step_path=debug_step_path,
+                        log_callback=lambda level, message: self._append_step_export_log(
+                            f"[{level.lower()}] {message}", level=self._normalize_log_level(level)
+                        ),
+                    )
+                    self._append_sim_log(
+                        f"[info] Complete scene STEP exported: {debug_result['exported']} object(s) to {debug_step_path}"
+                    )
+                    self._sim_full_scene_step_dirty = False
+                except Exception as exc:
+                    warning = f"[warn] Debug STEP export failed: {exc}"
+                    self._append_sim_log(warning)
+                    self._append_step_export_log(warning, level="WARNING")
 
             need_script = force_script or self._sim_script_dirty or (not self._sim_cached_script_bundle.get("master", ""))
 
@@ -4485,6 +4503,16 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        try:
+            self._export_full_scene_step = bool(int(settings.value("utility/export_full_scene_step", 0)))
+        except Exception:
+            pass
+
+        try:
+            self._boolean_decimation_enabled = bool(int(settings.value("utility/boolean_decimation_enabled", 0)))
+        except Exception:
+            pass
+
     def _save_app_settings(self) -> None:
         settings = QSettings()
         settings.setValue("display/units", self._units)
@@ -4512,6 +4540,8 @@ class MainWindow(QMainWindow):
         settings.setValue("mesh/refinement_max_size_mm", float(self._refinement_max_size_mm))
         settings.setValue("simulation/plot_sparams_after_sim", int(self._sim_plot_sparams_after_sim))
         settings.setValue("simulation/export_sparams_after_sim", int(self._sim_export_sparams_after_sim))
+        settings.setValue("utility/export_full_scene_step", int(self._export_full_scene_step))
+        settings.setValue("utility/boolean_decimation_enabled", int(self._boolean_decimation_enabled))
         settings.sync()
 
     def _sync_settings_dialog_values(self) -> None:
@@ -4539,6 +4569,8 @@ class MainWindow(QMainWindow):
             refinement_max_size_mm=self._refinement_max_size_mm,
             plot_sparams_after_sim=self._sim_plot_sparams_after_sim,
             export_sparams_after_sim=self._sim_export_sparams_after_sim,
+            export_full_scene_step=self._export_full_scene_step,
+            boolean_decimation_enabled=self._boolean_decimation_enabled,
         )
 
     def _apply_display_settings(self, values: dict) -> None:
@@ -4553,6 +4585,7 @@ class MainWindow(QMainWindow):
         old_locale = self._ui_locale
         old_mesh_resolution = self._mesh_resolution
         old_curved_boundary_resolution = self._curved_boundary_resolution
+        old_export_full_scene_step = self._export_full_scene_step
 
         self._units = units
         self._decimal_separator = decimal_separator
@@ -4583,6 +4616,10 @@ class MainWindow(QMainWindow):
         self._refinement_max_size_mm = max(0.0, float(values.get("refinement_max_size_mm", self._refinement_max_size_mm)))
         self._sim_plot_sparams_after_sim = bool(values.get("plot_sparams_after_sim", self._sim_plot_sparams_after_sim))
         self._sim_export_sparams_after_sim = bool(values.get("export_sparams_after_sim", self._sim_export_sparams_after_sim))
+        self._export_full_scene_step = bool(values.get("export_full_scene_step", self._export_full_scene_step))
+        self._boolean_decimation_enabled = bool(values.get("boolean_decimation_enabled", self._boolean_decimation_enabled))
+        if self._export_full_scene_step and not old_export_full_scene_step:
+            self._sim_full_scene_step_dirty = True
         self._project_tree.set_runtime_settings({
             "solver": self._sim_solver,
             "parallel_enabled": self._sim_parallel_enabled,
@@ -4624,7 +4661,7 @@ class MainWindow(QMainWindow):
         self._sync_settings_dialog_values()
         if dlg.exec_() == QDialog.Accepted:
             self._apply_display_settings(dlg.values())
-            self._info_bar.set_info("Display settings updated.")
+            self._info_bar.set_info("Application settings updated.")
 
     def _on_units_changed(self, units: str) -> None:
         workspace_size = self._workspace_size

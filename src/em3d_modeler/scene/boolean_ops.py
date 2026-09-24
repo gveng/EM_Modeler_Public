@@ -519,14 +519,24 @@ def boolean(op: str, a: "EMObject", b: "EMObject") -> vtk.vtkPolyData:
         ) from error
 
 
-def boolean_many(op: str, objects: list["EMObject"]) -> vtk.vtkPolyData:
+def boolean_many(
+    op: str,
+    objects: list["EMObject"],
+    target_reduction: float = 0.0,
+) -> vtk.vtkPolyData:
     """Apply one boolean operation to original base and tool objects together."""
     if len(objects) < 2:
         raise ValueError("Select at least two objects for a boolean operation")
+    reduction = float(target_reduction)
+    if not 0.0 <= reduction <= 0.8:
+        raise ValueError("Mesh reduction must be between 0 and 0.8")
+
+    def finish(poly: vtk.vtkPolyData) -> vtk.vtkPolyData:
+        return _decimate_polydata(poly, reduction) if reduction > 0.0 else poly
 
     occ_result = _occ_boolean(op, objects)
     if occ_result is not None:
-        return _postprocess(occ_result)
+        return finish(_postprocess(occ_result))
 
     current = objects[0]
     result = None
@@ -541,7 +551,7 @@ def boolean_many(op: str, objects: list["EMObject"]) -> vtk.vtkPolyData:
             )
     if result is None:
         raise RuntimeError(f"Boolean '{op}' produced no result")
-    return result
+    return finish(result)
 
 
 def _decimate_polydata(poly: vtk.vtkPolyData, target_reduction: float) -> vtk.vtkPolyData:

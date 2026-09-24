@@ -1,8 +1,9 @@
 import pytest
 import vtk
+from unittest.mock import Mock
 
 from em3d_modeler.emerge.occ_export_builder import build_occ_shape_for_export
-from em3d_modeler.scene.boolean_ops import _decimate_polydata, fuse_many
+from em3d_modeler.scene.boolean_ops import _decimate_polydata, boolean_many, fuse_many
 from em3d_modeler.scene.em_objects import MeshObject
 
 
@@ -52,6 +53,21 @@ def test_fuse_many_applies_requested_reduction():
     result = fuse_many([first, second], target_reduction=0.5)
 
     assert 0 < result.GetNumberOfPolys() < original_polys
+
+
+@pytest.mark.parametrize("operation", ["fuse", "cut", "common"])
+def test_boolean_many_applies_requested_reduction(operation, monkeypatch):
+    source = _sphere(12)
+    result = vtk.vtkPolyData()
+    decimator = Mock(return_value=result)
+    monkeypatch.setattr("em3d_modeler.scene.boolean_ops._occ_boolean", lambda op, objects: source)
+    monkeypatch.setattr("em3d_modeler.scene.boolean_ops._postprocess", lambda poly: poly)
+    monkeypatch.setattr("em3d_modeler.scene.boolean_ops._decimate_polydata", decimator)
+
+    actual = boolean_many(operation, [object(), object()], target_reduction=0.35)
+
+    assert actual is result
+    decimator.assert_called_once_with(source, 0.35)
 
 
 @pytest.mark.parametrize("reduction", [0.0, -0.1, 0.81, 1.0])

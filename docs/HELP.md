@@ -1,6 +1,6 @@
 # EM 3D Modeler Help
 
-**Version 1.3.0b1** · Release date 2026-09-24
+**Version 1.3.0b2** · Release date 2026-09-24
 
 The complete, illustrated user guide is [HELP.html](HELP.html). It contains a linked contents panel, workflow instructions, troubleshooting, and genuine screenshots captured from the application's PySide6 widgets.
 
@@ -24,6 +24,8 @@ The complete, illustrated user guide is [HELP.html](HELP.html). It contains a li
 
 To regenerate genuine help screenshots, see [SNAPSHOT_CAPTURE.md](SNAPSHOT_CAPTURE.md).
 
-## Fuse mesh simplification
+## Utility settings and Boolean mesh simplification
 
-When running **Fuse**, enter a target triangle reduction from 0% to 80% in 5% steps. The default, 0%, keeps full detail. A non-zero value simplifies only the resulting mesh, is saved with the Boolean result, and is reapplied when that result is recomputed. Its STEP export uses the simplified mesh rather than rebuilding the exact source BREP. Simplification can change dimensions and small features; inspect clearances, via connections, and port contact before simulation. The target is a reduction request, so topology-preserving decimation may achieve less on difficult meshes.
+In **Settings → Utility**, **Export complete scene STEP** enables a separate full-scene STEP export. Enabling it marks that export for the next simulation preparation; it does not force a re-export of the ordinary per-object STEP bundle when that bundle is already current.
+
+**Ask for mesh decimation on Fuse, Cut and Intersect** is off by default. When off, Boolean commands do not prompt and use 0% reduction. When on, each Fuse, Cut or Common (intersection) command asks for a target triangle reduction from 0% to 80% in 5% steps. A non-zero value simplifies the resulting mesh, is saved with the Boolean result, and is reapplied when that result is recomputed. STEP export uses the stored simplified mesh rather than rebuilding the exact source BREP. Simplification can change dimensions and small features; inspect clearances, via connections, and port contact before simulation. The target is a reduction request, so topology-preserving decimation may achieve less on difficult meshes.
