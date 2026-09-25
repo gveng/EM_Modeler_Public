@@ -17,6 +17,14 @@ box, a resolved dimension formula, and the Project Parameters editor. When
 `Main_window.png` is present in the output (or default snapshots) it also saves
 `toolbar-icons.png`, a crop of the actual toolbar rather than a recreated icon
 graphic.
+The embedded sketch-context toolbar is captured separately from the actual
+main window while sketch mode is active. Run only this capture with:
+
+```powershell
+python scripts/capture_help_screenshots.py --sketch-toolbar-only
+```
+
+It writes `toolbar-sketch-context.png` without regenerating the other screenshots.
 Use `--output-dir D:\path\to\folder` to choose another destination. PySide6
 and the application's normal Python dependencies must be installed.
 

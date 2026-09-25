@@ -7,7 +7,7 @@ The complete, illustrated user guide is [HELP.html](HELP.html). It contains a li
 ## Guide sections
 
 - Workspace, menus, viewport, selection, and project tree
-- Geometry creation, embedded and parametric sketches, exact segment lengths, transforms, patterns, STEP, and Boolean operations
+- Geometry creation, the embedded sketch editor and its icon-by-icon toolbar guide, transforms, patterns, STEP, and Boolean operations
 - Materials, object properties, formulas, and reference planes
 - Settings, project parameters, and mesh controls
 - Simulation jobs, ports, domains, boundaries, and local refinements
@@ -24,7 +24,7 @@ The complete, illustrated user guide is [HELP.html](HELP.html). It contains a li
 - If S-parameter fitting fails after a successful solve, the raw Touchstone samples are retained and automatic plots fall back to those samples; a fitted Touchstone file is not produced.
 - For a closed waveguide, an AIR containment error can indicate that open-region boundaries are enabled for an internal-air/PEC-wall model. Review the domain and boundary setup before changing geometry.
 
-To regenerate genuine help screenshots, see [SNAPSHOT_CAPTURE.md](SNAPSHOT_CAPTURE.md).
+To regenerate the embedded sketch toolbar screenshot by itself, run `python scripts/capture_help_screenshots.py --sketch-toolbar-only`. Other screenshot instructions are in [SNAPSHOT_CAPTURE.md](SNAPSHOT_CAPTURE.md).
 
 ## Utility settings and Boolean mesh simplification
 

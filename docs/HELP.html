@@ -32,7 +32,7 @@
     <li><a href="#workspace">Workspace and selection</a></li>
     <li><a href="#toolbar">Toolbar icon guide</a></li>
     <li><a href="#geometry">Create geometry</a></li>
-    <li><a href="#sketch">Parametric sketch</a></li>
+    <li><a href="#sketch">Embedded sketch editor</a></li>
     <li><a href="#transforms">Transforms and patterns</a></li>
     <li><a href="#booleans">Boolean operations</a></li>
     <li><a href="#materials">Objects and materials</a></li>
@@ -130,22 +130,57 @@
 <table><thead><tr><th>Tool family</th><th>Typical use</th><th>Next step</th></tr></thead><tbody>
 <tr><td><strong>Box, Cylinder, Cone, Sphere</strong></td><td>Basic solids positioned from viewport picks or editable numeric dimensions.</td><td>Inspect or edit dimensions in <a href="#materials">Body Properties</a>.</td></tr>
 <tr><td><strong>Plate / planar structure</strong></td><td>Thin conductive surfaces, including surfaces used for port assignments.</td><td>Assign material and simulation role; see <a href="#ports">Ports</a>.</td></tr>
-<tr><td><strong>Sketch</strong></td><td>Draw a 2D profile and turn it into an extruded or revolved object.</td><td>See <a href="#sketch">Parametric sketch</a>.</td></tr>
+<tr><td><strong>Sketch</strong></td><td>Draw and dimension a 2D profile directly in the viewport, then extrude, revolve or cut.</td><td>See <a href="#sketch">Embedded sketch editor</a>.</td></tr>
 <tr><td><strong>Import STEP</strong></td><td>Load CAD solids from <code>.step</code> or <code>.stp</code> files.</td><td>Review imported solids in Objects / Materials and assign materials.</td></tr>
 </tbody></table>
 <p>Primitive dimensions are editable after creation. Geometry display units are configured in <a href="#settings">Settings → Display</a>; exported EMERGE geometry uses metres.</p>
 </section>
 
 <section class="section" id="sketch">
-<div class="section-head"><h2>Parametric sketch</h2><a class="top" href="#top">Back to contents ↑</a></div>
-<figure class="shot"><img src="snapshots/dialog-sketch.png" alt="Genuine Sketch dialog showing drawing tools, profile canvas and solid creation controls"><figcaption><strong>Sketch dialog.</strong> Captured from the real application with a rectangular profile and circular inner feature.</figcaption></figure>
-<h3>Sketch directly in the viewport</h3>
-<p>Click <strong>Sketch</strong> to enter the embedded sketch editor. If a planar face is selected in Surface mode, that face supplies the plane; otherwise the active reference plane is used. If no plane is active, define one in the Reference Plane dialog first. The viewport aligns drawing to the sketch plane and the main toolbar is replaced by the sketch-context toolbar.</p>
-<p>Choose <strong>Line</strong> or <strong>Polyline</strong>, <strong>Corner Rectangle</strong> or <strong>Center Rectangle</strong>, <strong>Circle</strong>, <strong>3-Point Arc</strong> or <strong>Center Arc</strong>, then pick points in the viewport. <strong>Vertex Snap</strong> snaps new points to existing sketch vertices. <strong>Construction</strong> marks subsequently drawn geometry as construction geometry. Use <strong>Select</strong> to select entities and <strong>Delete</strong> to remove the selected entity and its dimensions.</p>
-<p>The <strong>Dimensions</strong> tools are <strong>Linear</strong>, <strong>Aligned</strong>, <strong>Angular</strong>, <strong>Radius</strong> and <strong>Diameter</strong>. Select the requested sketch references as prompted in the information bar. Linear/aligned and radius/diameter dimensions can set the referenced geometry; angular dimensions are measurement annotations, not solver constraints. <strong>Exit Sketch</strong> leaves sketch mode without creating or updating a 3D feature. To produce a solid or cut, choose <strong>Extrude</strong>, <strong>Revolve</strong> or <strong>Extruded Cut</strong> and follow the viewport prompts.</p>
+<div class="section-head"><h2>Embedded sketch editor</h2><a class="top" href="#top">Back to contents ↑</a></div>
+<figure class="shot"><img src="snapshots/toolbar-sketch-context.png" alt="Genuine screenshot of the embedded sketch toolbar with 3D, 2D, Dimensions, View and Edit icon groups"><figcaption><strong>Sketch-context toolbar.</strong> Captured from the running Qt main window while sketch mode is active. The groups are ordered left to right as listed below.</figcaption></figure>
+<p>Click <strong>Sketch</strong> to draw directly in the 3D viewport. A selected planar face in Surface selection mode supplies the sketch plane; otherwise the active reference plane is used. If no plane is active, the Reference Plane dialog opens first. The viewport aligns with the plane and replaces the main toolbar with the icon-only sketch toolbar. Hover over an icon to see its action name and tooltip. In each multi-row group, read icons left to right, then continue on the next row.</p>
+<h3>3D</h3>
+<table><thead><tr><th>Icon</th><th>Function</th></tr></thead><tbody>
+<tr><td><strong>Extrude</strong></td><td>Create or update a solid by extending a closed sketch profile along the sketch normal.</td></tr>
+<tr><td><strong>Revolve</strong></td><td>Revolve the profile around a sketch line selected as the axis; follow the viewport prompts.</td></tr>
+<tr><td><strong>Extruded Cut</strong></td><td>Subtract the sketch extrusion from exactly one selected base object.</td></tr>
+</tbody></table>
+<h3>2D</h3>
+<table><thead><tr><th>Icon</th><th>Function</th></tr></thead><tbody>
+<tr><td><strong>Line</strong></td><td>Draw one line segment by picking its two endpoints.</td></tr>
+<tr><td><strong>Polyline</strong></td><td>Pick successive vertices; press Enter or Escape to finish the polyline.</td></tr>
+<tr><td><strong>Corner Rectangle</strong></td><td>Draw a rectangle by picking two opposite corners.</td></tr>
+<tr><td><strong>Center Rectangle</strong></td><td>Draw a rectangle by picking its center and then one corner.</td></tr>
+<tr><td><strong>Construction</strong></td><td>Toggle construction geometry for newly drawn entities.</td></tr>
+<tr><td><strong>Vertex Snap</strong></td><td>Toggle snapping new drawing points to existing sketch vertices. It is enabled by default.</td></tr>
+<tr><td><strong>Circle</strong></td><td>Draw a circle by picking its center and a point on its radius.</td></tr>
+<tr><td><strong>3-Point Arc</strong></td><td>Draw an arc by picking its start, end and midpoint.</td></tr>
+<tr><td><strong>Center Arc</strong></td><td>Draw an arc by picking its center, start point and end angle.</td></tr>
+</tbody></table>
+<h3>Dimensions</h3>
+<table><thead><tr><th>Icon</th><th>Function</th></tr></thead><tbody>
+<tr><td><strong>Linear</strong></td><td>Dimension two sketch points along the dominant sketch axis.</td></tr>
+<tr><td><strong>Angular</strong></td><td>Measure the angle between two sketch lines. This is an annotation, not a solver constraint.</td></tr>
+<tr><td><strong>Radius</strong></td><td>Set or annotate the radius of a sketch circle or arc.</td></tr>
+<tr><td><strong>Diameter</strong></td><td>Set or annotate the diameter of a sketch circle or arc.</td></tr>
+<tr><td><strong>Aligned</strong></td><td>Dimension the true point-to-point distance, independent of the sketch axes.</td></tr>
+</tbody></table>
+<h3>View</h3>
+<table><thead><tr><th>Icon</th><th>Function</th></tr></thead><tbody>
+<tr><td><strong>Fit All</strong></td><td>Fit all visible objects in the viewport.</td></tr>
+<tr><td><strong>Fit Selection</strong></td><td>Fit the selected object or objects in the viewport.</td></tr>
+<tr><td><strong>Isometric View</strong></td><td>Switch to the standard isometric camera view.</td></tr>
+<tr><td><strong>Projection</strong></td><td>Toggle perspective and parallel projection; the checked state indicates parallel projection.</td></tr>
+</tbody></table>
+<h3>Edit</h3>
+<table><thead><tr><th>Icon</th><th>Function</th></tr></thead><tbody>
+<tr><td><strong>Select</strong></td><td>Switch to selecting or deselecting sketch entities.</td></tr>
+<tr><td><strong>Delete</strong></td><td>Delete the selected sketch entity and its associated dimensions.</td></tr>
+<tr><td><strong>Exit Sketch</strong></td><td>Leave sketch mode without creating or updating a 3D feature. Choose an operation in the 3D group to apply the profile.</td></tr>
+</tbody></table>
 <h3>Edit a saved sketch or feature</h3>
-<p>In <strong>Objects / Materials</strong>, right-click a sketch-definition child and choose <strong>Edit Sketch…</strong>. The scene is temporarily hidden to make the profile easier to edit. Run the relevant feature operation to update the associated object; leaving sketch mode with <strong>Exit Sketch</strong> does not apply a 3D operation. For an extrusion or revolution feature, right-click its operation child and choose <strong>Edit Extrude Operation…</strong> or <strong>Edit Revolve Operation…</strong>. The extrusion editor provides depth, <strong>Along sketch normal</strong>/<strong>Against sketch normal</strong> direction, and <strong>Both directions (total depth, centered)</strong>. When centered mode is enabled, depth is the total length and the direction selector is disabled. The revolve editor reopens the profile, sweep angle and axis controls.</p>
-<p>The separate <strong>Parametric Sketch</strong> window shown above is used when editing a saved Revolve feature. It loads that feature's profile and provides Line, Rectangle, Circle and Polyline tools, Undo/Clear, and a <strong>Segment lengths</strong> table: select a segment, enter a positive exact length, then click <strong>Set Length</strong>. Set the sweep angle or axis in the same window and choose <strong>Update Revolution</strong> to apply the changes.</p>
+<p>In <strong>Objects / Materials</strong>, right-click a sketch-definition child and choose <strong>Edit Sketch…</strong> to reopen the profile in the viewport; the scene is temporarily hidden while editing. Apply Extrude, Revolve or Extruded Cut to update/create the related feature. For an existing operation, use its child row's <strong>Edit Extrude Operation…</strong> or <strong>Edit Revolve Operation…</strong> action. The extrusion editor controls depth, direction and centered mode; the revolve editor controls the profile, sweep angle and axis.</p>
 </section>
 
 <section class="section" id="transforms">
@@ -319,7 +354,7 @@
 <table><thead><tr><th>Shortcut</th><th>Action</th></tr></thead><tbody><tr><td><kbd>Ctrl+N</kbd></td><td>New project</td></tr><tr><td><kbd>Ctrl+O</kbd></td><td>Open project</td></tr><tr><td><kbd>Ctrl+S</kbd></td><td>Save project</td></tr><tr><td><kbd>Ctrl+Z</kbd> / <kbd>Ctrl+Y</kbd></td><td>Undo / Redo</td></tr><tr><td><kbd>Delete</kbd></td><td>Delete selected objects</td></tr><tr><td><kbd>Esc</kbd></td><td>Cancel drawing or picking</td></tr><tr><td><kbd>Home</kbd></td><td>Reset camera</td></tr><tr><td><kbd>Ctrl+1</kbd>…<kbd>Ctrl+4</kbd>, <kbd>Ctrl+6</kbd></td><td>Standard camera views; Ctrl+6 shows Back, opposite Front (Ctrl+2)</td></tr><tr><td><kbd>Ctrl</kbd>-click</td><td>Multi-select in the Objects / Materials tree</td></tr></tbody></table>
 <h3>Common issues</h3><ul><li><strong>Boolean result is empty or wrong:</strong> verify selection order, solid overlap and valid closed geometry. Try a smaller operation.</li><li><strong>Preflight reports PML:</strong> configure an explicit PML shell, or choose supported PEC/PMC/Open/Radiation faces consistent with the domain.</li><li><strong>Port validation fails:</strong> confirm the assigned object is a suitable Plate; for a LumpedPort check two conductor contacts and a non-zero direction; for a WaveguidePort confirm the AIR end face.</li><li><strong>Plot is empty:</strong> confirm the job completed, the needed results/fields were saved and the chosen frequency is available.</li><li><strong>Solver cannot start:</strong> confirm the selected backend is installed and usable in the active EMERGE Python environment.</li></ul>
 <h3>Units at a glance</h3><p>Geometry inputs use the selected display length unit; exported geometry uses metres. Frequency inputs use GHz. Resistance uses ohms, conductivity uses S/m, angles use degrees, and local mesh sizes are entered in mm.</p>
-<p class="muted">This guide describes EM 3D Modeler 1.3.4b1. Optional solver behavior depends on the installed EMERGE environment. Genuine dialog and Project Tree screenshots are generated by <code>scripts/capture_help_screenshots.py</code>; see <a href="SNAPSHOT_CAPTURE.md">the capture instructions</a>.</p>
+<p class="muted">This guide describes EM 3D Modeler 1.3.4b1. Optional solver behavior depends on the installed EMERGE environment. Genuine dialog and Project Tree screenshots are generated by <code>scripts/capture_help_screenshots.py</code>. Capture the embedded sketch toolbar with <code>python scripts/capture_help_screenshots.py --sketch-toolbar-only</code>. See <a href="SNAPSHOT_CAPTURE.md">the capture instructions</a>.</p>
 </section>
 </main>
 </div>

@@ -222,7 +222,6 @@ def capture_dialogs(app, output_dir: Path) -> list[Path]:
     from em3d_modeler.ui.material_library_dialog import MaterialLibraryDialog, _MaterialEditorDialog
     from em3d_modeler.ui.reference_plane_dialog import ReferencePlaneDialog
     from em3d_modeler.ui.settings_dialog import SettingsDialog
-    from em3d_modeler.ui.sketch_widget import SketchDialog
 
     saved = []
 
@@ -242,17 +241,6 @@ def capture_dialogs(app, output_dir: Path) -> list[Path]:
         capture_widget(settings, path, app)
         saved.append(path)
     settings.close()
-
-    sketch = SketchDialog(plane_origin=(0.0, 0.0, 0.0), plane_normal=(0.0, 0.0, 1.0))
-    sketch._canvas._elements = [
-        ("rect", [(-25.0, -12.5), (25.0, 12.5)]),
-        ("circle", [(0.0, 0.0), 6.0]),
-    ]
-    sketch._canvas.update()
-    path = output_dir / "dialog-sketch.png"
-    capture_widget(sketch, path, app)
-    saved.append(path)
-    sketch.close()
 
     store = MaterialStore()
     record = store.add_project_material(
@@ -323,6 +311,44 @@ def capture_main_window(app, output_dir: Path) -> Path:
     return path
 
 
+def capture_sketch_context_toolbar(app, output_dir: Path) -> Path:
+    from PySide6.QtCore import QRect
+    from em3d_modeler.ui.main_window import MainWindow
+
+    window = MainWindow()
+    window.setWindowTitle("Sketch toolbar screenshot")
+    window.resize(1440, 760)
+    window._start_embedded_sketch((0.0, 0.0, 0.0), (0.0, 0.0, 1.0))
+    engine = window._viewport._sketch_engine
+    engine.add_rectangle((-30.0, -18.0), (30.0, 18.0))
+    engine.add_circle((0.0, 0.0), 7.0)
+    window._viewport._refresh_sketch_overlay()
+    window.show()
+    app.processEvents()
+
+    toolbar = window._sketch_context_toolbar
+    groups = [
+        toolbar.widgetForAction(action)
+        for action in toolbar.actions()
+        if toolbar.widgetForAction(action) is not None
+        and toolbar.widgetForAction(action).property("toolbarGroupTitle")
+    ]
+    if not groups:
+        window.close()
+        raise RuntimeError("The sketch context toolbar has no visible tool groups.")
+    left = min(group.geometry().left() for group in groups)
+    right = max(group.geometry().right() for group in groups)
+    crop_left = max(0, left - 6)
+    crop = QRect(crop_left, 0, right - crop_left + 7, toolbar.height())
+    pixmap = toolbar.grab().copy(crop)
+    path = output_dir / "toolbar-sketch-context.png"
+    if pixmap.isNull() or not pixmap.save(str(path), "PNG"):
+        window.close()
+        raise RuntimeError(f"Qt could not save screenshot: {path}")
+    window.close()
+    return path
+
+
 def configure_capture_font(app) -> None:
     from PySide6.QtGui import QFont, QFontDatabase
 
@@ -350,6 +376,10 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--skip-main-window", action="store_true",
         help="capture dialogs and project-tree panels only",
+    )
+    parser.add_argument(
+        "--sketch-toolbar-only", action="store_true",
+        help="capture the embedded sketch context toolbar only",
     )
     parser.add_argument(
         "--project-file", type=Path,
@@ -380,6 +410,15 @@ def main(argv: list[str] | None = None) -> int:
             return 0
         except Exception as exc:
             print(f"Main-window capture failed: {exc}", file=sys.stderr)
+            return 1
+
+    if args.sketch_toolbar_only:
+        try:
+            path = capture_sketch_context_toolbar(app, output_dir)
+            print(path)
+            return 0
+        except Exception as exc:
+            print(f"Sketch-toolbar capture failed: {exc}", file=sys.stderr)
             return 1
 
     saved = []
