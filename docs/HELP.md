@@ -1,17 +1,17 @@
 # EM 3D Modeler Help
 
-**Version 1.3.3b1** · Release date 2026-09-25
+**Version 1.3.4b1** · Release date 2026-09-25
 
 The complete, illustrated user guide is [HELP.html](HELP.html). It contains a linked contents panel, workflow instructions, troubleshooting, and genuine screenshots captured from the application's PySide6 widgets.
 
 ## Guide sections
 
 - Workspace, menus, viewport, selection, and project tree
-- Geometry creation, sketches, transforms, patterns, STEP, and Boolean operations
+- Geometry creation, embedded and parametric sketches, exact segment lengths, transforms, patterns, STEP, and Boolean operations
 - Materials, object properties, formulas, and reference planes
 - Settings, project parameters, and mesh controls
 - Simulation jobs, ports, domains, boundaries, and local refinements
-- Outputs, simulation checks, script generation, and EMERGE execution
+- Outputs, S-parameter fitting and raw/fitted Touchstone export, simulation checks, script generation, and EMERGE execution
 - Keyboard shortcuts, troubleshooting, and units
 
 ## Important simulation limitations
@@ -21,6 +21,8 @@ The complete, illustrated user guide is [HELP.html](HELP.html). It contains a li
 - A LumpedPort zero direction is rejected by preflight even though the editor tooltip describes inferring the Plate normal. Enter a non-zero direction.
 - **Check Simulation** is a local preflight, not an EMERGE run and not a guarantee that a requested solver backend is installed.
 - Far-field outputs save field data; use **Generate Plot** on saved results. They are not rendered by the ordinary automatic S-parameter plotting step.
+- If S-parameter fitting fails after a successful solve, the raw Touchstone samples are retained and automatic plots fall back to those samples; a fitted Touchstone file is not produced.
+- For a closed waveguide, an AIR containment error can indicate that open-region boundaries are enabled for an internal-air/PEC-wall model. Review the domain and boundary setup before changing geometry.
 
 To regenerate genuine help screenshots, see [SNAPSHOT_CAPTURE.md](SNAPSHOT_CAPTURE.md).
 

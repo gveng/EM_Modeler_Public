@@ -2495,7 +2495,9 @@ class MainWindow(QMainWindow):
         ]
         return result
 
-    def _recompute_pattern_instances(self, values: dict[str, float]) -> bool:
+    def _recompute_pattern_instances(
+        self, values: dict[str, float], *, source_name: str | None = None
+    ) -> bool:
         import itertools
         import math
 
@@ -2514,6 +2516,12 @@ class MainWindow(QMainWindow):
             settings = definition.get("settings", {})
             source_snapshots = definition.get("sources", [])
             if not isinstance(settings, dict) or not isinstance(source_snapshots, list):
+                continue
+            if source_name is not None and not any(
+                isinstance(snapshot, dict)
+                and str(snapshot.get("name", "")).strip() == source_name
+                for snapshot in source_snapshots
+            ):
                 continue
             expressions = settings.get("expressions", {})
             expressions = expressions if isinstance(expressions, dict) else {}
@@ -2586,21 +2594,21 @@ class MainWindow(QMainWindow):
                 for source_index, snapshot in enumerate(source_snapshots):
                     if not isinstance(snapshot, dict):
                         continue
-                    source_name = str(snapshot.get("name", "")).strip()
-                    source = objects_by_name.get(source_name)
+                    source_object_name = str(snapshot.get("name", "")).strip()
+                    source = objects_by_name.get(source_object_name)
                     if source in old_instances:
                         source = None
                     if source is None:
                         source = self._rebuild_object_from_snapshot(snapshot)
                         if source is None:
-                            raise ValueError(f"Pattern source '{source_name}' could not be restored")
+                            raise ValueError(f"Pattern source '{source_object_name}' could not be restored")
                         params = source.get_parameters()
                         for key, formula in (getattr(source, "param_formulas", {}) or {}).items():
                             params[key] = evaluate_expression(str(formula), values)
                         source.set_parameters(params)
                     actor = getattr(source, "actor", None)
                     if actor is None:
-                        raise ValueError(f"Pattern source '{source_name}' has no geometry")
+                        raise ValueError(f"Pattern source '{source_object_name}' has no geometry")
                     bounds = actor.GetBounds()
                     center = tuple(
                         (float(bounds[index]) + float(bounds[index + 1])) * 0.5
@@ -2694,10 +2702,10 @@ class MainWindow(QMainWindow):
                         clone_data = dict(snapshot)
                         clone_data["params"] = dict(snapshot.get("params", {}))
                         old_instance = old_by_key.get((instance_index, source_index))
-                        source_name = str(source.name)
+                        clone_source_name = str(source.name)
                         clone_name = (
                             str(old_instance.name) if old_instance is not None
-                            else f"{source_name}_Pattern_{instance_index + 1}"
+                            else f"{clone_source_name}_Pattern_{instance_index + 1}"
                         )
                         clone_data["name"] = clone_name
                         clone_data["params"]["Name"] = clone_name
@@ -2705,7 +2713,7 @@ class MainWindow(QMainWindow):
                         clone_data["pattern_instance"] = {
                             "instance_index": int(instance_index),
                             "source_index": int(source_index),
-                            "source_name": source_name,
+                            "source_name": clone_source_name,
                             "settings": deepcopy(settings),
                         }
                         clone = self._rebuild_object_from_snapshot(clone_data)
@@ -2951,6 +2959,21 @@ class MainWindow(QMainWindow):
     def _on_params_changed(self, obj, _params) -> None:
         self._sync_boolean_provenance(obj)
         if not self._history_restoring:
+            source_name = str(getattr(obj, "name", "")).strip()
+            if source_name and any(
+                isinstance(definition, dict)
+                and isinstance(definition.get("sources"), list)
+                and any(
+                    isinstance(snapshot, dict)
+                    and str(snapshot.get("name", "")).strip() == source_name
+                    for snapshot in definition["sources"]
+                )
+                for instance in self._viewport.scene.objects
+                for definition in [getattr(instance, "pattern_definition", None)]
+            ):
+                self._recompute_pattern_instances(
+                    self._parameter_values(), source_name=source_name
+                )
             self._history_record()
         self._viewport.scene.refresh_adaptive_grid()
         self._viewport._render()

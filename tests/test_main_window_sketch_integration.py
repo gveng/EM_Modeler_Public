@@ -14,6 +14,7 @@ import em3d_modeler.ui.main_window as main_window_module
 from em3d_modeler.ui.main_window import MainWindow
 from em3d_modeler.drawing.sketch_engine import SketchEngine
 from em3d_modeler.scene.em_objects import BoxObject, ExtrudedObject, MeshObject, RevolvedObject
+from em3d_modeler.scene.scene_manager import SceneManager
 
 
 def _main_window_stub(viewport):
@@ -90,6 +91,160 @@ def test_boolean_provenance_reuses_mesh_when_only_appearance_changes():
 
     serialize.assert_called_once_with(source, include_mesh=False)
     assert result.boolean_sources_data[0]["mesh"] is snapshot["mesh"]
+
+
+def test_source_parameter_edit_rebuilds_pattern_copies_before_history_record():
+    scene = SceneManager(vtk.vtkRenderer())
+    source = BoxObject("Source", x2=2)
+    scene.add_object(source)
+    window = SimpleNamespace(_viewport=SimpleNamespace(scene=scene))
+    window._serialize_object_snapshot = MethodType(MainWindow._serialize_object_snapshot, window)
+    window._rebuild_object_from_snapshot = MethodType(MainWindow._rebuild_object_from_snapshot, window)
+    source_snapshot = window._serialize_object_snapshot(source)
+    definition = {
+        "pattern_id": "linear-source-edit",
+        "sources": [source_snapshot],
+        "settings": {
+            "mode": "Linear",
+            "axis_enabled": [True, False, False],
+            "expressions": {"axis_count_x": "3", "offset_x": "5"},
+            "resolved": {},
+        },
+    }
+    for instance_index, offset in enumerate((5, 10), start=1):
+        clone = BoxObject(f"Source_Pattern_{instance_index + 1}", x2=2)
+        clone.actor.AddPosition(offset, 0, 0)
+        clone.pattern_definition = deepcopy(definition)
+        clone.pattern_instance = {"instance_index": instance_index, "source_index": 0}
+        scene.add_object(clone)
+
+    history_bounds = []
+    window._history_restoring = False
+    window._sync_boolean_provenance = Mock()
+    window._parameter_values = Mock(return_value={})
+    window._history_record = Mock(side_effect=lambda: history_bounds.extend(
+        obj.actor.GetBounds()
+        for obj in scene.objects
+        if getattr(obj, "pattern_instance", None)
+    ))
+    window._info_bar = SimpleNamespace(set_info=Mock())
+    window._refresh_materials = Mock()
+    window._viewport._render = Mock()
+    scene.refresh_adaptive_grid = Mock()
+    window._mark_simulation_dirty = Mock()
+    window._recompute_pattern_instances = MethodType(MainWindow._recompute_pattern_instances, window)
+
+    source.set_parameters({**source.get_parameters(), "X2": 4})
+    MainWindow._on_params_changed(window, source, source.get_parameters())
+
+    updated = {
+        obj.pattern_instance["instance_index"]: obj
+        for obj in scene.objects
+        if getattr(obj, "pattern_instance", None)
+    }
+    assert len(updated) == 2
+    assert updated[1].actor.GetBounds() == pytest.approx((5, 9, 0, 10, 0, 10))
+    assert updated[2].actor.GetBounds() == pytest.approx((10, 14, 0, 10, 0, 10))
+    assert all(
+        obj.pattern_definition["sources"][0]["params"]["X2"] == 4
+        for obj in updated.values()
+    )
+    assert history_bounds == [
+        pytest.approx((5, 9, 0, 10, 0, 10)),
+        pytest.approx((10, 14, 0, 10, 0, 10)),
+    ]
+
+
+def test_unrelated_parameter_edit_does_not_recompute_patterns():
+    pattern_source = {"name": "PatternSource"}
+    pattern = SimpleNamespace(pattern_definition={"sources": [pattern_source]})
+    scene = SimpleNamespace(
+        objects=[pattern],
+        refresh_adaptive_grid=Mock(),
+    )
+    window = SimpleNamespace(
+        _viewport=SimpleNamespace(scene=scene, _render=Mock()),
+        _history_restoring=False,
+        _sync_boolean_provenance=Mock(),
+        _history_record=Mock(),
+        _recompute_pattern_instances=Mock(),
+        _refresh_materials=Mock(),
+        _mark_simulation_dirty=Mock(),
+    )
+
+    MainWindow._on_params_changed(window, SimpleNamespace(name="Unrelated"), {})
+
+    window._recompute_pattern_instances.assert_not_called()
+
+
+def test_source_edit_updates_every_pattern_using_it_after_multi_source_pattern():
+    scene = SceneManager(vtk.vtkRenderer())
+    source = BoxObject("SharedSource", x2=2)
+    second_source = BoxObject("SecondSource", x1=20, x2=22)
+    scene.add_object(source)
+    scene.add_object(second_source)
+    window = SimpleNamespace(_viewport=SimpleNamespace(scene=scene))
+    window._serialize_object_snapshot = MethodType(MainWindow._serialize_object_snapshot, window)
+    window._rebuild_object_from_snapshot = MethodType(MainWindow._rebuild_object_from_snapshot, window)
+    source_snapshots = [
+        window._serialize_object_snapshot(source),
+        window._serialize_object_snapshot(second_source),
+    ]
+    multi_source_definition = {
+        "pattern_id": "multi-source-pattern",
+        "sources": source_snapshots,
+        "settings": {
+            "mode": "Linear",
+            "axis_enabled": [True, False, False],
+            "expressions": {"axis_count_x": "2", "offset_x": "5"},
+            "resolved": {},
+        },
+    }
+    single_source_definition = {
+        "pattern_id": "single-source-pattern",
+        "sources": [source_snapshots[0]],
+        "settings": {
+            "mode": "Linear",
+            "axis_enabled": [False, True, False],
+            "expressions": {"axis_count_y": "2", "offset_y": "7"},
+            "resolved": {},
+        },
+    }
+    for instance_index in (1,):
+        for source_index, (item, snapshot) in enumerate(zip((source, second_source), source_snapshots)):
+            clone = BoxObject(f"{item.name}_Multi", x2=2)
+            clone.actor.AddPosition(5 * instance_index, 0, 0)
+            clone.pattern_definition = deepcopy(multi_source_definition)
+            clone.pattern_instance = {"instance_index": instance_index, "source_index": source_index}
+            scene.add_object(clone)
+    single_clone = BoxObject("SharedSource_Single", x2=2)
+    single_clone.actor.AddPosition(0, 7, 0)
+    single_clone.pattern_definition = deepcopy(single_source_definition)
+    single_clone.pattern_instance = {"instance_index": 1, "source_index": 0}
+    scene.add_object(single_clone)
+
+    window._history_restoring = False
+    window._sync_boolean_provenance = Mock()
+    window._parameter_values = Mock(return_value={})
+    window._history_record = Mock()
+    window._info_bar = SimpleNamespace(set_info=Mock())
+    window._refresh_materials = Mock()
+    window._viewport._render = Mock()
+    scene.refresh_adaptive_grid = Mock()
+    window._mark_simulation_dirty = Mock()
+    window._recompute_pattern_instances = MethodType(MainWindow._recompute_pattern_instances, window)
+
+    source.set_parameters({**source.get_parameters(), "X2": 4})
+    MainWindow._on_params_changed(window, source, source.get_parameters())
+
+    updated = {
+        (obj.pattern_instance["source_index"], obj.pattern_definition["pattern_id"]): obj
+        for obj in scene.objects
+        if getattr(obj, "pattern_instance", None)
+    }
+    assert updated[(0, "multi-source-pattern")].actor.GetBounds() == pytest.approx((5, 9, 0, 10, 0, 10))
+    assert updated[(1, "multi-source-pattern")].actor.GetBounds() == pytest.approx((25, 27, 0, 10, 0, 10))
+    assert updated[(0, "single-source-pattern")].actor.GetBounds() == pytest.approx((0, 4, 7, 17, 0, 10))
 
 
 def test_non_planar_face_pick_is_not_used_for_sketch():
