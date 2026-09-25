@@ -52,6 +52,15 @@ _ICONS_DIR = next(
 )
 
 
+def _scale_profile_coordinates(profile, factor: float):
+    if (isinstance(profile, (list, tuple)) and len(profile) == 2
+            and all(isinstance(value, (int, float)) for value in profile)):
+        return (float(profile[0]) * factor, float(profile[1]) * factor)
+    if isinstance(profile, (list, tuple)):
+        return [_scale_profile_coordinates(item, factor) for item in profile]
+    return profile
+
+
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _PROCESS_TERMINATE = 0x0001
@@ -93,10 +102,10 @@ class _JobObjectExtendedLimitInformation(ctypes.Structure):
 def _icon(name: str) -> "QIcon":
     """Load SVG/PNG icon by Part_Name from the Icons folder."""
     for ext in ("svg", "png"):
-        p = _ICONS_DIR / f"{name}.{ext}"
-        if p.exists():
-            from PySide6.QtGui import QIcon
-            return QIcon(str(p))
+        for p in (_ICONS_DIR / f"{name}.{ext}", _ICONS_DIR / "Sketcher" / f"{name}.{ext}"):
+            if p.exists():
+                from PySide6.QtGui import QIcon
+                return QIcon(str(p))
     from PySide6.QtGui import QIcon
     return QIcon()
 
@@ -106,11 +115,62 @@ from PySide6.QtWidgets import (
     QLabel, QDialog, QInputDialog,
     QVBoxLayout, QFormLayout, QTextBrowser, QPlainTextEdit,
     QPushButton, QHBoxLayout, QGroupBox, QCheckBox,
-    QProgressDialog, QApplication, QTabWidget, QDialogButtonBox, QGridLayout, QToolButton,
+    QProgressDialog, QApplication, QTabWidget, QDialogButtonBox, QGridLayout, QToolButton, QToolBar,
     QRadioButton,
 )
 from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize, QUrl
 from PySide6.QtGui  import QIcon, QKeySequence, QAction, QDesktopServices, QPainter, QPen, QColor
+
+def _add_toolbar_group(
+    toolbar, title: str, actions: list, columns: int = 3, *, compact: bool = False
+) -> None:
+    group = QWidget(toolbar)
+    group.setProperty("toolbarGroupTitle", title)
+    if compact:
+        group.setAccessibleName(f"{title} tools")
+        grid = QGridLayout(group)
+        grid.setContentsMargins(2, 0, 2, 0)
+        grid.setHorizontalSpacing(2)
+        grid.setVerticalSpacing(2)
+    else:
+        layout = QVBoxLayout(group)
+        layout.setContentsMargins(10, 0, 10, 0)
+        layout.setSpacing(2)
+        caption = QLabel(title, group)
+        caption.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
+        caption.setStyleSheet("font-size: 9px; font-weight: bold; padding-top: 1px;")
+        layout.addWidget(caption)
+        grid = QGridLayout()
+        grid.setContentsMargins(0, 0, 0, 0)
+        grid.setHorizontalSpacing(4)
+        grid.setVerticalSpacing(2)
+    columns = max(1, columns)
+    for index, action in enumerate(actions):
+        if isinstance(action, QAction):
+            button = QToolButton(group)
+            button.setDefaultAction(action)
+            button.setToolButtonStyle(Qt.ToolButtonIconOnly)
+            button.setIconSize(toolbar.iconSize())
+            if compact:
+                button.setFixedSize(24, 24)
+                button.setAccessibleName(action.text())
+                button.setToolTip(action.toolTip() or action.text())
+            else:
+                button.setFixedSize(30, 27)
+            widget = button
+        else:
+            widget = action
+        grid.addWidget(widget, index // columns, index % columns)
+    if compact:
+        group.setFixedSize(group.sizeHint())
+    else:
+        layout.addLayout(grid)
+        margins = layout.contentsMargins()
+        group.setFixedWidth(max(122, grid.sizeHint().width() + margins.left() + margins.right()))
+    group_action = toolbar.addWidget(group)
+    alignment = Qt.AlignVCenter if compact else Qt.AlignTop
+    toolbar.layout().setAlignment(toolbar.widgetForAction(group_action), alignment)
+    toolbar.addSeparator()
 
 # Undo/Redo CommandStack
 
@@ -264,6 +324,7 @@ class MainWindow(QMainWindow):
         self._sim_full_scene_step_dirty = True
         self._export_full_scene_step = False
         self._boolean_decimation_enabled = False
+        self._workspace_path = ""
         self._sim_cached_script = ""
         self._sim_cached_script_bundle: dict = {"master": "", "scripts": []}
         self._sim_log_verbosity = "INFO"
@@ -286,6 +347,7 @@ class MainWindow(QMainWindow):
         self._history_undo: list[list[dict]] = []
         self._history_redo: list[list[dict]] = []
         self._history_restoring = False
+        self._sketch_after_plane_defined = False
 
         self._load_app_settings()
         set_selection_color(self._selection_color)
@@ -390,7 +452,10 @@ class MainWindow(QMainWindow):
         act_view_front = view_menu.addAction("Front (XZ)", lambda: self._set_view("front"))
         act_view_front.setShortcut(QKeySequence("Ctrl+2"))
         act_view_back = view_menu.addAction("Back (-XZ)", lambda: self._set_view("back"))
-        act_view_back.setShortcut(QKeySequence("Ctrl+Shift+2"))
+        act_view_back.setShortcuts([
+            QKeySequence("Ctrl+6"),
+            QKeySequence("Ctrl+Shift+2"),
+        ])
         act_view_right = view_menu.addAction("Right (YZ)", lambda: self._set_view("right"))
         act_view_right.setShortcut(QKeySequence("Ctrl+3"))
         act_view_left = view_menu.addAction("Left (-YZ)", lambda: self._set_view("left"))
@@ -501,40 +566,21 @@ class MainWindow(QMainWindow):
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� toolbar
     def _build_toolbar(self) -> None:
         tb = self.addToolBar("Main")
+        self._main_toolbar = tb
         tb.setObjectName("main_toolbar")
         tb.setMovable(False)
         tb.setIconSize(QSize(22, 22))
-        tb.setToolButtonStyle(Qt.ToolButtonTextBesideIcon)
+        tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
 
-        def add_group(title: str, actions: list, columns: int = 3) -> None:
-            group = QWidget(tb)
-            group.setFixedWidth(122)
-            layout = QVBoxLayout(group)
-            layout.setContentsMargins(10, 0, 10, 0)
-            layout.setSpacing(2)
-            caption = QLabel(title, group)
-            caption.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
-            caption.setStyleSheet("font-size: 9px; font-weight: bold; padding-top: 1px;")
-            layout.addWidget(caption)
-            grid = QGridLayout()
-            grid.setContentsMargins(0, 0, 0, 0)
-            grid.setHorizontalSpacing(4)
-            grid.setVerticalSpacing(2)
-            columns = min(3, max(1, columns))
-            for index, action in enumerate(actions):
-                if isinstance(action, QAction):
-                    button = QToolButton(group)
-                    button.setDefaultAction(action)
-                    button.setToolButtonStyle(Qt.ToolButtonIconOnly)
-                    button.setFixedSize(30, 27)
-                    widget = button
-                else:
-                    widget = action
-                grid.addWidget(widget, index // columns, index % columns)
-            layout.addLayout(grid)
-            group_action = tb.addWidget(group)
-            tb.layout().setAlignment(tb.widgetForAction(group_action), Qt.AlignTop)
-            tb.addSeparator()
+        def add_group(
+            title: str,
+            actions: list,
+            columns: int = 3,
+            toolbar=None,
+            compact: bool = False,
+        ) -> None:
+            target_toolbar = toolbar or tb
+            _add_toolbar_group(target_toolbar, title, actions, columns, compact=compact)
 
         # ������ Primitive shapes ������������������������������������������������������������������������������������������������������������������������
         _DRAW_ICONS = [
@@ -563,10 +609,15 @@ class MainWindow(QMainWindow):
         act_planar = QAction(_icon("Std_Plane"), "Planar", self)
         act_planar.setToolTip("Define planar structure: pick start/end (vertex/edge/face snap) on active plane")
         act_planar.triggered.connect(lambda: self._start_draw("planar"))
-        act_plate_face = QAction(_icon("Part_Box"), "Plate from Face/Edge", self)
+        act_plate_face = QAction(_icon("Std_Plane"), "Plate from Face/Edge", self)
         act_plate_face.setToolTip("Create a thin plate from the last selected face or axis-aligned edge")
         act_plate_face.triggered.connect(self._create_plate_from_face)
-        add_group("2D", [act_sketch, act_planar, act_plate_face], columns=3)
+        act_circular_plate = QAction(_icon("Sketcher_CreateCircle"), "Circular Plate", self)
+        act_circular_plate.setToolTip(
+            "Create a circular Plate by snapping its center and radius to the configured grid spacing"
+        )
+        act_circular_plate.triggered.connect(lambda: self._start_draw("circular_plate"))
+        add_group("2D", [act_sketch, act_planar, act_plate_face, act_circular_plate], columns=3)
 
         # ������ Boolean operations ������������������������������������������������������������������������������������������������������������
         act_cut = QAction(_icon("Part_Cut"), "Cut", self)
@@ -594,7 +645,7 @@ class MainWindow(QMainWindow):
         act_move_plane.setToolTip("Move and rotate the selected object around a reference point")
         act_move_plane.triggered.connect(self._move_selection_to_plane_origin)
 
-        act_pattern = QAction(_icon("Std_Tool4"), "Pattern", self)
+        act_pattern = QAction(_icon("LinkArray"), "Pattern", self)
         act_pattern.setToolTip("Create linear or circular instances of the selected object")
         act_pattern.triggered.connect(self._create_object_pattern)
 
@@ -629,7 +680,18 @@ class MainWindow(QMainWindow):
         act_isometric.setToolTip("Set an isometric view and fit all visible objects")
         act_isometric.triggered.connect(self._viewport.isometric_view)
 
-        add_group("Zoom", [act_fit_all, act_fit_selection, act_isometric], columns=3)
+        act_projection = QAction(_icon("view-perspective"), "Projection", self)
+        act_projection.setCheckable(True)
+        act_projection.setChecked(self._viewport.is_parallel_projection())
+        self._act_projection = act_projection
+        act_projection.toggled.connect(self._viewport.set_parallel_projection)
+        self._viewport.projection_changed.connect(self._sync_projection_action)
+        self._sync_projection_action(act_projection.isChecked())
+        add_group(
+            "View",
+            [act_fit_all, act_fit_selection, act_isometric, act_projection],
+            columns=4,
+        )
 
         # ������ Selection mode ���������������������������������������������������������������������������������������������������������������������������
         self._sel_mode_combo = QComboBox()
@@ -644,15 +706,199 @@ class MainWindow(QMainWindow):
         self._sel_mode_combo.currentTextChanged.connect(self._on_selection_mode_changed)
         add_group("Select", [self._sel_mode_combo], columns=1)
 
+        sketch_tb = self.addToolBar("Sketch")
+        self._sketch_context_toolbar = sketch_tb
+        sketch_tb.setObjectName("sketch_context_toolbar")
+        sketch_tb.setMovable(False)
+        sketch_tb.setIconSize(QSize(18, 18))
+        sketch_tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
+        sketch_tb.hide()
+
+        def sketch_action(label, icon_name, callback, tooltip, *, fallback=None, enabled=True):
+            icon = _icon(icon_name)
+            if icon.isNull() and fallback:
+                icon = _icon(fallback)
+            action = QAction(icon, label, self)
+            action.setObjectName(f"sketch_{label.lower().replace(' ', '_').replace('-', '_')}")
+            action.setToolTip(tooltip)
+            action.setEnabled(enabled)
+            if callback is not None:
+                action.triggered.connect(
+                    lambda _checked=False, slot=callback: self._activate_sketch_toolbar_action(slot)
+                )
+            return action
+
+        supported_2d = "Available in the viewport sketch engine."
+        unsupported = "Not yet supported by the viewport sketch engine."
+        extrude = sketch_action(
+            "Extrude", "Part_Extrude", self._viewport._sketch_request_extrude,
+            "Extrude the closed sketch profile.",
+        )
+        revolve = sketch_action(
+            "Revolve", "Part_Revolve", self._viewport._sketch_begin_revolve,
+            "Revolve the profile around a selected sketch line.",
+        )
+        extruded_cut = sketch_action(
+            "Extruded Cut", "Part_Cut", self._viewport._sketch_request_extruded_cut,
+            "Subtract the sketch extrusion from the single selected base object.",
+        )
+        self._sketch_context_actions = {
+            action.text(): action for action in (extrude, revolve, extruded_cut)
+        }
+        add_group("3D", [extrude, revolve, extruded_cut], toolbar=sketch_tb, compact=True)
+
+        def set_tool(tool_name):
+            return lambda _checked=False: self._viewport._sketch_set_tool(tool_name)
+
+        line = sketch_action(
+            "Line", "Sketcher_CreateLine", set_tool("line"),
+            "Draw a single line segment (two clicks).",
+        )
+        polyline = sketch_action(
+            "Polyline", "Sketcher_CreatePolyline", set_tool("polyline"),
+            "Draw a polyline; press Enter or Escape to finish it.",
+        )
+        corner_rectangle = sketch_action(
+            "Corner Rectangle", "Sketcher_CreateRectangle",
+            lambda: self._viewport._sketch_set_rectangle_mode("corner-corner"),
+            f"{supported_2d} Define the rectangle by opposite corners.",
+        )
+        center_rectangle = sketch_action(
+            "Center Rectangle", "Sketcher_CreateRectangle_Center",
+            lambda: self._viewport._sketch_set_rectangle_mode("center-corner"),
+            "Draw a rectangle from its center to one corner.",
+        )
+        construction = sketch_action(
+            "Construction", "Sketcher_ToggleConstruction",
+            lambda: self._viewport._sketch_set_construction_mode(
+                self._sketch_context_actions["Construction"].isChecked()
+            ),
+            "Toggle construction geometry for newly drawn entities.",
+        )
+        construction.setCheckable(True)
+        construction.toggled.connect(
+            lambda checked: construction.setIcon(_icon(
+                "Sketcher_ToggleConstruction_Constr" if checked
+                else "Sketcher_ToggleConstruction"
+            ))
+        )
+        vertex_snap = sketch_action(
+            "Vertex Snap", "vertex-selection",
+            lambda: self._viewport.set_sketch_vertex_snap(
+                self._sketch_context_actions["Vertex Snap"].isChecked()
+            ),
+            "Snap drawing points to existing sketch vertices.",
+        )
+        vertex_snap.setCheckable(True)
+        vertex_snap.setChecked(True)
+        circle = sketch_action(
+            "Circle", "Sketcher_CreateCircle", set_tool("circle"),
+            "Draw a circle by center and radius.",
+        )
+        three_point_arc = sketch_action(
+            "3-Point Arc", "Sketcher_Create3PointArc", set_tool("arc"),
+            "Draw an arc by start, end, and midpoint.",
+        )
+        center_arc = sketch_action(
+            "Center Arc", "Sketcher_CreateArc", set_tool("center_arc"),
+            "Draw an arc by center, start point, and end angle.",
+        )
+        self._sketch_context_actions.update({
+            action.text(): action
+            for action in (
+                line, polyline, corner_rectangle, center_rectangle, circle,
+                construction, vertex_snap, three_point_arc, center_arc,
+            )
+        })
+        add_group(
+            "2D",
+            [line, polyline, corner_rectangle, center_rectangle, construction, vertex_snap,
+             circle, three_point_arc, center_arc],
+            columns=5,
+            toolbar=sketch_tb,
+            compact=True,
+        )
+
+        dimensions = [
+            sketch_action("Linear", "Constraint_Dimension",
+                          lambda: self._viewport._sketch_begin_dimension("linear"),
+                          "Dimension two sketch points along the dominant sketch axis."),
+            sketch_action("Angular", "Constraint_InternalAngle",
+                          lambda: self._viewport._sketch_begin_dimension("angular"),
+                          "Measure two sketch lines; angular dimensions are annotations, not solver constraints."),
+            sketch_action("Radius", "Constraint_Radius",
+                          lambda: self._viewport._sketch_begin_dimension("radius"),
+                          "Set or annotate a sketch circle or arc radius."),
+            sketch_action("Diameter", "Constraint_Radiam",
+                          lambda: self._viewport._sketch_begin_dimension("diameter"),
+                          "Set or annotate a sketch circle or arc diameter."),
+            sketch_action("Aligned", "Constraint_Length",
+                          lambda: self._viewport._sketch_begin_dimension("aligned"),
+                          "Dimension the true distance between two sketch points."),
+        ]
+        self._sketch_context_actions.update({action.text(): action for action in dimensions})
+        add_group(
+            "Dimensions", dimensions, columns=3, toolbar=sketch_tb, compact=True,
+        )
+        add_group(
+            "View",
+            [act_fit_all, act_fit_selection, act_isometric, act_projection],
+            columns=4,
+            toolbar=sketch_tb,
+            compact=True,
+        )
+        select_sketch = sketch_action(
+            "Select", "edit-select-box", self._viewport._sketch_set_selection_mode,
+            "Select or deselect sketch geometry.",
+        )
+        delete_sketch = sketch_action(
+            "Delete", "edit-delete", self._viewport._sketch_delete_selected,
+            "Delete the selected sketch entity and its dimensions.",
+        )
+        exit_sketch = sketch_action(
+            "Exit Sketch", "Sketcher_LeaveSketch",
+            lambda: self._viewport.exit_sketch(commit=False),
+            "Exit sketch mode without creating or updating a 3D feature.",
+        )
+        self._sketch_context_actions.update({
+            action.text(): action for action in (select_sketch, delete_sketch, exit_sketch)
+        })
+        add_group(
+            "Edit", [select_sketch, delete_sketch, exit_sketch],
+            columns=3, toolbar=sketch_tb, compact=True,
+        )
+
+    def _sync_projection_action(self, parallel: bool) -> None:
+        action = getattr(self, "_act_projection", None)
+        if action is None:
+            return
+        parallel = bool(parallel)
+        action.blockSignals(True)
+        try:
+            action.setChecked(parallel)
+        finally:
+            action.blockSignals(False)
+        action.setIcon(_icon("view-axonometric" if parallel else "view-perspective"))
+        mode = "parallel" if parallel else "perspective"
+        target = "perspective" if parallel else "parallel"
+        action.setToolTip(
+            f"{mode.title()} projection is active. Click to switch to {target}."
+        )
+
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� signal wiring
     def _connect_signals(self) -> None:
         # Viewport ��� body props + materials
         self._viewport.object_selected.connect(self._on_object_selected)
         self._viewport.selection_changed.connect(self._on_selection_changed)
         self._viewport.scene_changed.connect(self._on_scene_changed)
+        self._viewport.sketch_extrude_requested.connect(self._on_extrude_requested)
+        self._viewport.sketch_cut_requested.connect(self._on_extruded_cut_requested)
+        self._viewport.sketch_revolve_requested.connect(self._on_revolve_requested)
+        self._viewport.sketch_finished.connect(self._on_viewport_sketch_finished)
         self._viewport.status_message.connect(self._info_bar.set_info)
         self._viewport.picked_coords.connect(self._info_bar.set_coords)
         self._viewport.clear_coords_requested.connect(self._info_bar.clear_coords)
+        self._viewport.set_sketch_dimension_resolver(self._resolve_formula_text)
 
         # Body props ��� viewport render
         self._body_props.params_changed.connect(self._on_params_changed)
@@ -663,6 +909,7 @@ class MainWindow(QMainWindow):
         self._body_props.material_picker_requested.connect(self._open_material_picker)
         self._body_props.project_parameters_changed.connect(self._on_project_parameters_changed)
         self._body_props.set_formula_resolver(self._resolve_formula_text)
+        self._sync_project_variable_names()
 
         # Materials tree ��� selection (single + multi)
         self._materials.object_selected.connect(self._on_material_tree_select)
@@ -679,6 +926,8 @@ class MainWindow(QMainWindow):
         self._materials.objects_show.connect(self._on_materials_show)
         self._materials.transform_edit_requested.connect(self._on_transform_edit_requested)
         self._materials.pattern_edit_requested.connect(self._create_object_pattern)
+        self._materials.feature_edit_requested.connect(self._edit_sketch_feature)
+        self._materials.sketch_edit_requested.connect(self._edit_sketch_definition)
         self._materials.objects_model_role_changed.connect(self._on_materials_model_role_changed)
         self._materials.object_rename.connect(self._on_materials_rename)
         self._materials.objects_bulk_rename.connect(self._on_materials_bulk_rename)
@@ -719,12 +968,12 @@ class MainWindow(QMainWindow):
         self._mark_simulation_dirty(steps=True, script=True)
 
     def _history_reset(self) -> None:
-        self._history_undo = [deepcopy(self._viewport.scene.to_json())]
+        self._history_undo = [self._viewport.scene.to_json(cache_meshes=True)]
         self._history_redo = []
         self._update_history_actions()
 
     def _history_record(self) -> None:
-        current = deepcopy(self._viewport.scene.to_json())
+        current = self._viewport.scene.to_json(cache_meshes=True)
         if self._history_undo and current == self._history_undo[-1]:
             return
         self._history_undo.append(current)
@@ -898,53 +1147,40 @@ class MainWindow(QMainWindow):
         self._refresh_materials()
         self._sync_port_reference_state()
         self._viewport._render()
+        self._viewport.scene_changed.emit()
         self._info_bar.set_info(f"Deleted {len(names)} object(s): {', '.join(names)}")
 
     def _scale_mesh_object(self, obj, factor: float) -> bool:
         actor = getattr(obj, "actor", None)
-        if actor is None or actor.GetMapper() is None or actor.GetMapper().GetInput() is None:
+        if actor is None:
             return False
-
-        src_poly = vtk.vtkPolyData()
-        src_poly.DeepCopy(actor.GetMapper().GetInput())
-
-        tfm = vtk.vtkTransform()
-        tfm.Scale(factor, factor, factor)
-
-        tf = vtk.vtkTransformPolyDataFilter()
-        tf.SetTransform(tfm)
-        tf.SetInputData(src_poly)
-        tf.Update()
-
-        out_poly = vtk.vtkPolyData()
-        out_poly.DeepCopy(tf.GetOutput())
-
-        actor.GetMapper().SetInputData(out_poly)
-        actor.GetMapper().Update()
-        if hasattr(obj, "_polydata"):
-            obj._polydata = out_poly
-        if getattr(obj, "step_source_path", None):
-            obj.step_geometry_modified = True
-            off = getattr(obj, "step_export_offset", (0.0, 0.0, 0.0))
-            try:
-                obj.step_export_offset = (
-                    float(off[0]) * factor,
-                    float(off[1]) * factor,
-                    float(off[2]) * factor,
-                )
-            except Exception:
-                obj.step_export_offset = (0.0, 0.0, 0.0)
+        scale = actor.GetScale()
+        actor.SetScale(*(float(value) * factor for value in scale))
         return True
 
     def _scale_by_attributes(self, obj, factor: float) -> bool:
         t = type(obj).__name__
+        actor = getattr(obj, "actor", None)
+        bounds_before = actor.GetBounds() if actor is not None else None
+
+        def finish_scale() -> bool:
+            if actor is not None and bounds_before is not None:
+                bounds_after = actor.GetBounds()
+                delta = tuple(
+                    (float(bounds_before[axis * 2]) + float(bounds_before[axis * 2 + 1])
+                     - float(bounds_after[axis * 2]) - float(bounds_after[axis * 2 + 1])) * 0.5
+                    for axis in range(3)
+                )
+                position = actor.GetPosition()
+                actor.SetPosition(*(float(position[axis]) + delta[axis] for axis in range(3)))
+            return True
 
         if t in {"BoxObject", "PlateObject"}:
             for name in ("x1", "y1", "z1", "x2", "y2", "z2"):
                 setattr(obj, name, float(getattr(obj, name)) * factor)
             obj._refresh_source()
             obj.refresh_appearance()
-            return True
+            return finish_scale()
 
         if t in {"CylinderObject", "ConeObject"}:
             obj.cx *= factor
@@ -955,7 +1191,7 @@ class MainWindow(QMainWindow):
             obj._refresh_source()
             obj._apply_orientation()
             obj.refresh_appearance()
-            return True
+            return finish_scale()
 
         if t == "SphereObject":
             obj.cx *= factor
@@ -964,7 +1200,7 @@ class MainWindow(QMainWindow):
             obj.radius *= factor
             obj._refresh_source()
             obj.refresh_appearance()
-            return True
+            return finish_scale()
 
         if t == "PyramidObject":
             obj.bx1 *= factor
@@ -976,7 +1212,7 @@ class MainWindow(QMainWindow):
             obj._refresh_source()
             obj._apply_position()
             obj.refresh_appearance()
-            return True
+            return finish_scale()
 
         if t == "WedgeObject":
             obj.x1 *= factor
@@ -991,7 +1227,7 @@ class MainWindow(QMainWindow):
             obj._source = obj._make_wedge_polydata()
             obj._actor.GetMapper().SetInputData(obj._source)
             obj.refresh_appearance()
-            return True
+            return finish_scale()
 
         if t == "TorusObject":
             obj.cx *= factor
@@ -1002,7 +1238,7 @@ class MainWindow(QMainWindow):
             obj._refresh_source()
             obj._actor.SetPosition(obj.cx, obj.cy, obj.cz)
             obj.refresh_appearance()
-            return True
+            return finish_scale()
 
         if t == "EllipsoidObject":
             obj.cx *= factor
@@ -1014,20 +1250,31 @@ class MainWindow(QMainWindow):
             obj._refresh_source()
             obj._apply_scale()
             obj.refresh_appearance()
-            return True
+            return finish_scale()
 
         if t == "ExtrudedObject":
-            obj._profile_pts = [(float(x) * factor, float(y) * factor) for x, y in obj._profile_pts]
+            obj._profile_pts = _scale_profile_coordinates(obj._profile_pts, factor)
             obj._depth *= factor
             obj._plane_origin = tuple(float(v) * factor for v in obj._plane_origin)
             obj._rebuild()
-            return True
+            return finish_scale()
 
         if t == "RevolvedObject":
-            obj._profile_pts = [(float(x) * factor, float(y) * factor) for x, y in obj._profile_pts]
-            obj._axis_pt1 = tuple(float(v) * factor for v in obj._axis_pt1)
-            obj._axis_pt2 = tuple(float(v) * factor for v in obj._axis_pt2)
-            obj._plane_origin = tuple(float(v) * factor for v in obj._plane_origin)
+            bounds = obj.actor.GetBounds()
+            center = tuple(
+                (float(bounds[axis * 2]) + float(bounds[axis * 2 + 1])) * 0.5
+                for axis in range(3)
+            )
+
+            def scale_world_point(point):
+                return tuple(center[axis] + (float(point[axis]) - center[axis]) * factor
+                             for axis in range(3))
+
+            obj._profile_pts = _scale_profile_coordinates(obj._profile_pts, factor)
+            obj._profile_contours = _scale_profile_coordinates(obj._profile_contours, factor)
+            obj._axis_pt1 = scale_world_point(obj._axis_pt1)
+            obj._axis_pt2 = scale_world_point(obj._axis_pt2)
+            obj._plane_origin = scale_world_point(obj._plane_origin)
             local_pts, user_matrix = obj._profile_local_and_transform()
             obj._revolve.SetInputData(obj._profile_to_polydata(local_pts))
             obj._revolve.SetAngle(obj._angle)
@@ -1038,7 +1285,7 @@ class MainWindow(QMainWindow):
             return True
 
         if t == "MeshObject":
-            return self._scale_mesh_object(obj, factor)
+            return finish_scale() if self._scale_mesh_object(obj, factor) else False
 
         return False
 
@@ -1098,33 +1345,14 @@ class MainWindow(QMainWindow):
 
     def _translate_mesh_object(self, obj, dx: float, dy: float, dz: float) -> bool:
         actor = getattr(obj, "actor", None)
-        if actor is None or actor.GetMapper() is None or actor.GetMapper().GetInput() is None:
+        if actor is None:
             return False
-        src_poly = vtk.vtkPolyData()
-        src_poly.DeepCopy(actor.GetMapper().GetInput())
-        tfm = vtk.vtkTransform()
-        tfm.Translate(dx, dy, dz)
-        tf = vtk.vtkTransformPolyDataFilter()
-        tf.SetTransform(tfm)
-        tf.SetInputData(src_poly)
-        tf.Update()
-        out_poly = vtk.vtkPolyData()
-        out_poly.DeepCopy(tf.GetOutput())
-        actor.GetMapper().SetInputData(out_poly)
-        actor.GetMapper().Update()
-        if hasattr(obj, "_polydata"):
-            obj._polydata = out_poly
-        if getattr(obj, "step_source_path", None):
-            obj.step_geometry_modified = True
-            off = getattr(obj, "step_export_offset", (0.0, 0.0, 0.0))
-            try:
-                obj.step_export_offset = (
-                    float(off[0]) + float(dx),
-                    float(off[1]) + float(dy),
-                    float(off[2]) + float(dz),
-                )
-            except Exception:
-                obj.step_export_offset = (float(dx), float(dy), float(dz))
+        position = actor.GetPosition()
+        actor.SetPosition(
+            float(position[0]) + float(dx),
+            float(position[1]) + float(dy),
+            float(position[2]) + float(dz),
+        )
         return True
 
     def _translate_object(self, obj, dx: float, dy: float, dz: float) -> bool:
@@ -1276,7 +1504,7 @@ class MainWindow(QMainWindow):
         dlg.accepted.connect(apply_transform)
         return
 
-    def _serialize_object_snapshot(self, obj):
+    def _serialize_object_snapshot(self, obj, *, include_mesh: bool = True):
         item = {
             "type": type(obj).__name__,
             "name": str(getattr(obj, "name", type(obj).__name__)),
@@ -1289,12 +1517,17 @@ class MainWindow(QMainWindow):
             "pattern_instance": deepcopy(getattr(obj, "pattern_instance", None)),
             "creation_reference_error": str(getattr(obj, "creation_reference_error", "")),
         }
-        if type(obj).__name__ == "MeshObject":
+        if type(obj).__name__ == "MeshObject" and include_mesh:
             mesh_poly = None
             if getattr(obj, "actor", None) is not None and obj.actor.GetMapper() is not None:
                 mesh_poly = obj.actor.GetMapper().GetInput()
             item["mesh"] = self._viewport.scene._polydata_to_json(mesh_poly)
         actor = getattr(obj, "actor", None)
+        if type(obj).__name__ == "MeshObject" and actor is not None:
+            mapper = actor.GetMapper()
+            mesh_poly = mapper.GetInput() if mapper is not None else None
+            if mesh_poly is not None:
+                item["mesh_mtime"] = int(mesh_poly.GetMTime())
         if actor is not None:
             item["actor_transform"] = {
                 "origin": list(actor.GetOrigin()),
@@ -1323,7 +1556,20 @@ class MainWindow(QMainWindow):
         try:
             if t == "MeshObject":
                 mesh_blob = item.get("mesh")
-                mesh_poly = self._viewport.scene._polydata_from_json(mesh_blob)
+                if mesh_blob is None and str(p.get("StepSourcePath", "") or "").strip():
+                    from ..emerge.step_importer import import_step
+
+                    imported_solids = import_step(str(p["StepSourcePath"]))
+                    solid_name = str(p.get("StepSolidName", "") or "")
+                    solid = next(
+                        (entry for entry in imported_solids if entry.get("name") == solid_name),
+                        imported_solids[0] if len(imported_solids) == 1 else None,
+                    )
+                    if solid is None:
+                        raise ValueError(f"STEP solid '{solid_name}' could not be restored")
+                    mesh_poly = solid["polydata"]
+                else:
+                    mesh_poly = self._viewport.scene._polydata_from_json(mesh_blob)
                 obj = cls(
                     name,
                     mesh_poly,
@@ -1842,7 +2088,10 @@ class MainWindow(QMainWindow):
         )
         result.source_objects = list([base] + tools)
         result.boolean_mesh_reduction = mesh_reduction
-        result.boolean_sources_data = [self._serialize_object_snapshot(o) for o in ([base] + tools)]
+        result.boolean_sources_data = [
+            self._serialize_object_snapshot(o)
+            for o in ([base] + tools)
+        ]
         result.refresh_appearance()
 
         scene = self._viewport.scene
@@ -2032,11 +2281,12 @@ class MainWindow(QMainWindow):
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� object selection
     def _on_project_selected(self) -> None:
         self._project_properties_active = True
-        self._body_props.set_project_parameters(self._project_tree.get_settings().get("parameters", []))
+        parameters = self._project_tree.get_settings().get("parameters", [])
+        self._body_props.set_project_parameters(parameters)
+        self._sync_project_variable_names(parameters)
         self._materials.highlight([])
         if hasattr(self._viewport.scene, "deselect_all"):
             self._viewport.scene.deselect_all()
-        self._body_props.set_project_parameters(self._project_tree.get_settings().get("parameters", []))
         self._info_bar.set_info(f"Project: {self._project_name}")
 
     def _on_project_parameters_changed(self, parameters: list) -> None:
@@ -2046,6 +2296,7 @@ class MainWindow(QMainWindow):
         self._project_tree.settings_changed.emit()
         self._recompute_simulation_parameters(settings)
         self._recompute_parametric_objects()
+        self.recompute_sketch_dimensions()
 
     def _recompute_simulation_parameters(self, settings: dict | None = None) -> None:
         settings = settings if isinstance(settings, dict) else self._project_tree.get_settings()
@@ -2085,6 +2336,7 @@ class MainWindow(QMainWindow):
         self._project_tree.load_settings(settings)
         self._project_tree.settings_changed.emit()
         self._recompute_parametric_objects()
+        self.recompute_sketch_dimensions()
 
     def _parameter_values(self) -> dict[str, float]:
         values = {}
@@ -2101,8 +2353,21 @@ class MainWindow(QMainWindow):
                 continue
         return values
 
+    def _sync_project_variable_names(self, parameters: list | None = None) -> None:
+        if parameters is None:
+            parameters = self._project_tree.get_settings().get("parameters", [])
+        names = [
+            str(entry.get("name", "")).strip()
+            for entry in parameters if isinstance(entry, dict)
+        ] if isinstance(parameters, list) else []
+        self._body_props.set_project_variable_names(names)
+
     def _resolve_formula_text(self, text: str) -> float:
         return evaluate_expression(text, self._parameter_values())
+
+    def recompute_sketch_dimensions(self) -> dict:
+        """Re-resolve active sketch dimensions against project parameters."""
+        return self._viewport.recompute_sketch_dimensions(self._resolve_formula_text)
 
     def _resolve_creation_snap(self, snap: dict, objects_by_name: dict) -> list[float] | None:
         source = objects_by_name.get(str(snap.get("object", "")))
@@ -2170,7 +2435,7 @@ class MainWindow(QMainWindow):
             obj.set_parameters(params)
             obj.refresh_appearance()
 
-    def _sync_boolean_provenance(self) -> None:
+    def _sync_boolean_provenance(self, changed_source=None) -> None:
         for result in list(self._viewport.scene.objects):
             if str(getattr(result, "boolean_op", "") or "").strip().lower() not in {"fuse", "cut", "common"}:
                 continue
@@ -2183,8 +2448,24 @@ class MainWindow(QMainWindow):
                 if not isinstance(snapshot, dict):
                     continue
                 source = live_sources.get(str(snapshot.get("name", "")).strip())
-                if source is not None:
-                    snapshots[index] = self._serialize_object_snapshot(source)
+                if source is None or (changed_source is not None and source is not changed_source):
+                    continue
+                actor = getattr(source, "actor", None)
+                mapper = actor.GetMapper() if actor is not None else None
+                mesh_poly = mapper.GetInput() if mapper is not None else None
+                mesh_mtime = int(mesh_poly.GetMTime()) if mesh_poly is not None else None
+                same_mesh = (
+                    type(source).__name__ == "MeshObject"
+                    and mesh_mtime is not None
+                    and snapshot.get("mesh_mtime") == mesh_mtime
+                )
+                updated = self._serialize_object_snapshot(
+                    source,
+                    include_mesh=not same_mesh,
+                )
+                if same_mesh and "mesh" in snapshot:
+                    updated["mesh"] = snapshot["mesh"]
+                snapshots[index] = updated
             result.boolean_sources_data = snapshots
 
     def _replace_boolean_result_geometry(self, result, polydata) -> None:
@@ -2208,7 +2489,10 @@ class MainWindow(QMainWindow):
         self._replace_boolean_result_geometry(result, polydata)
         result.source_objects = list(sources)
         result.boolean_source_names = [str(source.name) for source in sources]
-        result.boolean_sources_data = [self._serialize_object_snapshot(source) for source in sources]
+        result.boolean_sources_data = [
+            self._serialize_object_snapshot(source)
+            for source in sources
+        ]
         return result
 
     def _recompute_pattern_instances(self, values: dict[str, float]) -> bool:
@@ -2575,6 +2859,12 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 formula_failures.add(id(obj))
                 self._info_bar.set_info(f"{obj.name}: {exc}")
+
+        for obj in objects:
+            definition = getattr(obj, "sketch_definition", None)
+            if not isinstance(definition, dict):
+                continue
+            self._recompute_persisted_sketch(obj, definition, values)
         self._regenerate_snap_dependent_objects(objects)
 
         try:
@@ -2641,6 +2931,7 @@ class MainWindow(QMainWindow):
             self._info_bar.set_info(f"Selected: {obj.name}  [{type(obj).__name__}]")
 
     def _on_selection_changed(self, objects: list) -> None:
+        self._viewport._last_face_pick = None
         if self._project_properties_active:
             self._body_props.set_project_parameters(self._project_tree.get_settings().get("parameters", []))
             self._materials.highlight([])
@@ -2658,13 +2949,71 @@ class MainWindow(QMainWindow):
             self._info_bar.set_info(f"{len(objects)} objects selected (Ctrl+click to extend)")
 
     def _on_params_changed(self, obj, _params) -> None:
-        self._sync_boolean_provenance()
+        self._sync_boolean_provenance(obj)
+        if not self._history_restoring:
+            self._history_record()
         self._viewport.scene.refresh_adaptive_grid()
         self._viewport._render()
         self._refresh_materials()
         self._mark_simulation_dirty(steps=True, script=True)
 
+    def _recompute_persisted_sketch(self, obj, definition: dict, values: dict) -> bool:
+        from ..drawing.sketch_engine import SketchEngine
+        from ..scene.em_objects import ExtrudedObject, RevolvedObject
+
+        try:
+            engine = SketchEngine.from_dict(definition)
+            dimensions = list(engine.dimensions)
+            for dimension in dimensions:
+                if not dimension.expression:
+                    continue
+                engine.dimensions = [dimension]
+                try:
+                    engine.recompute_dimensions(
+                        lambda expression: evaluate_expression(expression, values)
+                    )
+                except Exception as exc:
+                    dimension.resolved_value = None
+                    self._info_bar.set_info(
+                        f"{obj.name}: sketch dimension unresolved: {exc}"
+                    )
+
+            engine.dimensions = dimensions
+            engine.dimensions = [
+                dimension for dimension in dimensions
+                if dimension.kind != "angular" and dimension.resolved_value is not None
+            ]
+            for dimension in engine.dimensions:
+                if not engine.apply_dimension(dimension):
+                    raise ValueError("a sketch dimension could not be applied")
+            engine.dimensions = dimensions
+            if isinstance(obj, ExtrudedObject):
+                regions = engine.operation_regions()
+                if any(not region or len(region[0]) < 3 for region in regions):
+                    raise ValueError("the sketch no longer forms a closed profile")
+                if len(regions) == 1:
+                    profile = regions[0][0] if len(regions[0]) == 1 else regions[0]
+                else:
+                    profile = regions
+                params = obj.get_parameters()
+                params["ProfilePts"] = profile
+                obj.set_parameters(params)
+            elif isinstance(obj, RevolvedObject):
+                profile = engine.operation_profile()
+                outer = profile[0] if profile and isinstance(profile[0][0], (list, tuple)) else profile
+                if len(outer) < 3:
+                    raise ValueError("the sketch no longer forms a closed profile")
+                params = obj.get_parameters()
+                params["ProfilePts"] = profile
+                obj.set_parameters(params)
+            obj.sketch_definition = engine.to_dict()
+            return True
+        except Exception as exc:
+            self._info_bar.set_info(f"{obj.name}: sketch recomputation failed: {exc}")
+            return False
+
     def _on_bulk_material(self, material: str, objects: list) -> None:
+        self._history_record()
         self._draw_material = material
         self._viewport._render()
         self._refresh_materials()
@@ -2673,6 +3022,7 @@ class MainWindow(QMainWindow):
         self._mark_simulation_dirty(steps=False, script=True)
 
     def _on_bulk_style(self, material: str, color_hex: str, objects: list) -> None:
+        self._history_record()
         self._draw_material = material
         self._viewport._render()
         self._refresh_materials()
@@ -2724,6 +3074,7 @@ class MainWindow(QMainWindow):
             for obj in selected_objects:
                 obj.material = name
                 obj.refresh_appearance()
+            self._history_record()
             self._viewport._render()
             self._refresh_materials()
             self._info_bar.set_info(f"Material '{name}' applied to {len(selected_objects)} objects")
@@ -2753,6 +3104,7 @@ class MainWindow(QMainWindow):
         if not objects:
             return
         self._viewport.scene.set_visibility(objects, False)
+        self._history_record()
         self._refresh_materials()
         self._materials.highlight(objects)  # Preserve selection after refresh
         self._viewport._render()
@@ -2762,6 +3114,7 @@ class MainWindow(QMainWindow):
         if not objects:
             return
         self._viewport.scene.set_visibility(objects, True)
+        self._history_record()
         self._refresh_materials()
         self._materials.highlight(objects)  # Preserve selection after refresh
         self._viewport._render()
@@ -2784,6 +3137,7 @@ class MainWindow(QMainWindow):
             return
         for obj in objects:
             obj.is_model = bool(is_model)
+        self._history_record()
         self._refresh_materials()
         self._materials.highlight(objects)
         self._viewport._render()
@@ -2808,6 +3162,7 @@ class MainWindow(QMainWindow):
         if obj is None:
             return
         obj.is_model = bool(is_model)
+        self._history_record()
         self._refresh_materials()
         self._materials.highlight(obj)
         self._viewport._render()
@@ -2821,6 +3176,7 @@ class MainWindow(QMainWindow):
         old_name = obj.name
         obj.name = new_name
         self._project_tree.rename_object_references(old_name, new_name)
+        self._history_record()
         self._refresh_materials()
         self._materials.highlight(obj)  # Preserve selection after refresh
         if self._viewport.scene.selected is obj:
@@ -2837,6 +3193,7 @@ class MainWindow(QMainWindow):
             new_name = f"{base_name}_{start_index + i}"
             obj.name = new_name
             self._project_tree.rename_object_references(old_name, new_name)
+        self._history_record()
         self._refresh_materials()
         self._materials.highlight(objects)
         self._viewport._render()
@@ -4167,26 +4524,295 @@ class MainWindow(QMainWindow):
             self._sim_log_view.appendPlainText(message)
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� sketch
+    @staticmethod
+    def _planar_face_sketch_plane(face_pick):
+        if not isinstance(face_pick, dict):
+            return None
+        try:
+            points = [tuple(float(value) for value in point) for point in face_pick["points"]]
+        except (KeyError, TypeError, ValueError):
+            return None
+        if len(points) < 3 or any(len(point) != 3 for point in points):
+            return None
+
+        import math
+
+        if any(not math.isfinite(value) for point in points for value in point):
+            return None
+        spans = [max(point[axis] for point in points) - min(point[axis] for point in points) for axis in range(3)]
+        scale = max(spans)
+        if scale <= 0.0:
+            return None
+
+        first = points[0]
+        normal = None
+        minimum_cross = max(scale * scale * 1e-10, 1e-30)
+        for first_index in range(1, len(points) - 1):
+            first_edge = tuple(points[first_index][axis] - first[axis] for axis in range(3))
+            for second_index in range(first_index + 1, len(points)):
+                second_edge = tuple(points[second_index][axis] - first[axis] for axis in range(3))
+                cross = (
+                    first_edge[1] * second_edge[2] - first_edge[2] * second_edge[1],
+                    first_edge[2] * second_edge[0] - first_edge[0] * second_edge[2],
+                    first_edge[0] * second_edge[1] - first_edge[1] * second_edge[0],
+                )
+                length = math.sqrt(sum(value * value for value in cross))
+                if length > minimum_cross:
+                    normal = tuple(value / length for value in cross)
+                    break
+            if normal is not None:
+                break
+        if normal is None:
+            return None
+
+        tolerance = max(scale * 1e-6, 1e-12)
+        if any(
+            abs(sum((point[axis] - first[axis]) * normal[axis] for axis in range(3))) > tolerance
+            for point in points
+        ):
+            return None
+        origin = tuple(sum(point[axis] for point in points) / len(points) for axis in range(3))
+        return origin, normal
+
     def _open_sketch(self) -> None:
         vp = self._viewport
+        face_plane = None
+        if (
+            getattr(vp, "_selection_mode", None) == "face"
+            and getattr(vp, "_sub_pick_actor", None) is not None
+        ):
+            face_plane = self._planar_face_sketch_plane(getattr(vp, "_last_face_pick", None))
+        if face_plane is not None:
+            self._start_embedded_sketch(*face_plane)
+            return
+
+        active_plane = getattr(vp.scene, "active_plane", None)
+        if active_plane is not None:
+            self._start_embedded_sketch(active_plane.origin, active_plane.normal)
+            return
+
+        self._open_reference_plane_dialog(start_sketch=True)
+
+    def _start_embedded_sketch(self, origin, normal, sketch_definition=None) -> None:
+        if sketch_definition is None:
+            self._viewport.start_sketch(tuple(origin), tuple(normal))
+        else:
+            self._viewport.start_sketch(tuple(origin), tuple(normal), sketch_definition)
+        self._viewport._sketch_toolbar.hide()
+        self._main_toolbar.setVisible(False)
+        self._sketch_context_toolbar.setVisible(True)
+
+    def _edit_sketch_definition(self, obj) -> None:
+        definition = getattr(obj, "sketch_definition", None)
+        if not isinstance(definition, dict):
+            self._info_bar.set_info("This object has no editable sketch definition.")
+            return
+        try:
+            origin = tuple(float(value) for value in definition["plane_origin"])
+            normal = tuple(float(value) for value in definition["plane_normal"])
+        except (KeyError, TypeError, ValueError) as exc:
+            QMessageBox.warning(self, "Edit Sketch", f"Invalid sketch plane: {exc}")
+            return
+        scene_objects = list(getattr(self._viewport.scene, "objects", []))
+        self._sketch_edit_visibility = [
+            (scene_obj, scene_obj.is_visible())
+            for scene_obj in scene_objects
+            if callable(getattr(scene_obj, "is_visible", None))
+            and callable(getattr(scene_obj, "set_visible", None))
+        ]
+        self._sketch_edit_target = obj
+        for scene_obj, _was_visible in self._sketch_edit_visibility:
+            scene_obj.set_visible(False)
+        try:
+            self._start_embedded_sketch(origin, normal, definition)
+        except Exception:
+            for scene_obj, was_visible in self._sketch_edit_visibility:
+                scene_obj.set_visible(was_visible)
+            self._sketch_edit_visibility = []
+            self._sketch_edit_target = None
+            raise
+        self._info_bar.set_info(f"Editing sketch for {obj.name}")
+
+    def _on_viewport_sketch_finished(self) -> None:
+        self._sketch_context_toolbar.setVisible(False)
+        self._main_toolbar.setVisible(True)
+        for obj, was_visible in getattr(self, "_sketch_edit_visibility", []):
+            obj.set_visible(was_visible)
+        self._sketch_edit_visibility = []
+        self._sketch_edit_target = None
+
+    def _activate_sketch_toolbar_action(self, callback) -> None:
+        callback()
+        self._viewport.setFocus()
+
+    def _edit_sketch_feature(self, obj) -> None:
+        import ast
+        from ..scene.em_objects import ExtrudedObject, RevolvedObject
+
+        if not isinstance(obj, (ExtrudedObject, RevolvedObject)):
+            return
+        if isinstance(obj, ExtrudedObject):
+            self._edit_extrusion_depth(obj)
+            return
+        params = obj.get_parameters()
+        try:
+            profile = ast.literal_eval(params.get("ProfilePts", ""))
+        except (SyntaxError, ValueError) as exc:
+            QMessageBox.warning(self, "Edit Feature", f"Unable to read the sketch profile: {exc}")
+            return
+
+        plane_origin = tuple(
+            float(params[f"PlaneOrigin{axis}"]) for axis in "XYZ"
+        )
+        plane_normal = tuple(
+            float(params[f"PlaneNormal{axis}"]) for axis in "XYZ"
+        )
+        is_extrude = isinstance(obj, ExtrudedObject)
+        axis_pt1 = tuple(float(params[f"AxisPt1{axis}"]) for axis in "XYZ") if not is_extrude else None
+        axis_pt2 = tuple(float(params[f"AxisPt2{axis}"]) for axis in "XYZ") if not is_extrude else None
         dlg = SketchDialog(
             self,
-            plane_origin=vp._custom_plane_origin,
-            plane_normal=vp._custom_plane_normal,
+            plane_origin=plane_origin,
+            plane_normal=plane_normal,
+            profile_pts=profile,
+            operation_mode="extrude" if is_extrude else "revolve",
+            extrusion_depth=float(params.get("Depth", 10.0)) if is_extrude else None,
+            revolve_angle=float(params.get("Angle", 360.0)) if not is_extrude else None,
+            revolve_axis_pt1=axis_pt1,
+            revolve_axis_pt2=axis_pt2,
         )
-        dlg.extrude_requested.connect(self._on_extrude_requested)
-        dlg.revolve_requested.connect(self._on_revolve_requested)
+
+        def update_extrusion(profile_pts, depth, origin, normal) -> bool:
+            try:
+                obj.set_parameters({
+                    "ProfilePts": profile_pts,
+                    "Depth": depth,
+                    **{f"PlaneOrigin{axis}": origin[index] for index, axis in enumerate("XYZ")},
+                    **{f"PlaneNormal{axis}": normal[index] for index, axis in enumerate("XYZ")},
+                })
+            except (TypeError, ValueError) as exc:
+                QMessageBox.warning(dlg, "Edit Extrusion", str(exc))
+                return False
+            self._finish_sketch_feature_edit(obj)
+            return True
+
+        def update_revolution(profile_pts, angle, start, end, origin, normal) -> bool:
+            try:
+                obj.set_parameters({
+                    "ProfilePts": profile_pts,
+                    "Angle": angle,
+                    **{f"AxisPt1{axis}": start[index] for index, axis in enumerate("XYZ")},
+                    **{f"AxisPt2{axis}": end[index] for index, axis in enumerate("XYZ")},
+                    **{f"PlaneOrigin{axis}": origin[index] for index, axis in enumerate("XYZ")},
+                    **{f"PlaneNormal{axis}": normal[index] for index, axis in enumerate("XYZ")},
+                })
+            except (TypeError, ValueError) as exc:
+                QMessageBox.warning(dlg, "Edit Revolution", str(exc))
+                return False
+            self._finish_sketch_feature_edit(obj)
+            return True
+
+        dlg.set_edit_apply_callback(update_extrusion if is_extrude else update_revolution)
         dlg.show()
 
-    def _on_extrude_requested(self, profile, depth, origin, normal) -> None:
+    def _edit_extrusion_depth(self, obj) -> None:
+        params = obj.get_parameters()
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Edit Extrude Height")
+        form = QFormLayout(dlg)
+        depth_input = QDoubleSpinBox(dlg, resolver=self._resolve_formula_text)
+        depth_input.setRange(0.000001, 1e9)
+        depth_input.setDecimals(6)
+        depth_input.setValue(float(params.get("Depth", 10.0)))
+        direction_input = QComboBox(dlg)
+        direction_input.addItem("Along sketch normal", "Normal")
+        direction_input.addItem("Against sketch normal", "Reverse")
+        direction_index = direction_input.findData(params.get("Direction", "Normal"))
+        direction_input.setCurrentIndex(max(direction_index, 0))
+        symmetric_input = QCheckBox("Both directions (total depth, centered)", dlg)
+        symmetric_input.setChecked(bool(params.get("Symmetric", False)))
+        direction_input.setEnabled(not symmetric_input.isChecked())
+        symmetric_input.toggled.connect(lambda checked: direction_input.setEnabled(not checked))
+        unit_label = f"Extrusion height ({self._units})" if self._units else "Extrusion height"
+        form.addRow(f"{unit_label} (total when centered)", depth_input)
+        form.addRow("Direction:", direction_input)
+        form.addRow("", symmetric_input)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
+        form.addRow(buttons)
+        saved_formula = str((getattr(obj, "param_formulas", {}) or {}).get("Depth", "")).strip()
+        if saved_formula:
+            depth_input.set_formula(saved_formula)
+
+        def apply_depth() -> None:
+            raw_value = depth_input.formula_text().strip()
+            try:
+                depth = float(depth_input.value())
+                obj.set_parameters({
+                    "Depth": depth,
+                    "Direction": direction_input.currentData(),
+                    "Symmetric": symmetric_input.isChecked(),
+                })
+            except (TypeError, ValueError) as exc:
+                QMessageBox.warning(dlg, "Invalid Extrusion Height", str(exc))
+                return
+            formulas = dict(getattr(obj, "param_formulas", {}) or {})
+            try:
+                float(raw_value.replace(",", "."))
+            except ValueError:
+                formulas["Depth"] = raw_value
+            else:
+                formulas.pop("Depth", None)
+            obj.param_formulas = formulas
+            self._finish_sketch_feature_edit(obj)
+            dlg.accept()
+
+        buttons.accepted.connect(apply_depth)
+        buttons.rejected.connect(dlg.reject)
+        self._extrusion_depth_dialog = dlg
+        dlg.show()
+
+    def _finish_sketch_feature_edit(self, obj) -> None:
+        self._viewport.scene.select(obj)
+        self._viewport.scene_changed.emit()
+        self._viewport.object_selected.emit(obj)
+        self._viewport.selection_changed.emit([obj])
+        self._viewport._render()
+        self._refresh_materials()
+        self._mark_simulation_dirty(steps=True, script=True)
+        self._info_bar.set_info(f"Updated feature operation: {obj.name}")
+
+    def _on_extrude_requested(
+        self, profile, depth, origin, normal, direction="Normal", symmetric=False
+    ) -> None:
         from ..scene.em_objects import ExtrudedObject
+        target = getattr(self, "_sketch_edit_target", None)
+        sketch_definition = self._viewport.sketch_definition()
+        if isinstance(target, ExtrudedObject):
+            try:
+                target.set_parameters({
+                    "ProfilePts": profile,
+                    "Depth": depth,
+                    "Direction": direction,
+                    "Symmetric": symmetric,
+                    **{f"PlaneOrigin{axis}": origin[index] for index, axis in enumerate("XYZ")},
+                    **{f"PlaneNormal{axis}": normal[index] for index, axis in enumerate("XYZ")},
+                })
+            except (TypeError, ValueError) as exc:
+                self._info_bar.set_info(f"Unable to update extrusion: {exc}")
+                return
+            target.sketch_definition = sketch_definition
+            self._finish_sketch_feature_edit(target)
+            return
         obj = ExtrudedObject(
             profile_pts  = profile,
             depth        = depth,
             plane_origin = origin,
             plane_normal = normal,
             material     = self._draw_material,
+            direction    = direction,
+            symmetric    = symmetric,
         )
+        obj.sketch_definition = sketch_definition
         self._viewport.scene.add_object(obj)
         self._viewport.scene.select(obj)
         self._viewport.object_selected.emit(obj)
@@ -4196,15 +4822,127 @@ class MainWindow(QMainWindow):
         self._refresh_materials()
         self._info_bar.set_info(f"Extruded body created: {obj.name}")
 
-    def _on_revolve_requested(self, profile, angle, axis_pt1, axis_pt2) -> None:
+    def _on_extruded_cut_requested(self, profile, depth, origin, normal) -> None:
+        from ..scene.boolean_ops import boolean_many
+        from ..scene.em_objects import ExtrudedObject, MeshObject
+
+        target = getattr(self, "_sketch_edit_target", None)
+        sketch_definition = self._viewport.sketch_definition()
+        if isinstance(target, MeshObject) and target.boolean_op == "cut":
+            sources = list(getattr(target, "source_objects", []) or [])
+            snapshots = list(getattr(target, "boolean_sources_data", []) or [])
+            base = sources[0] if sources else None
+            if base is None and snapshots:
+                base = self._rebuild_object_from_snapshot(snapshots[0])
+            if base is None:
+                self._info_bar.set_info(
+                    f"Unable to edit {target.name}: its original cut source is unavailable."
+                )
+                return
+            tool_name = (
+                str(sources[1].name) if len(sources) > 1
+                else str(snapshots[1].get("name", f"SketchCut_{base.name}"))
+                if len(snapshots) > 1
+                else f"SketchCut_{base.name}"
+            )
+            try:
+                tool = ExtrudedObject(
+                    name=tool_name,
+                    profile_pts=profile,
+                    depth=float(depth),
+                    plane_origin=origin,
+                    plane_normal=normal,
+                    material=base.material,
+                )
+                tool.sketch_definition = sketch_definition
+                result_poly = boolean_many("cut", [base, tool])
+            except Exception as exc:
+                QMessageBox.critical(self, "Extruded Cut failed", str(exc))
+                self._info_bar.set_info(f"Extruded Cut failed: {exc}")
+                return
+            target.sketch_definition = sketch_definition
+            self._replace_boolean_result_object(target, result_poly, [base, tool])
+            self._finish_sketch_feature_edit(target)
+            return
+
+        scene = self._viewport.scene
+        selection = list(scene.selection)
+        if len(selection) != 1:
+            self._info_bar.set_info("Extruded Cut requires exactly one selected base object.")
+            return
+        base = selection[0]
+        try:
+            tool = ExtrudedObject(
+                name=f"SketchCut_{base.name}",
+                profile_pts=profile,
+                depth=float(depth),
+                plane_origin=origin,
+                plane_normal=normal,
+                material=base.material,
+            )
+            tool.sketch_definition = sketch_definition
+            result_poly = boolean_many("cut", [base, tool])
+        except Exception as exc:
+            QMessageBox.critical(self, "Extruded Cut failed", str(exc))
+            self._info_bar.set_info(f"Extruded Cut failed: {exc}")
+            return
+
+        result = MeshObject(
+            name=f"ExtrudedCut_{base.name}",
+            polydata=result_poly,
+            material=base.material,
+            plate_role=self._is_plate_role_object(base),
+            boolean_op="cut",
+            boolean_source_names=[base.name, tool.name],
+        )
+        result.source_objects = [base, tool]
+        result.boolean_mesh_reduction = 0.0
+        result.boolean_sources_data = [
+            self._serialize_object_snapshot(source) for source in (base, tool)
+        ]
+        result.sketch_definition = sketch_definition
+        result.refresh_appearance()
+        scene.add_object(result)
+        scene.remove_object(base)
+        scene.select(result)
+        self._viewport.object_selected.emit(result)
+        self._viewport.selection_changed.emit([result])
+        self._viewport.scene_changed.emit()
+        self._refresh_materials()
+        self._viewport._render()
+        self._info_bar.set_info(f"Extruded Cut created: {result.name}")
+
+    def _on_revolve_requested(self, profile, angle, axis_pt1, axis_pt2,
+                              plane_origin, plane_normal) -> None:
         from ..scene.em_objects import RevolvedObject
+        target = getattr(self, "_sketch_edit_target", None)
+        sketch_definition = self._viewport.sketch_definition()
+        if isinstance(target, RevolvedObject):
+            try:
+                target.set_parameters({
+                    "ProfilePts": profile,
+                    "Angle": angle,
+                    **{f"AxisPt1{axis}": axis_pt1[index] for index, axis in enumerate("XYZ")},
+                    **{f"AxisPt2{axis}": axis_pt2[index] for index, axis in enumerate("XYZ")},
+                    **{f"PlaneOrigin{axis}": plane_origin[index] for index, axis in enumerate("XYZ")},
+                    **{f"PlaneNormal{axis}": plane_normal[index] for index, axis in enumerate("XYZ")},
+                })
+            except (TypeError, ValueError) as exc:
+                self._info_bar.set_info(f"Unable to update revolution: {exc}")
+                return
+            target.sketch_definition = sketch_definition
+            self._finish_sketch_feature_edit(target)
+            return
         obj = RevolvedObject(
             profile_pts = profile,
             angle       = angle,
             axis_pt1    = axis_pt1,
             axis_pt2    = axis_pt2,
+            plane_origin = plane_origin,
+            plane_normal = plane_normal,
             material    = self._draw_material,
         )
+        obj.sketch_definition = sketch_definition
         self._viewport.scene.add_object(obj)
         self._viewport.scene.select(obj)
         self._viewport.object_selected.emit(obj)
@@ -4215,8 +4953,9 @@ class MainWindow(QMainWindow):
         self._info_bar.set_info(f"Revolved body created: {obj.name}")
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� reference plane
-    def _open_reference_plane_dialog(self) -> None:
+    def _open_reference_plane_dialog(self, start_sketch: bool = False) -> None:
         vp = self._viewport
+        self._sketch_after_plane_defined = bool(start_sketch)
         # Reuse a single dialog instance so it survives hide/show during 3D picking
         dlg = getattr(self, "_ref_plane_dlg", None)
         if dlg is None:
@@ -4227,6 +4966,7 @@ class MainWindow(QMainWindow):
                 viewport=vp,
             )
             dlg.plane_defined.connect(self._on_plane_defined)
+            dlg.finished.connect(self._on_reference_plane_dialog_finished)
             self._ref_plane_dlg = dlg
         dlg.show()
         dlg.raise_()
@@ -4234,6 +4974,8 @@ class MainWindow(QMainWindow):
 
     def _on_plane_defined(self, origin, normal, name) -> None:
         """Slot for ReferencePlaneDialog.plane_defined."""
+        start_sketch = self._sketch_after_plane_defined
+        self._sketch_after_plane_defined = False
         scene = self._viewport.scene
         plane = scene.add_reference_plane(
             name or f"Plane {len(scene.reference_planes)+1}",
@@ -4248,6 +4990,11 @@ class MainWindow(QMainWindow):
         )
         self._refresh_materials()
         self._info_bar.set_info(f"Reference plane '{plane.name}' added and made active.")
+        if start_sketch:
+            self._start_embedded_sketch(origin, normal)
+
+    def _on_reference_plane_dialog_finished(self, _result: int) -> None:
+        self._sketch_after_plane_defined = False
 
     def _on_plane_make_active(self, plane) -> None:
         scene = self._viewport.scene
@@ -4512,6 +5259,7 @@ class MainWindow(QMainWindow):
             self._boolean_decimation_enabled = bool(int(settings.value("utility/boolean_decimation_enabled", 0)))
         except Exception:
             pass
+        self._workspace_path = str(settings.value("utility/workspace_path", self._workspace_path)).strip()
 
     def _save_app_settings(self) -> None:
         settings = QSettings()
@@ -4542,6 +5290,7 @@ class MainWindow(QMainWindow):
         settings.setValue("simulation/export_sparams_after_sim", int(self._sim_export_sparams_after_sim))
         settings.setValue("utility/export_full_scene_step", int(self._export_full_scene_step))
         settings.setValue("utility/boolean_decimation_enabled", int(self._boolean_decimation_enabled))
+        settings.setValue("utility/workspace_path", self._workspace_path)
         settings.sync()
 
     def _sync_settings_dialog_values(self) -> None:
@@ -4571,6 +5320,7 @@ class MainWindow(QMainWindow):
             export_sparams_after_sim=self._sim_export_sparams_after_sim,
             export_full_scene_step=self._export_full_scene_step,
             boolean_decimation_enabled=self._boolean_decimation_enabled,
+            workspace_path=self._workspace_path,
         )
 
     def _apply_display_settings(self, values: dict) -> None:
@@ -4618,6 +5368,7 @@ class MainWindow(QMainWindow):
         self._sim_export_sparams_after_sim = bool(values.get("export_sparams_after_sim", self._sim_export_sparams_after_sim))
         self._export_full_scene_step = bool(values.get("export_full_scene_step", self._export_full_scene_step))
         self._boolean_decimation_enabled = bool(values.get("boolean_decimation_enabled", self._boolean_decimation_enabled))
+        self._workspace_path = str(values.get("workspace_path", self._workspace_path)).strip()
         if self._export_full_scene_step and not old_export_full_scene_step:
             self._sim_full_scene_step_dirty = True
         self._project_tree.set_runtime_settings({
@@ -4717,6 +5468,7 @@ class MainWindow(QMainWindow):
         )
 
     def _on_settings_changed(self) -> None:
+        self._sync_project_variable_names()
         self._sync_log_verbosity_from_settings()
         self._sync_port_reference_state()
         self._info_bar.set_info("EMERGE settings updated.")
@@ -5272,6 +6024,7 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"EM 3D Modeler - {self._project_name}")
         self._project_tree.set_project_name(self._project_name)
         self._project_tree.reset_settings()
+        self._sync_project_variable_names()
         self._project_tree.set_runtime_settings({
             "solver": self._sim_solver,
             "parallel_enabled": self._sim_parallel_enabled,
@@ -5288,6 +6041,7 @@ class MainWindow(QMainWindow):
         self._sync_port_reference_state()
         self._refresh_materials()
         self._viewport._render()
+        self._history_reset()
         self._info_bar.set_info("New project created.")
 
     def _close_project(self) -> None:
@@ -5306,9 +6060,19 @@ class MainWindow(QMainWindow):
         self._new_project()
         self._info_bar.set_info("Project closed.")
 
+    def _workspace_dialog_directory(self) -> str:
+        configured_path = str(getattr(self, "_workspace_path", "")).strip()
+        if not configured_path:
+            return ""
+        directory = Path(configured_path).expanduser()
+        return str(directory.resolve()) if directory.is_dir() else ""
+
     def _open_project(self) -> None:
         path, _ = QFileDialog.getOpenFileName(
-            self, "Open Project", "", "EM3D Project (*.em3d);;All Files (*)"
+            self,
+            "Open Project",
+            self._workspace_dialog_directory(),
+            "EM3D Project (*.em3d);;All Files (*)",
         )
         if not path:
             return
@@ -5401,6 +6165,7 @@ class MainWindow(QMainWindow):
             self._sync_port_reference_state()
             self._refresh_materials()
             self._viewport._render()
+            self._history_reset()
             self._info_bar.set_info(f"Project loaded: {path}")
             self._remember_recent_project(path)
 
@@ -5414,8 +6179,11 @@ class MainWindow(QMainWindow):
             self._do_save(self._project_path)
 
     def _save_project_as(self) -> None:
+        filename = f"{self._project_name}.em3d"
+        workspace_directory = self._workspace_dialog_directory()
+        initial_path = str(Path(workspace_directory) / filename) if workspace_directory else filename
         path, _ = QFileDialog.getSaveFileName(
-            self, "Save Project", f"{self._project_name}.em3d",
+            self, "Save Project", initial_path,
             "EM3D Project (*.em3d);;All Files (*)"
         )
         if path:

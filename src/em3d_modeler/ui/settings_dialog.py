@@ -24,10 +24,12 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
+    QFileDialog,
     QFormLayout,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QLineEdit,
     QPushButton,
     QTabWidget,
     QVBoxLayout,
@@ -217,6 +219,16 @@ class SettingsDialog(QDialog):
         self._utility_tab = QWidget(self)
         self._tabs.addTab(self._utility_tab, "Utility")
         utility_layout = QVBoxLayout(self._utility_tab)
+        workspace_row = QHBoxLayout()
+        self._workspace_path_edit = QLineEdit(self._utility_tab)
+        self._workspace_path_edit.setReadOnly(True)
+        self._workspace_path_edit.setPlaceholderText("Not set")
+        workspace_row.addWidget(self._workspace_path_edit, 1)
+        self._workspace_browse_btn = QPushButton("Browse…", self._utility_tab)
+        self._workspace_browse_btn.clicked.connect(self._browse_workspace)
+        workspace_row.addWidget(self._workspace_browse_btn)
+        utility_layout.addWidget(QLabel("Workspace folder", self._utility_tab))
+        utility_layout.addLayout(workspace_row)
         self._export_full_scene_step_check = QCheckBox(
             "Export complete scene STEP",
             self._utility_tab,
@@ -233,6 +245,16 @@ class SettingsDialog(QDialog):
         btns.accepted.connect(self.accept)
         btns.rejected.connect(self.reject)
         root.addWidget(btns)
+
+    def _browse_workspace(self) -> None:
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select Workspace Folder",
+            self._workspace_path_edit.text(),
+            QFileDialog.ShowDirsOnly,
+        )
+        if directory:
+            self._workspace_path_edit.setText(directory)
 
     def _choose_custom_color(self) -> None:
         qcolor = QColorDialog.getColor(self._to_qcolor(self._custom_color), self, "Selection color")
@@ -319,6 +341,7 @@ class SettingsDialog(QDialog):
         export_sparams_after_sim: bool = True,
         export_full_scene_step: bool = False,
         boolean_decimation_enabled: bool = False,
+        workspace_path: str = "",
     ) -> None:
         self._units_combo.setCurrentText(units)
         self._current_units = units
@@ -360,6 +383,7 @@ class SettingsDialog(QDialog):
         self._refinement_max_size_spin.setValue(float(refinement_max_size_mm))
         self._export_full_scene_step_check.setChecked(bool(export_full_scene_step))
         self._boolean_decimation_check.setChecked(bool(boolean_decimation_enabled))
+        self._workspace_path_edit.setText(str(workspace_path or ""))
 
     def values(self) -> dict:
         color_name = self._selection_color_combo.currentText()
@@ -386,4 +410,5 @@ class SettingsDialog(QDialog):
             "export_sparams_after_sim": bool(self._export_sparams_check.isChecked()),
             "export_full_scene_step": bool(self._export_full_scene_step_check.isChecked()),
             "boolean_decimation_enabled": bool(self._boolean_decimation_check.isChecked()),
+            "workspace_path": self._workspace_path_edit.text().strip(),
         }

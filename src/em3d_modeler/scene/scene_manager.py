@@ -16,6 +16,7 @@
 
 """Scene manager: owns all EM objects and the VTK renderer."""
 from __future__ import annotations
+from copy import deepcopy
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -23,7 +24,8 @@ import vtk
 
 from .em_objects import (
     EMObject, BoxObject, CylinderObject, ConeObject, SphereObject, MeshObject,
-    PlateObject, PyramidObject, WedgeObject, TorusObject, EllipsoidObject
+    PlateObject, PyramidObject, WedgeObject, TorusObject, EllipsoidObject,
+    ExtrudedObject, RevolvedObject,
 )
 from .grid_actor import build_grid_actor, build_axes_widget, project_bounds_to_plane
 
@@ -38,6 +40,8 @@ _OBJECT_CLASSES = {
     "WedgeObject":    WedgeObject,
     "TorusObject":    TorusObject,
     "EllipsoidObject": EllipsoidObject,
+    "ExtrudedObject": ExtrudedObject,
+    "RevolvedObject": RevolvedObject,
 }
 
 
@@ -57,6 +61,7 @@ class SceneManager:
         self.objects: List[EMObject] = []
         self.selected: Optional[EMObject] = None
         self.selection: List[EMObject] = []   # multi-selection list
+        self._mesh_json_cache: Dict[int, Tuple[vtk.vtkPolyData, int, Dict[str, Any]]] = {}
 
         # Reference-plane registry (built-in axis presets + user-defined)
         self.reference_planes: List[ReferencePlane] = [
@@ -371,8 +376,20 @@ class SceneManager:
         poly.SetPolys(polys)
         return poly
 
-    def to_json(self) -> list:
+    def to_json(self, *, cache_meshes: bool = False) -> list:
         out = []
+        active_mesh_ids = set()
+        if cache_meshes:
+            for obj in self.objects:
+                actor = getattr(obj, "actor", None)
+                mapper = actor.GetMapper() if actor is not None else None
+                mesh_poly = mapper.GetInput() if mapper is not None else None
+                if isinstance(mesh_poly, vtk.vtkPolyData):
+                    active_mesh_ids.add(id(mesh_poly))
+            self._mesh_json_cache = {
+                key: entry for key, entry in self._mesh_json_cache.items()
+                if key in active_mesh_ids
+            }
         for obj in self.objects:
             item = {
                 "type": type(obj).__name__,
@@ -396,7 +413,26 @@ class SceneManager:
                 mesh_poly = None
                 if obj.actor is not None and obj.actor.GetMapper() is not None:
                     mesh_poly = obj.actor.GetMapper().GetInput()
-                item["mesh"] = self._polydata_to_json(mesh_poly)
+                if cache_meshes and isinstance(mesh_poly, vtk.vtkPolyData):
+                    cache_key = id(mesh_poly)
+                    mesh_mtime = int(mesh_poly.GetMTime())
+                    cached = self._mesh_json_cache.get(cache_key)
+                    if cached is not None and cached[0] is mesh_poly and cached[1] == mesh_mtime:
+                        mesh_data = cached[2]
+                    else:
+                        mesh_data = self._polydata_to_json(mesh_poly)
+                        self._mesh_json_cache[cache_key] = (mesh_poly, mesh_mtime, mesh_data)
+                else:
+                    mesh_data = self._polydata_to_json(mesh_poly)
+                item["mesh"] = mesh_data
+            if cache_meshes:
+                mesh_data = item.pop("mesh", None)
+                boolean_sources_data = item.get("params", {}).get("BooleanSourcesData")
+                item = deepcopy(item)
+                if isinstance(boolean_sources_data, list):
+                    item["params"]["BooleanSourcesData"] = boolean_sources_data
+                if mesh_data is not None:
+                    item["mesh"] = mesh_data
             out.append(item)
         return out
 
@@ -479,6 +515,9 @@ class SceneManager:
                               p["CenterX"], p["CenterY"], p["CenterZ"],
                               p["RadiusX"], p["RadiusY"], p["RadiusZ"],
                               p.get("Material", "PEC"))
+                elif t in ("ExtrudedObject", "RevolvedObject"):
+                    obj = cls(item.get("name", ""))
+                    obj.set_parameters(p)
                 else:
                     continue
                 obj.opacity = float(p.get("Opacity", 0.85))
@@ -509,13 +548,18 @@ class SceneManager:
                     position = transform.get("position")
                     orientation = transform.get("orientation")
                     scale = transform.get("scale")
-                    if isinstance(origin, (list, tuple)) and len(origin) == 3:
+                    feature_matrix = isinstance(obj, RevolvedObject)
+                    if (isinstance(origin, (list, tuple)) and len(origin) == 3
+                            and (not feature_matrix or tuple(origin) != (0.0, 0.0, 0.0))):
                         obj.actor.SetOrigin(*[float(value) for value in origin])
-                    if isinstance(position, (list, tuple)) and len(position) == 3:
+                    if (isinstance(position, (list, tuple)) and len(position) == 3
+                            and (not feature_matrix or tuple(position) != (0.0, 0.0, 0.0))):
                         obj.actor.SetPosition(*[float(value) for value in position])
-                    if isinstance(orientation, (list, tuple)) and len(orientation) == 3:
+                    if (isinstance(orientation, (list, tuple)) and len(orientation) == 3
+                            and (not feature_matrix or tuple(orientation) != (0.0, 0.0, 0.0))):
                         obj.actor.SetOrientation(*[float(value) for value in orientation])
-                    if isinstance(scale, (list, tuple)) and len(scale) == 3:
+                    if (isinstance(scale, (list, tuple)) and len(scale) == 3
+                            and (not feature_matrix or tuple(scale) != (1.0, 1.0, 1.0))):
                         obj.actor.SetScale(*[float(value) for value in scale])
 
                 if isinstance(obj, MeshObject) and obj.boolean_source_names:

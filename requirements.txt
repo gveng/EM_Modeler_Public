@@ -3,3 +3,4 @@ scipy
 matplotlib
 PySide6
 vtk
+shapely

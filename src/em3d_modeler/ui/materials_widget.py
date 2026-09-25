@@ -29,7 +29,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui  import QBrush, QColor, QAction
 
-from ..scene.em_objects import EMObject
+from ..scene.em_objects import EMObject, ExtrudedObject, RevolvedObject
 
 # Roles for QTreeWidgetItem.data()
 _ROLE_OBJ_ID      = Qt.UserRole       # int(id(EMObject))
@@ -41,6 +41,8 @@ _ROLE_MATERIAL     = Qt.UserRole + 5  # str(material_name) on material header ro
 _ROLE_TRANSFORM_ID = Qt.UserRole + 6  # int(id(EMObject)) on transform child row
 _ROLE_GRID_ADAPTIVE = Qt.UserRole + 7  # bool on the Grid row
 _ROLE_PATTERN_EDIT = Qt.UserRole + 8  # int(id(EMObject)) on a pattern settings row
+_ROLE_FEATURE_EDIT = Qt.UserRole + 9  # int(id(EMObject)) on a feature operation row
+_ROLE_SKETCH_EDIT = Qt.UserRole + 10  # int(id(EMObject)) on a sketch row
 
 
 class MaterialsWidget(QWidget):
@@ -69,6 +71,8 @@ class MaterialsWidget(QWidget):
     material_priority_changed = Signal(str, int)  # material_name, delta (1 for higher, -1 for lower)
     transform_edit_requested = Signal(list)  # List[EMObject]
     pattern_edit_requested = Signal(object)  # EMObject whose pattern definition should be edited
+    feature_edit_requested = Signal(object)  # ExtrudedObject or RevolvedObject
+    sketch_edit_requested = Signal(object)  # EMObject whose sketch definition should be edited
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -209,6 +213,19 @@ class MaterialsWidget(QWidget):
                 pattern_item.setToolTip(0, "Right-click to edit this object's pattern definition.")
                 pattern_item.setForeground(0, QBrush(QColor(120, 180, 220)))
                 child.addChild(pattern_item)
+            if isinstance(getattr(obj, "sketch_definition", None), dict):
+                sketch_item = QTreeWidgetItem(["Sketch"])
+                sketch_item.setData(0, _ROLE_SKETCH_EDIT, id(obj))
+                sketch_item.setToolTip(0, "Double-click or right-click to edit this sketch.")
+                sketch_item.setForeground(0, QBrush(QColor(120, 180, 220)))
+                child.addChild(sketch_item)
+            if isinstance(obj, (ExtrudedObject, RevolvedObject)):
+                operation = "Extrude" if isinstance(obj, ExtrudedObject) else "Revolve"
+                feature_item = QTreeWidgetItem([f"Operation: {operation}"])
+                feature_item.setData(0, _ROLE_FEATURE_EDIT, id(obj))
+                feature_item.setToolTip(0, f"Right-click to edit this {operation.lower()} operation.")
+                feature_item.setForeground(0, QBrush(QColor(120, 180, 220)))
+                child.addChild(feature_item)
             if id(obj) in prev_selected_ids:
                 child.setSelected(True)
 
@@ -274,6 +291,10 @@ class MaterialsWidget(QWidget):
     def _on_item_click(self, item: QTreeWidgetItem, _col: int) -> None:
         if item.data(0, _ROLE_PATTERN_EDIT) is not None:
             return
+        if item.data(0, _ROLE_FEATURE_EDIT) is not None:
+            return
+        if item.data(0, _ROLE_SKETCH_EDIT) is not None:
+            return
         transform_id = item.data(0, _ROLE_TRANSFORM_ID)
         if transform_id is not None:
             return
@@ -300,6 +321,18 @@ class MaterialsWidget(QWidget):
             self.object_selected.emit(obj)
 
     def _on_item_double_click(self, item: QTreeWidgetItem, _col: int) -> None:
+        sketch_obj_id = item.data(0, _ROLE_SKETCH_EDIT)
+        if sketch_obj_id is not None:
+            obj = self._obj_map.get(sketch_obj_id)
+            if obj is not None:
+                self.sketch_edit_requested.emit(obj)
+            return
+        feature_obj_id = item.data(0, _ROLE_FEATURE_EDIT)
+        if feature_obj_id is not None:
+            obj = self._obj_map.get(feature_obj_id)
+            if obj is not None:
+                self.feature_edit_requested.emit(obj)
+            return
         pattern_obj_id = item.data(0, _ROLE_PATTERN_EDIT)
         if pattern_obj_id is not None:
             obj = self._obj_map.get(pattern_obj_id)
@@ -313,18 +346,50 @@ class MaterialsWidget(QWidget):
                 self.transform_edit_requested.emit([obj])
 
     def _on_selection_changed(self) -> None:
+        selected_items = self._tree.selectedItems()
         selected = []
-        for item in self._tree.selectedItems():
+        for item in selected_items:
             obj_id = item.data(0, _ROLE_OBJ_ID)
             if obj_id is not None:
                 obj = self._obj_map.get(obj_id)
                 if obj:
                     selected.append(obj)
-        self.selection_changed.emit(selected)
+        has_operation_row = any(
+            item.data(0, role) is not None
+            for item in selected_items
+            for role in (_ROLE_FEATURE_EDIT, _ROLE_SKETCH_EDIT)
+        )
+        if selected or not has_operation_row:
+            self.selection_changed.emit(selected)
 
     def _on_context_menu(self, pos) -> None:
         item = self._tree.itemAt(pos)
         if item is None:
+            return
+
+        sketch_obj_id = item.data(0, _ROLE_SKETCH_EDIT)
+        if sketch_obj_id is not None:
+            obj = self._obj_map.get(sketch_obj_id)
+            if obj is None:
+                return
+            menu = QMenu(self._tree)
+            act_edit = QAction("Edit Sketch…", menu)
+            act_edit.triggered.connect(lambda: self.sketch_edit_requested.emit(obj))
+            menu.addAction(act_edit)
+            menu.exec_(self._tree.viewport().mapToGlobal(pos))
+            return
+
+        feature_obj_id = item.data(0, _ROLE_FEATURE_EDIT)
+        if feature_obj_id is not None:
+            obj = self._obj_map.get(feature_obj_id)
+            if obj is None:
+                return
+            operation = "Extrude" if isinstance(obj, ExtrudedObject) else "Revolve"
+            menu = QMenu(self._tree)
+            act_edit = QAction(f"Edit {operation} Operation…", menu)
+            act_edit.triggered.connect(lambda: self.feature_edit_requested.emit(obj))
+            menu.addAction(act_edit)
+            menu.exec_(self._tree.viewport().mapToGlobal(pos))
             return
 
         pattern_obj_id = item.data(0, _ROLE_PATTERN_EDIT)

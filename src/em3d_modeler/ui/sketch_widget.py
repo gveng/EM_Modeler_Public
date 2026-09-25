@@ -31,13 +31,15 @@ so the main window can add the new object to the scene.
 """
 from __future__ import annotations
 import math
-from typing import List, Optional, Tuple
+from typing import Callable, List, Optional, Tuple
 
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QToolBar,
     QSplitter, QGroupBox, QFormLayout,
     QLabel, QPushButton, QWidget, QSizePolicy,
     QDialogButtonBox, QComboBox, QColorDialog,
+    QTableWidget, QTableWidgetItem, QAbstractItemView, QHeaderView,
+    QLineEdit, QMessageBox,
 )
 from .formula_widgets import FormulaDoubleSpinBox as QDoubleSpinBox
 from PySide6.QtCore import Qt, QPointF, QRectF, QSizeF, Signal
@@ -113,6 +115,89 @@ class SketchCanvas(QWidget):
         if not pts:
             pts = [(0,0),(10,0),(10,10),(0,10),(0,0)]
         return pts
+
+    def set_profile(self, profile_pts: List[Point2D]) -> bool:
+        """Replace the sketch with an existing profile made of finite 2-D points."""
+        try:
+            points = [(float(x), float(y)) for x, y in profile_pts]
+        except (TypeError, ValueError):
+            return False
+        if any(not math.isfinite(x) or not math.isfinite(y) for x, y in points):
+            return False
+
+        self._elements = [("polyline", points)] if points else []
+        self._current = []
+        self.update()
+        self.sketch_changed.emit()
+        return True
+
+    @staticmethod
+    def _element_points(kind: str, data: List) -> List[Point2D]:
+        if kind == "rect":
+            (x1, y1), (x2, y2) = data
+            return [(x1, y1), (x2, y1), (x2, y2), (x1, y2), (x1, y1)]
+        if kind == "circle":
+            (cx, cy), radius = data
+            return [
+                (cx + radius * math.cos(2 * math.pi * i / 48),
+                 cy + radius * math.sin(2 * math.pi * i / 48))
+                for i in range(49)
+            ]
+        return list(data)
+
+    def get_segments(self) -> List[Tuple[int, int, Point2D, Point2D, float]]:
+        """Return (element, segment, start, end, measured length) entries."""
+        segments = []
+        for element_index, (kind, data) in enumerate(self._elements):
+            points = self._element_points(kind, data)
+            for segment_index, (start, end) in enumerate(zip(points, points[1:])):
+                segments.append((
+                    element_index, segment_index, start, end,
+                    math.hypot(end[0] - start[0], end[1] - start[1]),
+                ))
+        return segments
+
+    def set_segment_length(self, element_index: int, segment_index: int,
+                           target_length: float) -> bool:
+        """Set a segment length and translate its downstream vertices by its endpoint delta."""
+        try:
+            target_length = float(target_length)
+        except (TypeError, ValueError):
+            return False
+        if not math.isfinite(target_length) or target_length <= 0:
+            return False
+        if not 0 <= element_index < len(self._elements):
+            return False
+
+        kind, data = self._elements[element_index]
+        points = self._element_points(kind, data)
+        if not 0 <= segment_index < len(points) - 1:
+            return False
+
+        start = points[segment_index]
+        old_end = points[segment_index + 1]
+        dx, dy = old_end[0] - start[0], old_end[1] - start[1]
+        old_length = math.hypot(dx, dy)
+        if old_length == 0 or not math.isfinite(old_length):
+            return False
+
+        new_end = (
+            start[0] + (dx / old_length) * target_length,
+            start[1] + (dy / old_length) * target_length,
+        )
+        delta = (new_end[0] - old_end[0], new_end[1] - old_end[1])
+        updated_points = list(points)
+        for point_index in range(segment_index + 1, len(updated_points)):
+            point = updated_points[point_index]
+            updated_points[point_index] = (point[0] + delta[0], point[1] + delta[1])
+        if any(not math.isfinite(x) or not math.isfinite(y)
+               for x, y in updated_points):
+            return False
+
+        self._elements[element_index] = ("polyline", updated_points)
+        self.update()
+        self.sketch_changed.emit()
+        return True
 
     # ── coordinate helpers ───────────────────────────────────────────────────
     def _to_world(self, widget_pt: QPointF) -> Point2D:
@@ -272,30 +357,67 @@ class SketchDialog(QDialog):
     Signals
     -------
     extrude_requested(profile_pts, depth, origin, normal)
-    revolve_requested(profile_pts, angle, axis_pt1, axis_pt2)
+    revolve_requested(profile_pts, angle, axis_pt1, axis_pt2, plane_origin, plane_normal)
     """
 
     extrude_requested = Signal(list, float, tuple, tuple)
-    revolve_requested = Signal(list, float, tuple, tuple)
+    revolve_requested = Signal(list, float, tuple, tuple, tuple, tuple)
 
     def __init__(self, parent=None,
                  plane_origin=(0.0, 0.0, 0.0),
-                 plane_normal=(0.0, 0.0, 1.0)):
+                 plane_normal=(0.0, 0.0, 1.0),
+                 profile_pts: Optional[List[Point2D]] = None,
+                 operation_mode: Optional[str] = None,
+                 extrusion_depth: Optional[float] = None,
+                 revolve_angle: Optional[float] = None,
+                 revolve_axis_pt1: Optional[Tuple[float, float, float]] = None,
+                 revolve_axis_pt2: Optional[Tuple[float, float, float]] = None):
         super().__init__(parent)
         self.setWindowTitle("Parametric Sketch")
         self.setModal(False)           # allow interaction with 3D view
-        self.resize(700, 560)
+        self.resize(900, 600)
 
         self._origin = tuple(plane_origin)
         self._normal = tuple(plane_normal)
+        self._edit_apply_callback: Optional[Callable[..., bool]] = None
 
 
         # ── main layout ─────────────────────────────────────────────────────
         layout = QVBoxLayout(self)
 
-        # ── canvas ───────────────────────────────────────────────────────────
+        # ── canvas and segment editor ────────────────────────────────────────
+        canvas_splitter = QSplitter(Qt.Horizontal)
         self._canvas = SketchCanvas()
-        layout.addWidget(self._canvas, stretch=1)
+        canvas_splitter.addWidget(self._canvas)
+
+        segment_group = QGroupBox("Segment lengths")
+        segment_layout = QVBoxLayout(segment_group)
+        self._segment_table = QTableWidget(0, 2)
+        self._segment_table.setHorizontalHeaderLabels(["Segment", "Length"])
+        self._segment_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self._segment_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self._segment_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self._segment_table.horizontalHeader().setSectionResizeMode(
+            0, QHeaderView.Stretch
+        )
+        self._segment_table.horizontalHeader().setSectionResizeMode(
+            1, QHeaderView.ResizeToContents
+        )
+        segment_layout.addWidget(self._segment_table, stretch=1)
+        edit_layout = QHBoxLayout()
+        self._segment_length = QLineEdit()
+        self._segment_length.setPlaceholderText("Exact length")
+        self._segment_length.setToolTip("Enter a finite length greater than zero")
+        self._apply_segment_length = QPushButton("Set Length")
+        edit_layout.addWidget(self._segment_length, stretch=1)
+        edit_layout.addWidget(self._apply_segment_length)
+        segment_layout.addLayout(edit_layout)
+        self._segment_status = QLabel("")
+        segment_layout.addWidget(self._segment_status)
+        canvas_splitter.addWidget(segment_group)
+        canvas_splitter.setStretchFactor(0, 1)
+        canvas_splitter.setStretchFactor(1, 0)
+        layout.addWidget(canvas_splitter, stretch=1)
 
         # ── toolbar ──────────────────────────────────────────────────────────
         tb = QToolBar()
@@ -321,33 +443,54 @@ class SketchDialog(QDialog):
         ctrl_layout = QHBoxLayout(ctrl_widget)
 
         # Extrude group
-        ext_group = QGroupBox("Extrude")
-        ext_form  = QFormLayout(ext_group)
+        self._ext_group = QGroupBox("Extrude")
+        ext_form  = QFormLayout(self._ext_group)
         self._ext_depth = QDoubleSpinBox()
-        self._ext_depth.setRange(0.001, 1e6)
+        self._ext_depth.setRange(1e-12, 1e100)
+        self._ext_depth.setDecimals(12)
         self._ext_depth.setValue(10.0)
         self._ext_depth.setSuffix(" units")
         ext_form.addRow("Depth:", self._ext_depth)
-        btn_ext = QPushButton("Create Extruded Body")
-        btn_ext.clicked.connect(self._do_extrude)
-        ext_form.addRow(btn_ext)
-        ctrl_layout.addWidget(ext_group)
+        self._btn_ext = QPushButton("Create Extruded Body")
+        self._btn_ext.clicked.connect(self._do_extrude)
+        ext_form.addRow(self._btn_ext)
+        ctrl_layout.addWidget(self._ext_group)
 
         # Revolve group
         rev_group = QGroupBox("Revolve")
         rev_form  = QFormLayout(rev_group)
         self._rev_angle = QDoubleSpinBox()
-        self._rev_angle.setRange(1.0, 360.0)
+        self._rev_angle.setRange(1e-6, 360.0)
+        self._rev_angle.setDecimals(12)
         self._rev_angle.setValue(360.0)
         self._rev_angle.setSuffix(" °")
         rev_form.addRow("Sweep angle:", self._rev_angle)
         self._rev_axis = QComboBox()
-        self._rev_axis.addItems(["Y axis (local)", "X axis (local)", "Z axis (local)"])
+        self._rev_axis.addItems([
+            "Y axis (local)", "X axis (local)", "Z axis (local)",
+            "-Y axis (local)", "-X axis (local)", "-Z axis (local)",
+            "Custom axis",
+        ])
         rev_form.addRow("Revolution axis:", self._rev_axis)
-        btn_rev = QPushButton("Create Revolved Body")
-        btn_rev.clicked.connect(self._do_revolve)
-        rev_form.addRow(btn_rev)
-        ctrl_layout.addWidget(rev_group)
+        self._axis_fields = []
+        axis_start_row = QHBoxLayout()
+        axis_end_row = QHBoxLayout()
+        for row, fields in ((axis_start_row, self._axis_fields), (axis_end_row, self._axis_fields)):
+            for axis_label in ("X", "Y", "Z"):
+                row.addWidget(QLabel(axis_label))
+                field = QDoubleSpinBox()
+                field.setRange(-1e9, 1e9)
+                field.setDecimals(12)
+                row.addWidget(field)
+                fields.append(field)
+        rev_form.addRow("Axis start:", axis_start_row)
+        rev_form.addRow("Axis end:", axis_end_row)
+        self._btn_rev = QPushButton("Create Revolved Body")
+        self._btn_rev.clicked.connect(self._do_revolve)
+        rev_form.addRow(self._btn_rev)
+        self._rev_group = rev_group
+        ctrl_layout.addWidget(self._rev_group)
+        self._rev_axis.currentTextChanged.connect(self._on_revolve_axis_preset_changed)
 
         layout.addWidget(ctrl_widget)
 
@@ -356,27 +499,150 @@ class SketchDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn)
 
+        self._segment_rows: List[Tuple[int, int]] = []
+        self._segment_table.itemSelectionChanged.connect(
+            self._on_segment_selection_changed
+        )
+        self._apply_segment_length.clicked.connect(self._apply_selected_segment_length)
+        self._canvas.sketch_changed.connect(self._refresh_segment_table)
+        self._refresh_segment_table()
+        if profile_pts is not None:
+            self.set_profile(profile_pts)
+        axis_start = revolve_axis_pt1 or self._origin
+        axis_end = revolve_axis_pt2 or (axis_start[0], axis_start[1] + 1.0, axis_start[2])
+        self._set_revolve_axis_points(axis_start, axis_end)
+        if extrusion_depth is not None:
+            self._ext_depth.setValue(float(extrusion_depth))
+        if revolve_angle is not None:
+            self._rev_angle.setValue(float(revolve_angle))
+        if revolve_axis_pt1 is not None and revolve_axis_pt2 is not None:
+            self._select_axis_preset(revolve_axis_pt1, revolve_axis_pt2)
+        else:
+            self._select_axis_preset(axis_start, axis_end)
+        if operation_mode in {"extrude", "revolve"}:
+            self.setWindowTitle("Edit Extrude Operation" if operation_mode == "extrude" else "Edit Revolve Operation")
+            self._ext_group.setVisible(operation_mode == "extrude")
+            self._rev_group.setVisible(operation_mode == "revolve")
+            self._btn_ext.setText("Update Extrusion")
+            self._btn_rev.setText("Update Revolution")
+
+    def set_profile(self, profile_pts: List[Point2D]) -> bool:
+        """Load a 2-D profile into the dialog for editing or extrusion/revolution."""
+        return self._canvas.set_profile(profile_pts)
+
+    def set_edit_apply_callback(self, callback: Callable[..., bool]) -> None:
+        """Set the synchronous updater used instead of creation signals in edit mode."""
+        self._edit_apply_callback = callback
+
+    def _refresh_segment_table(self) -> None:
+        selected_row = self._segment_table.currentRow()
+        segments = self._canvas.get_segments()
+        self._segment_rows = [(item[0], item[1]) for item in segments]
+        self._segment_table.setRowCount(len(segments))
+        for row, (element_index, segment_index, _start, _end, length) in enumerate(segments):
+            self._segment_table.setItem(
+                row, 0,
+                QTableWidgetItem(
+                    f"Element {element_index + 1} / Segment {segment_index + 1}"
+                ),
+            )
+            self._segment_table.setItem(row, 1, QTableWidgetItem(f"{length:.12g}"))
+        if 0 <= selected_row < len(segments):
+            self._segment_table.selectRow(selected_row)
+
+    def _on_segment_selection_changed(self) -> None:
+        row = self._segment_table.currentRow()
+        if 0 <= row < len(self._segment_rows):
+            self._segment_length.setText(self._segment_table.item(row, 1).text())
+            self._segment_status.clear()
+
+    def _apply_selected_segment_length(self) -> None:
+        row = self._segment_table.currentRow()
+        if not 0 <= row < len(self._segment_rows):
+            self._segment_status.setText("Select a segment first.")
+            return
+        try:
+            target_length = float(self._segment_length.text().strip())
+        except ValueError:
+            target_length = math.nan
+        if not math.isfinite(target_length) or target_length <= 0:
+            self._segment_status.setText("Enter a finite length greater than zero.")
+            return
+
+        element_index, segment_index = self._segment_rows[row]
+        if not self._canvas.set_segment_length(
+                element_index, segment_index, target_length):
+            self._segment_status.setText(
+                "This segment cannot be resized (it may have zero length)."
+            )
+
+    def _set_revolve_axis_points(self, start, end) -> None:
+        for field, value in zip(self._axis_fields, (*start, *end)):
+            field.setValue(float(value))
+
+    def _select_axis_preset(self, start, end) -> None:
+        direction = tuple(float(end[index]) - float(start[index]) for index in range(3))
+        magnitude = math.hypot(*direction)
+        presets = {
+            "Y axis (local)": (0.0, 1.0, 0.0),
+            "X axis (local)": (1.0, 0.0, 0.0),
+            "Z axis (local)": (0.0, 0.0, 1.0),
+            "-Y axis (local)": (0.0, -1.0, 0.0),
+            "-X axis (local)": (-1.0, 0.0, 0.0),
+            "-Z axis (local)": (0.0, 0.0, -1.0),
+        }
+        selected = "Custom axis"
+        if magnitude > 0.0:
+            unit = tuple(value / magnitude for value in direction)
+            for label, preset in presets.items():
+                if all(abs(unit[index] - preset[index]) <= 1e-6 for index in range(3)):
+                    selected = label
+                    break
+        self._rev_axis.blockSignals(True)
+        self._rev_axis.setCurrentText(selected)
+        self._rev_axis.blockSignals(False)
+
+    def _on_revolve_axis_preset_changed(self, text: str) -> None:
+        direction_map = {
+            "Y axis (local)": (0, 1, 0),
+            "X axis (local)": (1, 0, 0),
+            "Z axis (local)": (0, 0, 1),
+            "-Y axis (local)": (0, -1, 0),
+            "-X axis (local)": (-1, 0, 0),
+            "-Z axis (local)": (0, 0, -1),
+        }
+        direction = direction_map.get(text)
+        if direction is None:
+            return
+        start = tuple(self._axis_fields[index].value() for index in range(3))
+        end = tuple(start[index] + direction[index] for index in range(3))
+        self._set_revolve_axis_points(start, end)
+
     # ─────────────────────────────────────────────── actions
     def _do_extrude(self) -> None:
         profile = self._canvas.get_polyline()
         depth   = self._ext_depth.value()
+        if self._edit_apply_callback is not None:
+            if self._edit_apply_callback(profile, depth, self._origin, self._normal):
+                self.accept()
+            return
         self.extrude_requested.emit(profile, depth, self._origin, self._normal)
         self.accept()
 
     def _do_revolve(self) -> None:
         profile = self._canvas.get_polyline()
         angle   = self._rev_angle.value()
-        # axis: origin to origin+axis_dir
-        axis_map = {
-            "Y axis (local)": (0,1,0),
-            "X axis (local)": (1,0,0),
-            "Z axis (local)": (0,0,1),
-        }
-        ax = axis_map[self._rev_axis.currentText()]
-        o  = self._origin
+        axis_pt1 = tuple(field.value() for field in self._axis_fields[:3])
+        axis_pt2 = tuple(field.value() for field in self._axis_fields[3:])
+        if math.hypot(*(axis_pt2[index] - axis_pt1[index] for index in range(3))) <= 1e-12:
+            QMessageBox.warning(self, "Revolve", "Revolution axis endpoints must be different.")
+            return
+        if self._edit_apply_callback is not None:
+            if self._edit_apply_callback(
+                    profile, angle, axis_pt1, axis_pt2, self._origin, self._normal):
+                self.accept()
+            return
         self.revolve_requested.emit(
-            profile, angle,
-            o,
-            (o[0]+ax[0], o[1]+ax[1], o[2]+ax[2])
+            profile, angle, axis_pt1, axis_pt2, self._origin, self._normal
         )
         self.accept()

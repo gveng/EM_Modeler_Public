@@ -38,11 +38,12 @@ from __future__ import annotations
 
 from collections import deque
 import math
-from typing import Optional, Tuple
+from typing import Callable, Optional, Tuple
 
 import vtk
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QSizePolicy, QToolBar, QInputDialog
+    QWidget, QVBoxLayout, QSizePolicy, QToolBar, QInputDialog, QDialog,
+    QFormLayout, QDoubleSpinBox, QComboBox, QCheckBox, QDialogButtonBox,
 )
 from PySide6.QtCore    import Signal, Qt
 from PySide6.QtGui     import QIcon, QAction
@@ -56,13 +57,14 @@ from pathlib import Path
 
 from ..drawing.interactor_style import EMInteractorStyle
 from ..drawing.sketch_engine    import (
-    SketchEngine, plane_basis, uv_to_world, world_to_uv,
+    SketchEngine, _rect_polyline, plane_basis, uv_to_world, world_to_uv,
 )
 from ..scene.scene_manager      import SceneManager
 from ..scene.em_objects         import (
     EMObject, BoxObject, CylinderObject, ConeObject, SphereObject,
     PlateObject, PyramidObject, WedgeObject, TorusObject, EllipsoidObject
 )
+from ..scene import em_objects as scene_objects
 from ..scene.grid_actor         import build_axes_widget
 
 
@@ -112,13 +114,15 @@ class Viewport3DWidget(QWidget):
     selection_changed = Signal(list)           # List[EMObject]
     # Emitted when the scene changes (add/remove objects)
     scene_changed     = Signal()
+    projection_changed = Signal(bool)
     # Status-bar message
     status_message    = Signal(str)
     # Coordinates for sub-element pick display (X,Y,Z,units)
     picked_coords     = Signal(float, float, float, str)
     clear_coords_requested = Signal()
     # Sketch-mode signals
-    sketch_extrude_requested = Signal(list, float, tuple, tuple)
+    sketch_extrude_requested = Signal(list, float, tuple, tuple, str, bool)
+    sketch_cut_requested     = Signal(list, float, tuple, tuple)
     sketch_revolve_requested = Signal(list, float, tuple, tuple, tuple, tuple)
     sketch_finished          = Signal()
 
@@ -142,6 +146,7 @@ class Viewport3DWidget(QWidget):
         self._style = EMInteractorStyle()
         self._style.left_press_callback  = self._on_left_press
         self._style.mouse_move_callback  = self._on_mouse_move
+        self._style.right_press_callback = self._on_sketch_right_press
         self._interactor.SetInteractorStyle(self._style)
 
         # Axes orientation widget
@@ -203,12 +208,19 @@ class Viewport3DWidget(QWidget):
         # ── Sketch state ──────────────────────────────────────────────────────
         self._sketch_engine: Optional[SketchEngine] = None
         self._sketch_lines_actor: Optional[vtk.vtkActor]   = None
+        self._sketch_construction_actor: Optional[vtk.vtkActor] = None
+        self._sketch_region_actor: Optional[vtk.vtkActor] = None
         self._sketch_hi_actor:    Optional[vtk.vtkActor]   = None
-        self._sketch_verts_actor: Optional[vtk.vtkActor]   = None
         self._sketch_preview_actor: Optional[vtk.vtkActor] = None
+        self._sketch_dimension_actors: list = []
         self._sketch_axis_pick_mode: bool = False
         self._sketch_axis_highlight: Optional[Tuple[Tuple[float, float],
                                                     Tuple[float, float]]] = None
+        self._sketch_dimension_kind: Optional[str] = None
+        self._sketch_dimension_picks: list = []
+        self._sketch_dimension_resolver: Optional[Callable[[str], float]] = None
+        self._last_sketch_definition: dict = {}
+        self._sketch_vertex_snap_enabled = True
         self.setFocusPolicy(Qt.StrongFocus)
 
     # ──────────────────────────────────────────────────────── public API
@@ -225,6 +237,10 @@ class Viewport3DWidget(QWidget):
         if mode == "planar":
             self.status_message.emit(
                 f"Planar: pick start point (vertex/edge/face) on {plane} plane"
+            )
+        elif mode == "circular_plate":
+            self.status_message.emit(
+                f"Circular Plate: click center, then radius (grid snap {self._grid_spacing:g} {self._units})"
             )
         else:
             self.status_message.emit(
@@ -274,6 +290,37 @@ class Viewport3DWidget(QWidget):
         cam = self._renderer.GetActiveCamera()
         cam.SetPosition(100, -150, 120)
         cam.SetFocalPoint(0, 0, 0)
+
+    def is_parallel_projection(self) -> bool:
+        return bool(self._renderer.GetActiveCamera().GetParallelProjection())
+
+    def set_parallel_projection(self, enabled: bool) -> None:
+        cam = self._renderer.GetActiveCamera()
+        enabled = bool(enabled)
+        if bool(cam.GetParallelProjection()) == enabled:
+            return
+
+        position = cam.GetPosition()
+        focal_point = cam.GetFocalPoint()
+        direction = tuple(position[index] - focal_point[index] for index in range(3))
+        distance = math.sqrt(sum(component * component for component in direction))
+        tangent = math.tan(math.radians(float(cam.GetViewAngle())) * 0.5)
+        if distance > 1e-12 and tangent > 1e-12:
+            if enabled:
+                cam.SetParallelScale(distance * tangent)
+            else:
+                distance = float(cam.GetParallelScale()) / tangent
+                direction_length = math.sqrt(sum(component * component for component in direction))
+                cam.SetPosition(*(
+                    focal_point[index] + direction[index] / direction_length * distance
+                    for index in range(3)
+                ))
+
+        cam.SetParallelProjection(enabled)
+        self._renderer.ResetCameraClippingRange()
+        self._render()
+        self.projection_changed.emit(enabled)
+
     def fit_all(self) -> None:
         self._fit_camera_to_objects(self.scene.objects)
 
@@ -497,6 +544,7 @@ class Viewport3DWidget(QWidget):
             cam.SetClippingRange(*state["clipping_range"])
         self._renderer.ResetCameraClippingRange()
         self._render()
+        self.projection_changed.emit(bool(cam.GetParallelProjection()))
 
     # ──────────────────────────────────────────────────────── public reference plane API
     def set_reference_plane(self, origin: tuple, normal: tuple) -> None:
@@ -714,6 +762,27 @@ class Viewport3DWidget(QWidget):
         dist = math.sqrt((px - closest[0])**2 + (py - closest[1])**2 + (pz - closest[2])**2)
         return closest, dist
 
+    @staticmethod
+    def _actor_point_to_world(actor, point) -> tuple:
+        world = actor.GetMatrix().MultiplyPoint([point[0], point[1], point[2], 1.0])
+        weight = world[3] if abs(world[3]) > 1e-12 else 1.0
+        return tuple(float(world[index] / weight) for index in range(3))
+
+    @staticmethod
+    def _actor_point_to_local(actor, point) -> tuple:
+        inverse = vtk.vtkMatrix4x4()
+        vtk.vtkMatrix4x4.Invert(actor.GetMatrix(), inverse)
+        local = inverse.MultiplyPoint([point[0], point[1], point[2], 1.0])
+        weight = local[3] if abs(local[3]) > 1e-12 else 1.0
+        return tuple(float(local[index] / weight) for index in range(3))
+
+    def _owner_for_actor(self, actor):
+        return next((
+            obj for obj in self.scene.objects
+            if getattr(obj, "actor", None) is actor
+            or any(candidate is actor for candidate in getattr(obj, "all_actors", ()))
+        ), None)
+
     def _snap_to_visible_geometry(self, sx: int, sy: int, fallback_pt: tuple, snap_mode: str = "all") -> tuple | None:
         """Try snapping against visible geometry using the requested filter.
 
@@ -732,11 +801,11 @@ class Viewport3DWidget(QWidget):
             point_picker.Pick(sx, sy, 0, self._renderer)
             point_actor = point_picker.GetActor()
             point_id = point_picker.GetPointId()
-            if point_actor is not None and point_id >= 0 and point_picker.GetDataSet() is not None:
-                local = point_picker.GetDataSet().GetPoint(point_id)
-                world = point_actor.GetMatrix().MultiplyPoint([local[0], local[1], local[2], 1.0])
-                point = (world[0], world[1], world[2])
-                source = next((obj for obj in self.scene.objects if obj.actor is point_actor), None)
+            point_data = point_picker.GetDataSet()
+            if point_actor is not None and point_id >= 0 and point_data is not None:
+                local = point_data.GetPoint(point_id)
+                point = self._actor_point_to_world(point_actor, local)
+                source = self._owner_for_actor(point_actor)
                 self._snap_records.append({
                     "kind": "vertex",
                     "object": str(source.name) if source is not None else "",
@@ -763,12 +832,8 @@ class Viewport3DWidget(QWidget):
             edge_pick = self._pick_edge_segment_local(ds, cell_id, actor, pos)
             if edge_pick is not None:
                 _, closest_local = edge_pick
-                m = actor.GetMatrix()
-                world4 = m.MultiplyPoint([closest_local[0], closest_local[1], closest_local[2], 1.0])
-                w = world4[3] if abs(world4[3]) > 1e-12 else 1.0
-                world = (world4[0] / w, world4[1] / w, world4[2] / w)
-                point = tuple(world)
-                source = next((obj for obj in self.scene.objects if obj.actor is actor), None)
+                point = self._actor_point_to_world(actor, closest_local)
+                source = self._owner_for_actor(actor)
                 self._snap_records.append({
                     "kind": "edge",
                     "object": str(source.name) if source is not None else "",
@@ -782,15 +847,13 @@ class Viewport3DWidget(QWidget):
 
         if mode in {"all", "face"}:
             point = tuple(pos)
-            source = next((obj for obj in self.scene.objects if obj.actor is actor), None)
-            inverse = vtk.vtkMatrix4x4()
-            vtk.vtkMatrix4x4.Invert(actor.GetMatrix(), inverse)
-            local4 = inverse.MultiplyPoint([pos[0], pos[1], pos[2], 1.0])
+            source = self._owner_for_actor(actor)
+            local = self._actor_point_to_local(actor, pos)
             self._snap_records.append({
                 "kind": "surface",
                 "object": str(source.name) if source is not None else "",
                 "cell_id": int(cell_id),
-                "local": [float(local4[i]) for i in range(3)],
+                "local": list(local),
                 "point": list(point),
             })
             return (point, "surface")
@@ -799,17 +862,16 @@ class Viewport3DWidget(QWidget):
 
     def _drawing_snap_point(self, sx: int, sy: int) -> Optional[tuple]:
         """Return a drawing point on the active plane using Select filter for snap."""
-        plane_pt = self._ray_plane_intersect(sx, sy)
-        if plane_pt is None:
-            return None
-
         snap_mode = self._selection_mode if self._selection_mode != "object" else "all"
-        geometry_pt = self._snap_to_visible_geometry(sx, sy, plane_pt, snap_mode=snap_mode)
+        geometry_pt = self._snap_to_visible_geometry(sx, sy, None, snap_mode=snap_mode)
         if geometry_pt is not None:
             pt, kind = geometry_pt
             self._last_drawing_snap_kind = str(kind)
             return pt
 
+        plane_pt = self._ray_plane_intersect(sx, sy)
+        if plane_pt is None:
+            return None
         self._last_drawing_snap_kind = "grid"
         return self._snap(plane_pt)
 
@@ -841,11 +903,25 @@ class Viewport3DWidget(QWidget):
         self, screen_x: int, screen_y: int, base_z: float
     ) -> float:
         """For height step: project cursor to vertical axis through base."""
+        snap_mode = self._selection_mode if self._selection_mode != "object" else "all"
+        geometry_pt = self._snap_to_visible_geometry(
+            screen_x, screen_y, None, snap_mode=snap_mode
+        )
+        axis_idx = self._active_plane_axis_index()
+        if geometry_pt is not None:
+            point, kind = geometry_pt
+            self._last_drawing_snap_kind = str(kind)
+            return point[axis_idx] - base_z
+
+        self._last_drawing_snap_kind = "grid"
         picker = vtk.vtkWorldPointPicker()
         picker.Pick(screen_x, screen_y, 0, self._renderer)
         p = picker.GetPickPosition()
-        axis_idx = self._active_plane_axis_index()
-        return p[axis_idx] - base_z
+        height = p[axis_idx] - base_z
+        spacing = abs(float(self._grid_spacing))
+        if spacing > 1e-12:
+            height = round(height / spacing) * spacing
+        return height
 
     def _plane_radius(self, pt: tuple, center: tuple) -> float:
         """2D distance on the drawing plane (plane-aware)."""
@@ -975,6 +1051,20 @@ class Viewport3DWidget(QWidget):
         actor.SetMapper(mapper)
         self._set_preview(actor)
 
+    def _preview_circular_plate(self, center, radius, normal) -> None:
+        source = vtk.vtkRegularPolygonSource()
+        source.SetNumberOfSides(96)
+        source.SetRadius(radius)
+        source.SetCenter(*center)
+        source.SetNormal(*normal)
+        source.GeneratePolygonOn()
+        source.Update()
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(source.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        self._set_preview(actor)
+
     # ──────────────────────────────────────────────────────── mouse events
     def _on_left_press(self, sx: int, sy: int, ctrl: bool = False) -> None:
         # Robust Ctrl detection: VTK's GetControlKey() is not always updated
@@ -991,7 +1081,7 @@ class Viewport3DWidget(QWidget):
         if self._handle_pick_request(sx, sy):
             return
         if self._sketch_engine is not None:
-            self._sketch_left_press(sx, sy)
+            self._sketch_left_press(sx, sy, ctrl=ctrl)
             return
         if self._draw_mode:
             self._drawing_click(sx, sy)
@@ -1004,6 +1094,19 @@ class Viewport3DWidget(QWidget):
             return
         if self._draw_mode and self._draw_state > 0:
             self._drawing_preview(sx, sy)
+
+    def _on_sketch_right_press(self, _sx: int, _sy: int) -> bool:
+        if self._sketch_engine is None:
+            return False
+        has_active_tool = (
+            self._sketch_engine.tool is not None
+            or self._sketch_axis_pick_mode
+            or self._sketch_dimension_kind is not None
+        )
+        if not has_active_tool:
+            return False
+        self._sketch_cancel_tool()
+        return True
 
     # ──────────────────────────────────────────────────────── selection
     def _selection_click(self, sx: int, sy: int, ctrl: bool = False) -> None:
@@ -1026,48 +1129,62 @@ class Viewport3DWidget(QWidget):
 
     def _sub_element_pick(self, sx: int, sy: int) -> None:
         """Pick a single face / edge / vertex on the topmost actor."""
-        picker = vtk.vtkCellPicker()
-        picker.SetTolerance(self._pick_tolerance_for_mode(self._selection_mode))
-        picker.Pick(sx, sy, 0, self._renderer)
-        actor = picker.GetActor()
-        if actor is None:
-            self._clear_sub_pick_marker()
-            self.clear_coords_requested.emit()
-            self.status_message.emit("No object under cursor.")
-            self._render()
-            return
+        mode = self._selection_mode
+        vertex_point = None
+        if mode == "vertex":
+            picker = vtk.vtkPointPicker()
+            picker.SetTolerance(self._pick_tolerance_for_mode("vertex"))
+            picker.Pick(sx, sy, 0, self._renderer)
+            actor = picker.GetActor()
+            ds = picker.GetDataSet()
+            point_id = picker.GetPointId()
+            if actor is None:
+                self._clear_sub_pick_marker()
+                self.clear_coords_requested.emit()
+                self.status_message.emit("No object under cursor.")
+                self._render()
+                return
+            if ds is None or point_id < 0:
+                self.clear_coords_requested.emit()
+                self.status_message.emit("Pick failed.")
+                return
+            vertex_point = self._actor_point_to_world(actor, ds.GetPoint(point_id))
+            pos = vertex_point
+            cell_id = -1
+        else:
+            picker = vtk.vtkCellPicker()
+            picker.SetTolerance(self._pick_tolerance_for_mode(mode))
+            picker.Pick(sx, sy, 0, self._renderer)
+            actor = picker.GetActor()
+            if actor is None:
+                self._clear_sub_pick_marker()
+                self.clear_coords_requested.emit()
+                self.status_message.emit("No object under cursor.")
+                self._render()
+                return
 
-        cell_id = picker.GetCellId()
-        pos     = picker.GetPickPosition()
-        ds      = picker.GetDataSet()
-        if ds is None or cell_id < 0:
-            self.clear_coords_requested.emit()
-            self.status_message.emit("Pick failed.")
-            return
+            cell_id = picker.GetCellId()
+            pos = picker.GetPickPosition()
+            ds = picker.GetDataSet()
+            if ds is None or cell_id < 0:
+                self.clear_coords_requested.emit()
+                self.status_message.emit("Pick failed.")
+                return
 
         # Find owning EMObject (for status)
-        owner = None
-        for o in self.scene.objects:
-            if any(a is actor for a in o.all_actors):
-                owner = o
-                break
+        owner = self._owner_for_actor(actor)
 
         self._clear_sub_pick_marker()
-        mode = self._selection_mode
 
         if mode == "face":
             self._last_edge_pick = None
-            marker = self._build_face_region_marker(ds, cell_id, actor)
-            cell = ds.GetCell(cell_id)
-            face_points = []
-            if cell is not None:
-                for point_index in range(cell.GetNumberOfPoints()):
-                    local_point = cell.GetPoints().GetPoint(point_index)
-                    world_point = actor.GetMatrix().MultiplyPoint([*local_point, 1.0])
-                    face_points.append(tuple(float(world_point[i]) for i in range(3)))
+            region_ids = self._face_region_cell_ids(ds, cell_id)
+            marker = self._build_face_region_marker(ds, cell_id, actor, region_ids)
+            face_points = self._face_region_points_world(ds, region_ids, actor)
             self._last_face_pick = {
                 "owner": owner,
                 "points": face_points,
+                "cell_ids": sorted(region_ids),
                 "cell_id": int(cell_id),
             }
             self.picked_coords.emit(float(pos[0]), float(pos[1]), float(pos[2]), self._units)
@@ -1103,17 +1220,9 @@ class Viewport3DWidget(QWidget):
                 f"({edge_world[0]:.2f}, {edge_world[1]:.2f}, {edge_world[2]:.2f})"
             )
         else:  # vertex
-            point_picker = vtk.vtkPointPicker()
-            point_picker.SetTolerance(self._pick_tolerance_for_mode("vertex"))
-            point_picker.Pick(sx, sy, 0, self._renderer)
-            pid = point_picker.GetPointId()
-            if pid >= 0 and point_picker.GetDataSet() is not None:
-                vp_local = point_picker.GetDataSet().GetPoint(pid)
-                vp4 = actor.GetMatrix().MultiplyPoint([vp_local[0], vp_local[1], vp_local[2], 1.0])
-                w = vp4[3] if abs(vp4[3]) > 1e-12 else 1.0
-                vp = (vp4[0] / w, vp4[1] / w, vp4[2] / w)
-            else:
-                vp = pos
+            self._last_face_pick = None
+            self._last_edge_pick = None
+            vp = vertex_point
             marker = self._build_vertex_marker(vp, actor)
             self.picked_coords.emit(float(vp[0]), float(vp[1]), float(vp[2]), self._units)
             self.status_message.emit(
@@ -1143,8 +1252,7 @@ class Viewport3DWidget(QWidget):
         ]
         spans = [bounds[axis + 3] - bounds[axis] for axis in range(3)]
         normal_axis = min(range(3), key=lambda axis: spans[axis])
-        thickness = max(self._grid_spacing * 0.01, 1e-6)
-        bounds[normal_axis + 3] = bounds[normal_axis] + thickness
+        bounds[normal_axis + 3] = bounds[normal_axis]
         obj = PlateObject(
             material=material,
             x1=bounds[0], y1=bounds[1], z1=bounds[2],
@@ -1203,7 +1311,7 @@ class Viewport3DWidget(QWidget):
         bounds_min[thickness_axis] = float(owner_bounds[thickness_axis * 2])
         bounds_max[thickness_axis] = float(owner_bounds[thickness_axis * 2 + 1])
         bounds_min[normal_axis] = edge_min[normal_axis]
-        bounds_max[normal_axis] = edge_min[normal_axis] + max(self._grid_spacing * 0.01, 1e-6)
+        bounds_max[normal_axis] = edge_min[normal_axis]
 
         from ..scene.em_objects import PlateObject
 
@@ -1249,28 +1357,50 @@ class Viewport3DWidget(QWidget):
         # Inherit transform of original actor so marker overlays exactly
         actor.SetUserMatrix(ref_actor.GetMatrix())
         actor.GetProperty().SetColor(1.0, 0.6, 0.0)
-        actor.GetProperty().SetOpacity(0.85)
-        actor.GetProperty().EdgeVisibilityOn()
-        actor.GetProperty().SetEdgeColor(1.0, 0.9, 0.0)
-        actor.GetProperty().SetLineWidth(2.0)
+        actor.GetProperty().SetOpacity(0.4)
+        actor.GetProperty().EdgeVisibilityOff()
         actor.PickableOff()
         return actor
 
-    def _build_face_region_marker(self, dataset, cell_id: int, ref_actor) -> Optional[vtk.vtkActor]:
+    def _face_region_cell_ids(self, dataset, cell_id: int) -> set[int]:
         poly = vtk.vtkPolyData.SafeDownCast(dataset)
         if poly is None:
-            return self._build_face_marker(dataset, cell_id, ref_actor)
+            return {int(cell_id)}
 
         face_ids = poly.GetCellData().GetArray("OCCFaceId")
         if face_ids is not None and cell_id < face_ids.GetNumberOfTuples():
             face_id = face_ids.GetValue(cell_id)
-            region_ids = {
+            return {
                 cell_index
                 for cell_index in range(poly.GetNumberOfCells())
                 if face_ids.GetValue(cell_index) == face_id
             }
-        else:
-            region_ids = self._coplanar_region_cell_ids(poly, cell_id)
+        return self._coplanar_region_cell_ids(poly, cell_id)
+
+    def _face_region_points_world(self, dataset, cell_ids, ref_actor) -> list[tuple]:
+        point_ids = set()
+        for cell_id in cell_ids:
+            cell = dataset.GetCell(cell_id)
+            if cell is None:
+                continue
+            point_ids.update(
+                int(cell.GetPointId(index))
+                for index in range(cell.GetNumberOfPoints())
+            )
+        return [
+            self._actor_point_to_world(ref_actor, dataset.GetPoint(point_id))
+            for point_id in sorted(point_ids)
+        ]
+
+    def _build_face_region_marker(
+        self, dataset, cell_id: int, ref_actor, region_ids=None
+    ) -> Optional[vtk.vtkActor]:
+        poly = vtk.vtkPolyData.SafeDownCast(dataset)
+        if poly is None:
+            return self._build_face_marker(dataset, cell_id, ref_actor)
+
+        if region_ids is None:
+            region_ids = self._face_region_cell_ids(poly, cell_id)
         if not region_ids:
             return self._build_face_marker(dataset, cell_id, ref_actor)
 
@@ -1300,20 +1430,13 @@ class Viewport3DWidget(QWidget):
         actor.SetMapper(mapper)
         actor.SetUserMatrix(ref_actor.GetMatrix())
         actor.GetProperty().SetColor(1.0, 0.6, 0.0)
-        actor.GetProperty().SetOpacity(0.85)
-        actor.GetProperty().EdgeVisibilityOn()
-        actor.GetProperty().SetEdgeColor(1.0, 0.9, 0.0)
-        actor.GetProperty().SetLineWidth(2.0)
+        actor.GetProperty().SetOpacity(0.4)
+        actor.GetProperty().EdgeVisibilityOff()
         actor.PickableOff()
         return actor
-
     def _pick_edge_segment_local(self, dataset, cell_id: int, ref_actor, pos):
         """Return the complete nearest feature edge and its closest local point."""
-        m = ref_actor.GetMatrix()
-        inv = vtk.vtkMatrix4x4()
-        vtk.vtkMatrix4x4.Invert(m, inv)
-        local = inv.MultiplyPoint([pos[0], pos[1], pos[2], 1.0])
-        lp = (local[0], local[1], local[2])
+        lp = self._actor_point_to_local(ref_actor, pos)
 
         poly = vtk.vtkPolyData.SafeDownCast(dataset)
         best_edge = None
@@ -1476,11 +1599,11 @@ class Viewport3DWidget(QWidget):
         p0 = cell.GetPoints().GetPoint(0)
         p1 = cell.GetPoints().GetPoint(1)
         p2 = cell.GetPoints().GetPoint(2)
-        e1 = (p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2])
-        e2 = (p2[0] - p0[0], p2[1] - p0[1], p2[2] - p0[2])
-        nx = e1[1] * e2[2] - e1[2] * e2[1]
-        ny = e1[2] * e2[0] - e1[0] * e2[2]
-        nz = e1[0] * e2[1] - e1[1] * e2[0]
+        e1 = (p1[0]-p0[0], p1[1]-p0[1], p1[2]-p0[2])
+        e2 = (p2[0]-p0[0], p2[1]-p0[1], p2[2]-p0[2])
+        nx = e1[1]*e2[2] - e1[2]*e2[1]
+        ny = e1[2]*e2[0] - e1[0]*e2[2]
+        nz = e1[0]*e2[1] - e1[1]*e2[0]
         mag = math.sqrt(nx * nx + ny * ny + nz * nz)
         if mag < 1e-12:
             return None, None
@@ -1526,11 +1649,22 @@ class Viewport3DWidget(QWidget):
             if cell is None:
                 continue
 
+            edge_point_ids = []
             for ei in range(cell.GetNumberOfEdges()):
                 edge = cell.GetEdge(ei)
                 if edge is None:
                     continue
-                poly.GetCellNeighbors(cid, edge.GetPointIds(), neigh_ids)
+                edge_point_ids.append(tuple(
+                    int(edge.GetPointId(point_index))
+                    for point_index in range(edge.GetNumberOfPoints())
+                ))
+
+            for edge_points in edge_point_ids:
+                edge_ids = vtk.vtkIdList()
+                for point_id in edge_points:
+                    edge_ids.InsertNextId(point_id)
+                neigh_ids.Reset()
+                poly.GetCellNeighbors(cid, edge_ids, neigh_ids)
                 for ni in range(neigh_ids.GetNumberOfIds()):
                     nid = int(neigh_ids.GetId(ni))
                     if nid in visited:
@@ -1581,12 +1715,22 @@ class Viewport3DWidget(QWidget):
 
     # ──────────────────────────────────────────────────────── drawing FSM
     def _drawing_click(self, sx: int, sy: int) -> None:
-        pt = self._drawing_snap_point(sx, sy)
-        if pt is None:
-            return
-
         mode = self._draw_mode
         state = self._draw_state
+        height_states = {
+            "box": 2,
+            "cylinder": 2,
+            "cone": 2,
+            "pyramid": 2,
+            "wedge": 3,
+            "ellipsoid": 2,
+        }
+        if self._draw_pts and height_states.get(mode) == state:
+            pt = self._draw_pts[-1]
+        else:
+            pt = self._drawing_snap_point(sx, sy)
+            if pt is None:
+                return
 
         if mode == "box":
             self._fsm_box_click(pt, sx, sy, state)
@@ -1608,6 +1752,8 @@ class Viewport3DWidget(QWidget):
             self._fsm_ellipsoid_click(pt, sx, sy, state)
         elif mode == "planar":
             self._fsm_planar_click(pt, sx, sy, state)
+        elif mode == "circular_plate":
+            self._fsm_circular_plate_click(pt, state)
 
     def _drawing_preview(self, sx: int, sy: int) -> None:
         mode  = self._draw_mode
@@ -1632,6 +1778,8 @@ class Viewport3DWidget(QWidget):
             self._fsm_ellipsoid_preview(sx, sy, state)
         elif mode == "planar":
             self._fsm_planar_preview(sx, sy, state)
+        elif mode == "circular_plate":
+            self._fsm_circular_plate_preview(sx, sy, state)
         self._render()
 
     # ────────────── BOX FSM ──────────────
@@ -1816,6 +1964,96 @@ class Viewport3DWidget(QWidget):
             self._preview_sphere(ctr[0], ctr[1], ctr[2], r)
             self.status_message.emit(f"Sphere: radius = {r:.2f} {self._units}{self._drawing_snap_status_suffix()}")
 
+    def _circular_plate_radius(self, center, point):
+        _, normal = self._active_draw_origin_normal()
+        normal_length = math.sqrt(sum(float(value) ** 2 for value in normal))
+        if normal_length <= 1e-12:
+            return 0.0, tuple(center), (0.0, 0.0, 1.0)
+        unit_normal = tuple(float(value) / normal_length for value in normal)
+        delta = tuple(float(point[index]) - float(center[index]) for index in range(3))
+        axial = sum(delta[index] * unit_normal[index] for index in range(3))
+        radial = tuple(delta[index] - axial * unit_normal[index] for index in range(3))
+        raw_radius = math.sqrt(sum(value * value for value in radial))
+        if raw_radius <= 1e-12:
+            return 0.0, tuple(center), unit_normal
+
+        spacing = abs(float(self._grid_spacing))
+        radius = math.floor(raw_radius / spacing + 0.5) * spacing if spacing > 1e-12 else raw_radius
+        endpoint = tuple(
+            float(center[index]) + radial[index] * radius / raw_radius
+            for index in range(3)
+        )
+        return radius, endpoint, unit_normal
+
+    def _fsm_circular_plate_click(self, point, state):
+        if state == 0:
+            center = self._project_point_to_draw_plane(point)
+            self._draw_pts = [center]
+            self._draw_state = 1
+            self.status_message.emit(
+                f"Circular Plate: center [{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]"
+                " — click radius"
+            )
+            return
+
+        center = self._draw_pts[0]
+        point = self._project_point_to_draw_plane(point)
+        radius, endpoint, normal = self._circular_plate_radius(center, point)
+        if radius <= 1e-12:
+            self.status_message.emit(
+                f"Circular Plate radius must be at least half the grid snap ({self._grid_spacing:g} {self._units})"
+            )
+            return
+
+        source = vtk.vtkRegularPolygonSource()
+        source.SetNumberOfSides(96)
+        source.SetRadius(radius)
+        source.SetCenter(*center)
+        source.SetNormal(*normal)
+        source.GeneratePolygonOn()
+        source.Update()
+        polydata = vtk.vtkPolyData()
+        polydata.DeepCopy(source.GetOutput())
+        from ..scene.em_objects import MeshObject
+        obj = MeshObject(
+            name=scene_objects._auto_name("CircularPlate"),
+            polydata=polydata,
+            material=self._draw_material,
+            plate_role=True,
+        )
+        thickness = max(abs(float(self._grid_spacing)) * 0.01, 1e-6)
+        obj.set_parameters({
+            **obj.get_parameters(),
+            "CircularPlate": True,
+            "CenterX": center[0],
+            "CenterY": center[1],
+            "CenterZ": center[2],
+            "Radius": radius,
+            "Thickness": thickness,
+            "CircularPlateNormalX": normal[0],
+            "CircularPlateNormalY": normal[1],
+            "CircularPlateNormalZ": normal[2],
+        })
+        self._draw_pts.append(endpoint)
+        self._finish_object(obj)
+
+    def _fsm_circular_plate_preview(self, sx, sy, state):
+        if state != 1:
+            return
+        point = self._drawing_snap_point(sx, sy)
+        if point is None:
+            return
+        center = self._draw_pts[0]
+        point = self._project_point_to_draw_plane(point)
+        radius, _endpoint, normal = self._circular_plate_radius(center, point)
+        if radius <= 1e-12:
+            return
+        self._preview_circular_plate(center, radius, normal)
+        self.status_message.emit(
+            f"Circular Plate: radius = {radius:.3f} {self._units}"
+            f" (snap {self._grid_spacing:g}){self._drawing_snap_status_suffix()}"
+        )
+
     # ────────────── PLATE FSM (thin box) ──────────────────────────────
     def _fsm_plate_click(self, pt, sx, sy, state):
         if state == 0:
@@ -1824,15 +2062,10 @@ class Viewport3DWidget(QWidget):
             self.status_message.emit(f"Plate: click opposite corner")
         elif state == 1:
             self._draw_pts.append(pt)
-            self._draw_state = 2
-            self.status_message.emit("Plate: move mouse to set thickness, then click")
-        elif state == 2:
             p1 = self._draw_pts[0]
-            p2 = self._draw_pts[1]
+            p2 = list(self._draw_pts[1])
             axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
-            thick = self._height_from_cursor(sx, sy, p1[axis_idx]) or 0.1
-            p2 = list(p2)
-            p2[axis_idx] = p1[axis_idx] + thick
+            p2[axis_idx] = p1[axis_idx]
             obj = PlateObject(
                 material=self._draw_material,
                 x1=p1[0], y1=p1[1], z1=p1[2],
@@ -1852,10 +2085,9 @@ class Viewport3DWidget(QWidget):
             p1 = self._draw_pts[0]
             p2 = list(self._draw_pts[1])
             axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
-            thick = self._height_from_cursor(sx, sy, p1[axis_idx]) or 0.01
-            p2[axis_idx] = p1[axis_idx] + thick
+            p2[axis_idx] = p1[axis_idx]
             self._preview_box(p1[0], p1[1], p1[2], p2[0], p2[1], p2[2])
-            self.status_message.emit(f"Plate: thickness = {abs(thick):.3f} {self._units}{self._drawing_snap_status_suffix()}")
+            self.status_message.emit(f"Plate: zero thickness{self._drawing_snap_status_suffix()}")
 
     # ────────────── PYRAMID FSM ──────────────────────────────────
     def _fsm_pyramid_click(self, pt, sx, sy, state):
@@ -1924,7 +2156,15 @@ class Viewport3DWidget(QWidget):
             self._finish_object(obj)
 
     def _fsm_wedge_preview(self, sx, sy, state):
-        if state >= 1:
+        if state == 3:
+            base = self._draw_pts[0]
+            axis_idx = self._active_plane_axis_index()
+            height = self._height_from_cursor(sx, sy, base[axis_idx])
+            self.status_message.emit(
+                f"Wedge: height = {abs(height):.2f} {self._units}"
+                f"{self._drawing_snap_status_suffix()}"
+            )
+        elif state >= 1:
             self.status_message.emit(f"Wedge: point {state} collected")
 
     # ────────────── TORUS FSM ──────────────────────────────────
@@ -2028,9 +2268,8 @@ class Viewport3DWidget(QWidget):
 
             p1 = self._draw_pts[0]
             p2 = list(self._draw_pts[1])
-            thickness = max(self._grid_spacing * 0.01, 1e-6)
             axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
-            p2[axis_idx] = p1[axis_idx] + thickness
+            p2[axis_idx] = p1[axis_idx]
 
             obj = PlateObject(
                 material=self._draw_material,
@@ -2048,9 +2287,8 @@ class Viewport3DWidget(QWidget):
 
         p1 = self._draw_pts[0]
         p2 = list(pt)
-        thickness = max(self._grid_spacing * 0.01, 1e-6)
         axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
-        p2[axis_idx] = p1[axis_idx] + thickness
+        p2[axis_idx] = p1[axis_idx]
         self._preview_box(p1[0], p1[1], p1[2], p2[0], p2[1], p2[2])
         self.status_message.emit(
             f"Planar: second point [{pt[0]:.2f}, {pt[1]:.2f}, {pt[2]:.2f}]{self._drawing_snap_status_suffix()}"
@@ -2130,14 +2368,22 @@ class Viewport3DWidget(QWidget):
     def keyPressEvent(self, event):
         if event.key() == Qt.Key_Escape and self._sketch_engine is not None:
             eng = self._sketch_engine
-            if eng.tool is not None or eng.pending or self._sketch_axis_pick_mode:
-                eng.cancel_current()
-                self._sketch_axis_pick_mode = False
-                self._sketch_axis_highlight = None
-                self.status_message.emit("Sketch tool cancelled")
-                self._refresh_sketch_overlay()
+            if (eng.tool is not None or eng.pending or self._sketch_axis_pick_mode
+                    or self._sketch_dimension_kind is not None):
+                self._sketch_cancel_tool()
             else:
                 self.exit_sketch(commit=False)
+            event.accept()
+            return
+        if self._sketch_engine is not None and event.key() in (Qt.Key_Delete, Qt.Key_Backspace):
+            self._sketch_delete_selected()
+            event.accept()
+            return
+        if (self._sketch_engine is not None
+                and event.key() in (Qt.Key_Return, Qt.Key_Enter)
+                and self._sketch_engine.tool is not None):
+            self._sketch_engine.finish_current()
+            self._sketch_set_selection_mode()
             event.accept()
             return
         super().keyPressEvent(event)
@@ -2157,23 +2403,40 @@ class Viewport3DWidget(QWidget):
             tb.addAction(act)
             return act
 
+        add("Select", "Std_Select", self._sketch_set_selection_mode,
+            "Select or deselect sketch entities")
         add("Line",      "Sketch_Line",      lambda: self._sketch_set_tool("line"),
             "Draw a single line segment (2 clicks)")
         add("Polyline",  "Sketch_Polyline",  lambda: self._sketch_set_tool("polyline"),
-            "Draw a polyline (click to add points; Esc to finish)")
+            "Draw a polyline; click to add points, then press Enter or Esc to finish")
         add("Arc",       "Sketch_Arc",       lambda: self._sketch_set_tool("arc"),
             "Draw a 3-point arc: start, end, mid")
         add("Circle",    "Sketch_Circle",    lambda: self._sketch_set_tool("circle"),
             "Draw a circle (centre + radius)")
-        add("Rect",      "Sketch_Rect",      lambda: self._sketch_set_tool("rect"),
+        add("Rect",      "Sketch_Rect",      lambda: self._sketch_set_rectangle_mode("corner-corner"),
             "Draw a rectangle (two opposite corners)")
+        add("Center Rect", "Sketch_RectCenter",
+            lambda: self._sketch_set_rectangle_mode("center-corner"),
+            "Draw a rectangle from its center to one corner")
+        construction = add("Construction", "Sketch_Construction",
+                           self._sketch_toggle_construction,
+                           "Toggle construction geometry for new entities")
+        construction.setCheckable(True)
+        self._sketch_construction_action = construction
+        add("Center Arc", "Sketch_ArcCenter", lambda: self._sketch_set_tool("center_arc"),
+            "Draw an arc by center, start point, and end angle")
+        for label, kind in (("Linear", "linear"), ("Aligned", "aligned"),
+                            ("Angular", "angular"), ("Radius", "radius"),
+                            ("Diameter", "diameter")):
+            add(label, "Sketch_Dimension", lambda k=kind: self._sketch_begin_dimension(k),
+                f"Create a {kind} sketch dimension")
         tb.addSeparator()
         add("Fillet",    "Sketch_Fillet",    self._sketch_apply_fillet,
             "Round the last polyline corner")
         add("Chamfer",   "Sketch_Chamfer",   self._sketch_apply_chamfer,
             "Chamfer the last polyline corner")
-        add("Trim/Del",  "Sketch_Trim",      self._sketch_delete_last,
-            "Delete the last entity")
+        add("Delete", "Sketch_Delete", self._sketch_delete_selected,
+            "Delete the selected entity and its dimensions")
         add("Close",     "Sketch_Close",     self._sketch_close_profile,
             "Close the active polyline")
         add("Cancel",    "Sketch_Cancel",    self._sketch_cancel_tool,
@@ -2181,35 +2444,53 @@ class Viewport3DWidget(QWidget):
         tb.addSeparator()
         add("Extrude",   "Part_Extrude",     self._sketch_request_extrude,
             "Extrude the sketch profile")
+        add("Extruded Cut", "Part_Cut", self._sketch_request_extruded_cut,
+            "Subtract the sketch extrusion from the selected base object")
         add("Revolve",   "Part_Revolve",     self._sketch_begin_revolve,
             "Revolve: pick a sketch line as axis")
         add("Exit",      "Sketch_Exit",      lambda: self.exit_sketch(commit=False),
             "Exit sketch mode without committing")
         return tb
 
-    def start_sketch(self, plane_origin: tuple, plane_normal: tuple) -> None:
+    def start_sketch(self, plane_origin: tuple, plane_normal: tuple,
+                     sketch_definition: Optional[dict] = None) -> None:
         self._cancel_draw()
         self.cancel_pick()
-        self._sketch_engine = SketchEngine(plane_origin, plane_normal)
+        if isinstance(sketch_definition, dict):
+            self._sketch_engine = SketchEngine.from_dict(sketch_definition)
+            plane_origin = self._sketch_engine.plane_origin
+            plane_normal = self._sketch_engine.plane_normal
+        else:
+            self._sketch_engine = SketchEngine(plane_origin, plane_normal)
+        self._last_sketch_definition = {}
+        self._sketch_dimension_kind = None
+        self._sketch_dimension_picks = []
+        if hasattr(self, "_sketch_construction_action"):
+            self._sketch_construction_action.setChecked(
+                bool(self._sketch_engine.construction_mode)
+            )
         # Align the viewport's projection plane with the sketch plane
         self._custom_plane_active = True
         self._custom_plane_origin = tuple(plane_origin)
         self._custom_plane_normal = tuple(plane_normal)
         self._sketch_toolbar.setVisible(True)
-        self.setCursor(Qt.CrossCursor)
+        self.setCursor(Qt.ArrowCursor)
         self.setFocus()
         self.status_message.emit(
-            "Sketch mode: pick a tool from the toolbar  |  Esc to exit"
+            "Sketch: Select  |  click geometry to select; Esc to exit"
         )
         self._refresh_sketch_overlay()
 
     def exit_sketch(self, commit: bool = False) -> None:
         if self._sketch_engine is None:
             return
+        self._last_sketch_definition = self._sketch_engine.to_dict()
         self._remove_sketch_actors()
         self._sketch_engine = None
         self._sketch_axis_pick_mode = False
         self._sketch_axis_highlight = None
+        self._sketch_dimension_kind = None
+        self._sketch_dimension_picks = []
         self._sketch_toolbar.setVisible(False)
         self.setCursor(Qt.ArrowCursor)
         self.status_message.emit(
@@ -2225,16 +2506,107 @@ class Viewport3DWidget(QWidget):
         # Selecting another tool cancels axis-pick
         self._sketch_axis_pick_mode = False
         self._sketch_axis_highlight = None
+        self._sketch_dimension_kind = None
+        self._sketch_dimension_picks = []
         self._sketch_engine.set_tool(name)
+        self.setCursor(Qt.CrossCursor)
         self.status_message.emit(f"Sketch tool: {name}")
         self._refresh_sketch_overlay()
+
+    def _sketch_set_selection_mode(self) -> None:
+        if self._sketch_engine is None:
+            return
+        self._sketch_engine.set_tool(None)
+        self._sketch_axis_pick_mode = False
+        self._sketch_axis_highlight = None
+        self._sketch_dimension_kind = None
+        self._sketch_dimension_picks = []
+        self.setCursor(Qt.ArrowCursor)
+        self.status_message.emit("Sketch: Select")
+        self._refresh_sketch_overlay()
+
+    def _sketch_delete_selected(self) -> None:
+        if self._sketch_engine is None:
+            return
+        if not self._sketch_engine.delete_selected():
+            self.status_message.emit("No sketch entity selected")
+            return
+        self.status_message.emit("Selected sketch entity deleted")
+        self._refresh_sketch_overlay()
+
+    def _sketch_set_rectangle_mode(self, mode: str) -> None:
+        if self._sketch_engine is None:
+            return
+        self._sketch_engine.set_rectangle_mode(mode)
+        self._sketch_set_tool("rect")
+
+    def _sketch_set_construction_mode(self, enabled: Optional[bool] = None) -> bool:
+        if self._sketch_engine is None:
+            return False
+        if enabled is None:
+            enabled = not self._sketch_engine.construction_mode
+        self._sketch_engine.set_construction_mode(bool(enabled))
+        if hasattr(self, "_sketch_construction_action"):
+            self._sketch_construction_action.setChecked(bool(enabled))
+        state = "on" if enabled else "off"
+        self.status_message.emit(f"Construction geometry {state} for new entities")
+        return bool(enabled)
+
+    def _sketch_toggle_construction(self) -> None:
+        self._sketch_set_construction_mode()
+
+    def set_sketch_dimension_resolver(self, resolver: Callable[[str], float]) -> None:
+        self._sketch_dimension_resolver = resolver
+
+    def set_sketch_vertex_snap(self, enabled: bool) -> bool:
+        self._sketch_vertex_snap_enabled = bool(enabled)
+        return self._sketch_vertex_snap_enabled
+
+    def recompute_sketch_dimensions(self, resolver: Optional[Callable[[str], float]] = None) -> dict:
+        engine = self._sketch_engine
+        resolver = resolver or self._sketch_dimension_resolver
+        if engine is None or not engine.dimensions:
+            return {"resolved": {}, "unresolved": {}}
+        if resolver is None:
+            return {"resolved": {}, "unresolved": {"resolver": "No formula resolver is configured"}}
+
+        resolved = {}
+        unresolved = {}
+        all_dimensions = engine.dimensions
+        for dimension in all_dimensions:
+            if dimension.expression:
+                engine.dimensions = [dimension]
+                try:
+                    resolved.update(engine.recompute_dimensions(resolver))
+                except Exception as exc:
+                    dimension.resolved_value = None
+                    unresolved[dimension.dimension_id] = str(exc)
+        engine.dimensions = all_dimensions
+
+        for dimension in all_dimensions:
+            if dimension.kind != "angular" and dimension.resolved_value is not None:
+                if not engine.apply_dimension(dimension):
+                    unresolved.setdefault(dimension.dimension_id, "Dimension is not supported by the sketch solver")
+        self._refresh_sketch_overlay()
+        if unresolved:
+            self.status_message.emit(
+                "Some sketch dimensions remain unresolved: "
+                + "; ".join(unresolved.values())
+            )
+        return {"resolved": resolved, "unresolved": unresolved}
 
     def _sketch_cancel_tool(self) -> None:
         if self._sketch_engine is None:
             return
-        self._sketch_engine.cancel_current()
+        active_polyline_id = self._sketch_engine._active_polyline_id
+        if self._sketch_engine.tool == "polyline" and active_polyline_id is not None:
+            self._sketch_engine.delete_entity(active_polyline_id)
+        else:
+            self._sketch_engine.cancel_current()
         self._sketch_axis_pick_mode = False
         self._sketch_axis_highlight = None
+        self._sketch_dimension_kind = None
+        self._sketch_dimension_picks = []
         self.status_message.emit("Sketch tool cancelled")
         self._refresh_sketch_overlay()
 
@@ -2260,7 +2632,7 @@ class Viewport3DWidget(QWidget):
         if not ok:
             return
         if not self._sketch_engine.apply_fillet(float(r)):
-            self.status_message.emit("Fillet requires a polyline with ≥3 points")
+            self.status_message.emit("Fillet requires a polyline with ≥3 points to extrude")
             return
         self._refresh_sketch_overlay()
 
@@ -2274,49 +2646,189 @@ class Viewport3DWidget(QWidget):
         if not ok:
             return
         if not self._sketch_engine.apply_chamfer(float(d)):
-            self.status_message.emit("Chamfer requires a polyline with ≥3 points")
+            self.status_message.emit("Chamfer requires a polyline with ≥3 points to extrude")
             return
         self._refresh_sketch_overlay()
 
     def _sketch_request_extrude(self) -> None:
         if self._sketch_engine is None:
             return
-        profile = self._sketch_engine.build_profile()
-        if len(profile) < 3:
-            self.status_message.emit("Sketch needs at least 3 points to extrude")
+        try:
+            regions = self._sketch_engine.operation_regions()
+        except ValueError as exc:
+            self.status_message.emit(str(exc))
+            return
+        if any(not region or len(region[0]) < 3 for region in regions):
+            self.status_message.emit("Every selected sketch region needs at least 3 points to extrude")
+            return
+        if len(regions) == 1:
+            profile = regions[0][0] if len(regions[0]) == 1 else regions[0]
+        else:
+            profile = regions
+        options = self._request_extrude_options()
+        if options is None:
+            return
+        depth, direction, symmetric = options
+        origin = self._sketch_engine.plane_origin
+        normal = self._sketch_engine.plane_normal
+        self.sketch_extrude_requested.emit(
+            list(profile), float(depth), tuple(origin), tuple(normal), direction, symmetric
+        )
+        self.exit_sketch(commit=True)
+
+    def _request_extrude_options(self):
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Extrude")
+        form = QFormLayout(dlg)
+        depth = QDoubleSpinBox(dlg)
+        depth.setRange(0.000001, 1e9)
+        depth.setDecimals(6)
+        depth.setValue(10.0)
+        direction = QComboBox(dlg)
+        direction.addItem("Along sketch normal", "Normal")
+        direction.addItem("Against sketch normal", "Reverse")
+        symmetric = QCheckBox("Both directions (total depth, centered)", dlg)
+        form.addRow(f"Depth ({self._units}; total when centered):", depth)
+        form.addRow("Direction:", direction)
+        form.addRow("", symmetric)
+        symmetric.toggled.connect(lambda checked: direction.setEnabled(not checked))
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, dlg)
+        form.addRow(buttons)
+        buttons.accepted.connect(dlg.accept)
+        buttons.rejected.connect(dlg.reject)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return None
+        return float(depth.value()), str(direction.currentData()), symmetric.isChecked()
+
+    def _sketch_request_extruded_cut(self) -> None:
+        if self._sketch_engine is None:
+            return
+        if len(self.scene.selection) != 1:
+            self.status_message.emit("Select exactly one base object before using Extruded Cut")
+            return
+        try:
+            profile = self._sketch_engine.operation_profile()
+        except ValueError as exc:
+            self.status_message.emit(str(exc))
+            return
+        outer = profile[0] if profile and isinstance(profile[0][0], (list, tuple)) else profile
+        if len(outer) < 3:
+            self.status_message.emit("Sketch region needs at least 3 points to cut")
             return
         depth, ok = QInputDialog.getDouble(
-            self, "Extrude", f"Depth ({self._units}):",
-            10.0, -1e6, 1e6, 3,
+            self, "Extruded Cut", f"Cut depth ({self._units}):",
+            10.0, 0.001, 1e6, 3,
         )
         if not ok:
             return
-        origin = self._sketch_engine.plane_origin
-        normal = self._sketch_engine.plane_normal
-        self.sketch_extrude_requested.emit(list(profile), float(depth), tuple(origin), tuple(normal))
+        origin = tuple(self._sketch_engine.plane_origin)
+        normal = tuple(self._sketch_engine.plane_normal)
+        self.sketch_cut_requested.emit(list(profile), float(depth), origin, normal)
         self.exit_sketch(commit=True)
 
+    @staticmethod
+    def _sketch_revolve_axis_segments(engine) -> list:
+        engine._ensure_entity_records()
+        segments = []
+        for entity in engine.entities:
+            if entity[0] == "line":
+                segments.append((entity[1], entity[2]))
+            elif entity[0] == "polyline":
+                segments.extend(zip(entity[1], entity[1][1:]))
+        return segments
+
+    @staticmethod
+    def _sketch_revolve_segments_match(first, second) -> bool:
+        tolerance = 1e-8
+        return (
+            math.dist(first[0], second[0]) <= tolerance
+            and math.dist(first[1], second[1]) <= tolerance
+        ) or (
+            math.dist(first[0], second[1]) <= tolerance
+            and math.dist(first[1], second[0]) <= tolerance
+        )
+
     def _sketch_begin_revolve(self) -> None:
-        if self._sketch_engine is None:
+        engine = self._sketch_engine
+        if engine is None:
             return
-        if not self._sketch_engine.entities:
-            self.status_message.emit("Draw a sketch first, then pick an axis line")
+        if not engine.selected_region_profile():
+            self.status_message.emit(
+                "Select a closed sketch region before starting Revolve"
+            )
             return
-        self._sketch_engine.set_tool(None)
+        try:
+            profile = engine.operation_profile()
+        except ValueError as exc:
+            self.status_message.emit(str(exc))
+            return
+        outer = profile[0] if profile and isinstance(profile[0][0], (list, tuple)) else profile
+        if len(outer) < 3:
+            self.status_message.emit("Selected sketch region needs at least 3 points to revolve")
+            return
+        engine.set_tool(None)
         self._sketch_axis_pick_mode = True
-        self.status_message.emit("Revolve: click a sketch line to use as axis")
+        self.status_message.emit(
+            "Revolve: region selected; click a separate sketch or construction line for the axis"
+        )
         self._refresh_sketch_overlay()
 
     # ── click / move dispatch ─────────────────────────────────────────
-    def _sketch_left_press(self, sx: int, sy: int) -> None:
-        uv = self._uv_from_screen(sx, sy)
+    def _sketch_left_press(self, sx: int, sy: int, ctrl: bool = False) -> None:
+        if self._sketch_dimension_kind is not None:
+            self._sketch_dimension_left_press(sx, sy)
+            return
+        uv = self._uv_from_screen(
+            sx, sy, snap=(self._sketch_engine.tool is not None and not self._sketch_axis_pick_mode)
+        )
         if uv is None:
             return
         if self._sketch_axis_pick_mode:
             tol = max(self._grid_spacing * 0.6, 1e-3)
             line = self._sketch_engine.find_line_at_uv(uv, tol)
             if line is None:
-                self.status_message.emit("No line under cursor – click on a sketch line")
+                self.status_message.emit(
+                    "No axis line under cursor; click a sketch or construction line"
+                )
+                return
+            if math.dist(line[0], line[1]) <= 1e-12:
+                self.status_message.emit("Revolve axis must have two distinct endpoints")
+                return
+            try:
+                profile = self._sketch_engine.operation_profile()
+            except ValueError as exc:
+                self.status_message.emit(str(exc))
+                self._sketch_axis_pick_mode = False
+                self._refresh_sketch_overlay()
+                return
+            outer = profile[0] if profile and isinstance(profile[0][0], (list, tuple)) else profile
+            if len(outer) < 3:
+                self.status_message.emit("Selected sketch region needs at least 3 points to revolve")
+                self._sketch_axis_pick_mode = False
+                self._refresh_sketch_overlay()
+                return
+            boundaries = [
+                (start, end)
+                for contour in (self._sketch_engine.selected_region_profile() or [])
+                for start, end in zip(contour, contour[1:])
+            ]
+            axis_segments = self._sketch_revolve_axis_segments(self._sketch_engine)
+            line_is_boundary = any(
+                self._sketch_revolve_segments_match(line, boundary)
+                for boundary in boundaries
+            )
+            has_separate_axis = any(
+                not any(
+                    self._sketch_revolve_segments_match(segment, boundary)
+                    for boundary in boundaries
+                )
+                for segment in axis_segments
+                if math.dist(segment[0], segment[1]) > 1e-12
+            )
+            if line_is_boundary and has_separate_axis:
+                self.status_message.emit(
+                    "That line bounds the selected region; choose a separate sketch axis"
+                )
                 return
             self._sketch_axis_highlight = line
             self._refresh_sketch_overlay()
@@ -2325,13 +2837,6 @@ class Viewport3DWidget(QWidget):
                 360.0, -360.0, 360.0, 2,
             )
             if not ok:
-                self._sketch_axis_pick_mode = False
-                self._sketch_axis_highlight = None
-                self._refresh_sketch_overlay()
-                return
-            profile = self._sketch_engine.build_profile()
-            if len(profile) < 2:
-                self.status_message.emit("Sketch needs at least 2 profile points to revolve")
                 self._sketch_axis_pick_mode = False
                 self._sketch_axis_highlight = None
                 self._refresh_sketch_overlay()
@@ -2348,12 +2853,39 @@ class Viewport3DWidget(QWidget):
             self.exit_sketch(commit=True)
             return
 
-        if self._sketch_engine.tool is None:
+        if self._sketch_engine.tool == "center_arc":
+            self._sketch_center_arc_click(uv)
             return
+
+        if self._sketch_engine.tool is None:
+            tolerance = Viewport3DWidget._sketch_entity_pick_tolerance(self, sx, sy, uv)
+            if ctrl and self._sketch_engine.select_region_at_uv(
+                uv, additive=True, toggle=True
+            ):
+                message = "Sketch region added to selection"
+            else:
+                selected = self._sketch_engine.select_entity_at_uv(
+                    uv, tolerance, preserve_regions=ctrl
+                )
+                if selected:
+                    message = "Sketch entity selected"
+                elif not ctrl and self._sketch_engine.select_region_at_uv(uv):
+                    message = "Sketch region selected"
+                else:
+                    message = "Sketch selection cleared"
+            self.status_message.emit(message)
+            self._refresh_sketch_overlay()
+            return
+        active_tool = self._sketch_engine.tool
         self._sketch_engine.on_click(uv)
+        if active_tool is not None and self._sketch_engine.tool is None:
+            self.setCursor(Qt.ArrowCursor)
+            self.status_message.emit("Sketch: Select")
         self._refresh_sketch_overlay()
 
     def _sketch_mouse_move(self, sx: int, sy: int) -> None:
+        if self._sketch_dimension_kind is not None:
+            return
         if self._sketch_engine.tool is None and not self._sketch_axis_pick_mode:
             return
         uv = self._uv_from_screen(sx, sy)
@@ -2362,17 +2894,376 @@ class Viewport3DWidget(QWidget):
         self._sketch_engine.on_move(uv)
         self._refresh_sketch_preview()
 
+    def _sketch_center_arc_click(self, uv: tuple) -> None:
+        pending = self._sketch_engine.pending
+        pending.append(uv)
+        if len(pending) < 3:
+            self.status_message.emit(
+                "Center Arc: " + ("pick the start point" if len(pending) == 1 else "pick the end angle")
+            )
+            self._refresh_sketch_overlay()
+            return
+        center, start, end_cursor = pending
+        path = self._center_arc_path(center, start, end_cursor)
+        if path is None:
+            self.status_message.emit("Center Arc needs distinct center, start, and end points")
+            self._sketch_engine.pending = []
+            self._refresh_sketch_overlay()
+            return
+        self._sketch_engine.add_arc(path[0], path[-1], path[len(path) // 2])
+        self._sketch_engine.pending = []
+        self._sketch_engine.preview_uv = None
+        self._sketch_set_selection_mode()
+        self.status_message.emit("Center Arc created")
+
+    @staticmethod
+    def _center_arc_path(center: tuple, start: tuple, end_cursor: tuple) -> Optional[list]:
+        radius = math.hypot(start[0] - center[0], start[1] - center[1])
+        end_dx, end_dy = end_cursor[0] - center[0], end_cursor[1] - center[1]
+        if radius < 1e-9 or math.hypot(end_dx, end_dy) < 1e-9:
+            return None
+        start_angle = math.atan2(start[1] - center[1], start[0] - center[0])
+        end_angle = math.atan2(end_dy, end_dx)
+        sweep = (end_angle - start_angle) % (2.0 * math.pi)
+        if sweep < 1e-9:
+            return None
+        return [
+            (center[0] + radius * math.cos(start_angle + sweep * step / 32.0),
+             center[1] + radius * math.sin(start_angle + sweep * step / 32.0))
+            for step in range(33)
+        ]
+
+    def _sketch_begin_dimension(self, kind: str) -> None:
+        if self._sketch_engine is None:
+            return
+        if kind not in {"linear", "aligned", "angular", "radius", "diameter"}:
+            raise ValueError(f"Unsupported sketch dimension: {kind}")
+        self._sketch_engine.set_tool(None)
+        self._sketch_dimension_kind = kind
+        self._sketch_dimension_picks = []
+        self._sketch_axis_pick_mode = False
+        required = 1 if kind in {"radius", "diameter"} else 2
+        target = {
+            "linear": "sketch vertices or edges",
+            "aligned": "sketch vertices or edges",
+            "angular": "two sketch lines",
+            "radius": "a sketch circle or arc",
+            "diameter": "a sketch circle or arc",
+        }[kind]
+        self.status_message.emit(f"{kind.title()} dimension: pick {required} {target}")
+
+    def _sketch_dimension_left_press(self, sx: int, sy: int) -> None:
+        world = self._ray_plane_intersect(sx, sy)
+        if world is None:
+            return
+        external_snap = None
+        for snap_mode in ("vertex", "edge"):
+            snapped = self._snap_to_visible_geometry(sx, sy, world, snap_mode=snap_mode)
+            if snapped is not None:
+                world, external_snap = snapped
+                world = self._project_point_to_draw_plane(world)
+                break
+        uv = world_to_uv(
+            world, self._sketch_engine.plane_origin,
+            self._sketch_engine.u_axis, self._sketch_engine.v_axis,
+        )
+        tolerance = max(float(self._grid_spacing) * 0.45, 1e-3)
+        ref = self._sketch_dimension_ref_at_uv(self._sketch_dimension_kind, uv, tolerance)
+        if ref is None:
+            if external_snap:
+                self.status_message.emit(
+                    "External geometry snapped, but dimensions require a persistent sketch reference; "
+                    "pick sketch geometry near that snap."
+                )
+            else:
+                self.status_message.emit("No compatible sketch reference under the cursor")
+            return
+
+        self._sketch_dimension_picks.append(ref)
+        needed = 1 if self._sketch_dimension_kind in {"radius", "diameter"} else 2
+        if len(self._sketch_dimension_picks) < needed:
+            snap_note = f"; aligned to external {external_snap}" if external_snap else ""
+            self.status_message.emit(f"Dimension reference 1/{needed} selected{snap_note}; pick the next reference")
+            return
+        refs = list(self._sketch_dimension_picks)
+        kind = self._sketch_dimension_kind
+        self._sketch_dimension_kind = None
+        self._sketch_dimension_picks = []
+        self._sketch_create_dimension(kind, refs)
+
+    def _sketch_dimension_ref_at_uv(self, kind: str, uv: tuple, tolerance: float):
+        engine = self._sketch_engine
+        if kind in {"linear", "aligned"}:
+            candidates = []
+            segments = []
+            for index, entity in enumerate(engine.entities):
+                tag = entity[0]
+                point_indexes = {
+                    "line": (0, 1), "rect": (0, 1), "polyline": range(len(entity[1])),
+                    "arc": (0, 1, 2), "circle": (0,),
+                }.get(tag, ())
+                for point_index in point_indexes:
+                    position = engine._point_position(engine.point_ref(index, point_index))
+                    candidates.append((math.hypot(uv[0] - position[0], uv[1] - position[1]),
+                                       engine.point_ref(index, point_index)))
+                if tag == "line":
+                    point_indexes = (0, 1)
+                    segments.append((entity[1], entity[2],
+                                     engine.point_ref(index, 0), engine.point_ref(index, 1)))
+                elif tag == "rect":
+                    corners = _rect_polyline(
+                        entity[1], entity[2],
+                        getattr(entity, "rectangle_mode", None) or "corner-corner",
+                    )
+                    for first, second in zip(corners, corners[1:]):
+                        segments.append((first, second,
+                                         engine.point_ref(index, 0), engine.point_ref(index, 1)))
+                elif tag == "polyline":
+                    for point_index in range(len(entity[1]) - 1):
+                        segments.append((entity[1][point_index], entity[1][point_index + 1],
+                                         engine.point_ref(index, point_index),
+                                         engine.point_ref(index, point_index + 1)))
+            if candidates:
+                distance, point_ref = min(candidates, key=lambda item: item[0])
+                if distance <= tolerance * 0.35:
+                    return point_ref
+            edge_candidates = []
+            for start, end, first_ref, second_ref in segments:
+                projection, distance = self._closest_point_2d(uv, start, end)
+                if distance <= tolerance:
+                    first = engine._point_position(first_ref)
+                    second = engine._point_position(second_ref)
+                    edge_candidates.append((distance, first_ref if math.dist(uv, first) <= math.dist(uv, second) else second_ref))
+            if edge_candidates:
+                return min(edge_candidates, key=lambda item: item[0])[1]
+            if candidates:
+                distance, point_ref = min(candidates, key=lambda item: item[0])
+                if distance <= tolerance:
+                    return point_ref
+            return None
+
+        best = None
+        for index, entity in enumerate(engine.entities):
+            tag = entity[0]
+            if kind == "angular" and tag not in {"line", "polyline"}:
+                continue
+            if kind in {"radius", "diameter"} and tag not in {"circle", "arc"}:
+                continue
+            if tag == "line":
+                segments = [(entity[1], entity[2])]
+            elif tag == "polyline":
+                segments = list(zip(entity[1], entity[1][1:]))
+            elif tag == "circle":
+                center, radius = entity[1], entity[2]
+                distance = abs(math.hypot(uv[0] - center[0], uv[1] - center[1]) - radius)
+                segments = []
+            else:
+                points = self._sketch_arc_points(entity[1], entity[2], entity[3])
+                segments = list(zip(points, points[1:]))
+            if tag in {"line", "polyline", "arc"}:
+                distance = min(
+                    (self._closest_point_2d(uv, start, end)[1] for start, end in segments),
+                    default=float("inf"),
+                )
+            if distance <= tolerance and (best is None or distance < best[0]):
+                best = (distance, engine.entity_ref(index))
+        return None if best is None else best[1]
+
+    @staticmethod
+    def _closest_point_2d(point: tuple, start: tuple, end: tuple) -> tuple:
+        dx, dy = end[0] - start[0], end[1] - start[1]
+        denominator = dx * dx + dy * dy
+        factor = 0.0 if denominator < 1e-12 else max(
+            0.0, min(1.0, ((point[0] - start[0]) * dx + (point[1] - start[1]) * dy) / denominator)
+        )
+        closest = (start[0] + factor * dx, start[1] + factor * dy)
+        return closest, math.hypot(point[0] - closest[0], point[1] - closest[1])
+
+    @staticmethod
+    def _sketch_arc_points(start: tuple, end: tuple, mid: tuple) -> list:
+        ax, ay = start
+        bx, by = mid
+        cx, cy = end
+        denominator = 2.0 * (ax * (by - cy) + bx * (cy - ay) + cx * (ay - by))
+        if abs(denominator) < 1e-10:
+            return [start, end]
+        center_x = ((ax * ax + ay * ay) * (by - cy)
+                    + (bx * bx + by * by) * (cy - ay)
+                    + (cx * cx + cy * cy) * (ay - by)) / denominator
+        center_y = ((ax * ax + ay * ay) * (cx - bx)
+                    + (bx * bx + by * by) * (ax - cx)
+                    + (cx * cx + cy * cy) * (bx - ax)) / denominator
+        radius = math.hypot(ax - center_x, ay - center_y)
+        start_angle = math.atan2(ay - center_y, ax - center_x)
+        end_angle = math.atan2(cy - center_y, cx - center_x)
+        mid_angle = math.atan2(by - center_y, bx - center_x)
+        ccw_sweep = (end_angle - start_angle) % (2.0 * math.pi)
+        mid_sweep = (mid_angle - start_angle) % (2.0 * math.pi)
+        sweep = ccw_sweep if mid_sweep <= ccw_sweep else ccw_sweep - 2.0 * math.pi
+        return [
+            (center_x + radius * math.cos(start_angle + sweep * step / 32.0),
+             center_y + radius * math.sin(start_angle + sweep * step / 32.0))
+            for step in range(33)
+        ]
+
+    def _sketch_create_dimension(self, kind: str, refs: list) -> None:
+        engine = self._sketch_engine
+        axis = None
+        if kind == "linear":
+            first = engine._point_position(refs[0])
+            second = engine._point_position(refs[1])
+            axis = "u" if abs(second[0] - first[0]) >= abs(second[1] - first[1]) else "v"
+        try:
+            dimension = engine.add_dimension(kind, refs, axis=axis)
+        except (LookupError, TypeError, ValueError) as exc:
+            self.status_message.emit(f"Unable to create dimension: {exc}")
+            return
+        default_expression = f"{dimension.value:.6g}"
+        expression, accepted = QInputDialog.getText(
+            self, f"{kind.title()} Dimension", "Numeric value or project parameter expression:",
+            text=default_expression,
+        )
+        if not accepted:
+            engine.dimensions.remove(dimension)
+            self.status_message.emit("Dimension creation cancelled")
+            self._refresh_sketch_overlay()
+            return
+        expression = str(expression).strip()
+        dimension.expression = expression or None
+        dimension.resolved_value = dimension.value if not expression else None
+        if expression:
+            result = self.recompute_sketch_dimensions()
+            if dimension.dimension_id in result["unresolved"]:
+                self.status_message.emit(
+                    f"Dimension kept unresolved: {result['unresolved'][dimension.dimension_id]}"
+                )
+                self._refresh_sketch_overlay()
+                return
+        elif kind != "angular" and not engine.apply_dimension(dimension):
+            self.status_message.emit("This dimension could not be applied to the selected sketch geometry")
+        if kind == "angular":
+            self.status_message.emit(
+                "Angular dimension recorded as a measurement; the current sketch engine has no angular solver"
+            )
+        else:
+            self.status_message.emit(f"{kind.title()} dimension created and applied")
+        self._refresh_sketch_overlay()
+
+    def sketch_definition(self) -> dict:
+        if self._sketch_engine is not None:
+            return self._sketch_engine.to_dict()
+        return dict(self._last_sketch_definition)
+
+    def _sketch_dimension_label(self, dimension) -> tuple[str, tuple]:
+        engine = self._sketch_engine
+        measured = engine.measure_dimension(dimension)
+        target = dimension.resolved_value if dimension.resolved_value is not None else dimension.value
+        if dimension.kind == "angular":
+            if dimension.expression and dimension.resolved_value is None:
+                target_text = f"{dimension.expression}: unresolved"
+            elif dimension.expression:
+                target_text = f"{dimension.expression} = {target:.2f} deg"
+            else:
+                target_text = "unresolved" if target is None else f"target {target:.2f} deg"
+            label = f"{measured:.2f} deg ({target_text}; not driven)"
+        elif dimension.expression and dimension.resolved_value is None:
+            label = f"{measured:.3f} {self._units} ({dimension.expression}: unresolved)"
+        elif dimension.expression:
+            label = f"{dimension.expression} = {target:.3f} {self._units}"
+        else:
+            label = f"{target:.3f} {self._units}"
+
+        points = []
+        for ref in dimension.refs:
+            if hasattr(ref, "point_index"):
+                points.append(engine._point_position(ref))
+            else:
+                entity = engine._entity_for_ref(ref)
+                if entity[0] == "circle":
+                    points.append(entity[1])
+                elif entity[0] == "arc":
+                    points.append(entity[1])
+                elif entity[0] == "line":
+                    points.append(((entity[1][0] + entity[2][0]) * 0.5,
+                                   (entity[1][1] + entity[2][1]) * 0.5))
+                elif entity[0] == "polyline" and entity[1]:
+                    points.append(entity[1][len(entity[1]) // 2])
+        anchor = (sum(point[0] for point in points) / len(points),
+                  sum(point[1] for point in points) / len(points))
+        return label, anchor
+
     # ── coordinate helpers ────────────────────────────────────────────
-    def _uv_from_screen(self, sx: int, sy: int) -> Optional[tuple]:
+    def _uv_from_screen(self, sx: int, sy: int, *, snap: bool = True) -> Optional[tuple]:
         if self._sketch_engine is None:
             return None
         world = self._ray_plane_intersect(sx, sy)
         if world is None:
             return None
-        world = self._snap(world)
-        return world_to_uv(world, self._sketch_engine.plane_origin,
-                           self._sketch_engine.u_axis,
-                           self._sketch_engine.v_axis)
+        uv = world_to_uv(world, self._sketch_engine.plane_origin,
+                         self._sketch_engine.u_axis,
+                         self._sketch_engine.v_axis)
+        if not snap:
+            return uv
+        if self._sketch_vertex_snap_enabled:
+            snapped_vertex = self._nearest_sketch_vertex(uv)
+            if snapped_vertex is not None:
+                return snapped_vertex
+        spacing = abs(float(self._grid_spacing))
+        if spacing > 1e-12:
+            return (round(uv[0] / spacing) * spacing,
+                    round(uv[1] / spacing) * spacing)
+        return uv
+
+    def _sketch_entity_pick_tolerance(self, sx: int, sy: int, uv: tuple) -> float:
+        spacing = abs(float(self._grid_spacing))
+        minimum = max(spacing * 0.01, 1e-4)
+        maximum = max(minimum, spacing * 0.05)
+        fallback = max(minimum, spacing * 0.03)
+        try:
+            world = self._ray_plane_intersect(sx + 6, sy)
+            if world is None:
+                return fallback
+            offset_uv = world_to_uv(
+                world, self._sketch_engine.plane_origin,
+                self._sketch_engine.u_axis, self._sketch_engine.v_axis,
+            )
+            pixel_distance = math.hypot(offset_uv[0] - uv[0], offset_uv[1] - uv[1])
+            return max(minimum, min(maximum, pixel_distance))
+        except (AttributeError, TypeError, ValueError):
+            return fallback
+
+    def _nearest_sketch_vertex(self, uv: tuple) -> Optional[tuple]:
+        engine = self._sketch_engine
+        if engine is None:
+            return None
+        candidates = []
+        for entity in engine.entities:
+            tag = entity[0]
+            if tag == "line":
+                candidates.extend((entity[1], entity[2]))
+            elif tag == "polyline":
+                candidates.extend(entity[1])
+            elif tag == "rect":
+                first, second = entity[1], entity[2]
+                if entity.rectangle_mode == "center-corner":
+                    first = (2.0 * first[0] - second[0],
+                             2.0 * first[1] - second[1])
+                left, right = sorted((first[0], second[0]))
+                bottom, top = sorted((first[1], second[1]))
+                candidates.extend(((left, bottom), (right, bottom),
+                                   (right, top), (left, top)))
+            elif tag == "arc":
+                candidates.extend(entity[1:4])
+            elif tag == "circle":
+                candidates.append(entity[1])
+        if not candidates:
+            return None
+        distance, point = min(
+            (math.hypot(uv[0] - point[0], uv[1] - point[1]), point)
+            for point in candidates
+        )
+        tolerance = max(abs(float(self._grid_spacing)) * 0.45, 1e-3)
+        return tuple(point) if distance <= tolerance else None
 
     def _world_from_uv(self, u: float, v: float) -> tuple:
         if self._sketch_engine is None:
@@ -2383,41 +3274,117 @@ class Viewport3DWidget(QWidget):
 
     # ── overlay rendering ─────────────────────────────────────────────
     def _remove_sketch_actors(self) -> None:
-        for attr in ("_sketch_lines_actor", "_sketch_hi_actor",
-                     "_sketch_verts_actor", "_sketch_preview_actor"):
-            actor = getattr(self, attr)
+        for attr in ("_sketch_lines_actor", "_sketch_construction_actor", "_sketch_hi_actor",
+                     "_sketch_region_actor",
+                     "_sketch_preview_actor"):
+            actor = getattr(self, attr, None)
             if actor is not None:
                 self._renderer.RemoveActor(actor)
                 setattr(self, attr, None)
+        for actor in self._sketch_dimension_actors:
+            self._renderer.RemoveActor(actor)
+        self._sketch_dimension_actors = []
 
     def _refresh_sketch_overlay(self) -> None:
         if self._sketch_engine is None:
             self._render()
             return
-        # Remove old line/highlight/vertex actors (preview kept until next move)
-        for attr in ("_sketch_lines_actor", "_sketch_hi_actor",
-                     "_sketch_verts_actor"):
-            actor = getattr(self, attr)
+        # Remove old line/highlight actors (preview kept until next move)
+        for attr in ("_sketch_lines_actor", "_sketch_construction_actor", "_sketch_hi_actor",
+                 "_sketch_region_actor",
+                 ):
+            actor = getattr(self, attr, None)
             if actor is not None:
                 self._renderer.RemoveActor(actor)
                 setattr(self, attr, None)
 
-        normal_poly, hi_poly = self._sketch_engine.to_lines_polydata(
-            highlight=self._sketch_axis_highlight
-        )
+        self._sketch_engine._ensure_entity_records()
+        normal_entities = [
+            entity for entity in self._sketch_engine.entities
+            if not entity.construction
+        ]
+        normal_engine = SketchEngine.from_dict(self._sketch_engine.to_dict())
+        normal_engine.entities = normal_entities
+        normal_engine.selected_entity_id = self._sketch_engine.selected_entity_id
+        normal_engine.selected_entity_id = self._sketch_engine.selected_entity_id
+        normal_poly, hi_poly = normal_engine.to_lines_polydata()
         self._sketch_lines_actor = self._make_line_actor(
             normal_poly, color=(1.0, 0.5, 0.0), width=2.0
         )
         self._renderer.AddActor(self._sketch_lines_actor)
+        construction_entities = [
+            entity for entity in self._sketch_engine.entities
+            if entity.construction
+        ]
+        if construction_entities:
+            construction_engine = SketchEngine.from_dict(self._sketch_engine.to_dict())
+            construction_engine.entities = construction_entities
+            construction_engine.selected_entity_id = self._sketch_engine.selected_entity_id
+            construction_engine.selected_entity_id = self._sketch_engine.selected_entity_id
+            construction_poly, construction_hi_poly = construction_engine.to_lines_polydata()
+            self._sketch_construction_actor = self._make_line_actor(
+                construction_poly, color=(0.35, 0.8, 1.0), width=1.5, dashed=True
+            )
+            self._renderer.AddActor(self._sketch_construction_actor)
+            if construction_hi_poly.GetNumberOfCells() > 0:
+                highlights = vtk.vtkAppendPolyData()
+                highlights.AddInputData(hi_poly)
+                highlights.AddInputData(construction_hi_poly)
+                highlights.Update()
+                hi_poly = highlights.GetOutput()
+        if self._sketch_axis_highlight is not None:
+            highlights = vtk.vtkAppendPolyData()
+            highlights.AddInputData(hi_poly)
+            highlights.AddInputData(self._sketch_uv_path_polydata(
+                list(self._sketch_axis_highlight)
+            ))
+            highlights.Update()
+            hi_poly = highlights.GetOutput()
         if hi_poly.GetNumberOfCells() > 0:
             self._sketch_hi_actor = self._make_line_actor(
                 hi_poly, color=(1.0, 0.85, 0.0), width=4.0
             )
             self._renderer.AddActor(self._sketch_hi_actor)
-        verts_poly = self._sketch_engine.to_vertex_polydata()
-        if verts_poly.GetNumberOfCells() > 0:
-            self._sketch_verts_actor = self._make_vertex_actor(verts_poly)
-            self._renderer.AddActor(self._sketch_verts_actor)
+        selected_regions = self._sketch_engine.selected_region_profiles()
+        if selected_regions:
+            selected_surfaces = vtk.vtkAppendPolyData()
+            for region in selected_regions:
+                contour_points = vtk.vtkPoints()
+                contour_lines = vtk.vtkCellArray()
+                for contour in region:
+                    ids = vtk.vtkIdList()
+                    for u, v in contour:
+                        ids.InsertNextId(contour_points.InsertNextPoint(u, v, 0.0))
+                    contour_lines.InsertNextCell(ids)
+                contour_data = vtk.vtkPolyData()
+                contour_data.SetPoints(contour_points)
+                contour_data.SetLines(contour_lines)
+                triangulator = vtk.vtkContourTriangulator()
+                triangulator.SetInputData(contour_data)
+                triangulator.Update()
+                cap = vtk.vtkPolyData()
+                cap.DeepCopy(triangulator.GetOutput())
+                world_points = vtk.vtkPoints()
+                for point_index in range(cap.GetNumberOfPoints()):
+                    u, v, _ = cap.GetPoint(point_index)
+                    world_points.InsertNextPoint(*self._world_from_uv(u, v))
+                cap.SetPoints(world_points)
+                selected_surfaces.AddInputData(cap)
+            selected_surfaces.Update()
+            self._sketch_region_actor = vtk.vtkActor()
+            region_mapper = vtk.vtkPolyDataMapper()
+            region_mapper.SetInputData(selected_surfaces.GetOutput())
+            self._sketch_region_actor.SetMapper(region_mapper)
+            region_property = self._sketch_region_actor.GetProperty()
+            region_property.SetColor(*scene_objects.SELECTION_COLOR)
+            region_property.SetOpacity(0.48)
+            region_property.SetRepresentationToSurface()
+            region_property.EdgeVisibilityOn()
+            region_property.SetEdgeColor(*scene_objects.SELECTION_COLOR)
+            region_property.SetLineWidth(2.0)
+            self._sketch_region_actor.PickableOff()
+            self._renderer.AddActor(self._sketch_region_actor)
+        self._refresh_sketch_dimensions()
         self._refresh_sketch_preview()
 
     def _refresh_sketch_preview(self) -> None:
@@ -2427,13 +3394,62 @@ class Viewport3DWidget(QWidget):
         if self._sketch_engine is None:
             self._render()
             return
-        prev = self._sketch_engine.to_preview_polydata()
+        if (self._sketch_engine.tool == "center_arc"
+                and len(self._sketch_engine.pending) == 2
+                and self._sketch_engine.preview_uv is not None):
+            path = self._center_arc_path(
+                self._sketch_engine.pending[0],
+                self._sketch_engine.pending[1],
+                self._sketch_engine.preview_uv,
+            )
+            prev = self._sketch_uv_path_polydata(path or [])
+        else:
+            prev = self._sketch_engine.to_preview_polydata()
         if prev.GetNumberOfCells() > 0:
             self._sketch_preview_actor = self._make_line_actor(
                 prev, color=(1.0, 0.5, 0.0), width=1.5, dashed=True
             )
             self._renderer.AddActor(self._sketch_preview_actor)
         self._render()
+
+    def _refresh_sketch_dimensions(self) -> None:
+        for actor in self._sketch_dimension_actors:
+            self._renderer.RemoveActor(actor)
+        self._sketch_dimension_actors = []
+        if self._sketch_engine is None:
+            return
+        for index, dimension in enumerate(self._sketch_engine.dimensions):
+            try:
+                label, anchor = self._sketch_dimension_label(dimension)
+            except (LookupError, TypeError, ValueError, ZeroDivisionError):
+                continue
+            offset = max(float(self._grid_spacing) * (0.18 + index * 0.08), 0.2)
+            world = self._world_from_uv(anchor[0], anchor[1])
+            world = tuple(
+                world[axis] + self._sketch_engine.v_axis[axis] * offset
+                for axis in range(3)
+            )
+            actor = vtk.vtkBillboardTextActor3D()
+            actor.SetInput(label)
+            actor.SetPosition(*world)
+            text = actor.GetTextProperty()
+            text.SetFontSize(14)
+            text.SetColor(1.0, 0.9, 0.45)
+            text.SetBold(True)
+            text.SetBackgroundColor(0.08, 0.08, 0.08)
+            text.SetBackgroundOpacity(0.72)
+            self._renderer.AddActor(actor)
+            self._sketch_dimension_actors.append(actor)
+
+    def _sketch_uv_path_polydata(self, path: list) -> vtk.vtkPolyData:
+        points = vtk.vtkPoints()
+        lines = vtk.vtkCellArray()
+        if self._sketch_engine is not None and len(path) >= 2:
+            self._sketch_engine._append_polyline_3d(path, points, lines)
+        polydata = vtk.vtkPolyData()
+        polydata.SetPoints(points)
+        polydata.SetLines(lines)
+        return polydata
 
     @staticmethod
     def _make_line_actor(poly: vtk.vtkPolyData, color: tuple,
@@ -2449,26 +3465,5 @@ class Viewport3DWidget(QWidget):
         if dashed:
             prop.SetLineStipplePattern(0xF0F0)
             prop.SetLineStippleRepeatFactor(1)
-        actor.PickableOff()
-        return actor
-
-    def _make_vertex_actor(self, poly: vtk.vtkPolyData) -> vtk.vtkActor:
-        size = max(self._grid_spacing * 0.18, 0.4)
-        sphere = vtk.vtkSphereSource()
-        sphere.SetRadius(size)
-        sphere.SetPhiResolution(10)
-        sphere.SetThetaResolution(10)
-        glyph = vtk.vtkGlyph3D()
-        glyph.SetInputData(poly)
-        glyph.SetSourceConnection(sphere.GetOutputPort())
-        glyph.ScalingOff()
-        glyph.Update()
-        mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(glyph.GetOutputPort())
-        actor = vtk.vtkActor()
-        actor.SetMapper(mapper)
-        prop = actor.GetProperty()
-        prop.SetColor(1.0, 0.5, 0.0)
-        prop.SetLighting(False)
         actor.PickableOff()
         return actor

@@ -22,7 +22,7 @@
   <div class="eyebrow">EM 3D Modeler · User documentation</div>
   <h1>Build the model.<br>Prepare the simulation.</h1>
   <p>A practical guide to the desktop workspace, geometry tools, project setup, EMERGE export and result plotting. UI screenshots below are genuine captures of the application's Qt widgets populated with reproducible example values.</p>
-  <div class="version">Version 1.3.0b2 · Release date 2026-09-24</div>
+  <div class="version">Version 1.3.3b1 · Release date 2026-09-25</div>
 </header>
 <div class="layout">
 <nav class="toc" aria-label="Contents">
@@ -75,7 +75,7 @@
 <section class="section" id="toolbar">
 <div class="section-head"><h2>Toolbar icons</h2><a class="top" href="#top">Back to contents ↑</a></div>
 <p>The image is a crop of the real application toolbar. Buttons are icon-only; use this guide alongside their group labels. Most creation and edit commands act on the active selection or wait for viewport picks.</p>
-<figure class="shot"><img src="snapshots/toolbar-icons.png" alt="Cropped genuine EM 3D Modeler toolbar showing all icons in 3D, 2D, Boolean, Transform, Simulation, Zoom and Select groups"><figcaption><strong>Main toolbar.</strong> Real icons cropped from the user-provided application screenshot.</figcaption></figure>
+<figure class="shot"><img src="snapshots/toolbar-icons.png" alt="Cropped genuine EM 3D Modeler toolbar showing icons in 3D, 2D, Boolean, Transform, Simulation, View and Select groups"><figcaption><strong>Main toolbar.</strong> Real icons cropped from the user-provided application screenshot.</figcaption></figure>
 <h3>3D</h3>
 <table><thead><tr><th class="toolbar-icon-column">Icon / control</th><th>Action</th></tr></thead><tbody>
 <tr><td><span class="toolbar-icon" role="img" aria-label="Box icon" style="background-position:-13px -22px"></span></td><td><strong>Box:</strong> start drawing a box on the active plane.</td></tr>
@@ -89,6 +89,7 @@
 <tr><td><span class="toolbar-icon" role="img" aria-label="Sketch icon" style="background-position:-140px -22px"></span></td><td><strong>Sketch:</strong> open the 2D profile editor for extrusion or revolution.</td></tr>
 <tr><td><span class="toolbar-icon" role="img" aria-label="Planar structure icon" style="background-position:-176px -22px"></span></td><td><strong>Planar:</strong> define a planar structure by picking snapped points on the active plane.</td></tr>
 <tr><td><span class="toolbar-icon" role="img" aria-label="Plate from Face or Edge icon" style="background-position:-211px -22px"></span></td><td><strong>Plate from Face/Edge:</strong> create a thin Plate from the last selected face or a supported axis-aligned edge.</td></tr>
+<tr><td><span class="toolbar-icon" role="img" aria-label="Circular Plate icon">&#9711;</span></td><td><strong>Circular Plate:</strong> click the center and radius on the active plane; both snap to the configured grid spacing.</td></tr>
 </tbody></table>
 <h3>Boolean</h3>
 <table><thead><tr><th class="toolbar-icon-column">Icon / control</th><th>Action</th></tr></thead><tbody>
@@ -109,11 +110,12 @@
 <tr><td><span class="toolbar-icon" role="img" aria-label="Check Simulation icon" style="background-position:-647px -22px"></span></td><td><strong>Check Simulation:</strong> run local preflight checks; this does not launch EMERGE.</td></tr>
 <tr><td><span class="toolbar-icon" role="img" aria-label="Run simulation icon" style="background-position:-682px -22px"></span></td><td><strong>Play:</strong> prepare the EMERGE scripts and open the simulation window.</td></tr>
 </tbody></table>
-<h3>Zoom</h3>
+<h3>View</h3>
 <table><thead><tr><th class="toolbar-icon-column">Icon / control</th><th>Action</th></tr></thead><tbody>
 <tr><td><span class="toolbar-icon" role="img" aria-label="Fit All icon" style="background-position:-738px -22px"></span></td><td><strong>Fit All:</strong> fit all visible objects without changing view orientation.</td></tr>
 <tr><td><span class="toolbar-icon" role="img" aria-label="Fit Selection icon" style="background-position:-774px -22px"></span></td><td><strong>Fit Selection:</strong> fit selected visible objects without changing view orientation.</td></tr>
 <tr><td><span class="toolbar-icon" role="img" aria-label="Isometric View icon" style="background-position:-808px -22px"></span></td><td><strong>Isometric View:</strong> set the standard isometric camera and fit all visible objects.</td></tr>
+<tr><td><span class="toolbar-icon" role="img" aria-label="Perspective and parallel projection toggle">&#8644;</span></td><td><strong>Projection:</strong> toggle between perspective and parallel projection. The checked state and icon indicate the active mode; the view framing is preserved when switching.</td></tr>
 </tbody></table>
 <h3>Select</h3>
 <table><thead><tr><th class="toolbar-control-column">Icon / control</th><th>Action</th></tr></thead><tbody>
@@ -172,7 +174,7 @@
 <figure class="shot"><img src="snapshots/panel-body-properties.png" alt="Actual Body Properties widget for a selected parametric box, showing name, material, MODEL role, opacity, color and a dimension formula with resolved value"><figcaption><strong>Selected object Properties.</strong> The X2 formula is shown in Value and its evaluated number in Resolved.</figcaption></figure>
 <p>Click an object in the viewport or Objects / Materials tree. The lower-left <strong>Properties</strong> panel switches to that object's editor. It contains:</p>
 <ul><li><strong>Name:</strong> edit the scene object name.</li><li><strong>Material:</strong> choose a material; <code>…</code> opens the material selector and <code>+</code> adds a material name to the project.</li><li><strong>Simulation role:</strong> <strong>MODEL</strong> is included in simulation export; <strong>NON MODEL</strong> remains in the scene but is excluded.</li><li><strong>Opacity</strong> and <strong>Color:</strong> change the rendered appearance. <strong>Pick</strong> opens the color picker.</li><li><strong>Parameter / Value / Resolved:</strong> geometry parameters appear in the table. Edit a Value cell and commit the edit; the object updates immediately. Color is selected with the color picker rather than formula editing.</li></ul>
-<p>For a formula-driven row, <strong>Value</strong> retains the expression and <strong>Resolved</strong> shows the evaluated numeric value. Hover over the formula value to see its expression and resolved number. A plain number is also accepted.</p>
+<p>For a formula-driven row, <strong>Value</strong> retains the expression and <strong>Resolved</strong> shows the evaluated numeric value. While typing a project variable in a Value cell, matching variable names are suggested; choose one or press Enter to complete the current name without replacing the rest of the formula. Press Ctrl+Space to show all available variables. Hover over the formula value to see its expression and resolved number. A plain number is also accepted.</p>
 <p>With multiple objects selected, the geometry table is hidden. The panel provides shared material, opacity and color controls plus <strong>Apply material to all selected</strong>; the simulation-role selector is disabled for multi-selection. Enable or disable <strong>Apply color in bulk</strong> to control whether the bulk action replaces existing colors.</p>
 <h3>Material Library</h3><p>Use <strong>Tools → Material Library</strong> to search and manage project and global records. Material fields include family, relative permittivity (<code>er</code>), relative permeability (<code>ur</code>), loss tangent (<code>tan d</code>), conductivity (<code>sigma [S/m]</code>), color and opacity. Global database location and reload commands are under <strong>File</strong>.</p>
 </section>
@@ -210,7 +212,7 @@
 <h3>Display</h3><p>Configure length units, decimal separator, workspace size, grid size, adaptive grid margin, plane-triad size and selection color. These settings affect drawing/display behavior, not the physical dimensions of saved geometry.</p>
 <h3>Simulation</h3><p>Choose a solver name, enable/disable parallel computation and set PARDISO and ACC thread counts. Optional post-run switches control automatic S-parameter plotting and Touchstone export where supported. A solver appearing in this list does not prove that its backend is installed; verify the EMERGE environment.</p>
 <h3>Mesh</h3><p>Set the global wavelength-fraction resolution and curved-boundary segmentation. Object-specific resolution and local refinement assignments are described in <a href="#mesh">Mesh and local refinement</a>.</p>
-<h3>Utility</h3><p><strong>Export complete scene STEP</strong> writes a separate STEP containing the complete scene when simulation assets are next prepared; it does not re-export the ordinary object bundle if unchanged. <strong>Ask for mesh decimation on Fuse, Cut and Intersect</strong> enables the per-operation triangle-reduction prompt. Both preferences are saved for future sessions.</p>
+<h3>Utility</h3><p><strong>Workspace folder</strong> sets the initial directory used by <strong>Open Project</strong> and <strong>Save Project As</strong>; it is saved as an application preference. <strong>Export complete scene STEP</strong> writes a separate STEP containing the complete scene when simulation assets are next prepared; it does not re-export the ordinary object bundle if unchanged. <strong>Ask for mesh decimation on Fuse, Cut and Intersect</strong> enables the per-operation triangle-reduction prompt. Utility preferences are saved for future sessions.</p>
 </section>
 
 <section class="section" id="parameters">
@@ -305,13 +307,13 @@
 
 <section class="section" id="shortcuts">
 <div class="section-head"><h2>Shortcuts and troubleshooting</h2><a class="top" href="#top">Back to contents ↑</a></div>
-<table><thead><tr><th>Shortcut</th><th>Action</th></tr></thead><tbody><tr><td><kbd>Ctrl+N</kbd></td><td>New project</td></tr><tr><td><kbd>Ctrl+O</kbd></td><td>Open project</td></tr><tr><td><kbd>Ctrl+S</kbd></td><td>Save project</td></tr><tr><td><kbd>Ctrl+Z</kbd> / <kbd>Ctrl+Y</kbd></td><td>Undo / Redo</td></tr><tr><td><kbd>Delete</kbd></td><td>Delete selected objects</td></tr><tr><td><kbd>Esc</kbd></td><td>Cancel drawing or picking</td></tr><tr><td><kbd>Home</kbd></td><td>Reset camera</td></tr><tr><td><kbd>Ctrl+1</kbd>…<kbd>Ctrl+4</kbd></td><td>Standard camera views</td></tr><tr><td><kbd>Ctrl</kbd>-click</td><td>Multi-select in the Objects / Materials tree</td></tr></tbody></table>
+<table><thead><tr><th>Shortcut</th><th>Action</th></tr></thead><tbody><tr><td><kbd>Ctrl+N</kbd></td><td>New project</td></tr><tr><td><kbd>Ctrl+O</kbd></td><td>Open project</td></tr><tr><td><kbd>Ctrl+S</kbd></td><td>Save project</td></tr><tr><td><kbd>Ctrl+Z</kbd> / <kbd>Ctrl+Y</kbd></td><td>Undo / Redo</td></tr><tr><td><kbd>Delete</kbd></td><td>Delete selected objects</td></tr><tr><td><kbd>Esc</kbd></td><td>Cancel drawing or picking</td></tr><tr><td><kbd>Home</kbd></td><td>Reset camera</td></tr><tr><td><kbd>Ctrl+1</kbd>…<kbd>Ctrl+4</kbd>, <kbd>Ctrl+6</kbd></td><td>Standard camera views; Ctrl+6 shows Back, opposite Front (Ctrl+2)</td></tr><tr><td><kbd>Ctrl</kbd>-click</td><td>Multi-select in the Objects / Materials tree</td></tr></tbody></table>
 <h3>Common issues</h3><ul><li><strong>Boolean result is empty or wrong:</strong> verify selection order, solid overlap and valid closed geometry. Try a smaller operation.</li><li><strong>Preflight reports PML:</strong> configure an explicit PML shell, or choose supported PEC/PMC/Open/Radiation faces consistent with the domain.</li><li><strong>Port validation fails:</strong> confirm the assigned object is a suitable Plate; for a LumpedPort check two conductor contacts and a non-zero direction; for a WaveguidePort confirm the AIR end face.</li><li><strong>Plot is empty:</strong> confirm the job completed, the needed results/fields were saved and the chosen frequency is available.</li><li><strong>Solver cannot start:</strong> confirm the selected backend is installed and usable in the active EMERGE Python environment.</li></ul>
 <h3>Units at a glance</h3><p>Geometry inputs use the selected display length unit; exported geometry uses metres. Frequency inputs use GHz. Resistance uses ohms, conductivity uses S/m, angles use degrees, and local mesh sizes are entered in mm.</p>
-<p class="muted">This guide describes EM 3D Modeler 1.3.0b2. Optional solver behavior depends on the installed EMERGE environment. Genuine dialog and Project Tree screenshots are generated by <code>scripts/capture_help_screenshots.py</code>; see <a href="SNAPSHOT_CAPTURE.md">the capture instructions</a>.</p>
+<p class="muted">This guide describes EM 3D Modeler 1.3.3b1. Optional solver behavior depends on the installed EMERGE environment. Genuine dialog and Project Tree screenshots are generated by <code>scripts/capture_help_screenshots.py</code>; see <a href="SNAPSHOT_CAPTURE.md">the capture instructions</a>.</p>
 </section>
 </main>
 </div>
-<footer>EM 3D Modeler · Help version 1.3.0b2 · <a href="#top">Return to the top</a></footer>
+<footer>EM 3D Modeler · Help version 1.3.3b1 · <a href="#top">Return to the top</a></footer>
 </body>
 </html>

@@ -45,7 +45,7 @@ from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 _runtime_packages = [
     "emerge", "emsutil", "OCP", "scipy", "numpy", "matplotlib",
-    "pyvista", "vtk", "trame", "gmsh",
+    "pyvista", "vtk", "trame", "gmsh", "shapely",
 ]
 _runtime_datas = []
 _runtime_binaries = []

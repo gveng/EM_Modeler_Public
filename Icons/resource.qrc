@@ -324,6 +324,23 @@
         <file>zoom-in.svg</file>
         <file>zoom-out.svg</file>
         <file>zoom-selection.svg</file>
+        <file>Part_Extrude.svg</file>
+        <file>Part_Revolve.svg</file>
+        <file>Sketcher/Constraint_Dimension.svg</file>
+        <file>Sketcher/Constraint_InternalAngle.svg</file>
+        <file>Sketcher/Constraint_Length.svg</file>
+        <file>Sketcher/Constraint_Radiam.svg</file>
+        <file>Sketcher/Constraint_Radius.svg</file>
+        <file>Sketcher/Sketcher_Create3PointArc.svg</file>
+        <file>Sketcher/Sketcher_CreateArc.svg</file>
+        <file>Sketcher/Sketcher_CreateCircle.svg</file>
+        <file>Sketcher/Sketcher_CreateLine.svg</file>
+        <file>Sketcher/Sketcher_CreatePolyline.svg</file>
+        <file>Sketcher/Sketcher_CreateRectangle.svg</file>
+        <file>Sketcher/Sketcher_CreateRectangle_Center.svg</file>
+        <file>Sketcher/Sketcher_LeaveSketch.svg</file>
+        <file>Sketcher/Sketcher_ToggleConstruction.svg</file>
+        <file>Sketcher/Sketcher_ToggleConstruction_Constr.svg</file>
     </qresource>
     <qresource prefix="/icons/FreeCAD-default">
         <file>index.theme</file>

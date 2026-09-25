@@ -16,7 +16,10 @@
 
 """EM scene objects: Box, Cylinder, Cone, Sphere."""
 from __future__ import annotations
+import ast
 from copy import deepcopy
+import json
+import math
 from typing import Any, Dict, List
 
 import vtk
@@ -38,6 +41,94 @@ _OBJECT_COUNTER: Dict[str, int] = {}
 def _auto_name(prefix: str) -> str:
     _OBJECT_COUNTER[prefix] = _OBJECT_COUNTER.get(prefix, 0) + 1
     return f"{prefix}_{_OBJECT_COUNTER[prefix]}"
+
+
+def _finite_float(value: Any, label: str) -> float:
+    try:
+        result = float(value)
+    except (TypeError, ValueError) as exc:
+        raise ValueError(f"{label} must be a finite number") from exc
+    if not math.isfinite(result):
+        raise ValueError(f"{label} must be a finite number")
+    return result
+
+
+def _vector3(values: Any, label: str) -> tuple[float, float, float]:
+    if isinstance(values, (str, bytes)):
+        raise ValueError(f"{label} must contain three finite numbers")
+    try:
+        values = tuple(values)
+    except TypeError as exc:
+        raise ValueError(f"{label} must contain three finite numbers") from exc
+    if len(values) != 3:
+        raise ValueError(f"{label} must contain three finite numbers")
+    return tuple(_finite_float(value, label) for value in values)
+
+
+def _unit_vector3(values: Any, label: str) -> tuple[float, float, float]:
+    vector = _vector3(values, label)
+    length = math.hypot(*vector)
+    if not math.isfinite(length) or length == 0.0:
+        raise ValueError(f"{label} must have a finite, non-zero length")
+    return tuple(value / length for value in vector)
+
+
+def _json_safe_copy(value: Any) -> Any | None:
+    try:
+        return json.loads(json.dumps(value, allow_nan=False))
+    except (TypeError, ValueError, OverflowError, RecursionError):
+        return None
+
+
+def _profile_points(value: Any, minimum: int, require_area: bool = False) -> list[tuple[float, float]]:
+    if isinstance(value, str):
+        try:
+            value = ast.literal_eval(value)
+        except (SyntaxError, ValueError) as exc:
+            raise ValueError("ProfilePts must be a literal sequence of point pairs") from exc
+    if not isinstance(value, (list, tuple)):
+        raise ValueError("ProfilePts must be a sequence of point pairs")
+
+    points = []
+    for point in value:
+        if not isinstance(point, (list, tuple)) or len(point) != 2:
+            raise ValueError("ProfilePts must contain only (x, y) point pairs")
+        points.append((_finite_float(point[0], "ProfilePts"),
+                       _finite_float(point[1], "ProfilePts")))
+    if len(points) < minimum:
+        raise ValueError(f"ProfilePts must contain at least {minimum} points")
+    if len(set(points)) < 2:
+        raise ValueError("ProfilePts must span a non-zero length")
+    if require_area:
+        twice_area = sum(
+            points[index][0] * points[(index + 1) % len(points)][1]
+            - points[(index + 1) % len(points)][0] * points[index][1]
+            for index in range(len(points))
+        )
+        if twice_area == 0.0:
+            raise ValueError("ProfilePts must enclose a non-zero area")
+    return points
+
+
+def _color_from_parameters(params: Dict[str, Any], current: tuple | None) -> tuple | None:
+    if "Color" not in params:
+        return current
+    color = str(params["Color"]).strip()
+    if len(color) != 7 or not color.startswith("#"):
+        return current
+    try:
+        return tuple(int(color[index:index + 2], 16) / 255.0 for index in (1, 3, 5))
+    except ValueError:
+        return current
+
+
+def _position_delta(params: Dict[str, Any], keys: tuple[str, str, str], reference: tuple) -> tuple[float, float, float]:
+    if not any(key in params for key in keys):
+        return (0.0, 0.0, 0.0)
+    target = tuple(_finite_float(params.get(key, reference[index]), key)
+                   for index, key in enumerate(keys))
+    return tuple(_finite_float(target[index] - reference[index], key)
+                 for index, key in enumerate(keys))
 
 
 def set_selection_color(color: tuple) -> None:
@@ -66,6 +157,7 @@ class EMObject:
         self.creation_history: Dict[str, Any] = {}
         self.pattern_definition: Dict[str, Any] | None = None
         self.pattern_instance: Dict[str, Any] | None = None
+        self.sketch_definition: Dict[str, Any] | None = None
         self.creation_reference_error: str = ""
         self._actor: vtk.vtkActor | None = None
         self._build()
@@ -184,6 +276,7 @@ class EMObject:
             "creation_history": dict(self.creation_history),
             "pattern_definition": deepcopy(self.pattern_definition),
             "pattern_instance": deepcopy(self.pattern_instance),
+            "sketch_definition": _json_safe_copy(self.sketch_definition),
         }
 
     def from_json_state(self, data: Dict[str, Any]) -> None:
@@ -194,6 +287,8 @@ class EMObject:
         normal = data.get("creation_plane_normal", self.creation_plane_normal)
         try:
             origin_tuple = tuple(float(v) for v in origin)
+            if len(origin_tuple) != 3:
+                raise ValueError
         except Exception:
             origin_tuple = self.creation_plane_origin
         try:
@@ -209,6 +304,30 @@ class EMObject:
         self.pattern_definition = deepcopy(pattern) if isinstance(pattern, dict) else None
         instance = data.get("pattern_instance")
         self.pattern_instance = deepcopy(instance) if isinstance(instance, dict) else None
+        sketch_definition = _json_safe_copy(data.get("sketch_definition"))
+        self.sketch_definition = sketch_definition if isinstance(sketch_definition, dict) else None
+
+    def sketch_reference_point(self) -> tuple[float, float, float]:
+        """Return the world-space first profile point, or the feature origin."""
+        definition = self.sketch_definition
+        if isinstance(definition, dict):
+            try:
+                from ..drawing.sketch_engine import SketchEngine
+
+                engine = SketchEngine.from_dict(definition)
+                profile = engine.build_profile()
+                if profile:
+                    u, v = profile[0]
+                    return tuple(
+                        engine.plane_origin[axis]
+                        + u * engine.u_axis[axis]
+                        + v * engine.v_axis[axis]
+                        for axis in range(3)
+                    )
+            except (KeyError, TypeError, ValueError, IndexError):
+                pass
+        fallback = getattr(self, "_axis_pt1", getattr(self, "_plane_origin", (0.0, 0.0, 0.0)))
+        return tuple(fallback)
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -864,25 +983,50 @@ class ExtrudedObject(EMObject):
                  depth: float = 10.0,
                  plane_origin=(0.0, 0.0, 0.0),
                  plane_normal=(0.0, 0.0, 1.0),
-                 material: str = "PEC"):
-        self._profile_pts  = list(profile_pts or [(0,0),(10,0),(10,10),(0,10)])
-        self._depth        = depth
-        self._plane_origin = tuple(plane_origin)
-        self._plane_normal = tuple(plane_normal)
+                 material: str = "PEC",
+                 direction: str = "Normal",
+                 symmetric: bool = False):
+        initial_profile = profile_pts if profile_pts is not None else [(0, 0), (10, 0), (10, 10), (0, 10)]
+        self._profile_pts, _ = self._parse_profile_groups(initial_profile)
+        self._depth = _finite_float(depth, "Depth")
+        if self._depth <= 0.0:
+            raise ValueError("Depth must be greater than zero")
+        self._plane_origin = _vector3(plane_origin, "PlaneOrigin")
+        self._plane_normal = _vector3(plane_normal, "PlaneNormal")
+        _unit_vector3(self._plane_normal, "PlaneNormal")
+        self._direction = self._normalize_direction(direction)
+        self._symmetric = bool(symmetric)
         super().__init__(name or _auto_name("Extrude"), material)
+
+    @staticmethod
+    def _normalize_direction(direction: Any) -> str:
+        value = str(direction).strip().lower()
+        if value in {"normal", "1", "+1", "along normal"}:
+            return "Normal"
+        if value in {"reverse", "-1", "opposite normal"}:
+            return "Reverse"
+        raise ValueError("Direction must be 'Normal' or 'Reverse'")
+
+    @staticmethod
+    def _extrusion_frame(origin, normal, depth, direction, symmetric):
+        unit_normal = _unit_vector3(normal, "PlaneNormal")
+        if symmetric:
+            start = tuple(origin[index] - unit_normal[index] * depth * 0.5 for index in range(3))
+            vector = unit_normal
+        else:
+            start = tuple(origin)
+            sign = -1.0 if direction == "Reverse" else 1.0
+            vector = tuple(component * sign for component in unit_normal)
+        return start, vector
 
     # ── build ────────────────────────────────────────────────────────
     def _build(self) -> None:
-        poly = self._profile_to_polydata()
-        self._extrude = vtk.vtkLinearExtrusionFilter()
-        self._extrude.SetInputData(poly)
-        nx, ny, nz = self._plane_normal
-        self._extrude.SetExtrusionTypeToVectorExtrusion()
-        self._extrude.SetVector(nx * self._depth,
-                                ny * self._depth,
-                                nz * self._depth)
-        self._extrude.CappingOn()
-        self._extrude.Update()
+        start, vector = self._extrusion_frame(
+            self._plane_origin, self._plane_normal, self._depth,
+            self._direction, self._symmetric,
+        )
+        poly = self._profile_to_polydata(plane_origin=start)
+        self._extrude = self._make_extrusion(poly, self._depth, vector)
 
         mapper = vtk.vtkPolyDataMapper()
         mapper.SetInputConnection(self._extrude.GetOutputPort())
@@ -890,57 +1034,187 @@ class ExtrudedObject(EMObject):
         self._actor.SetMapper(mapper)
         self._apply_appearance(self._actor)
 
-    def _profile_to_polydata(self) -> vtk.vtkPolyData:
-        """Convert 2-D profile points to vtkPolyData in the sketch plane."""
-        import math
-        pts = self._profile_pts
+    @staticmethod
+    def _parse_profile(value: Any) -> tuple[list, list[list[tuple[float, float]]]]:
+        if isinstance(value, str):
+            try:
+                value = ast.literal_eval(value)
+            except (SyntaxError, ValueError) as exc:
+                raise ValueError("ProfilePts must be a literal sequence of point pairs or contours") from exc
+        if not isinstance(value, (list, tuple)) or not value:
+            raise ValueError("ProfilePts must be a sequence of point pairs or contours")
+
+        first = value[0]
+        flat_profile = (
+            isinstance(first, (list, tuple))
+            and len(first) == 2
+            and not isinstance(first[0], (list, tuple))
+            and not isinstance(first[1], (list, tuple))
+        )
+        raw_contours = [value] if flat_profile else value
+        contours = []
+        for raw_contour in raw_contours:
+            if not isinstance(raw_contour, (list, tuple)):
+                raise ValueError("ProfilePts contours must be sequences of point pairs")
+            contour = _profile_points(raw_contour, 3)
+            if contour[0] == contour[-1]:
+                contour.pop()
+            if len(contour) < 3:
+                raise ValueError("ProfilePts contours must contain at least three distinct vertices")
+            if any(contour[index] == contour[(index + 1) % len(contour)]
+                   for index in range(len(contour))):
+                raise ValueError("ProfilePts contours must not contain zero-length edges")
+            twice_area = sum(
+                contour[index][0] * contour[(index + 1) % len(contour)][1]
+                - contour[(index + 1) % len(contour)][0] * contour[index][1]
+                for index in range(len(contour))
+            )
+            if not math.isfinite(twice_area) or twice_area == 0.0:
+                raise ValueError("ProfilePts contours must enclose a finite, non-zero area")
+            contours.append(contour)
+        if not contours:
+            raise ValueError("ProfilePts must contain at least one contour")
+
+        profile = contours[0] if len(contours) == 1 else contours
+        return profile, contours
+
+    @classmethod
+    def _parse_profile_groups(cls, value: Any) -> tuple[list, list[list[list[tuple[float, float]]]]]:
+        if isinstance(value, str):
+            try:
+                value = ast.literal_eval(value)
+            except (SyntaxError, ValueError) as exc:
+                raise ValueError("ProfilePts must be a literal sequence of points, contours, or regions") from exc
+        if (isinstance(value, (list, tuple)) and value
+                and isinstance(value[0], (list, tuple)) and value[0]
+                and isinstance(value[0][0], (list, tuple)) and value[0][0]
+                and isinstance(value[0][0][0], (list, tuple))):
+            profiles = []
+            groups = []
+            for raw_group in value:
+                _, contours = cls._parse_profile(raw_group)
+                profiles.append(contours)
+                groups.append(contours)
+            return profiles, groups
+        profile, contours = cls._parse_profile(value)
+        return profile, [contours]
+
+    @staticmethod
+    def _make_extrusion(poly: vtk.vtkPolyData, depth: float,
+                        plane_normal: tuple[float, float, float]) -> vtk.vtkLinearExtrusionFilter:
+        extrude = vtk.vtkLinearExtrusionFilter()
+        extrude.SetInputData(poly)
+        nx, ny, nz = _unit_vector3(plane_normal, "PlaneNormal")
+        extrude.SetExtrusionTypeToVectorExtrusion()
+        extrude.SetVector(nx * depth, ny * depth, nz * depth)
+        extrude.CappingOn()
+        extrude.Update()
+        if extrude.GetOutput().GetNumberOfCells() == 0:
+            raise ValueError("ProfilePts could not be triangulated for extrusion")
+        return extrude
+
+    def _profile_to_polydata(self, profile_pts=None, plane_origin=None,
+                             plane_normal=None) -> vtk.vtkPolyData:
+        """Triangulate profile contours and map the cap into the sketch plane."""
+        profile = self._profile_pts if profile_pts is None else profile_pts
+        origin = self._plane_origin if plane_origin is None else plane_origin
+        normal = self._plane_normal if plane_normal is None else plane_normal
+        _, profile_groups = self._parse_profile_groups(profile)
+        caps = vtk.vtkAppendPolyData()
+        for contours in profile_groups:
+            contour_points = vtk.vtkPoints()
+            contour_lines = vtk.vtkCellArray()
+            expected_area = 0.0
+            for contour_index, contour in enumerate(contours):
+                signed_twice_area = sum(
+                    contour[index][0] * contour[(index + 1) % len(contour)][1]
+                    - contour[(index + 1) % len(contour)][0] * contour[index][1]
+                    for index in range(len(contour))
+                )
+                if ((contour_index == 0 and signed_twice_area < 0.0)
+                        or (contour_index > 0 and signed_twice_area > 0.0)):
+                    contour = list(reversed(contour))
+                contour_ids = vtk.vtkIdList()
+                contour_ids.SetNumberOfIds(len(contour) + 1)
+                start = contour_points.GetNumberOfPoints()
+                for point_index, (x, y) in enumerate(contour):
+                    contour_points.InsertNextPoint(x, y, 0.0)
+                    contour_ids.SetId(point_index, start + point_index)
+                contour_ids.SetId(len(contour), start)
+                contour_lines.InsertNextCell(contour_ids)
+                area = abs(signed_twice_area) * 0.5
+                expected_area += area if contour_index == 0 else -area
+
+            if expected_area <= 0.0:
+                raise ValueError("ProfilePts contours must enclose a positive area")
+
+            contour_data = vtk.vtkPolyData()
+            contour_data.SetPoints(contour_points)
+            contour_data.SetLines(contour_lines)
+            triangulator = vtk.vtkContourTriangulator()
+            triangulator.SetInputData(contour_data)
+            triangulator.Update()
+            cap = triangulator.GetOutput()
+            cap_area = 0.0
+            for cell_index in range(cap.GetNumberOfCells()):
+                cell = cap.GetCell(cell_index)
+                if cell.GetNumberOfPoints() != 3:
+                    raise ValueError("ProfilePts contours could not be triangulated")
+                p0, p1, p2 = (cap.GetPoint(cell.GetPointId(index)) for index in range(3))
+                a = (p1[0] - p0[0], p1[1] - p0[1])
+                b = (p2[0] - p0[0], p2[1] - p0[1])
+                cap_area += abs(a[0] * b[1] - a[1] * b[0]) * 0.5
+            if (cap.GetNumberOfCells() == 0
+                or not math.isclose(cap_area, expected_area, rel_tol=1e-6,
+                            abs_tol=max(1.0, expected_area) * 1e-10)):
+                raise ValueError("ProfilePts contours must form one outer boundary with enclosed holes")
+            caps.AddInputData(cap)
+
+        caps.Update()
+        cap = caps.GetOutput()
+
         # Build orthonormal basis in the plane
-        n = list(self._plane_normal)
+        n = list(_unit_vector3(normal, "PlaneNormal"))
         # Find a vector not parallel to n
         ref = [1, 0, 0] if abs(n[1]) > 0.1 or abs(n[2]) > 0.1 else [0, 1, 0]
         # u = n × ref  (cross product)
         u = [n[1]*ref[2] - n[2]*ref[1],
              n[2]*ref[0] - n[0]*ref[2],
              n[0]*ref[1] - n[1]*ref[0]]
-        um = math.sqrt(sum(v*v for v in u))
+        um = math.hypot(*u)
         u = [v/um for v in u]
         # v = u × n
         v = [u[1]*n[2] - u[2]*n[1],
              u[2]*n[0] - u[0]*n[2],
              u[0]*n[1] - u[1]*n[0]]
 
-        ox, oy, oz = self._plane_origin
+        ox, oy, oz = origin
         vtk_pts = vtk.vtkPoints()
-        polygon  = vtk.vtkPolygon()
-        polygon.GetPointIds().SetNumberOfIds(len(pts))
-        for i, (px, py) in enumerate(pts):
+        for i in range(cap.GetNumberOfPoints()):
+            px, py, _ = cap.GetPoint(i)
             wx = ox + px*u[0] + py*v[0]
             wy = oy + px*u[1] + py*v[1]
             wz = oz + px*u[2] + py*v[2]
             vtk_pts.InsertNextPoint(wx, wy, wz)
-            polygon.GetPointIds().SetId(i, i)
-
-        cells = vtk.vtkCellArray()
-        cells.InsertNextCell(polygon)
         poly = vtk.vtkPolyData()
         poly.SetPoints(vtk_pts)
-        poly.SetPolys(cells)
+        poly.SetPolys(cap.GetPolys())
         return poly
 
-    def _rebuild(self) -> None:
-        poly = self._profile_to_polydata()
-        self._extrude.SetInputData(poly)
-        nx, ny, nz = self._plane_normal
-        self._extrude.SetVector(nx * self._depth,
-                                ny * self._depth,
-                                nz * self._depth)
-        self._extrude.Update()
+    def _rebuild(self, extrusion: vtk.vtkLinearExtrusionFilter | None = None) -> None:
+        if extrusion is None:
+            poly = self._profile_to_polydata()
+            extrusion = self._make_extrusion(poly, self._depth, self._plane_normal)
+        self._extrude = extrusion
+        self._actor.GetMapper().SetInputConnection(self._extrude.GetOutputPort())
         self.refresh_appearance()
 
     # ── parameters ───────────────────────────────────────────────────
     def get_parameters(self) -> Dict[str, Any]:
-        return dict(
+        params = dict(
             Depth      = self._depth,
+            Direction  = self._direction,
+            Symmetric  = self._symmetric,
             PlaneOriginX = self._plane_origin[0],
             PlaneOriginY = self._plane_origin[1],
             PlaneOriginZ = self._plane_origin[2],
@@ -951,12 +1225,50 @@ class ExtrudedObject(EMObject):
             Material   = self.material,
             Opacity    = self.opacity,
         )
+        if self.custom_color is not None:
+            params["Color"] = f"#{int(self.custom_color[0]*255):02x}{int(self.custom_color[1]*255):02x}{int(self.custom_color[2]*255):02x}"
+        return params
 
     def set_parameters(self, params: Dict[str, Any]) -> None:
-        self._depth = float(params.get("Depth", self._depth))
-        self.material = params.get("Material", self.material)
-        self.opacity  = float(params.get("Opacity", self.opacity))
-        self._rebuild()
+        if not isinstance(params, dict):
+            raise ValueError("Parameters must be a dictionary")
+        depth = _finite_float(params.get("Depth", self._depth), "Depth")
+        if depth <= 0.0:
+            raise ValueError("Depth must be greater than zero")
+        profile, _ = self._parse_profile_groups(params.get("ProfilePts", self._profile_pts))
+        direction = self._normalize_direction(params.get("Direction", self._direction))
+        symmetric_value = params.get("Symmetric", self._symmetric)
+        symmetric = (
+            symmetric_value.strip().lower() in {"1", "true", "yes", "on"}
+            if isinstance(symmetric_value, str) else bool(symmetric_value)
+        )
+        origin = tuple(_finite_float(params.get(key, self._plane_origin[index]), key)
+                       for index, key in enumerate(("PlaneOriginX", "PlaneOriginY", "PlaneOriginZ")))
+        normal = tuple(_finite_float(params.get(key, self._plane_normal[index]), key)
+                       for index, key in enumerate(("PlaneNormalX", "PlaneNormalY", "PlaneNormalZ")))
+        _unit_vector3(normal, "PlaneNormal")
+        delta = _position_delta(params, ("PositionX", "PositionY", "PositionZ"), self.sketch_reference_point())
+        origin = _vector3(tuple(origin[index] + delta[index] for index in range(3)), "PlaneOrigin")
+        opacity = _finite_float(params.get("Opacity", self.opacity), "Opacity")
+        if not 0.0 <= opacity <= 1.0:
+            raise ValueError("Opacity must be between zero and one")
+        start, vector = self._extrusion_frame(origin, normal, depth, direction, symmetric)
+        poly = self._profile_to_polydata(profile, start, normal)
+        extrusion = self._make_extrusion(poly, depth, vector)
+
+        self._depth = depth
+        self._profile_pts = profile
+        self._plane_origin = origin
+        self._plane_normal = normal
+        self._direction = direction
+        self._symmetric = symmetric
+        if isinstance(self.sketch_definition, dict) and any(delta):
+            self.sketch_definition = deepcopy(self.sketch_definition)
+            self.sketch_definition["plane_origin"] = list(origin)
+        self.material = str(params.get("Material", self.material))
+        self.opacity = opacity
+        self.custom_color = _color_from_parameters(params, self.custom_color)
+        self._rebuild(extrusion)
 
     def to_emerge_script(self) -> str:
         lines = [
@@ -973,7 +1285,7 @@ class RevolvedObject(EMObject):
 
     Parameters
     ----------
-    profile_pts : list of (x, y) tuples – 2-D profile (x=radial, y=axial)
+    profile_pts : point pairs or contours defining one outer profile and holes
     angle       : sweep angle in degrees (0–360)
     axis_pt1    : first point of revolution axis (world coords)
     axis_pt2    : second point of revolution axis (world coords)
@@ -984,65 +1296,133 @@ class RevolvedObject(EMObject):
                  profile_pts=None,
                  angle: float = 360.0,
                  axis_pt1=(0.0, 0.0, 0.0),
-                 axis_pt2=(0.0, 0.0, 1.0),
+                 axis_pt2=(1.0, 0.0, 0.0),
                  plane_origin=(0.0, 0.0, 0.0),
                  plane_normal=(0.0, 0.0, 1.0),
                  material: str = "PEC"):
-        self._profile_pts  = list(profile_pts or [(2,0),(5,0),(5,10),(2,10)])
-        self._angle        = angle
-        self._axis_pt1     = tuple(axis_pt1)
-        self._axis_pt2     = tuple(axis_pt2)
-        self._plane_origin = tuple(plane_origin)
-        self._plane_normal = tuple(plane_normal)
+        initial_profile = profile_pts if profile_pts is not None else [(2, 0), (5, 0), (5, 10), (2, 10)]
+        self._profile_pts, self._profile_contours = self._parse_profile(initial_profile)
+        self._angle = _finite_float(angle, "Angle")
+        if not 0.0 < self._angle <= 360.0:
+            raise ValueError("Angle must be greater than zero and at most 360 degrees")
+        self._axis_pt1 = _vector3(axis_pt1, "AxisPt1")
+        self._axis_pt2 = _vector3(axis_pt2, "AxisPt2")
+        initial_axis_length = math.hypot(*(self._axis_pt2[index] - self._axis_pt1[index] for index in range(3)))
+        if not math.isfinite(initial_axis_length) or initial_axis_length == 0.0:
+            raise ValueError("Revolve axis endpoints must be distinct")
+        self._plane_origin = _vector3(plane_origin, "PlaneOrigin")
+        self._plane_normal = _vector3(plane_normal, "PlaneNormal")
+        _unit_vector3(self._plane_normal, "PlaneNormal")
         super().__init__(name or _auto_name("Revolve"), material)
+
+    @staticmethod
+    def _parse_profile(value: Any) -> tuple[list, list[list[tuple[float, float]]]]:
+        if isinstance(value, str):
+            try:
+                value = ast.literal_eval(value)
+            except (SyntaxError, ValueError) as exc:
+                raise ValueError("ProfilePts must be a literal sequence of point pairs or contours") from exc
+        if not isinstance(value, (list, tuple)) or not value:
+            raise ValueError("ProfilePts must be a sequence of point pairs or contours")
+
+        first = value[0]
+        flat_profile = (
+            isinstance(first, (list, tuple))
+            and len(first) == 2
+            and not isinstance(first[0], (list, tuple))
+            and not isinstance(first[1], (list, tuple))
+        )
+        raw_contours = [value] if flat_profile else value
+        contours = []
+        for raw_contour in raw_contours:
+            if not isinstance(raw_contour, (list, tuple)):
+                raise ValueError("ProfilePts contours must be sequences of point pairs")
+            contour = _profile_points(raw_contour, 3)
+            if contour[0] == contour[-1]:
+                contour.pop()
+            if len(contour) < 3:
+                raise ValueError("ProfilePts contours must contain at least three distinct vertices")
+            if any(contour[index] == contour[(index + 1) % len(contour)]
+                   for index in range(len(contour))):
+                raise ValueError("ProfilePts contours must not contain zero-length edges")
+            twice_area = sum(
+                contour[index][0] * contour[(index + 1) % len(contour)][1]
+                - contour[(index + 1) % len(contour)][0] * contour[index][1]
+                for index in range(len(contour))
+            )
+            if not math.isfinite(twice_area) or twice_area == 0.0:
+                raise ValueError("ProfilePts contours must enclose a finite, non-zero area")
+            contours.append(contour)
+        if not contours:
+            raise ValueError("ProfilePts must contain at least one contour")
+
+        profile = contours[0] if len(contours) == 1 else contours
+        return profile, contours
 
     @staticmethod
     def _plane_basis(normal):
         import math
         n = list(normal)
-        nm = math.sqrt(sum(v*v for v in n)) or 1.0
+        nm = math.hypot(*n)
+        if not math.isfinite(nm) or nm == 0.0:
+            raise ValueError("PlaneNormal must have a finite, non-zero length")
         n = [v/nm for v in n]
         ref = [1, 0, 0] if abs(n[1]) > 0.1 or abs(n[2]) > 0.1 else [0, 1, 0]
         u = [n[1]*ref[2] - n[2]*ref[1],
              n[2]*ref[0] - n[0]*ref[2],
              n[0]*ref[1] - n[1]*ref[0]]
-        um = math.sqrt(sum(v*v for v in u)) or 1.0
+        um = math.hypot(*u) or 1.0
         u = [v/um for v in u]
         v = [u[1]*n[2] - u[2]*n[1],
              u[2]*n[0] - u[0]*n[2],
              u[0]*n[1] - u[1]*n[0]]
         return n, u, v
 
-    def _profile_local_and_transform(self):
-        """Convert (u,v) sketch profile points to (radial, axial) local coords,
-        and produce a vtkTransform that maps local Y-axis to the world axis."""
+    def _profile_local_and_transform(self, contours=None, plane_origin=None,
+                                     plane_normal=None, axis_pt1=None, axis_pt2=None):
+        """Map sketch contours to an axis-aligned radial/axial frame."""
         import math
-        _, ub, vb = self._plane_basis(self._plane_normal)
-        ox, oy, oz = self._plane_origin
+        contours = self._profile_contours if contours is None else contours
+        plane_origin = self._plane_origin if plane_origin is None else plane_origin
+        plane_normal = self._plane_normal if plane_normal is None else plane_normal
+        axis_pt1 = self._axis_pt1 if axis_pt1 is None else axis_pt1
+        axis_pt2 = self._axis_pt2 if axis_pt2 is None else axis_pt2
+        _, ub, vb = self._plane_basis(plane_normal)
+        ox, oy, oz = plane_origin
 
-        # Axis in world coords
-        a1 = self._axis_pt1
-        a2 = self._axis_pt2
+        a1 = axis_pt1
+        a2 = axis_pt2
         ad = (a2[0]-a1[0], a2[1]-a1[1], a2[2]-a1[2])
-        am = math.sqrt(sum(v*v for v in ad)) or 1.0
+        am = math.hypot(*ad)
+        if not math.isfinite(am) or am == 0.0:
+            raise ValueError("Revolve axis endpoints must have a finite, non-zero separation")
         ax = (ad[0]/am, ad[1]/am, ad[2]/am)
 
-        local_pts = []
-        for (pu, pv) in self._profile_pts:
-            # World coords of profile point
-            wx = ox + pu*ub[0] + pv*vb[0]
-            wy = oy + pu*ub[1] + pv*vb[1]
-            wz = oz + pu*ub[2] + pv*vb[2]
-            # Vector from axis_pt1
-            dx, dy, dz = wx-a1[0], wy-a1[1], wz-a1[2]
-            # Axial component (signed projection)
-            axial = dx*ax[0] + dy*ax[1] + dz*ax[2]
-            # Perpendicular component (radial vector)
-            px = dx - axial*ax[0]
-            py = dy - axial*ax[1]
-            pz = dz - axial*ax[2]
-            radial = math.sqrt(px*px + py*py + pz*pz)
-            local_pts.append((radial, axial))
+        local_contours = []
+        for contour_index, contour in enumerate(contours):
+            local_contour = []
+            for pu, pv in contour:
+                wx = ox + pu*ub[0] + pv*vb[0]
+                wy = oy + pu*ub[1] + pv*vb[1]
+                wz = oz + pu*ub[2] + pv*vb[2]
+                dx, dy, dz = wx-a1[0], wy-a1[1], wz-a1[2]
+                axial = dx*ax[0] + dy*ax[1] + dz*ax[2]
+                px = dx - axial*ax[0]
+                py = dy - axial*ax[1]
+                pz = dz - axial*ax[2]
+                radial = math.sqrt(px*px + py*py + pz*pz)
+                local_contour.append((radial, axial))
+            twice_area = sum(
+                local_contour[index][0] * local_contour[(index + 1) % len(local_contour)][1]
+                - local_contour[(index + 1) % len(local_contour)][0] * local_contour[index][1]
+                for index in range(len(local_contour))
+            )
+            if not math.isfinite(twice_area):
+                raise ValueError("ProfilePts must map to finite coordinates relative to the revolve axis")
+            if ((contour_index == 0 and twice_area < 0.0)
+                    or (contour_index > 0 and twice_area > 0.0)):
+                local_contour.reverse()
+            local_contours.append(local_contour)
 
         # Build a transform: local frame has Y == world axis direction, origin at axis_pt1.
         # vtkRotationalExtrusionFilter rotates around local Y, sweeping in the +X direction.
@@ -1055,7 +1435,7 @@ class RevolvedObject(EMObject):
         # local X = normalize(tmp - (tmp·ax)*ax)
         d = tmp[0]*ax[0] + tmp[1]*ax[1] + tmp[2]*ax[2]
         lx = (tmp[0]-d*ax[0], tmp[1]-d*ax[1], tmp[2]-d*ax[2])
-        lm = math.sqrt(sum(v*v for v in lx)) or 1.0
+        lm = math.hypot(*lx) or 1.0
         lx = (lx[0]/lm, lx[1]/lm, lx[2]/lm)
         # local Z = ax × lx
         lz = (ax[1]*lx[2]-ax[2]*lx[1],
@@ -1070,53 +1450,146 @@ class RevolvedObject(EMObject):
         m.SetElement(0, 1, lz[0]); m.SetElement(1, 1, lz[1]); m.SetElement(2, 1, lz[2])
         m.SetElement(0, 2, ax[0]); m.SetElement(1, 2, ax[1]); m.SetElement(2, 2, ax[2])
         m.SetElement(0, 3, a1[0]); m.SetElement(1, 3, a1[1]); m.SetElement(2, 3, a1[2])
-        return local_pts, m
+        return local_contours, m
 
     def _build(self) -> None:
-        local_pts, user_matrix = self._profile_local_and_transform()
-        poly = self._profile_to_polydata(local_pts)
-        self._revolve = vtk.vtkRotationalExtrusionFilter()
-        self._revolve.SetInputData(poly)
-        self._revolve.SetAngle(self._angle)
-        self._revolve.SetResolution(60)
-        self._revolve.Update()
-
-        normals = vtk.vtkPolyDataNormals()
-        normals.SetInputConnection(self._revolve.GetOutputPort())
-        normals.ConsistencyOn()
-        normals.AutoOrientNormalsOn()
-        normals.Update()
+        local_contours, user_matrix = self._profile_local_and_transform()
+        self._revolve, self._revolve_normals = self._make_revolved_mesh(local_contours, self._angle)
 
         mapper = vtk.vtkPolyDataMapper()
-        mapper.SetInputConnection(normals.GetOutputPort())
+        mapper.SetInputConnection(self._revolve_normals.GetOutputPort())
         self._actor = vtk.vtkActor()
         self._actor.SetMapper(mapper)
         self._actor.SetUserMatrix(user_matrix)
         self._apply_appearance(self._actor)
 
-    def _profile_to_polydata(self, local_pts=None) -> vtk.vtkPolyData:
-        """Profile in local frame: x=radial, y=0, z=axial.
-        vtkRotationalExtrusionFilter sweeps the polyline around local Z axis."""
-        if local_pts is None:
-            local_pts = self._profile_pts
+    @staticmethod
+    def _profile_to_polydata(local_contours) -> vtk.vtkPolyData:
+        """Create closed contour lines in the local radial/axial plane."""
         vtk_pts = vtk.vtkPoints()
-        for pr, pa in local_pts:
-            vtk_pts.InsertNextPoint(pr, 0.0, pa)
-        n = vtk_pts.GetNumberOfPoints()
         lines = vtk.vtkCellArray()
-        if n >= 2:
-            polyline = vtk.vtkPolyLine()
-            polyline.GetPointIds().SetNumberOfIds(n)
-            for i in range(n):
-                polyline.GetPointIds().SetId(i, i)
-            lines.InsertNextCell(polyline)
+        for contour in local_contours:
+            start = vtk_pts.GetNumberOfPoints()
+            for radial, axial in contour:
+                vtk_pts.InsertNextPoint(radial, 0.0, axial)
+            ids = vtk.vtkIdList()
+            ids.SetNumberOfIds(len(contour) + 1)
+            for index in range(len(contour)):
+                ids.SetId(index, start + index)
+            ids.SetId(len(contour), start)
+            lines.InsertNextCell(ids)
         poly = vtk.vtkPolyData()
         poly.SetPoints(vtk_pts)
         poly.SetLines(lines)
         return poly
 
+    @classmethod
+    def _make_revolved_mesh(cls, local_contours, angle):
+        """Sweep contour boundaries and cap partial revolutions with the profile face."""
+        profile_points = vtk.vtkPoints()
+        profile_lines = vtk.vtkCellArray()
+        expected_area = 0.0
+        for contour_index, contour in enumerate(local_contours):
+            start = profile_points.GetNumberOfPoints()
+            ids = vtk.vtkIdList()
+            ids.SetNumberOfIds(len(contour) + 1)
+            for index, (radial, axial) in enumerate(contour):
+                profile_points.InsertNextPoint(radial, axial, 0.0)
+                ids.SetId(index, start + index)
+            ids.SetId(len(contour), start)
+            profile_lines.InsertNextCell(ids)
+            twice_area = sum(
+                contour[index][0] * contour[(index + 1) % len(contour)][1]
+                - contour[(index + 1) % len(contour)][0] * contour[index][1]
+                for index in range(len(contour))
+            )
+            expected_area += abs(twice_area) * (0.5 if contour_index == 0 else -0.5)
+
+        degenerate_section = expected_area == 0.0 and len(local_contours) == 1
+        if expected_area < 0.0 or (expected_area == 0.0 and not degenerate_section):
+            raise ValueError("ProfilePts contours must enclose a positive area")
+        cap = None
+        if not degenerate_section:
+            profile = vtk.vtkPolyData()
+            profile.SetPoints(profile_points)
+            profile.SetLines(profile_lines)
+            triangulator = vtk.vtkContourTriangulator()
+            triangulator.SetInputData(profile)
+            triangulator.Update()
+            cap = triangulator.GetOutput()
+            cap_area = 0.0
+            for cell_index in range(cap.GetNumberOfCells()):
+                cell = cap.GetCell(cell_index)
+                if cell.GetNumberOfPoints() != 3:
+                    raise ValueError("ProfilePts contours could not be triangulated")
+                p0, p1, p2 = (cap.GetPoint(cell.GetPointId(index)) for index in range(3))
+                cap_area += abs(
+                    (p1[0] - p0[0]) * (p2[1] - p0[1])
+                    - (p1[1] - p0[1]) * (p2[0] - p0[0])
+                ) * 0.5
+            if (cap.GetNumberOfCells() == 0
+                    or not math.isclose(cap_area, expected_area, rel_tol=1e-6,
+                                        abs_tol=max(1.0, expected_area) * 1e-10)):
+                raise ValueError("ProfilePts contours must form one outer boundary with enclosed holes")
+
+        revolve = vtk.vtkRotationalExtrusionFilter()
+        revolve.SetInputData(cls._profile_to_polydata(local_contours))
+        revolve.SetAngle(angle)
+        revolve.SetResolution(120)
+        revolve.Update()
+
+        append = vtk.vtkAppendPolyData()
+        append.AddInputConnection(revolve.GetOutputPort())
+        if angle < 360.0 and cap is not None:
+            cap_points = vtk.vtkPoints()
+            cap_polys = vtk.vtkCellArray()
+            for angle_index, sweep_angle in enumerate((0.0, angle)):
+                radians = math.radians(sweep_angle)
+                cosine, sine = math.cos(radians), math.sin(radians)
+                reverse = angle_index == 1
+                for cell_index in range(cap.GetNumberOfCells()):
+                    cell = cap.GetCell(cell_index)
+                    triangle = [cap.GetPoint(cell.GetPointId(index)) for index in range(3)]
+                    twice_area = (
+                        (triangle[1][0] - triangle[0][0]) * (triangle[2][1] - triangle[0][1])
+                        - (triangle[1][1] - triangle[0][1]) * (triangle[2][0] - triangle[0][0])
+                    )
+                    if (twice_area < 0.0) != reverse:
+                        triangle[1], triangle[2] = triangle[2], triangle[1]
+                    ids = vtk.vtkIdList()
+                    ids.SetNumberOfIds(3)
+                    for index, (radial, axial, _unused) in enumerate(triangle):
+                        ids.SetId(index, cap_points.InsertNextPoint(
+                            radial * cosine, radial * sine, axial
+                        ))
+                    cap_polys.InsertNextCell(ids)
+            cap_polydata = vtk.vtkPolyData()
+            cap_polydata.SetPoints(cap_points)
+            cap_polydata.SetPolys(cap_polys)
+            append.AddInputData(cap_polydata)
+        append.Update()
+
+        normals = vtk.vtkPolyDataNormals()
+        normals.SetInputConnection(append.GetOutputPort())
+        normals.ConsistencyOn()
+        normals.AutoOrientNormalsOff()
+        normals.SplittingOff()
+        normals.Update()
+        triangles = vtk.vtkTriangleFilter()
+        triangles.SetInputConnection(normals.GetOutputPort())
+        triangles.Update()
+        mass = vtk.vtkMassProperties()
+        mass.SetInputConnection(triangles.GetOutputPort())
+        mass.Update()
+        volume = mass.GetVolume()
+        if (normals.GetOutput().GetNumberOfCells() == 0
+            or not math.isfinite(volume)
+            or (not degenerate_section and volume <= 0.0)):
+            raise ValueError("ProfilePts could not produce a closed revolved solid")
+        return revolve, normals
+
     def get_parameters(self) -> Dict[str, Any]:
-        return dict(
+        params = dict(
             Angle      = self._angle,
             AxisPt1X   = self._axis_pt1[0],
             AxisPt1Y   = self._axis_pt1[1],
@@ -1124,21 +1597,73 @@ class RevolvedObject(EMObject):
             AxisPt2X   = self._axis_pt2[0],
             AxisPt2Y   = self._axis_pt2[1],
             AxisPt2Z   = self._axis_pt2[2],
+            PlaneOriginX = self._plane_origin[0],
+            PlaneOriginY = self._plane_origin[1],
+            PlaneOriginZ = self._plane_origin[2],
+            PlaneNormalX = self._plane_normal[0],
+            PlaneNormalY = self._plane_normal[1],
+            PlaneNormalZ = self._plane_normal[2],
             ProfilePts = str(self._profile_pts),
             Material   = self.material,
             Opacity    = self.opacity,
         )
+        if self.custom_color is not None:
+            params["Color"] = f"#{int(self.custom_color[0]*255):02x}{int(self.custom_color[1]*255):02x}{int(self.custom_color[2]*255):02x}"
+        return params
 
     def set_parameters(self, params: Dict[str, Any]) -> None:
-        self._angle = float(params.get("Angle", self._angle))
-        self.material = params.get("Material", self.material)
-        self.opacity  = float(params.get("Opacity", self.opacity))
-        local_pts, user_matrix = self._profile_local_and_transform()
-        self._revolve.SetInputData(self._profile_to_polydata(local_pts))
-        self._revolve.SetAngle(self._angle)
-        self._revolve.Update()
-        if self._actor is not None:
-            self._actor.SetUserMatrix(user_matrix)
+        if not isinstance(params, dict):
+            raise ValueError("Parameters must be a dictionary")
+        angle = _finite_float(params.get("Angle", self._angle), "Angle")
+        if not 0.0 < angle <= 360.0:
+            raise ValueError("Angle must be greater than zero and at most 360 degrees")
+        profile, contours = self._parse_profile(params.get("ProfilePts", self._profile_pts))
+        axis_pt1 = tuple(_finite_float(params.get(key, self._axis_pt1[index]), key)
+                         for index, key in enumerate(("AxisPt1X", "AxisPt1Y", "AxisPt1Z")))
+        axis_pt2 = tuple(_finite_float(params.get(key, self._axis_pt2[index]), key)
+                         for index, key in enumerate(("AxisPt2X", "AxisPt2Y", "AxisPt2Z")))
+        axis_length = math.hypot(*(axis_pt2[index] - axis_pt1[index] for index in range(3)))
+        if not math.isfinite(axis_length) or axis_length == 0.0:
+            raise ValueError("Revolve axis endpoints must have a finite, non-zero separation")
+        origin = tuple(_finite_float(params.get(key, self._plane_origin[index]), key)
+                       for index, key in enumerate(("PlaneOriginX", "PlaneOriginY", "PlaneOriginZ")))
+        normal = tuple(_finite_float(params.get(key, self._plane_normal[index]), key)
+                       for index, key in enumerate(("PlaneNormalX", "PlaneNormalY", "PlaneNormalZ")))
+        _unit_vector3(normal, "PlaneNormal")
+        delta = _position_delta(params, ("PositionX", "PositionY", "PositionZ"), self.sketch_reference_point())
+        origin = _vector3(tuple(origin[index] + delta[index] for index in range(3)), "PlaneOrigin")
+        axis_pt1 = _vector3(tuple(axis_pt1[index] + delta[index] for index in range(3)), "AxisPt1")
+        axis_pt2 = _vector3(tuple(axis_pt2[index] + delta[index] for index in range(3)), "AxisPt2")
+        opacity = _finite_float(params.get("Opacity", self.opacity), "Opacity")
+        if not 0.0 <= opacity <= 1.0:
+            raise ValueError("Opacity must be between zero and one")
+
+        local_contours, user_matrix = self._profile_local_and_transform(
+            contours, origin, normal, axis_pt1, axis_pt2
+        )
+        revolve, revolve_normals = self._make_revolved_mesh(local_contours, angle)
+        material = str(params.get("Material", self.material))
+        custom_color = _color_from_parameters(params, self.custom_color)
+        sketch_definition = self.sketch_definition
+        if isinstance(sketch_definition, dict) and any(delta):
+            sketch_definition = deepcopy(sketch_definition)
+            sketch_definition["plane_origin"] = list(origin)
+
+        self._angle = angle
+        self._profile_pts = profile
+        self._profile_contours = contours
+        self._axis_pt1 = axis_pt1
+        self._axis_pt2 = axis_pt2
+        self._plane_origin = origin
+        self._plane_normal = normal
+        self.sketch_definition = sketch_definition
+        self.material = material
+        self.opacity = opacity
+        self.custom_color = custom_color
+        self._revolve = revolve
+        self._revolve_normals = revolve_normals
+        self._actor.GetMapper().SetInputConnection(revolve_normals.GetOutputPort())
+        self._actor.SetUserMatrix(user_matrix)
         self.refresh_appearance()
 
     def to_emerge_script(self) -> str:
@@ -1175,6 +1700,11 @@ class MeshObject(EMObject):
         self.boolean_mesh_reduction = 0.0
         self.boolean_source_names = [str(x) for x in (boolean_source_names or []) if str(x)]
         self.boolean_sources_data = [x for x in (boolean_sources_data or []) if isinstance(x, dict)]
+        self.circular_plate = False
+        self.circular_plate_center = (0.0, 0.0, 0.0)
+        self.circular_plate_radius = 1.0
+        self.circular_plate_thickness = 0.1
+        self.circular_plate_normal = (0.0, 0.0, 1.0)
         super().__init__(name or _auto_name("Mesh"), material)
         if color is not None:
             self.custom_color = color
@@ -1194,6 +1724,38 @@ class MeshObject(EMObject):
         self._actor.SetMapper(mapper)
         self._apply_appearance(self._actor)
 
+    @staticmethod
+    def _make_circular_plate_polydata(center, radius, thickness, normal):
+        unit_normal = _unit_vector3(normal, "CircularPlateNormal")
+        center = _vector3(center, "CircularPlateCenter")
+        radius = _finite_float(radius, "Radius")
+        thickness = _finite_float(thickness, "Thickness")
+        if radius <= 0.0:
+            raise ValueError("Radius must be greater than zero")
+        if thickness <= 0.0:
+            raise ValueError("Thickness must be greater than zero")
+
+        source = vtk.vtkRegularPolygonSource()
+        source.SetNumberOfSides(96)
+        source.SetRadius(radius)
+        source.SetCenter(*(
+            center[index] - unit_normal[index] * thickness * 0.5
+            for index in range(3)
+        ))
+        source.SetNormal(*unit_normal)
+        source.GeneratePolygonOn()
+        source.Update()
+
+        extrusion = vtk.vtkLinearExtrusionFilter()
+        extrusion.SetInputConnection(source.GetOutputPort())
+        extrusion.SetExtrusionTypeToVectorExtrusion()
+        extrusion.SetVector(*(value * thickness for value in unit_normal))
+        extrusion.CappingOn()
+        extrusion.Update()
+        polydata = vtk.vtkPolyData()
+        polydata.DeepCopy(extrusion.GetOutput())
+        return polydata
+
     def get_parameters(self) -> Dict[str, Any]:
         p = dict(Material=self.material, Opacity=self.opacity)
         if self.step_source_path:
@@ -1204,6 +1766,18 @@ class MeshObject(EMObject):
             p["StepGeometryModified"] = True
         if self.plate_role:
             p["PlateRole"] = True
+        if self.circular_plate:
+            p.update({
+                "CircularPlate": True,
+                "CenterX": self.circular_plate_center[0],
+                "CenterY": self.circular_plate_center[1],
+                "CenterZ": self.circular_plate_center[2],
+                "Radius": self.circular_plate_radius,
+                "Thickness": self.circular_plate_thickness,
+                "CircularPlateNormalX": self.circular_plate_normal[0],
+                "CircularPlateNormalY": self.circular_plate_normal[1],
+                "CircularPlateNormalZ": self.circular_plate_normal[2],
+            })
         ox, oy, oz = self.step_export_offset
         if abs(float(ox)) > 1e-12 or abs(float(oy)) > 1e-12 or abs(float(oz)) > 1e-12:
             p["StepExportOffset"] = [float(ox), float(oy), float(oz)]
@@ -1220,6 +1794,33 @@ class MeshObject(EMObject):
         return p
 
     def set_parameters(self, params: Dict[str, Any]) -> None:
+        circular_plate_value = params.get("CircularPlate", self.circular_plate)
+        if isinstance(circular_plate_value, str):
+            circular_plate_value = circular_plate_value.strip().lower() in {
+                "true", "1", "yes", "on",
+            }
+        circular_plate = bool(circular_plate_value)
+        circular_plate_data = None
+        if circular_plate:
+            center = tuple(
+                _finite_float(params.get(key, self.circular_plate_center[index]), key)
+                for index, key in enumerate(("CenterX", "CenterY", "CenterZ"))
+            )
+            radius = _finite_float(params.get("Radius", self.circular_plate_radius), "Radius")
+            thickness = _finite_float(
+                params.get("Thickness", self.circular_plate_thickness), "Thickness"
+            )
+            normal = tuple(
+                _finite_float(
+                    params.get(key, self.circular_plate_normal[index]), key
+                )
+                for index, key in enumerate((
+                    "CircularPlateNormalX", "CircularPlateNormalY", "CircularPlateNormalZ",
+                ))
+            )
+            polydata = self._make_circular_plate_polydata(center, radius, thickness, normal)
+            circular_plate_data = (center, radius, thickness, _unit_vector3(normal, "CircularPlateNormal"), polydata)
+
         self.material = params.get("Material", self.material)
         self.opacity  = float(params.get("Opacity", self.opacity))
         self.step_source_path = params.get("StepSourcePath", self.step_source_path)
@@ -1234,6 +1835,17 @@ class MeshObject(EMObject):
             except Exception:
                 pass
         self.boolean_op = str(params.get("BooleanOperation", self.boolean_op or "")).strip().lower() or None
+        self.circular_plate = circular_plate
+        if circular_plate_data is not None:
+            (
+                self.circular_plate_center,
+                self.circular_plate_radius,
+                self.circular_plate_thickness,
+                self.circular_plate_normal,
+                self._polydata,
+            ) = circular_plate_data
+            self.plate_role = True
+            self._actor.GetMapper().SetInputData(self._polydata)
         try:
             reduction = float(params.get("BooleanMeshReduction", self.boolean_mesh_reduction))
             self.boolean_mesh_reduction = reduction if 0.0 <= reduction <= 0.8 else 0.0

@@ -455,7 +455,6 @@ def validate_simulation(
     conductors = [
         obj for obj in model_objects
         if str(getattr(obj, "name", "")).strip() not in port_object_names
-        and type(obj).__name__ != "PlateObject"
         and not bool(getattr(obj, "plate_role", False))
         and _is_conductor(obj, material_catalog)
     ]

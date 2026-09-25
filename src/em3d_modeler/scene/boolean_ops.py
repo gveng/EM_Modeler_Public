@@ -182,7 +182,92 @@ def _world_polydata(obj: "EMObject") -> vtk.vtkPolyData:
     tri.PassLinesOff()
     tri.PassVertsOff()
     tri.Update()
-    return tri.GetOutput()
+    result = tri.GetOutput()
+    from .em_objects import ExtrudedObject
+    if isinstance(obj, ExtrudedObject):
+        normals = vtk.vtkPolyDataNormals()
+        normals.SetInputData(result)
+        normals.ConsistencyOn()
+        normals.AutoOrientNormalsOn()
+        normals.SplittingOff()
+        normals.Update()
+        result = normals.GetOutput()
+    return result
+
+
+def _extend_extruded_tool_at_base_ends(tool, base_poly, tool_poly):
+    """Overrun coincident extrusion ends to avoid coplanar boolean caps."""
+    from .em_objects import ExtrudedObject
+
+    if not isinstance(tool, ExtrudedObject):
+        return None
+
+    normal = tuple(float(value) for value in tool._plane_normal)
+    direction_sign = -1.0 if tool._direction == "Reverse" and not tool._symmetric else 1.0
+    local_axis = tuple(value * direction_sign for value in normal)
+    matrix = tool.actor.GetMatrix()
+    world_axis = tuple(
+        sum(matrix.GetElement(row, column) * local_axis[column] for column in range(3))
+        for row in range(3)
+    )
+    axis_scale = math.sqrt(sum(value * value for value in world_axis))
+    if axis_scale <= 1e-15:
+        return None
+    world_axis = tuple(value / axis_scale for value in world_axis)
+
+    def projection_bounds(poly):
+        values = [
+            sum(poly.GetPoint(index)[axis] * world_axis[axis] for axis in range(3))
+            for index in range(poly.GetNumberOfPoints())
+        ]
+        return min(values), max(values)
+
+    base_min, base_max = projection_bounds(base_poly)
+    tool_min, tool_max = projection_bounds(tool_poly)
+    span = max(base_max - base_min, tool_max - tool_min, 1.0)
+    location = max(abs(base_min), abs(base_max), abs(tool_min), abs(tool_max))
+    tolerance = max(span * 1e-6, math.ulp(location) * 16.0)
+    extend_start = abs(tool_min - base_min) <= tolerance
+    extend_end = abs(tool_max - base_max) <= tolerance
+    if not extend_start and not extend_end:
+        return None
+
+    overrun_world = max((tool_max - tool_min) * 0.005, tolerance)
+    overrun = overrun_world / axis_scale
+    if tool._symmetric:
+        local_direction = tuple(float(value) for value in tool._plane_normal)
+        origin_shift = tuple(
+            local_direction[index] * (
+                (overrun if extend_end else 0.0)
+                - (overrun if extend_start else 0.0)
+            ) * 0.5
+            for index in range(3)
+        )
+    else:
+        local_direction = local_axis
+        origin_shift = tuple(
+            -local_direction[index] * (overrun if extend_start else 0.0)
+            for index in range(3)
+        )
+
+    extended = ExtrudedObject(
+        name=f"_boolean_tool_{tool.name}",
+        profile_pts=tool._profile_pts,
+        depth=tool._depth + (overrun if extend_start else 0.0)
+        + (overrun if extend_end else 0.0),
+        plane_origin=tuple(
+            tool._plane_origin[index] + origin_shift[index] for index in range(3)
+        ),
+        plane_normal=tool._plane_normal,
+        material=tool.material,
+        direction=tool._direction,
+        symmetric=tool._symmetric,
+    )
+    extended.actor.SetOrigin(*tool.actor.GetOrigin())
+    extended.actor.SetPosition(*tool.actor.GetPosition())
+    extended.actor.SetOrientation(*tool.actor.GetOrientation())
+    extended.actor.SetScale(*tool.actor.GetScale())
+    return extended
 
 
 def _axis_aligned_box_bounds(poly: vtk.vtkPolyData) -> tuple[float, float, float, float, float, float] | None:
@@ -313,24 +398,75 @@ def _cut_axis_aligned_boxes(base: vtk.vtkPolyData, tool: vtk.vtkPolyData) -> vtk
     ):
         return _axis_aligned_box_shell([base_bounds])
 
-    x0, x1, y0, y1, z0, z1 = base_bounds
-    ix0, ix1, iy0, iy1, iz0, iz1 = intersection
-    pieces = [
-        (x0, ix0, y0, y1, z0, z1),
-        (ix1, x1, y0, y1, z0, z1),
-        (ix0, ix1, y0, iy0, z0, z1),
-        (ix0, ix1, iy1, y1, z0, z1),
-        (ix0, ix1, iy0, iy1, z0, iz0),
-        (ix0, ix1, iy0, iy1, iz1, z1),
+    coordinates = [
+        sorted({base_bounds[axis * 2], intersection[axis * 2],
+                intersection[axis * 2 + 1], base_bounds[axis * 2 + 1]})
+        for axis in range(3)
     ]
-    valid_pieces = [
-        piece for piece in pieces
-        if piece[0] < piece[1] and piece[2] < piece[3] and piece[4] < piece[5]
-    ]
-    return _axis_aligned_box_shell(valid_pieces) if valid_pieces else vtk.vtkPolyData()
+    retained_cells = set()
+    for i in range(len(coordinates[0]) - 1):
+        for j in range(len(coordinates[1]) - 1):
+            for k in range(len(coordinates[2]) - 1):
+                indices = (i, j, k)
+                center = tuple(
+                    (coordinates[axis][indices[axis]]
+                     + coordinates[axis][indices[axis] + 1]) * 0.5
+                    for axis in range(3)
+                )
+                in_tool = all(
+                    intersection[axis * 2] < center[axis] < intersection[axis * 2 + 1]
+                    for axis in range(3)
+                )
+                if not in_tool:
+                    retained_cells.add(indices)
+
+    if not retained_cells:
+        return vtk.vtkPolyData()
+
+    points = vtk.vtkPoints()
+    faces = vtk.vtkCellArray()
+    for cell in retained_cells:
+        for axis in range(3):
+            other_axes = [index for index in range(3) if index != axis]
+            for direction in (-1, 1):
+                neighbor = list(cell)
+                neighbor[axis] += direction
+                if tuple(neighbor) in retained_cells:
+                    continue
+
+                fixed = coordinates[axis][cell[axis] + (1 if direction > 0 else 0)]
+                first = coordinates[other_axes[0]][cell[other_axes[0]]:cell[other_axes[0]] + 2]
+                second = coordinates[other_axes[1]][cell[other_axes[1]]:cell[other_axes[1]] + 2]
+                if axis == 0:
+                    corners = [
+                        (fixed, first[0], second[0]), (fixed, first[1], second[0]),
+                        (fixed, first[1], second[1]), (fixed, first[0], second[1]),
+                    ]
+                elif axis == 1:
+                    corners = [
+                        (first[0], fixed, second[0]), (first[0], fixed, second[1]),
+                        (first[1], fixed, second[1]), (first[1], fixed, second[0]),
+                    ]
+                else:
+                    corners = [
+                        (first[0], second[0], fixed), (first[1], second[0], fixed),
+                        (first[1], second[1], fixed), (first[0], second[1], fixed),
+                    ]
+                if direction < 0:
+                    corners.reverse()
+                point_ids = [points.InsertNextPoint(corner) for corner in corners]
+                faces.InsertNextCell(4, point_ids)
+
+    result = vtk.vtkPolyData()
+    result.SetPoints(points)
+    result.SetPolys(faces)
+    triangulate = vtk.vtkTriangleFilter()
+    triangulate.SetInputData(result)
+    triangulate.Update()
+    return triangulate.GetOutput()
 
 
-def _postprocess(poly: vtk.vtkPolyData) -> vtk.vtkPolyData:
+def _postprocess(poly: vtk.vtkPolyData, auto_orient: bool = True) -> vtk.vtkPolyData:
     if poly is None or poly.GetNumberOfPoints() == 0:
         raise RuntimeError("Boolean produced an empty result")
 
@@ -350,7 +486,10 @@ def _postprocess(poly: vtk.vtkPolyData) -> vtk.vtkPolyData:
     normals = vtk.vtkPolyDataNormals()
     normals.SetInputData(cleaned_data)
     normals.ConsistencyOn()
-    normals.AutoOrientNormalsOn()
+    if auto_orient:
+        normals.AutoOrientNormalsOn()
+    else:
+        normals.AutoOrientNormalsOff()
     normals.SetFeatureAngle(60.0)
     normals.SplittingOn()
     normals.Update()
@@ -427,25 +566,35 @@ def _implicit_cut_polydata(base: vtk.vtkPolyData, tool: vtk.vtkPolyData) -> vtk.
     contour.SetInputConnection(sample.GetOutputPort())
     contour.SetValue(0, 0.0)
     contour.Update()
-    return _postprocess(contour.GetOutput())
+    reverse = vtk.vtkReverseSense()
+    reverse.SetInputConnection(contour.GetOutputPort())
+    reverse.ReverseCellsOn()
+    reverse.ReverseNormalsOn()
+    reverse.Update()
+    return _postprocess(reverse.GetOutput(), auto_orient=False)
 
 
 def _occ_boolean(op: str, objects: list["EMObject"]) -> vtk.vtkPolyData | None:
     """Run an exact OpenCascade boolean for supported native primitives."""
     try:
-        from ..emerge.occ_export_builder import _apply_boolean, build_occ_shape_for_export
+        from ..emerge.occ_export_builder import (
+            _combine_boolean_shapes,
+            build_occ_shape_for_export,
+        )
     except ImportError:
         return None
 
     try:
-        shapes = [build_occ_shape_for_export(obj) for obj in objects]
+        shape_cache = {}
+        shapes = [
+            build_occ_shape_for_export(obj, cache=shape_cache)
+            for obj in objects
+        ]
         if any(shape is None for shape in shapes):
             return None
-        result = shapes[0]
-        for tool in shapes[1:]:
-            result = _apply_boolean(result, tool, op)
-            if result is None:
-                return None
+        result = _combine_boolean_shapes(shapes, op)
+        if result is None:
+            return None
 
         bounds = result.BoundingBox() if hasattr(result, "BoundingBox") else None
         if bounds is not None:
@@ -484,6 +633,14 @@ def boolean(op: str, a: "EMObject", b: "EMObject") -> vtk.vtkPolyData:
     if op == "cut":
         if not _bounds_have_volume_overlap(pa, pb):
             return _postprocess(pa)
+        exact_cut = _cut_axis_aligned_boxes(pa, pb)
+        if exact_cut is not None:
+            if exact_cut.GetNumberOfPoints() == 0:
+                raise RuntimeError(
+                    "Boolean cut removes the entire base object. "
+                    "Select the solid to keep first, then the solid to subtract."
+                )
+            return _postprocess(exact_cut, auto_orient=False)
     elif op == "fuse" and not _bounds_overlap(pa, pb):
         append = vtk.vtkAppendPolyData()
         append.AddInputData(pa)
@@ -492,17 +649,14 @@ def boolean(op: str, a: "EMObject", b: "EMObject") -> vtk.vtkPolyData:
         return _postprocess(append.GetOutput())
     elif op == "common" and not _bounds_have_volume_overlap(pa, pb):
         raise RuntimeError("Boolean 'common' inputs have no overlapping volume")
-        exact_cut = _cut_axis_aligned_boxes(pa, pb)
-        if exact_cut is not None:
-            if exact_cut.GetNumberOfPoints() == 0:
-                raise RuntimeError(
-                    "Boolean cut removes the entire base object. "
-                    "Select the solid to keep first, then the solid to subtract."
-                )
-            return _postprocess(exact_cut)
     occ_result = _occ_boolean(op, [a, b])
     if occ_result is not None:
         return _postprocess(occ_result)
+    if op == "cut":
+        extended_tool = _extend_extruded_tool_at_base_ends(b, pa, pb)
+        if extended_tool is not None:
+            b = extended_tool
+            pb = _world_polydata(b)
     if op == "cut" and _bounds_share_coplanar_plane(pa, pb):
         pb = _separate_coplanar_tool_planes(pa, pb)
     try:
@@ -531,8 +685,27 @@ def boolean_many(
     if not 0.0 <= reduction <= 0.8:
         raise ValueError("Mesh reduction must be between 0 and 0.8")
 
-    def finish(poly: vtk.vtkPolyData) -> vtk.vtkPolyData:
-        return _decimate_polydata(poly, reduction) if reduction > 0.0 else poly
+    def finish(poly: vtk.vtkPolyData, auto_orient: bool = True) -> vtk.vtkPolyData:
+        if reduction <= 0.0:
+            return poly
+        if auto_orient:
+            return _decimate_polydata(poly, reduction)
+        return _decimate_polydata(poly, reduction, auto_orient=False)
+
+    if op == "cut" and len(objects) == 2 and all(
+        getattr(obj, "actor", None) is not None for obj in objects
+    ):
+        base_poly, tool_poly = (_world_polydata(obj) for obj in objects)
+        if _bounds_have_volume_overlap(base_poly, tool_poly):
+            exact_cut = _cut_axis_aligned_boxes(base_poly, tool_poly)
+            if exact_cut is not None:
+                if exact_cut.GetNumberOfPoints() == 0:
+                    raise RuntimeError(
+                        "Boolean cut removes the entire base object. "
+                        "Select the solid to keep first, then the solid to subtract."
+                    )
+                exact_cut = _postprocess(exact_cut, auto_orient=False)
+                return finish(exact_cut, auto_orient=False)
 
     occ_result = _occ_boolean(op, objects)
     if occ_result is not None:
@@ -554,7 +727,11 @@ def boolean_many(
     return finish(result)
 
 
-def _decimate_polydata(poly: vtk.vtkPolyData, target_reduction: float) -> vtk.vtkPolyData:
+def _decimate_polydata(
+    poly: vtk.vtkPolyData,
+    target_reduction: float,
+    auto_orient: bool = True,
+) -> vtk.vtkPolyData:
     reduction = float(target_reduction)
     if not 0.0 < reduction <= 0.8:
         raise ValueError("Mesh reduction must be greater than 0 and at most 0.8")
@@ -585,7 +762,7 @@ def _decimate_polydata(poly: vtk.vtkPolyData, target_reduction: float) -> vtk.vt
     result.DeepCopy(decimator.GetOutput())
     if result.GetNumberOfPolys() == 0:
         raise RuntimeError("Mesh decimation produced an empty result")
-    return _postprocess(result)
+    return _postprocess(result, auto_orient=auto_orient)
 
 
 def fuse_many(objects: list["EMObject"], target_reduction: float = 0.0) -> vtk.vtkPolyData:

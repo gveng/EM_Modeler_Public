@@ -3,7 +3,7 @@ from PySide6.QtWidgets import QApplication
 from em3d_modeler.ui.settings_dialog import SettingsDialog
 
 
-def test_utility_settings_are_exposed_and_default_off():
+def test_utility_settings_are_exposed_and_default_off(tmp_path):
     app = QApplication.instance() or QApplication([])
     dialog = SettingsDialog()
 
@@ -11,6 +11,7 @@ def test_utility_settings_are_exposed_and_default_off():
 
     assert values["export_full_scene_step"] is False
     assert values["boolean_decimation_enabled"] is False
+    assert values["workspace_path"] == ""
     assert [dialog._tabs.tabText(index) for index in range(dialog._tabs.count())] == [
         "Display",
         "Simulation",
@@ -28,8 +29,23 @@ def test_utility_settings_are_exposed_and_default_off():
         locale=dialog._workspace_spin.locale(),
         export_full_scene_step=True,
         boolean_decimation_enabled=True,
+        workspace_path=str(tmp_path),
     )
 
     updated = dialog.values()
     assert updated["export_full_scene_step"] is True
     assert updated["boolean_decimation_enabled"] is True
+    assert updated["workspace_path"] == str(tmp_path)
+
+
+def test_workspace_folder_picker_updates_the_selected_path(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog()
+    monkeypatch.setattr(
+        "em3d_modeler.ui.settings_dialog.QFileDialog.getExistingDirectory",
+        lambda *_args: str(tmp_path),
+    )
+
+    dialog._browse_workspace()
+
+    assert dialog.values()["workspace_path"] == str(tmp_path)

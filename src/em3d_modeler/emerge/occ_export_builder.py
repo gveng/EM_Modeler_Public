@@ -445,18 +445,34 @@ def _align_occ_shape_to_actor_bounds(shape: Any, obj: Any) -> Any:
     target_bounds = _world_poly_bounds_from_actor(obj)
     if source_bounds is None or target_bounds is None:
         return shape
-    scales = []
-    for axis in range(3):
-        source_span = source_bounds[axis * 2 + 1] - source_bounds[axis * 2]
-        target_span = target_bounds[axis * 2 + 1] - target_bounds[axis * 2]
-        if abs(source_span) < 1e-12:
-            return shape
-        scales.append(target_span / source_span)
-    translation = [
-        target_bounds[axis * 2] - scales[axis] * source_bounds[axis * 2]
+    source_spans = [
+        source_bounds[axis * 2 + 1] - source_bounds[axis * 2]
         for axis in range(3)
     ]
-    if max(abs(scale - 1.0) for scale in scales) < 1e-9 and max(abs(value) for value in translation) < 1e-9:
+    target_spans = [
+        target_bounds[axis * 2 + 1] - target_bounds[axis * 2]
+        for axis in range(3)
+    ]
+    denominator = sum(span * span for span in source_spans)
+    if denominator < 1e-24:
+        return shape
+    scale = sum(
+        source_spans[axis] * target_spans[axis]
+        for axis in range(3)
+    ) / denominator
+    source_center = [
+        (source_bounds[axis * 2] + source_bounds[axis * 2 + 1]) * 0.5
+        for axis in range(3)
+    ]
+    target_center = [
+        (target_bounds[axis * 2] + target_bounds[axis * 2 + 1]) * 0.5
+        for axis in range(3)
+    ]
+    translation = [
+        target_center[axis] - scale * source_center[axis]
+        for axis in range(3)
+    ]
+    if abs(scale - 1.0) < 1e-9 and max(abs(value) for value in translation) < 1e-9:
         return shape
 
     for pkg in ("OCP", "OCC.Core"):
@@ -469,9 +485,9 @@ def _align_occ_shape_to_actor_bounds(shape: Any, obj: Any) -> Any:
                 from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Transform
             transform = gp_Trsf()
             transform.SetValues(
-                scales[0], 0.0, 0.0, translation[0],
-                0.0, scales[1], 0.0, translation[1],
-                0.0, 0.0, scales[2], translation[2],
+                scale, 0.0, 0.0, translation[0],
+                0.0, scale, 0.0, translation[1],
+                0.0, 0.0, scale, translation[2],
             )
             return BRepBuilderAPI_Transform(shape, transform, True).Shape()
         except ImportError:
@@ -725,14 +741,14 @@ def _boolean_from_source_data(obj: Any, cache: Dict[str, Any], depth: int) -> An
 def _combine_boolean_shapes(shapes: List[Any], op: str) -> Any | None:
     if not shapes:
         return None
-    if op == "fuse" and len(shapes) > 1:
+    if op in {"fuse", "cut"} and len(shapes) > 2:
         for package in ("OCP", "OCC.Core"):
             try:
                 if package == "OCP":
-                    from OCP.BOPAlgo import BOPAlgo_BOP, BOPAlgo_FUSE
+                    from OCP.BOPAlgo import BOPAlgo_BOP, BOPAlgo_CUT, BOPAlgo_FUSE
                     from OCP.TopTools import TopTools_ListOfShape
                 else:
-                    from OCC.Core.BOPAlgo import BOPAlgo_BOP, BOPAlgo_FUSE
+                    from OCC.Core.BOPAlgo import BOPAlgo_BOP, BOPAlgo_CUT, BOPAlgo_FUSE
                     from OCC.Core.TopTools import TopTools_ListOfShape
 
                 arguments = TopTools_ListOfShape()
@@ -743,7 +759,7 @@ def _combine_boolean_shapes(shapes: List[Any], op: str) -> Any | None:
                 operation = BOPAlgo_BOP()
                 operation.SetArguments(arguments)
                 operation.SetTools(tools)
-                operation.SetOperation(BOPAlgo_FUSE)
+                operation.SetOperation(BOPAlgo_FUSE if op == "fuse" else BOPAlgo_CUT)
                 try:
                     operation.SetRunParallel(True)
                 except AttributeError:
@@ -869,8 +885,9 @@ def build_occ_shape_for_export(obj: Any, cache: Dict[str, Any] | None = None, de
     selected = _select_shape_for_mesh_object(obj, root_shape)
     transformed = _apply_actor_transform(selected, obj)
     target_bounds = _world_poly_bounds_from_actor(obj)
-    transformed = _align_occ_shape_to_actor_bounds(transformed, obj)
     if target_bounds is not None:
+        if bool(getattr(obj, "step_geometry_modified", False)):
+            transformed = _align_occ_shape_to_actor_bounds(transformed, obj)
         # Bounds alignment already includes the current scale and translation;
         # do not apply stale offsets persisted by the legacy exporter.
         recovered = None

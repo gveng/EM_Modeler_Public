@@ -21,18 +21,84 @@ Multi-selection   → shows object count, common material combo, opacity slider,
                     and an "Apply to all" button
 """
 from __future__ import annotations
+import re
 from typing import Any, Dict, List, Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
     QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
     QSlider, QPushButton, QFrame, QInputDialog, QColorDialog, QCheckBox, QMessageBox,
+    QCompleter, QStyledItemDelegate,
 )
 from PySide6.QtCore import Qt, Signal
-from PySide6.QtGui import QColor
+from PySide6.QtGui import QColor, QKeySequence
 
-from ..scene.em_objects import EMObject
+from ..scene.em_objects import EMObject, ExtrudedObject, MeshObject, RevolvedObject
 from ..scene.param_expr import evaluate_expression
+
+
+class _VariableCompleterLineEdit(QLineEdit):
+    def __init__(self, variables: List[str], parent=None):
+        super().__init__(parent)
+        self._completer = QCompleter(variables, self)
+        self._completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self._completer.setFilterMode(Qt.MatchStartsWith)
+        self._completer.setCompletionMode(QCompleter.PopupCompletion)
+        self._completer.setWidget(self)
+        self._completer.activated[str].connect(self._insert_completion)
+        self.textEdited.connect(self._update_completions)
+        self._token_start = 0
+        self._token_end = 0
+
+    def keyPressEvent(self, event) -> None:
+        if event.matches(QKeySequence.StandardKey.InsertParagraphSeparator):
+            popup = self._completer.popup()
+            if popup.isVisible() and self._completer.currentCompletion():
+                self._insert_completion(self._completer.currentCompletion())
+                event.accept()
+                return
+        if event.key() == Qt.Key_Space and event.modifiers() & Qt.ControlModifier:
+            self._update_completions(self.text(), show_all=True)
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
+    def _update_completions(self, _text: str, *, show_all: bool = False) -> None:
+        cursor = self.cursorPosition()
+        prefix_text = self.text()[:cursor]
+        match = re.search(r"[A-Za-z_][A-Za-z0-9_]*$", prefix_text)
+        if match is None and not show_all:
+            self._completer.popup().hide()
+            return
+        self._token_start = match.start() if match is not None else cursor
+        self._token_end = cursor
+        prefix = match.group(0) if match is not None else ""
+        self._completer.setCompletionPrefix(prefix)
+        if self._completer.completionCount() == 0:
+            self._completer.popup().hide()
+            return
+        popup = self._completer.popup()
+        popup.setCurrentIndex(self._completer.completionModel().index(0, 0))
+        rect = self.cursorRect()
+        rect.setWidth(popup.sizeHintForColumn(0) + popup.verticalScrollBar().sizeHint().width())
+        self._completer.complete(rect)
+
+    def _insert_completion(self, completion: str) -> None:
+        text = self.text()
+        self.setText(text[:self._token_start] + completion + text[self._token_end:])
+        self.setCursorPosition(self._token_start + len(completion))
+        self._completer.popup().hide()
+
+
+class _VariableCompleterDelegate(QStyledItemDelegate):
+    def __init__(self, owner, parent=None):
+        super().__init__(parent)
+        self._owner = owner
+
+    def createEditor(self, parent, option, index):
+        if self._owner._project_mode or index.column() != 1:
+            return super().createEditor(parent, option, index)
+        return _VariableCompleterLineEdit(self._owner._project_variable_names, parent)
 
 
 class BodyPropertiesWidget(QWidget):
@@ -53,6 +119,7 @@ class BodyPropertiesWidget(QWidget):
         self._blocked = False
         self._project_mode = False
         self._formula_resolver = None
+        self._project_variable_names: List[str] = []
         self._materials: List[str] = ["PEC"]
         self._color_hex: str = "#bebee6"
 
@@ -155,6 +222,7 @@ class BodyPropertiesWidget(QWidget):
 
         # ── Geometry parameters table (single selection only)
         self._table = QTableWidget(0, 3)
+        self._table.setItemDelegateForColumn(1, _VariableCompleterDelegate(self, self._table))
         self._table.setHorizontalHeaderLabels(["Parameter", "Value", "Resolved"])
         self._table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._table.setAlternatingRowColors(True)
@@ -244,6 +312,11 @@ class BodyPropertiesWidget(QWidget):
 
     def set_formula_resolver(self, resolver) -> None:
         self._formula_resolver = resolver
+
+    def set_project_variable_names(self, names: List[str]) -> None:
+        self._project_variable_names = list(dict.fromkeys(
+            str(name).strip() for name in names if str(name).strip()
+        ))
 
     def _project_parameters_from_table(self) -> List[Dict[str, Any]]:
         entries = []
@@ -342,7 +415,33 @@ class BodyPropertiesWidget(QWidget):
 
         params = obj.get_parameters()
         exclude = {"Material", "Opacity"}
-        rows = [(k, v) for k, v in params.items() if k not in exclude]
+        position_rows = []
+        if isinstance(obj, ExtrudedObject):
+            exclude.update({
+                "PlaneOriginX", "PlaneOriginY", "PlaneOriginZ",
+                "PlaneNormalX", "PlaneNormalY", "PlaneNormalZ", "ProfilePts",
+            })
+            position_rows = [
+                (f"Position{axis}", value)
+                for axis, value in zip("XYZ", obj.sketch_reference_point())
+            ]
+        elif isinstance(obj, MeshObject) and bool(getattr(obj, "circular_plate", False)):
+            exclude.update({
+                "CircularPlate",
+                "CircularPlateNormalX", "CircularPlateNormalY", "CircularPlateNormalZ",
+            })
+        elif isinstance(obj, RevolvedObject):
+            exclude.update({
+                "AxisPt1X", "AxisPt1Y", "AxisPt1Z",
+                "AxisPt2X", "AxisPt2Y", "AxisPt2Z",
+                "PlaneOriginX", "PlaneOriginY", "PlaneOriginZ",
+                "PlaneNormalX", "PlaneNormalY", "PlaneNormalZ", "ProfilePts",
+            })
+            position_rows = [
+                (f"Position{axis}", value)
+                for axis, value in zip("XYZ", obj.sketch_reference_point())
+            ]
+        rows = position_rows + [(k, v) for k, v in params.items() if k not in exclude]
         # Always expose Color in Properties so user can assign it even when
         # the object currently uses only material-based coloring.
         if not any(k == "Color" for k, _ in rows):
@@ -439,10 +538,16 @@ class BodyPropertiesWidget(QWidget):
                 if k.text() in metadata_keys:
                     params[k.text()] = original_params.get(k.text(), v.text())
                     continue
+                original_value = original_params.get(k.text())
+                if isinstance(original_value, bool):
+                    normalized = v.text().strip().lower()
+                    if normalized not in {"true", "false", "1", "0", "yes", "no", "on", "off"}:
+                        raise ValueError(f"{k.text()} must be True or False")
+                    params[k.text()] = normalized in {"true", "1", "yes", "on"}
+                    continue
                 try:
                     params[k.text()] = float(v.text())
                 except ValueError:
-                    original_value = original_params.get(k.text())
                     if isinstance(original_value, str) or self._formula_resolver is None:
                         params[k.text()] = v.text()
                     else:

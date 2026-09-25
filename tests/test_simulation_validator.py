@@ -40,6 +40,17 @@ def test_lumped_port_connected_to_signal_and_reference_passes():
     assert not any(item.severity == "ERROR" and item.category == "Ports" for item in findings)
 
 
+def test_lumped_port_connected_to_conductive_reference_plate_passes():
+    signal = BoxObject("Signal", 0, 0, 0, 1, 1, 1, "COPPER")
+    ground = PlateObject("Ground", 0, 2, 0, 1, 2, 1, "COPPER")
+    port = PlateObject("Port", 0.9, 0.9, 0.4, 1.1, 2.1, 0.6, "PEC")
+
+    findings = validate_simulation([signal, ground, port], _settings())
+
+    assert any(item.severity == "OK" and "connected to Signal, Ground" in item.message for item in findings)
+    assert not any(item.severity == "ERROR" and item.category == "Ports" for item in findings)
+
+
 def test_lumped_port_touching_one_conductor_is_error():
     signal = BoxObject("Signal", 0, 0, 0, 1, 1, 1, "COPPER")
     port = PlateObject("Port", 0.9, 0.9, 0.4, 1.1, 2.1, 0.6, "PEC")

@@ -41,6 +41,7 @@ class EMInteractorStyle(vtk.vtkInteractorStyleUser):
         self.left_press_callback = None
         self.left_release_callback = None
         self.mouse_move_callback = None
+        self.right_press_callback = None
 
         self.AddObserver("MiddleButtonPressEvent",   self._on_mid_press)
         self.AddObserver("MiddleButtonReleaseEvent", self._on_mid_release)
@@ -85,6 +86,9 @@ class EMInteractorStyle(vtk.vtkInteractorStyleUser):
     def _on_right_press(self, _obj, _ev):
         iren = self.GetInteractor()
         self._last_x, self._last_y = iren.GetEventPosition()
+        if self.right_press_callback and self.right_press_callback(self._last_x, self._last_y):
+            self._panning = False
+            return
         self._panning = True
 
     def _on_right_release(self, _obj, _ev):
