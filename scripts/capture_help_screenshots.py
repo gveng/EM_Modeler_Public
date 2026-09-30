@@ -38,13 +38,31 @@ def demo_project_settings() -> dict:
                 "NumberOfPoints": 111, "LogVerbosity": "Info",
             },
             {
+                "name": "Length_Sweep", "type": "Parametric", "enabled": True,
+                "ParamName": "antenna_length", "ParamValuesMode": "range",
+                "ParamStart": "40", "ParamEnd": "60", "ParamStep": "10",
+                "ParamValues": "40,50,60", "Fmin_GHz": 8.0,
+                "Fmax_GHz": 10.0, "Fstep_GHz": 0.02,
+                "NumberOfPoints": 101, "progressive_sparams_enabled": True,
+                "progressive_sparams_chunk_size": 5, "LogVerbosity": "Info",
+            },
+            {
                 "name": "Resonant_Modes", "type": "Eigenmode", "enabled": True,
                 "EigenmodeCount": 6, "NumberOfPoints": 100, "LogVerbosity": "Info",
             },
         ],
+        "parameters": [
+            {"name": "antenna_length", "value": 50.0, "unit": "mm"},
+            {"name": "wall", "value": 2.0, "unit": "mm"},
+        ],
         "outputs": [
             {"name": "S_Parameters", "simulation": "Frequency_Sweep", "plot_type": "plot_sp", "enabled": True},
             {"name": "VSWR", "simulation": "Frequency_Sweep", "plot_type": "plot_vswr", "enabled": True},
+            {
+                "name": "Parametric_S11", "simulation": "Length_Sweep",
+                "plot_type": "plot_sp", "plot_mode": "live", "enabled": True,
+                "params": {"s_parameters": ["S11", "S21"]},
+            },
         ],
         "mesh": {
             "default_fraction": 0.3,
@@ -74,13 +92,17 @@ def capture_toolbar_crop(output_dir: Path) -> Path | None:
     from PySide6.QtCore import QRect
     from PySide6.QtGui import QImage
 
-    source_path = output_dir / "Main_window.png"
+    source_path = output_dir / "window-main.png"
+    if not source_path.is_file():
+        source_path = output_dir / "Main_window.png"
+    if not source_path.is_file():
+        source_path = DEFAULT_OUTPUT_DIR / "window-main.png"
     if not source_path.is_file():
         source_path = DEFAULT_OUTPUT_DIR / "Main_window.png"
     source = QImage(str(source_path))
     if source.isNull():
         return None
-    crop = source.copy(QRect(0, 62, min(982, source.width()), min(82, source.height() - 62)))
+    crop = source.copy(QRect(0, 62, min(1200, source.width()), min(82, source.height() - 62)))
     output_path = output_dir / "toolbar-icons.png"
     return output_path if crop.save(str(output_path), "PNG") else None
 
@@ -132,10 +154,6 @@ def capture_project_tree_sections(app, output_dir: Path) -> list[Path]:
         ("mesh", tree_widget._m_node),
     ]
     saved = []
-
-    toolbar_path = capture_toolbar_crop(output_dir)
-    if toolbar_path is not None:
-        saved.append(toolbar_path)
 
     def count_visible_rows(item) -> int:
         count = 1
@@ -219,6 +237,7 @@ def capture_object_materials_tree(app, output_dir: Path, project_file: Path | No
 
 def capture_dialogs(app, output_dir: Path) -> list[Path]:
     from em3d_modeler.emerge.material_store import MaterialStore
+    from em3d_modeler.ui.material_assign_dialog import MaterialAssignDialog
     from em3d_modeler.ui.material_library_dialog import MaterialLibraryDialog, _MaterialEditorDialog
     from em3d_modeler.ui.reference_plane_dialog import ReferencePlaneDialog
     from em3d_modeler.ui.settings_dialog import SettingsDialog
@@ -235,6 +254,7 @@ def capture_dialogs(app, output_dir: Path) -> list[Path]:
         ("display", settings._display_tab),
         ("simulation", settings._simulation_tab),
         ("mesh", settings._mesh_tab),
+        ("utility", settings._utility_tab),
     ):
         settings._tabs.setCurrentWidget(tab_widget)
         path = output_dir / f"dialog-settings-{tab_name}.png"
@@ -247,7 +267,7 @@ def capture_dialogs(app, output_dir: Path) -> list[Path]:
         "Low-loss dielectric", family="Dielectrics", er=2.2,
         tan_d=0.0009, color="#4a9b8e", opacity=0.92,
     )
-    store.add_project_material(
+    copper_record = store.add_project_material(
         "Copper", family="Metals", er=1.0, sigma=59600000.0,
         color="#c97845", opacity=1.0,
     )
@@ -277,7 +297,128 @@ def capture_dialogs(app, output_dir: Path) -> list[Path]:
     saved.append(path)
     plane.close()
 
+    assign = MaterialAssignDialog(
+        None,
+        project_records={record.name: record, copper_record.name: copper_record},
+        selected_name=record.name,
+    )
+    assign_path = output_dir / "dialog-assign-material.png"
+    capture_widget(assign, assign_path, app)
+    saved.append(assign_path)
+    assign.close()
+
     return saved
+
+
+def capture_project_tree_dialogs(app, output_dir: Path) -> list[Path]:
+        from PySide6.QtWidgets import QDialog, QWidget
+        from em3d_modeler.ui.main_window import MainWindow
+        from em3d_modeler.ui.project_tree_widget import ProjectTreeWidget
+
+        tree = ProjectTreeWidget()
+        tree.set_project_name("Dipole_Antenna")
+        tree.load_settings(demo_project_settings())
+        tree._scene_object_names = ["Air_Region", "Radiator"]
+        captures = {
+            "Parametric Simulation": ("dialog-simulation-parametric.png", (760, 760)),
+            "Live S-parameter Output": ("dialog-output-live.png", (720, 620)),
+            "Waveguide Port": ("dialog-port-waveguide.png", (620, 540)),
+            "Lumped Port": ("dialog-port-lumped.png", (620, 540)),
+            "Edit 2 Boundaries": ("dialog-boundaries.png", (520, 280)),
+            "Select open-region domain": ("dialog-open-region-domain.png", (520, 240)),
+            "Edit Mesh Refinement - Radiator": ("dialog-local-mesh-refinement.png", (560, 420)),
+            "Assign Boundary Condition": ("dialog-object-boundary.png", (600, 520)),
+            "Open Region / PML Wizard": ("dialog-open-region-pml.png", (620, 520)),
+        }
+        saved = []
+        original_exec = QDialog.exec
+        original_exec_ = getattr(QDialog, "exec_", None)
+
+        def capture_exec(dialog) -> int:
+            entry = captures.get(dialog.windowTitle())
+            if entry is not None:
+                filename, size = entry
+                dialog.resize(*size)
+                path = output_dir / filename
+                capture_widget(dialog, path, app)
+                saved.append(path)
+            return QDialog.Rejected
+
+        QDialog.exec = capture_exec
+        if original_exec_ is not None:
+            QDialog.exec_ = capture_exec
+        try:
+            tree._simulation_dialog_data({
+                "name": "Length_Sweep",
+                "type": "Parametric",
+                "enabled": True,
+                "ParamName": "antenna_length",
+                "ParamValuesMode": "list",
+                "ParamValues": "40, 50, 60",
+                "Fmin_GHz": 8.0,
+                "Fmax_GHz": 10.0,
+                "Fstep_GHz": 0.02,
+                "NumberOfPoints": 101,
+                "progressive_sparams_enabled": True,
+                "progressive_sparams_chunk_size": 5,
+            }, "Parametric Simulation")
+            tree._output_dialog_data({
+                "name": "Parametric_S11",
+                "simulation": "Length_Sweep",
+                "plot_type": "plot_sp",
+                "plot_mode": "live",
+                "enabled": True,
+                "params": {"s_parameters": ["S11", "S21"]},
+            }, "Live S-parameter Output")
+            tree._port_dialog_data({
+                "number": 1,
+                "name": "Input",
+                "type": "WaveguidePort",
+                "x": 0,
+                "y": 0,
+                "z": 24,
+                "params": {"Mode": "TE10", "Impedance_Ohm": 50.0},
+            }, "Radiator", "Waveguide Port")
+            tree._port_dialog_data({
+                "number": 2,
+                "name": "Feed",
+                "type": "LumpedPort",
+                "params": {
+                    "Resistance_Ohm": 50.0,
+                    "Voltage_V": 1.0,
+                    "Direction_X": 0.0,
+                    "Direction_Y": 0.0,
+                    "Direction_Z": -1.0,
+                },
+            }, "Feed", "Lumped Port")
+            tree._edit_boundaries(["Xmin", "Xmax"])
+            tree._edit_open_region_domain()
+            tree._edit_local_mesh_refinement(0)
+            tree._object_boundary_dialog_data({
+                "name": "Radiator_BC",
+                "type": "PEC",
+                "params": {},
+            }, "Radiator", "Assign Boundary Condition")
+
+            model = SimpleNamespace(
+                is_model=True,
+                material="Copper",
+                actor=SimpleNamespace(
+                    GetBounds=lambda: (-20.0, 20.0, -2.0, 2.0, 0.0, 42.0)
+                ),
+            )
+            wizard_host = QWidget()
+            wizard_host._viewport = SimpleNamespace(
+                scene=SimpleNamespace(objects=[model])
+            )
+            MainWindow._open_region_pml_wizard(wizard_host)
+            wizard_host.close()
+        finally:
+            QDialog.exec = original_exec
+            if original_exec_ is not None:
+                QDialog.exec_ = original_exec_
+            tree.close()
+        return saved
 
 
 def capture_main_window(app, output_dir: Path) -> Path:
@@ -347,6 +488,124 @@ def capture_sketch_context_toolbar(app, output_dir: Path) -> Path:
         raise RuntimeError(f"Qt could not save screenshot: {path}")
     window.close()
     return path
+
+
+def capture_simulation_workspace(app, output_dir: Path) -> Path:
+    from PySide6.QtWidgets import QMainWindow, QTabWidget, QWidget
+    from em3d_modeler.ui.main_window import MainWindow
+
+    host = QMainWindow()
+    host.setWindowTitle("EM 3D Modeler - Simulation")
+    host.resize(1440, 900)
+    host._workspace_tabs = QTabWidget(host)
+    host.setCentralWidget(host._workspace_tabs)
+    host._workspace_tabs.addTab(QWidget(), "Model")
+    host._sim_dlg = None
+    host._sim_log_verbosity = "Info"
+    host._sim_cached_script_bundle = {}
+    host._generate_simulation_assets = lambda **_kwargs: "master script"
+    host._write_cached_simulation_scripts = lambda: output_dir / "Dipole_Antenna_master.py"
+    host._append_sim_log = lambda message: host._sim_log_view.appendPlainText(message)
+    host._on_sim_option_changed = lambda *_args: None
+    host._on_check_simulation = lambda *_args: None
+    host._on_sim_generate = lambda *_args, **_kwargs: None
+    host._on_sim_save_script = lambda *_args: None
+    host._on_sim_log_level_changed = lambda *_args: None
+    host._on_sim_run = lambda *_args: None
+    host._on_sim_stop = lambda *_args: None
+    host._rebuild_window_menu = lambda: None
+
+    script_bundle = {
+        "master": "# Sequential simulation workflow\n# Runs each enabled worker in order.",
+        "scripts": [
+            {
+                "name": "Frequency_Sweep",
+                "job_name": "Frequency_Sweep",
+                "index": 1,
+                "content": "# Frequency sweep worker\nrun_sweep()",
+            },
+            {
+                "name": "Length_Sweep (antenna_length=40)",
+                "job_name": "Length_Sweep",
+                "index": 2,
+                "content": "# Parametric worker: antenna_length=40\nrun_sweep()",
+            },
+            {
+                "name": "Length_Sweep (antenna_length=50)",
+                "job_name": "Length_Sweep",
+                "index": 3,
+                "content": "# Parametric worker: antenna_length=50\nrun_sweep()",
+            },
+        ],
+    }
+    host._sim_cached_script_bundle = script_bundle
+    MainWindow._open_simulation_window(host)
+    MainWindow._update_simulation_script_tabs(host, script_bundle)
+    host._sim_script_tabs.setCurrentIndex(2)
+    host._sim_log_view.setPlainText(
+        "[info] Project saved before simulation run.\n"
+        "[master] Running job 'Length_Sweep (antenna_length=40)'\n"
+        "EM3D_SPARAM_PROGRESS: first parameter, chunk 5/101"
+    )
+    path = output_dir / "window-simulation.png"
+    capture_widget(host, path, app)
+    host.close()
+    return path
+
+
+def capture_parametric_plot(app, output_dir: Path) -> list[Path]:
+    import numpy as np
+    from em3d_modeler.ui.chart_view import PlotView, _AxisRangeDialog
+
+    frequencies = np.linspace(8.0, 10.0, 101).tolist()
+    first_values = [
+        complex(
+            0.12 + 0.66 * np.exp(-((frequency - 8.85) / 0.22) ** 2),
+            0.035 * np.sin(frequency * 3.1),
+        )
+        for frequency in frequencies
+    ]
+    partial_frequencies = frequencies[:5]
+    partial_values = [
+        complex(
+            0.15 + 0.52 * np.exp(-((frequency - 9.35) / 0.3) ** 2),
+            0.03 * np.cos(frequency * 2.7),
+        )
+        for frequency in partial_frequencies
+    ]
+    plot = PlotView("plot_sp")
+    plot.resize(1280, 760)
+    plot.set_plot_data(
+        frequencies,
+        [
+            {
+                "label": "S11",
+                "values": first_values,
+                "file_name": "antenna_length=40 mm",
+                "file_id": "length-40",
+            },
+            {
+                "label": "S11",
+                "values": partial_values,
+                "x_values": partial_frequencies,
+                "file_name": "antenna_length=50 mm (5/101 points)",
+                "file_id": "length-50",
+            },
+        ],
+        title="Parametric S11 - live sequential update",
+        xlabel="Frequency (GHz)",
+        ylabel="S-parameter",
+    )
+    plot_path = output_dir / "window-parametric-plot.png"
+    capture_widget(plot, plot_path, app)
+    plot.close()
+
+    axes_dialog = _AxisRangeDialog((8.0, 10.0), (0.0, 1.0), False, False)
+    axes_dialog.resize(440, 320)
+    axes_path = output_dir / "dialog-plot-axes.png"
+    capture_widget(axes_dialog, axes_path, app)
+    axes_dialog.close()
+    return [plot_path, axes_path]
 
 
 def configure_capture_font(app) -> None:
@@ -422,12 +681,18 @@ def main(argv: list[str] | None = None) -> int:
             return 1
 
     saved = []
-    for capture in (
+    capture_groups = [
         lambda: capture_dialogs(app, output_dir),
         lambda: capture_project_tree_sections(app, output_dir),
+        lambda: capture_project_tree_dialogs(app, output_dir),
         lambda: capture_properties_and_parameters(app, output_dir),
+        lambda: [capture_simulation_workspace(app, output_dir)],
+        lambda: capture_parametric_plot(app, output_dir),
         lambda: [capture_object_materials_tree(app, output_dir, args.project_file)],
-    ):
+    ]
+    if not args.offscreen:
+        capture_groups.append(lambda: [capture_sketch_context_toolbar(app, output_dir)])
+    for capture in capture_groups:
         try:
             saved.extend(capture())
         except Exception as exc:
@@ -458,8 +723,19 @@ def main(argv: list[str] | None = None) -> int:
                 message = detail[-1] if detail else f"child process exited {result.returncode}"
                 print(f"Main-window capture unavailable: {message}", file=sys.stderr)
 
+    toolbar_path = capture_toolbar_crop(output_dir)
+    if toolbar_path is not None:
+        saved.append(toolbar_path)
+
     if not saved:
         print("No screenshots were captured.", file=sys.stderr)
+        return 1
+    missing = [path for path in saved if not path.is_file() or path.stat().st_size == 0]
+    if missing:
+        print(
+            "Screenshot capture incomplete: " + ", ".join(str(path) for path in missing),
+            file=sys.stderr,
+        )
         return 1
     print(f"Saved {len(saved)} screenshots to {args.output_dir.resolve()}")
     for path in saved:

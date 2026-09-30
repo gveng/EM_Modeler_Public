@@ -785,6 +785,7 @@ def export_objects_to_step_bundle(
                 "solid_count": solid_count,
                 "poly_points": int(poly.GetNumberOfPoints()),
                 "poly_polys": int(poly.GetNumberOfPolys()),
+                "bounds_mm": tuple(float(value) for value in poly.GetBounds()),
                 "boolean_op": str(getattr(export_obj, "boolean_op", "") or "").strip().lower() or None,
                 "source_count": len(list(getattr(export_obj, "source_objects", []) or [])),
             }

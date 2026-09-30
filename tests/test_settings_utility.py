@@ -11,6 +11,8 @@ def test_utility_settings_are_exposed_and_default_off(tmp_path):
 
     assert values["export_full_scene_step"] is False
     assert values["boolean_decimation_enabled"] is False
+    assert "progressive_sparams_enabled" not in values
+    assert not hasattr(dialog, "_progressive_sparams_check")
     assert values["workspace_path"] == ""
     assert [dialog._tabs.tabText(index) for index in range(dialog._tabs.count())] == [
         "Display",
@@ -35,6 +37,7 @@ def test_utility_settings_are_exposed_and_default_off(tmp_path):
     updated = dialog.values()
     assert updated["export_full_scene_step"] is True
     assert updated["boolean_decimation_enabled"] is True
+    assert "progressive_sparams_enabled" not in updated
     assert updated["workspace_path"] == str(tmp_path)
 
 

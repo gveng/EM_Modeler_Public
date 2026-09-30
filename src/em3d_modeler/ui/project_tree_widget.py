@@ -34,7 +34,9 @@ Structure
       └── Assigned To Objects (resolution 1/λ)
 """
 from __future__ import annotations
+import math
 import re
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict
 
 from PySide6.QtWidgets import (
@@ -99,10 +101,16 @@ def _default_simulation_item() -> Dict[str, Any]:
         "Fmin_GHz": 0.1,
         "Fmax_GHz": 10.0,
         "Fstep_GHz": 0.1,
-        "NumberOfPoints": 100,
+        "NumberOfPoints": 21,
         "EigenmodeCount": 5,
         "ParamName": "",
         "ParamValues": "",
+        "ParamValuesMode": "range",
+        "ParamStart": "0",
+        "ParamEnd": "1",
+        "ParamStep": "1",
+        "progressive_sparams_enabled": False,
+        "progressive_sparams_chunk_size": 10,
         "sparam_fitting": {"enabled": False, "points": 1001},
         "LogVerbosity": "Info",
     }
@@ -113,6 +121,7 @@ def _default_output_item(simulation_name: str, idx: int) -> Dict[str, Any]:
         "name": f"Output_{idx}",
         "simulation": simulation_name,
         "plot_type": "plot_sp",
+        "plot_mode": "final",
         "enabled": True,
     }
 
@@ -124,7 +133,7 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
     "simulation": {"Fmin_GHz": 0.1, "Fmax_GHz": 10.0, "Fstep_GHz": 0.1, "NumberOfPoints": 100, "LogVerbosity": "Info"},
     "simulations": [_default_simulation_item()],
     "outputs": [],
-    "mesh":       {"default_fraction": 0.3, "object_resolutions": {}, "local_refinements": []},
+    "mesh":       {"default_fraction": 0.3, "emerge_scale_factor": 1.0, "object_resolutions": {}, "local_refinements": []},
     "runtime": {
         "solver": "PARDISO",
         "parallel_enabled": True,
@@ -135,6 +144,24 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
     },
     "material_priorities": {},  # Maps material_name -> priority_value
 }
+
+
+def _parametric_range_values(start: float, end: float, step: float) -> list[str]:
+    try:
+        first = Decimal(str(start))
+        last = Decimal(str(end))
+        increment = Decimal(str(step))
+    except InvalidOperation as exc:
+        raise ValueError("Parameter range values must be numeric.") from exc
+    if not all(value.is_finite() for value in (first, last, increment)):
+        raise ValueError("Parameter range values must be finite.")
+    if increment == 0 or (last > first and increment < 0) or (last < first and increment > 0):
+        raise ValueError("Step must be non-zero and point from start toward end.")
+    count = int(abs((last - first) / increment)) + 1
+    if count > 100000:
+        raise ValueError("Parameter range produces more than 100,000 values.")
+    values = [first + index * increment for index in range(count)]
+    return [format(value.normalize(), "f") for value in values]
 
 _NUMERIC_LOCALE = QLocale.c()
 
@@ -340,6 +367,9 @@ class ProjectTreeWidget(QWidget):
         if not isinstance(runtime, dict):
             runtime = {}
             merged["runtime"] = runtime
+        legacy_progressive_sparams_enabled = bool(
+            runtime.pop("progressive_sparams_enabled", False)
+        )
         solver = str(runtime.get("solver", "PARDISO")).strip().upper()
         runtime["solver"] = solver if solver in {"PARDISO", "SUPERLU", "UMFPACK", "CUDSS", "AASDS", "MUMPS"} else "PARDISO"
         runtime["parallel_enabled"] = bool(runtime.get("parallel_enabled", True))
@@ -354,6 +384,8 @@ class ProjectTreeWidget(QWidget):
 
         if not isinstance(merged.get("simulations"), list):
             merged["simulations"] = []
+        if not isinstance(loaded.get("simulations"), list):
+            merged["simulations"] = []
         if not isinstance(merged.get("outputs"), list):
             merged["outputs"] = []
 
@@ -366,6 +398,13 @@ class ProjectTreeWidget(QWidget):
             mesh_cfg["default_fraction"] = max(0.01, min(1.0, float(mesh_cfg.get("default_fraction", 0.3))))
         except Exception:
             mesh_cfg["default_fraction"] = 0.3
+        try:
+            emerge_scale_factor = float(mesh_cfg.get("emerge_scale_factor", 1.0))
+            if not math.isfinite(emerge_scale_factor):
+                emerge_scale_factor = 1.0
+            mesh_cfg["emerge_scale_factor"] = max(1.0, min(1_000_000.0, emerge_scale_factor))
+        except Exception:
+            mesh_cfg["emerge_scale_factor"] = 1.0
 
         obj_res = mesh_cfg.get("object_resolutions")
         if not isinstance(obj_res, dict):
@@ -429,6 +468,15 @@ class ProjectTreeWidget(QWidget):
             sim["Fmax_GHz"] = float(legacy_sim.get("Fmax_GHz", sim["Fmax_GHz"]))
             sim["Fstep_GHz"] = float(legacy_sim.get("Fstep_GHz", sim["Fstep_GHz"]))
             sim["NumberOfPoints"] = max(2, int(legacy_sim.get("NumberOfPoints", round((sim["Fmax_GHz"] - sim["Fmin_GHz"]) / max(sim["Fstep_GHz"], 1e-9)) + 1)))
+            sim["progressive_sparams_enabled"] = bool(
+                legacy_sim.get("progressive_sparams_enabled", legacy_progressive_sparams_enabled)
+            )
+            try:
+                sim["progressive_sparams_chunk_size"] = max(
+                    1, int(legacy_sim.get("progressive_sparams_chunk_size", 10))
+                )
+            except (TypeError, ValueError):
+                sim["progressive_sparams_chunk_size"] = 10
             lv = str(legacy_sim.get("LogVerbosity", "Info")).strip().title()
             sim["LogVerbosity"] = lv if lv in _LOG_VERBOSITY_LEVELS else "Info"
             merged["simulations"] = [sim]
@@ -436,6 +484,15 @@ class ProjectTreeWidget(QWidget):
         for sim in merged["simulations"]:
             if not isinstance(sim, dict):
                 continue
+            sim["progressive_sparams_enabled"] = bool(
+                sim.get("progressive_sparams_enabled", legacy_progressive_sparams_enabled)
+            )
+            try:
+                sim["progressive_sparams_chunk_size"] = max(
+                    1, int(sim.get("progressive_sparams_chunk_size", 10))
+                )
+            except (TypeError, ValueError):
+                sim["progressive_sparams_chunk_size"] = 10
             try:
                 sim["NumberOfPoints"] = max(2, int(sim.get("NumberOfPoints", round((float(sim.get("Fmax_GHz", 10.0)) - float(sim.get("Fmin_GHz", 0.1))) / max(float(sim.get("Fstep_GHz", 0.1)), 1e-9)) + 1)))
             except (TypeError, ValueError, ZeroDivisionError):
@@ -463,6 +520,11 @@ class ProjectTreeWidget(QWidget):
                     "name": name,
                     "simulation": simulation,
                     "plot_type": plot_type,
+                    "plot_mode": (
+                        "live"
+                        if str(output.get("plot_mode", "final")).strip().lower() == "live"
+                        else "final"
+                    ),
                     "enabled": bool(output.get("enabled", True)),
                     "params": dict(output.get("params", {})) if isinstance(output.get("params", {}), dict) else {},
                 }
@@ -516,6 +578,12 @@ class ProjectTreeWidget(QWidget):
         self._s_node   = self._make_section(root, "Simulation")
         self._o_node   = self._make_section(root, "Outputs")
         self._m_node   = self._make_section(root, "Mesh")
+        self._m_scale_item = self._make_leaf(self._m_node, "EMERGE scale factor", "1")
+        self._m_scale_item.setData(0, Qt.UserRole, ("__emerge_scale_factor__", 0))
+        self._m_scale_item.setToolTip(
+            0,
+            "Experimental EMERGE global scale. CAD coordinates and mesh constraints scale together; port width/height remain physical. 1 disables scaling.",
+        )
 
         # Boundaries
         open_region = self._settings.get("open_region", {})
@@ -657,7 +725,7 @@ class ProjectTreeWidget(QWidget):
                 names.append(name)
         return names
 
-    def _refresh_outputs(self) -> None:
+    def _refresh_outputs(self, expand_simulation: str | None = None) -> None:
         node = getattr(self, "_o_node", None)
         if node is None:
             return
@@ -686,7 +754,9 @@ class ProjectTreeWidget(QWidget):
         for sim_name in sim_names:
             sim_node = self._make_section(node, sim_name)
             sim_node.setData(0, Qt.UserRole, ("__out_sim__", sim_name))
-            sim_node.setExpanded(sim_name in expanded_simulations)
+            sim_node.setExpanded(
+                sim_name in expanded_simulations or sim_name == expand_simulation
+            )
             rows = grouped.get(sim_name, [])
             for out_idx, output in rows:
                 name = str(output.get("name", f"Output_{out_idx+1}")).strip() or f"Output_{out_idx+1}"
@@ -742,6 +812,10 @@ class ProjectTreeWidget(QWidget):
         default_row = QTreeWidgetItem(["Default resolution (1/λ)", _format_locale_number(default_fraction)])
         default_row.setData(0, Qt.UserRole, ("__mesh_default__", 0))
         node.addChild(default_row)
+
+        if hasattr(self, "_m_scale_item"):
+            scale_factor = float(mesh_cfg.get("emerge_scale_factor", 1.0))
+            self._m_scale_item.setText(1, _format_locale_number(scale_factor))
 
         obj_res = mesh_cfg.get("object_resolutions", {})
         if not isinstance(obj_res, dict):
@@ -820,6 +894,9 @@ class ProjectTreeWidget(QWidget):
                 return
             if tag == "__mesh_default__":
                 self._edit_default_mesh_resolution()
+                return
+            if tag == "__emerge_scale_factor__":
+                self._edit_emerge_scale_factor()
                 return
             if tag == "__open_region__":
                 self._edit_open_region_domain()
@@ -1366,6 +1443,32 @@ class ProjectTreeWidget(QWidget):
         self._refresh_object_mesh_assignments()
         self.settings_changed.emit()
 
+    def _edit_emerge_scale_factor(self) -> None:
+        mesh_cfg = self._settings.get("mesh", {})
+        if not isinstance(mesh_cfg, dict):
+            mesh_cfg = {}
+            self._settings["mesh"] = mesh_cfg
+        try:
+            current = float(mesh_cfg.get("emerge_scale_factor", 1.0))
+        except (TypeError, ValueError):
+            current = 1.0
+        if not math.isfinite(current):
+            current = 1.0
+        value, ok = QInputDialog.getDouble(
+            self,
+            "EMERGE Geometry Scale",
+            "Experimental scale factor (1 disables scaling):",
+            max(1.0, min(1_000_000.0, current)),
+            1.0,
+            1_000_000.0,
+            3,
+        )
+        if not ok:
+            return
+        mesh_cfg["emerge_scale_factor"] = float(value)
+        self._refresh_object_mesh_assignments()
+        self.settings_changed.emit()
+
     def _add_simulation_dialog(self) -> None:
         sims = self._settings.setdefault("simulations", [])
         if not isinstance(sims, list):
@@ -1469,7 +1572,7 @@ class ProjectTreeWidget(QWidget):
         if created is None:
             return
         outputs.append(created)
-        self._refresh_outputs()
+        self._refresh_outputs(expand_simulation=str(created.get("simulation", "")))
         self.settings_changed.emit()
 
     def _edit_output_dialog(self, index: int) -> None:
@@ -1528,6 +1631,7 @@ class ProjectTreeWidget(QWidget):
             "name": str(output.get("name", f"Output_{index + 1}")).strip() or f"Output_{index + 1}",
             "simulation": str(output.get("simulation", "")).strip(),
             "plot_type": str(output.get("plot_type", "plot_sp")).strip() or "plot_sp",
+            "plot_mode": str(output.get("plot_mode", "final")).strip().lower(),
             "enabled": bool(output.get("enabled", True)),
             "params": dict(output.get("params", {})) if isinstance(output.get("params", {}), dict) else {},
         }
@@ -1558,6 +1662,12 @@ class ProjectTreeWidget(QWidget):
         cb_enabled = QComboBox(dlg)
         cb_enabled.addItems(["Enabled", "Disabled"])
         cb_enabled.setCurrentText("Enabled" if bool(initial.get("enabled", True)) else "Disabled")
+
+        cb_plot_mode = QComboBox(dlg)
+        cb_plot_mode.addItem("After simulation", "final")
+        cb_plot_mode.addItem("Live (progressive S-parameters)", "live")
+        current_plot_mode = str(initial.get("plot_mode", "final")).strip().lower()
+        cb_plot_mode.setCurrentIndex(max(0, cb_plot_mode.findData(current_plot_mode)))
 
         params = initial.get("params", {}) if isinstance(initial.get("params", {}), dict) else {}
         configured_ports = self._settings.get("ports", [])
@@ -1630,13 +1740,43 @@ class ProjectTreeWidget(QWidget):
         form.addRow("Simulation", cb_sim)
         form.addRow("Plot type", cb_type)
         form.addRow("State", cb_enabled)
+        form.addRow("Plot timing", cb_plot_mode)
         form.addRow("S-parameters (output × input)", s_parameter_matrix)
         form.addRow("Far-field plane", cb_plane)
         form.addRow("Polar view", cb_polar_view)
         form.addRow("Far-field frequency", farfield_frequency)
-        s_parameter_rows = (4,)
-        farfield_rows = (5, 7)
-        polar_view_rows = (6,)
+        s_parameter_rows = (5,)
+        farfield_rows = (6, 8)
+        polar_view_rows = (7,)
+
+        def update_plot_mode_availability(_value: str = "") -> None:
+            s_parameter_plot = cb_type.currentText().strip() in {"plot_sp", "plot_vswr", "smith", "plot"}
+            selected_simulation = next(
+                (
+                    sim for sim in self._settings.get("simulations", [])
+                    if isinstance(sim, dict)
+                    and str(sim.get("name", "")).strip() == cb_sim.currentText().strip()
+                ),
+                {},
+            )
+            live_supported = (
+                s_parameter_plot
+                and str(selected_simulation.get("type", "")).strip().lower()
+                in {"sweep", "parametric"}
+                and bool(selected_simulation.get("progressive_sparams_enabled", False))
+            )
+            cb_plot_mode.setEnabled(live_supported)
+            cb_plot_mode.setToolTip(
+                "Live plots require an S-parameter output and a Sweep or Parametric simulation with progressive plotting enabled."
+                if not live_supported
+                else "Update this plot as progressive simulation results arrive."
+            )
+            if not live_supported:
+                cb_plot_mode.setCurrentIndex(0)
+
+        update_plot_mode_availability()
+        cb_type.currentTextChanged.connect(update_plot_mode_availability)
+        cb_sim.currentTextChanged.connect(update_plot_mode_availability)
 
         def update_parameter_visibility(plot_type: str) -> None:
             is_s_parameter = plot_type in {"plot_sp", "plot_vswr", "smith", "plot"}
@@ -1645,6 +1785,7 @@ class ProjectTreeWidget(QWidget):
             is_farfield = plot_type in {"plot_ff", "plot_ff_polar", "plot_ff_3d"}
             for row in farfield_rows:
                 form.setRowVisible(row, is_farfield)
+            form.setRowVisible(4, is_s_parameter)
             is_3d_polar = plot_type == "plot_ff_3d"
             for row in polar_view_rows:
                 form.setRowVisible(row, is_3d_polar)
@@ -1674,6 +1815,7 @@ class ProjectTreeWidget(QWidget):
             "name": le_name.text().strip() or "Output",
             "simulation": cb_sim.currentText().strip(),
             "plot_type": cb_type.currentText().strip(),
+            "plot_mode": str(cb_plot_mode.currentData() or "final"),
             "enabled": cb_enabled.currentText() == "Enabled",
             "params": {
                 "s_parameter": selected_parameters[0],
@@ -1713,13 +1855,39 @@ class ProjectTreeWidget(QWidget):
         points_formula = str(initial.get("NumberOfPointsFormula") or "").strip()
         le_points = QLineEdit(points_formula or str(initial_points))
         le_modes = QLineEdit(str(int(initial.get("EigenmodeCount", 5))))
-        le_param_name = QLineEdit(str(initial.get("ParamName", "")))
         le_param_values = QLineEdit(str(initial.get("ParamValues", "")))
+        values_mode = str(
+            initial.get("ParamValuesMode")
+            or ("list" if le_param_values.text().strip() else "range")
+        ).strip().lower()
+        cb_param_values_mode = QComboBox(dlg)
+        cb_param_values_mode.setObjectName("parametricValuesMode")
+        cb_param_values_mode.addItem("Range", "range")
+        cb_param_values_mode.addItem("Explicit values (CSV)", "list")
+        cb_param_values_mode.setCurrentIndex(
+            max(0, cb_param_values_mode.findData(values_mode))
+        )
+        le_param_start = QLineEdit(str(initial.get("ParamStart", "0")))
+        le_param_start.setObjectName("parametricStart")
+        le_param_end = QLineEdit(str(initial.get("ParamEnd", "1")))
+        le_param_end.setObjectName("parametricEnd")
+        le_param_step = QLineEdit(str(initial.get("ParamStep", "1")))
+        le_param_step.setObjectName("parametricStep")
         variables = [
             str(entry.get("name", "")).strip()
             for entry in self._settings.get("parameters", [])
             if isinstance(entry, dict) and str(entry.get("name", "")).strip()
         ]
+        cb_param_name = QComboBox(dlg)
+        cb_param_name.setObjectName("parametricParameterName")
+        cb_param_name.setToolTip("Select a parameter defined in the project Parameters table.")
+        cb_param_name.addItem("Select parameter", "")
+        for variable in dict.fromkeys(variables):
+            cb_param_name.addItem(variable, variable)
+        selected_param_index = cb_param_name.findData(str(initial.get("ParamName", "")).strip())
+        if selected_param_index >= 0:
+            cb_param_name.setCurrentIndex(selected_param_index)
+        cb_param_name.setEnabled(bool(variables))
         active_variable = QComboBox(dlg)
         active_variable.addItem("None", "")
         active_variable.addItems(variables)
@@ -1736,6 +1904,20 @@ class ProjectTreeWidget(QWidget):
         fit_config = initial.get("sparam_fitting", {}) if isinstance(initial.get("sparam_fitting", {}), dict) else {}
         fit_check = QCheckBox("Enable S-parameter line fitting", dlg)
         fit_check.setChecked(bool(fit_config.get("enabled", False)))
+        progressive_check = QCheckBox("Enable progressive S-parameter plotting", dlg)
+        progressive_check.setToolTip(
+            "Plots Sweep frequency chunks or each completed Parametric frequency sweep. Requires EMERGE 3.0.0a16."
+        )
+        progressive_check.setChecked(bool(initial.get("progressive_sparams_enabled", False)))
+        progressive_chunk_size = QSpinBox(dlg)
+        progressive_chunk_size.setObjectName("progressiveSparamsChunkSize")
+        progressive_chunk_size.setRange(1, 1000000)
+        progressive_chunk_size.setValue(
+            max(1, int(initial.get("progressive_sparams_chunk_size", 10)))
+        )
+        progressive_chunk_size.setToolTip(
+            "Emit a chart update after this many frequency points for each sweep, including each Parametric value."
+        )
         fit_points = QSpinBox(dlg)
         fit_points.setRange(8, 100001)
         fit_points.setSingleStep(1)
@@ -1754,12 +1936,18 @@ class ProjectTreeWidget(QWidget):
         form.addRow("Fstep [GHz]", le_fstep)
         form.addRow("Number of points", le_points)
         form.addRow("Eigenmode count", le_modes)
-        form.addRow("Parametric name", le_param_name)
+        form.addRow("Parametric name", cb_param_name)
+        form.addRow("Parameter values mode", cb_param_values_mode)
+        form.addRow("Parameter start", le_param_start)
+        form.addRow("Parameter end", le_param_end)
+        form.addRow("Parameter step", le_param_step)
         form.addRow("Parametric values (CSV)", le_param_values)
         form.addRow("Active variable", active_variable)
         form.addRow("Variable value", active_value)
         form.addRow("S-parameter fitting", fit_check)
         form.addRow("Fitting points", fit_points)
+        form.addRow("Progressive plot", progressive_check)
+        form.addRow("Update every N points", progressive_chunk_size)
         form.addRow("Log verbosity", cb_log)
 
         def _update_visibility(sim_type: str) -> None:
@@ -1769,14 +1957,30 @@ class ProjectTreeWidget(QWidget):
             for w in (le_fmin, le_fmax, le_fstep, le_points):
                 w.setVisible(is_sweep or is_param)
             le_modes.setVisible(is_eigen)
-            le_param_name.setVisible(is_param)
-            le_param_values.setVisible(is_param)
+            cb_param_name.setVisible(is_param)
+            cb_param_values_mode.setVisible(is_param)
+            range_mode = cb_param_values_mode.currentData() == "range"
+            for widget in (le_param_start, le_param_end, le_param_step):
+                widget.setVisible(is_param and range_mode)
+            le_param_values.setVisible(is_param and not range_mode)
             fit_check.setVisible(is_sweep or is_param)
             fit_points.setVisible(is_sweep or is_param)
             fit_points.setEnabled(fit_check.isChecked() and (is_sweep or is_param))
+            progressive_check.setEnabled(is_sweep or is_param)
+            progressive_chunk_size.setEnabled(
+                (is_sweep or is_param) and progressive_check.isChecked()
+            )
 
         _update_visibility(current_type)
         cb_type.currentTextChanged.connect(_update_visibility)
+        cb_param_values_mode.currentIndexChanged.connect(
+            lambda _index: _update_visibility(cb_type.currentText())
+        )
+        progressive_check.toggled.connect(
+            lambda checked: progressive_chunk_size.setEnabled(
+                cb_type.currentText() in {"Sweep", "Parametric"} and bool(checked)
+            )
+        )
         fit_check.toggled.connect(lambda checked: fit_points.setEnabled(bool(checked)))
 
         syncing_points = {"active": False}
@@ -1817,7 +2021,25 @@ class ProjectTreeWidget(QWidget):
         le_points.editingFinished.connect(update_step_from_points)
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
-        btns.accepted.connect(dlg.accept)
+
+        parametric_range = {"values": []}
+
+        def _accept_simulation() -> None:
+            if (
+                cb_type.currentText() == "Parametric"
+                and cb_param_values_mode.currentData() == "range"
+            ):
+                try:
+                    start = self._parse_formula_float(le_param_start.text())
+                    end = self._parse_formula_float(le_param_end.text())
+                    step = self._parse_formula_float(le_param_step.text())
+                    parametric_range["values"] = _parametric_range_values(start, end, step)
+                except (TypeError, ValueError, OverflowError) as exc:
+                    QMessageBox.warning(dlg, "Invalid parameter range", str(exc))
+                    return
+            dlg.accept()
+
+        btns.accepted.connect(_accept_simulation)
         btns.rejected.connect(dlg.reject)
         form.addRow(btns)
 
@@ -1828,6 +2050,13 @@ class ProjectTreeWidget(QWidget):
             sim_type = cb_type.currentText().strip().title()
             if sim_type not in _SIMULATION_TYPES:
                 sim_type = "Sweep"
+            if sim_type == "Parametric" and not str(cb_param_name.currentData() or "").strip():
+                QMessageBox.warning(
+                    dlg,
+                    "Parameter required",
+                    "Select a parameter from the project Parameters table.",
+                )
+                return
             fmin = self._parse_formula_float(le_fmin.text())
             fmax = self._parse_formula_float(le_fmax.text())
             fstep = self._parse_formula_float(le_fstep.text())
@@ -1851,12 +2080,22 @@ class ProjectTreeWidget(QWidget):
                 "NumberOfPointsFormula": le_points.text().strip() if re.search(r"[A-Za-z_]", le_points.text()) else "",
                 "ActiveVariable": str(active_variable.currentData() or ""),
                 "EigenmodeCount": int(modes),
-                "ParamName": le_param_name.text().strip(),
-                "ParamValues": le_param_values.text().strip(),
+                "ParamName": str(cb_param_name.currentData() or "").strip(),
+                "ParamValues": (
+                    ",".join(parametric_range["values"])
+                    if sim_type == "Parametric" and cb_param_values_mode.currentData() == "range"
+                    else le_param_values.text().strip()
+                ),
+                "ParamValuesMode": str(cb_param_values_mode.currentData()),
+                "ParamStart": le_param_start.text().strip(),
+                "ParamEnd": le_param_end.text().strip(),
+                "ParamStep": le_param_step.text().strip(),
                 "sparam_fitting": {
                     "enabled": bool(fit_check.isChecked()),
                     "points": int(fit_points.value()),
                 },
+                "progressive_sparams_enabled": bool(progressive_check.isChecked()),
+                "progressive_sparams_chunk_size": int(progressive_chunk_size.value()),
                 "LogVerbosity": log_v,
             }
         except Exception:

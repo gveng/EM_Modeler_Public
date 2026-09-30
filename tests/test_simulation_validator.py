@@ -223,6 +223,31 @@ def test_non_finite_point_and_pml_layer_values_are_reported_without_crashing():
     assert any(item.severity == "ERROR" and item.category == "Boundaries" and "PML parameters" in item.message for item in findings)
 
 
+def test_invalid_emerge_scale_factor_is_reported_before_export():
+    settings = _settings()
+    settings["mesh"] = {"emerge_scale_factor": float("inf")}
+
+    findings = validate_simulation([], settings)
+
+    assert any(
+        item.severity == "ERROR" and item.category == "Mesh" and "EMERGE scale factor" in item.message
+        for item in findings
+    )
+
+
+def test_missing_lumped_port_dimensions_are_reported_before_export():
+    findings = validate_simulation(
+        [],
+        _settings(),
+        exported_ports=[{"name": "P1", "type": "LumpedPort", "width": 0.01}],
+    )
+
+    assert any(
+        item.severity == "ERROR" and item.category == "Ports" and "width and height" in item.message
+        for item in findings
+    )
+
+
 def test_closed_waveguide_uses_unique_air_fill_without_open_region_boundaries():
     air = BoxObject("AIR", 1.0, 0.0, 1.0, 23.86, 50.0, 11.16, "AIR")
     wall = BoxObject("Cut_Box_1", 0.0, 0.0, 0.0, 24.86, 50.0, 12.16, "PEC")

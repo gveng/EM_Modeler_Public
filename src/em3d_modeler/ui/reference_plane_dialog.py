@@ -65,6 +65,8 @@ class ReferencePlaneDialog(QDialog):
         self._viewport = viewport
         self._origin = list(current_origin)
         self._normal = list(current_normal)
+        self._active_origin = tuple(float(value) for value in current_origin)
+        self._active_normal = self._normalized_normal(current_normal)
         # Storage for 3-point plane definition
         self._three_pts: list = []
 
@@ -86,6 +88,31 @@ class ReferencePlaneDialog(QDialog):
             btn.clicked.connect(lambda _=False, n=nm: self._set_preset(n))
             preset_form.addWidget(btn)
         layout.addWidget(preset_group)
+
+        perpendicular_group = QGroupBox("Perpendicular to active plane")
+        perpendicular_layout = QHBoxLayout(perpendicular_group)
+        self._perpendicular_buttons = {}
+        for label, normal in (
+            ("XY", (0.0, 0.0, 1.0)),
+            ("XZ", (0.0, 1.0, 0.0)),
+            ("YZ", (1.0, 0.0, 0.0)),
+        ):
+            button = QPushButton(label)
+            button.setObjectName(f"perpendicular_plane_{label}")
+            button.setToolTip(
+                f"Create a plane parallel to {label} and perpendicular to the active plane."
+            )
+            button.clicked.connect(
+                lambda _=False, n=normal: self._set_perpendicular_preset(n)
+            )
+            self._perpendicular_buttons[label] = button
+            perpendicular_layout.addWidget(button)
+        self._perpendicular_status = QLabel()
+        self._perpendicular_status.setWordWrap(True)
+        layout.addWidget(perpendicular_group)
+        layout.addWidget(self._perpendicular_status)
+        self._update_perpendicular_presets()
+
         # ── Pick from 3D viewport ──────────────────────────────────
         pick_group = QGroupBox("Pick from 3D viewport")
         pick_layout = QVBoxLayout(pick_group)
@@ -181,6 +208,47 @@ class ReferencePlaneDialog(QDialog):
         self._nx.setValue(normal[0])
         self._ny.setValue(normal[1])
         self._nz.setValue(normal[2])
+
+    @staticmethod
+    def _normalized_normal(normal) -> Vec3:
+        values = tuple(float(value) for value in normal)
+        magnitude = math.sqrt(sum(value * value for value in values))
+        if not math.isfinite(magnitude) or magnitude < 1e-12:
+            return (0.0, 0.0, 1.0)
+        return tuple(value / magnitude for value in values)
+
+    def set_active_plane(self, origin: Vec3, normal: Vec3) -> None:
+        """Refresh the geometric reference used by perpendicular presets."""
+        self._active_origin = tuple(float(value) for value in origin)
+        self._active_normal = self._normalized_normal(normal)
+        self._update_perpendicular_presets()
+
+    def _update_perpendicular_presets(self) -> None:
+        valid_count = 0
+        for label, normal in (
+            ("XY", (0.0, 0.0, 1.0)),
+            ("XZ", (0.0, 1.0, 0.0)),
+            ("YZ", (1.0, 0.0, 0.0)),
+        ):
+            perpendicular = abs(sum(
+                self._active_normal[index] * normal[index]
+                for index in range(3)
+            )) <= 1e-6
+            self._perpendicular_buttons[label].setEnabled(perpendicular)
+            valid_count += int(perpendicular)
+        if valid_count:
+            self._perpendicular_status.setText(
+                "Choose an axis-aligned orientation perpendicular to the active plane."
+            )
+        else:
+            self._perpendicular_status.setText(
+                "No XY, XZ, or YZ orientation is perpendicular to the active plane."
+            )
+
+    def _set_perpendicular_preset(self, normal: tuple) -> None:
+        self._set_origin(self._active_origin)
+        self._set_preset(normal)
+        self._rot_spin.setValue(0.0)
 
     # ─────────────────────────────────────────────────── 3D pick handlers
     def _arm_pick(self, kind: str, callback) -> None:

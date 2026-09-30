@@ -35,8 +35,23 @@ $pythonPath = $pythonCommand.Source
 $dependencyCheck = @'
 import importlib.util
 import sys
-required = ('PyInstaller', 'emerge', 'emsutil', 'OCP', 'gmsh', 'pyvista', 'vtk', 'trame', 'scipy', 'numpy', 'matplotlib', 'PySide6')
+required = ('PyInstaller', 'emerge', 'emerge_config', 'emerge_iron', 'emsutil', 'OCP', 'gmsh', 'pyvista', 'vtk', 'trame', 'scipy', 'numpy', 'matplotlib', 'PySide6', 'cupy', 'cupy_backends', 'cuda', 'nvmath')
 missing = [name for name in required if importlib.util.find_spec(name) is None]
+from pathlib import Path
+nvidia = Path(sys.prefix) / 'Lib' / 'site-packages' / 'nvidia'
+cuda12_dlls = (
+    'cu12/bin/cudss64_0.dll',
+    'cu12/bin/cudss_mtlayer_vcomp140.dll',
+    'cublas/bin/cublas64_12.dll',
+    'cublas/bin/cublasLt64_12.dll',
+    'cuda_runtime/bin/cudart64_12.dll',
+    'cusparse/bin/cusparse64_12.dll',
+    'nvjitlink/bin/nvJitLink_120_0.dll',
+)
+missing.extend('CuDSS CUDA 12 DLL: ' + str(nvidia / item) for item in cuda12_dlls if not (nvidia / item).is_file())
+mkl_runtime = Path(sys.prefix) / 'Library' / 'bin'
+if not any(mkl_runtime.glob('mkl_rt*.dll')):
+    missing.append('PARDISO runtime mkl_rt*.dll in ' + str(mkl_runtime))
 if missing:
     print('Missing build/runtime packages: ' + ', '.join(missing), file=sys.stderr)
     raise SystemExit(1)
@@ -61,9 +76,30 @@ try {
 
     $internalBin = Join-Path $internal 'bin'
     $portableBin = Join-Path $bundle 'bin'
+    foreach ($dllName in @(
+        'cudss64_0.dll',
+        'cudss_mtlayer_vcomp140.dll',
+        'cublas64_12.dll',
+        'cublasLt64_12.dll',
+        'cudart64_12.dll',
+        'cusparse64_12.dll',
+        'nvJitLink_120_0.dll'
+    )) {
+        if (-not (Test-Path (Join-Path $internalBin $dllName))) {
+            throw "CuDSS CUDA 12 runtime DLL is missing from the portable bundle: $dllName"
+        }
+    }
     if (Test-Path $internalBin) {
         New-Item -ItemType Directory -Force -Path $portableBin | Out-Null
         Copy-Item -Path (Join-Path $internalBin '*') -Destination $portableBin -Recurse -Force
+    }
+
+    foreach ($resourceDirectory in @('docs', 'Icons')) {
+        $internalResource = Join-Path $internal $resourceDirectory
+        $portableResource = Join-Path $bundle $resourceDirectory
+        if (Test-Path $internalResource) {
+            Copy-Item -LiteralPath $internalResource -Destination $portableResource -Recurse -Force
+        }
     }
 
     foreach ($relativePath in @(

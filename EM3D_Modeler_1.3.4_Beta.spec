@@ -5,8 +5,8 @@ import sys
 from PyInstaller.utils.hooks import collect_all, collect_submodules
 
 _runtime_packages = [
-    "emerge", "emsutil", "OCP", "scipy", "numpy", "matplotlib",
-    "pyvista", "vtk", "trame", "gmsh", "shapely",
+    "emerge", "emerge_config", "emerge_iron", "emsutil", "OCP", "scipy", "numpy", "matplotlib",
+    "pyvista", "vtk", "trame", "gmsh", "shapely", "cupy", "cupy_backends", "cuda", "nvmath",
 ]
 _runtime_datas = []
 _runtime_binaries = []
@@ -27,6 +27,34 @@ _runtime_hiddenimports = sorted({
     _module for _module in _runtime_hiddenimports
     if ".tests" not in _module and not _module.endswith(".conftest")
 })
+_runtime_hiddenimports.append("graphlib")
+
+_mkl_bin = Path(sys.prefix) / "Library" / "bin"
+_mkl_dlls = []
+for _pattern in ("mkl_*.dll", "libiomp5md.dll", "tbb*.dll"):
+    _mkl_dlls.extend(_mkl_bin.glob(_pattern))
+if not any(_dll.name.lower().startswith("mkl_rt") for _dll in _mkl_dlls):
+    raise RuntimeError(f"PARDISO runtime mkl_rt*.dll not found in {_mkl_bin}")
+_runtime_binaries.extend((str(_dll), "bin") for _dll in _mkl_dlls)
+
+_nvidia_site = Path(sys.prefix) / "Lib" / "site-packages" / "nvidia"
+_cuda12_dlls = {
+    "cu12/bin": ("cudss64_0.dll", "cudss_mtlayer_vcomp140.dll"),
+    "cublas/bin": ("cublas64_12.dll", "cublasLt64_12.dll"),
+    "cuda_runtime/bin": ("cudart64_12.dll",),
+    "cusparse/bin": ("cusparse64_12.dll",),
+    "nvjitlink/bin": ("nvJitLink_120_0.dll",),
+}
+_missing_cuda12_dlls = []
+for _relative_dir, _dll_names in _cuda12_dlls.items():
+    for _dll_name in _dll_names:
+        _dll_path = _nvidia_site / _relative_dir / _dll_name
+        if not _dll_path.is_file():
+            _missing_cuda12_dlls.append(str(_dll_path))
+        else:
+            _runtime_binaries.append((str(_dll_path), "bin"))
+if _missing_cuda12_dlls:
+    raise RuntimeError("CuDSS CUDA 12 runtime DLLs missing: " + ", ".join(_missing_cuda12_dlls))
 
 _gmsh_dll = Path(sys.prefix) / "Lib" / "gmsh-4.14.dll"
 if _gmsh_dll.exists():

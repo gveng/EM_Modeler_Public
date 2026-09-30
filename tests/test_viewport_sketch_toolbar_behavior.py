@@ -641,9 +641,10 @@ def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions(
         "_start_draw", "_open_region_pml_wizard", "_open_sketch",
         "_create_plate_from_face", "_bool_cut", "_bool_fuse", "_bool_common",
         "_scale_selected_objects", "_move_selection_to_plane_origin",
-        "_create_object_pattern", "_bool_dissolve", "_import_step",
+        "_create_object_pattern", "_copy_selected_object_by_vertices",
+        "_bool_dissolve", "_import_step",
         "_open_simulation_window", "_on_check_simulation", "_on_selection_mode_changed",
-        "_sync_projection_action",
+        "_sync_projection_action", "_open_measure_tool", "_open_project_parameters",
     ):
         setattr(window, name, Mock())
 
@@ -666,6 +667,17 @@ def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions(
 
     main_groups = groups_by_title(window._main_toolbar)
     sketch_groups = groups_by_title(window._sketch_context_toolbar)
+    main_3d_buttons = main_groups["3D"].findChildren(QToolButton)
+    assert [button.defaultAction().text() for button in main_3d_buttons] == [
+        "Box", "Cylinder", "Cone", "Sphere", "Open Region / PML", "Import STEP",
+    ]
+    simulation_buttons = main_groups["Simulation"].findChildren(QToolButton)
+    assert [button.defaultAction().text() for button in simulation_buttons] == [
+        "Check Simulation", "Play",
+    ]
+    tools_buttons = main_groups["Tools"].findChildren(QToolButton)
+    assert [button.defaultAction().text() for button in tools_buttons] == ["Measure", "Parameters"]
+    assert all(not button.defaultAction().icon().isNull() for button in tools_buttons)
     main_2d_buttons = main_groups["2D"].findChildren(QToolButton)
     assert [button.defaultAction().text() for button in main_2d_buttons] == [
         "Sketch", "Planar", "Plate from Face/Edge", "Circular Plate",

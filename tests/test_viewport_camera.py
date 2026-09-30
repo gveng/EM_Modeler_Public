@@ -6,6 +6,7 @@ import pytest
 import vtk
 
 from em3d_modeler.ui.viewport_widget import Viewport3DWidget
+from em3d_modeler.ui.main_window import MainWindow
 
 
 class _Signal:
@@ -68,3 +69,30 @@ def test_projection_toggle_preserves_framing_and_round_trips_camera_state():
     assert camera.GetPosition() == pytest.approx(initial_position)
     assert viewport.projection_changed.values == [True, False]
     assert restored_viewport.projection_changed.values == [True]
+
+
+def test_top_and_bottom_views_are_opposites_and_fit_visible_scene():
+    camera = SimpleNamespace(
+        SetPosition=Mock(),
+        SetFocalPoint=Mock(),
+        SetViewUp=Mock(),
+    )
+    viewport = SimpleNamespace(
+        _renderer=SimpleNamespace(
+            GetActiveCamera=lambda: camera,
+            ResetCameraClippingRange=Mock(),
+        ),
+        _render=Mock(),
+        fit_all=Mock(),
+    )
+    window = SimpleNamespace(_viewport=viewport)
+
+    MainWindow._set_view(window, "top")
+    assert camera.SetPosition.call_args.args == (0, 0, 300)
+    camera.SetPosition.reset_mock()
+    camera.SetViewUp.reset_mock()
+
+    MainWindow._set_view(window, "bottom")
+    assert camera.SetPosition.call_args.args == (0, 0, -300)
+    assert camera.SetViewUp.call_args.args == (0, 1, 0)
+    assert viewport.fit_all.call_count == 2

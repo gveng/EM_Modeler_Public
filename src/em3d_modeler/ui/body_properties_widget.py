@@ -111,6 +111,7 @@ class BodyPropertiesWidget(QWidget):
     material_added = Signal(str)
     material_picker_requested = Signal(str, list)
     project_parameters_changed = Signal(list)
+    content_changed = Signal(bool)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -118,6 +119,7 @@ class BodyPropertiesWidget(QWidget):
         self._selection: List[EMObject] = []
         self._blocked = False
         self._project_mode = False
+        self._has_content = False
         self._formula_resolver = None
         self._project_variable_names: List[str] = []
         self._materials: List[str] = ["PEC"]
@@ -309,6 +311,15 @@ class BodyPropertiesWidget(QWidget):
             self._table.setVisible(True)
         finally:
             self._blocked = False
+        self._set_panel_content(True)
+
+    @property
+    def has_content(self) -> bool:
+        return self._has_content
+
+    def _set_panel_content(self, has_content: bool) -> None:
+        self._has_content = bool(has_content)
+        self.content_changed.emit(self._has_content)
 
     def set_formula_resolver(self, resolver) -> None:
         self._formula_resolver = resolver
@@ -388,9 +399,11 @@ class BodyPropertiesWidget(QWidget):
         self._apply_color_bulk_chk.setEnabled(False)
         self._apply_color_bulk_chk.setVisible(False)
         self._apply_btn.setVisible(False)
+        self._set_panel_content(False)
 
     def _refresh_single(self, obj: EMObject) -> None:
         self._set_content_visible(True)
+        self._set_panel_content(True)
         self._title.setText("Properties")
         self._name_widget.setVisible(True)
         self._name_edit.setText(obj.name)
@@ -478,6 +491,7 @@ class BodyPropertiesWidget(QWidget):
 
     def _refresh_multi(self, objects: List[EMObject]) -> None:
         self._set_content_visible(True)
+        self._set_panel_content(True)
         self._title.setText("Properties")
         self._name_widget.setVisible(False)
         self._table.setRowCount(0)

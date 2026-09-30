@@ -1,4 +1,7 @@
 import os
+import json
+import math
+from pathlib import Path
 from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 from copy import deepcopy
@@ -26,12 +29,605 @@ def _main_window_stub(viewport):
     )
 
 
+def test_progressive_stdout_parser_buffers_split_json_lines():
+    payload = {
+        "simulation": "Sweep",
+        "frequencies": [1e9],
+        "s_matrices": [[[[0.1, 0.0]]]],
+        "completed_samples": 1,
+        "expected_samples": 1,
+        "complete": True,
+    }
+    process = SimpleNamespace(readAllStandardOutput=Mock(side_effect=[
+        b"EM3D_SPARAM_PROG",
+        ("RESS:" + json.dumps(payload) + "\n[info] done\n").encode(),
+    ]))
+    window = SimpleNamespace(
+        _sim_process=process,
+        _sim_stdout_buffer="",
+        _update_progressive_sparams_plot=Mock(),
+        _append_sim_log=Mock(),
+    )
+    window._process_sim_stdout_line = MethodType(MainWindow._process_sim_stdout_line, window)
+
+    MainWindow._on_sim_process_output(window)
+    assert window._sim_stdout_buffer == "EM3D_SPARAM_PROG"
+    MainWindow._on_sim_process_output(window)
+
+    window._update_progressive_sparams_plot.assert_called_once_with(payload)
+    window._append_sim_log.assert_called_once_with("[info] done")
+    assert window._sim_stdout_buffer == ""
+
+
+def test_completed_job_stdout_event_dispatches_final_output_plotting():
+    window = SimpleNamespace(
+        _plot_completed_simulation_outputs=Mock(),
+        _append_sim_log=Mock(),
+    )
+
+    MainWindow._process_sim_stdout_line(
+        window,
+        'EM3D_JOB_COMPLETED:{"name":"Sweep","filename":"sweep.py"}',
+    )
+
+    window._plot_completed_simulation_outputs.assert_called_once_with("Sweep")
+    window._append_sim_log.assert_not_called()
+
+
+def test_progressive_plot_preserves_s_output_input_orientation():
+    show_chart = Mock()
+    window = SimpleNamespace(
+        _sim_progressive_plot_data=None,
+        _project_tree=SimpleNamespace(get_settings=lambda: {
+            "simulations": [{
+                "name": "Sweep",
+                "type": "Sweep",
+                "progressive_sparams_enabled": True,
+            }],
+            "outputs": [{
+                "name": "Selected Sij",
+                "simulation": "Sweep",
+                "plot_type": "plot_sp",
+                "params": {"s_parameters": ["S12", "S21"]},
+            }],
+        }),
+        _show_chart=show_chart,
+    )
+    payload = {
+        "simulation": "Sweep",
+        "frequencies": [1e9],
+        "s_matrices": [[[[0.1, 0.0], [0.2, 0.0]], [[0.3, 0.0], [0.4, 0.0]]]],
+        "completed_samples": 1,
+        "expected_samples": 1,
+        "complete": True,
+    }
+
+    MainWindow._update_progressive_sparams_plot(window, payload)
+
+    series = show_chart.call_args.args[1]["series"]
+    assert {item["label"]: item["values"] for item in series} == {
+        "S11": [0.1 + 0.0j],
+        "S12": [0.2 + 0.0j],
+        "S21": [0.3 + 0.0j],
+        "S22": [0.4 + 0.0j],
+    }
+    assert [item["visible"] for item in series] == [False, True, True, False]
+    assert show_chart.call_args.kwargs == {"progressive": True}
+
+
+def test_parametric_progressive_events_add_one_trace_per_parameter_value(monkeypatch):
+    show_chart = Mock()
+    monkeypatch.setattr(MainWindow, "_refresh_simulation_status", Mock())
+    window = SimpleNamespace(
+        _sim_progressive_plot_data=None,
+        _project_tree=SimpleNamespace(get_settings=lambda: {
+            "simulations": [{
+                "name": "Parametric",
+                "type": "Parametric",
+                "progressive_sparams_enabled": True,
+            }],
+            "outputs": [{
+                "name": "Width sweep",
+                "simulation": "Parametric",
+                "plot_type": "plot_sp",
+                "params": {"s_parameters": ["S11"]},
+            }],
+        }),
+        _show_chart=show_chart,
+    )
+    window._update_progressive_parametric_sparams_plot = MethodType(
+        MainWindow._update_progressive_parametric_sparams_plot, window
+    )
+
+    for index, value in enumerate(("0.2", "0.4"), start=1):
+        for chunk_start, frequencies, values in (
+            (0, [1e9], [index / 10]),
+            (1, [2e9], [index / 5]),
+        ):
+            MainWindow._update_progressive_sparams_plot(window, {
+                "simulation": "Parametric",
+                "parameter_name": "width",
+                "parameter_value": value,
+                "parameter_index": index,
+                "completed_parameters": index,
+                "expected_parameters": 2,
+                "chunk_start": chunk_start,
+                "completed_samples": chunk_start + 1,
+                "expected_samples": 2,
+                "frequencies": frequencies,
+                "s_matrices": [[[[sample_value, 0.0]]] for sample_value in values],
+                "complete": chunk_start == 1,
+            })
+            if index == 2 and chunk_start == 0:
+                partial_chart = show_chart.call_args.args[1]
+                assert [item["x_values"] for item in partial_chart["series"]] == [
+                    [1.0, 2.0], [1.0],
+                ]
+
+    chart_data = show_chart.call_args.args[1]
+    assert [item["file_name"] for item in chart_data["series"]] == [
+        "width=0.2", "width=0.4",
+    ]
+    assert [item["values"] for item in chart_data["series"]] == [
+        [0.1 + 0j, 0.2 + 0j], [0.2 + 0j, 0.4 + 0j],
+    ]
+    assert show_chart.call_args.kwargs == {"progressive": True}
+
+
+def test_reset_progressive_plot_clears_existing_live_output_chart():
+    chart_view = Mock()
+    window = SimpleNamespace(
+        _sim_progressive_plot_data={"simulation": "Sweep"},
+        _sim_stdout_buffer="partial line",
+        _project_tree=SimpleNamespace(get_settings=lambda: {
+            "simulations": [{
+                "name": "Sweep",
+                "type": "Sweep",
+                "progressive_sparams_enabled": True,
+            }],
+            "outputs": [{
+                "name": "Output_1",
+                "simulation": "Sweep",
+                "plot_type": "plot_sp",
+                "enabled": True,
+            }],
+        }),
+        _plot_views={"Sweep::Output_1": chart_view},
+    )
+
+    MainWindow._reset_progressive_sparams_plot(window)
+
+    assert window._sim_progressive_plot_data is None
+    assert window._sim_stdout_buffer == ""
+    chart_view.clear_data.assert_called_once_with()
+
+
+def test_final_plot_uses_first_results_directory_with_simdata():
+    empty_results = Path("unused.EMResults")
+    valid_results = Path("project.EMResults")
+    plot_output = Mock()
+    window = SimpleNamespace(
+        _project_tree=SimpleNamespace(get_settings=lambda: {
+            "outputs": [{"name": "Output_1", "simulation": "Sweep", "enabled": True}],
+        }),
+        _candidate_results_dirs_for_sim=lambda _name: [empty_results, valid_results],
+        _simdata_file_in_dir=lambda path: Path(path) == valid_results,
+        _on_output_plot_requested=plot_output,
+        _append_sim_log=Mock(),
+    )
+
+    MainWindow._plot_completed_simulation_outputs(window, "Sweep")
+
+    assert plot_output.call_args.kwargs == {"results_dir": valid_results}
+
+
+def test_completed_parametric_job_keeps_existing_live_chart():
+    plot_output = Mock()
+    window = SimpleNamespace(
+        _project_tree=SimpleNamespace(get_settings=lambda: {
+            "simulations": [{
+                "name": "Parametric",
+                "type": "Parametric",
+                "progressive_sparams_enabled": True,
+            }],
+            "outputs": [{
+                "name": "Width sweep",
+                "simulation": "Parametric",
+                "plot_mode": "live",
+                "enabled": True,
+            }],
+        }),
+        _candidate_results_dirs_for_sim=lambda _name: [Path("results")],
+        _simdata_file_in_dir=lambda path: Path(path),
+        _simulation_bundle_dir=lambda: Path("bundle"),
+        _plot_views={"Parametric::Width sweep": object()},
+        _sim_progressive_plot_data={
+            "simulation": "Parametric",
+            "expected_parameters": 1,
+            "expected_samples": 2,
+            "parameter_runs": {
+                1: {"value": "0.2", "frequencies": [1e9, 2e9]},
+            },
+        },
+        _on_output_plot_requested=plot_output,
+        _append_sim_log=Mock(),
+    )
+
+    MainWindow._plot_completed_simulation_outputs(window, "Parametric")
+
+    plot_output.assert_not_called()
+
+
+def test_completed_parametric_job_reloads_incomplete_live_chart():
+    plot_output = Mock()
+    result_dir = Path("results")
+    window = SimpleNamespace(
+        _project_tree=SimpleNamespace(get_settings=lambda: {
+            "outputs": [{
+                "name": "Width sweep",
+                "simulation": "Parametric",
+                "plot_mode": "live",
+                "enabled": True,
+            }],
+        }),
+        _candidate_results_dirs_for_sim=lambda _name: [result_dir],
+        _simdata_file_in_dir=lambda path: Path(path),
+        _simulation_bundle_dir=lambda: Path("bundle"),
+        _plot_views={"Parametric::Width sweep": object()},
+        _sim_progressive_plot_data={
+            "simulation": "Parametric",
+            "expected_parameters": 1,
+            "expected_samples": 4,
+            "parameter_runs": {
+                1: {"value": "0.2", "frequencies": [1e9, 2e9]},
+            },
+        },
+        _on_output_plot_requested=plot_output,
+        _append_sim_log=Mock(),
+    )
+
+    MainWindow._plot_completed_simulation_outputs(window, "Parametric")
+
+    assert plot_output.call_args.kwargs == {"results_dir": result_dir}
+
+
+def test_loading_legacy_touchstone_appends_to_source_chart(tmp_path, monkeypatch):
+    legacy_path = tmp_path / "previous_run.s2p"
+    legacy_path.write_text(
+        "# GHZ S RI R 50\n1 0.1 0 0.2 0 0.3 0 0.4 0\n",
+        encoding="ascii",
+    )
+    chart_view = SimpleNamespace(
+        selected_parameters=Mock(return_value=["S21", "S11"]),
+        configured_parameters=Mock(return_value=["S11"]),
+        add_file_data=Mock(),
+    )
+    window = SimpleNamespace(
+        _simulation_bundle_dir=Mock(return_value=tmp_path),
+        _plot_views={"Sweep::Configured output": chart_view},
+    )
+    monkeypatch.setattr(
+        main_window_module.QFileDialog,
+        "getOpenFileName",
+        Mock(return_value=(str(tmp_path / "Touchstone" / legacy_path.name), "")),
+    )
+
+    MainWindow._load_touchstone_for_chart(window, "Sweep::Configured output")
+
+    chart_view.add_file_data.assert_called_once()
+    x_values, series = chart_view.add_file_data.call_args.args
+    assert [item["label"] for item in series] == [
+        "S11", "S12", "S21", "S22",
+    ]
+    assert x_values == [1.0]
+    assert [item["visible"] for item in series] == [True, False, True, False]
+    assert {item["file_name"] for item in series} == {legacy_path.name}
+    assert (tmp_path / "Touchstone" / legacy_path.name).is_file()
+
+
+def test_generate_plot_uses_saved_touchstone_without_loading_emerge(tmp_path):
+    touchstone_dir = tmp_path / "Touchstone"
+    touchstone_dir.mkdir()
+    (touchstone_dir / "Model_Sweep_20260929-120000.s2p").write_text(
+        "# GHZ S RI R 50\n2 0.1 0 0.2 0 0.3 0 0.4 0\n",
+        encoding="ascii",
+    )
+    show_chart = Mock()
+    window = SimpleNamespace(
+        _project_name="Model",
+        _simulation_bundle_dir=Mock(return_value=tmp_path),
+        _load_sim_grid_from_results=Mock(side_effect=AssertionError("EMERGE result loader called")),
+        _show_chart=show_chart,
+        _info_bar=SimpleNamespace(set_info=Mock()),
+        _append_sim_log=Mock(),
+    )
+
+    MainWindow._on_output_plot_requested(
+        window,
+        {
+            "name": "Transmission",
+            "simulation": "Sweep",
+            "plot_type": "plot_sp",
+            "params": {"s_parameters": ["S21"]},
+        },
+    )
+
+    chart_key, chart_data = show_chart.call_args.args
+    assert chart_key == "Sweep::Transmission"
+    assert chart_data["x_values"] == [2.0]
+    assert [item["label"] for item in chart_data["series"]] == ["S11", "S12", "S21", "S22"]
+    assert [item["visible"] for item in chart_data["series"]] == [False, False, True, False]
+    assert chart_data["series"][2]["values"] == [0.2 + 0j]
+    assert chart_data["series"][0]["file_name"].endswith(".s2p")
+    window._load_sim_grid_from_results.assert_not_called()
+    window._append_sim_log.assert_called_once()
+
+
+def test_generate_plot_opens_empty_chart_when_simulation_has_no_results(tmp_path):
+    show_chart = Mock()
+    window = SimpleNamespace(
+        _project_name="Model",
+        _simulation_bundle_dir=Mock(return_value=tmp_path),
+        _candidate_results_dirs_for_sim=Mock(return_value=[tmp_path]),
+        _simdata_file_in_dir=Mock(return_value=None),
+        _load_sim_grid_from_results=Mock(side_effect=RuntimeError("no simdata")),
+        _show_chart=show_chart,
+        _info_bar=SimpleNamespace(set_info=Mock()),
+        _append_sim_log=Mock(),
+    )
+
+    MainWindow._on_output_plot_requested(window, {
+        "name": "First-run S-parameters",
+        "simulation": "Parametric",
+        "plot_type": "plot_sp",
+        "params": {"s_parameters": ["S11"]},
+    })
+
+    chart_key, chart_data = show_chart.call_args.args
+    assert chart_key == "Parametric::First-run S-parameters"
+    assert chart_data["x_values"] == []
+    assert chart_data["series"] == []
+    assert chart_data["plot_type"] == "plot_sp"
+    window._load_sim_grid_from_results.assert_called_once()
+    window._info_bar.set_info.assert_called_once()
+
+
+def test_generate_parametric_plot_uses_raw_results_when_grid_is_irregular(tmp_path):
+    scalar_data = SimpleNamespace(
+        _variables=[
+            {"freq": frequency, "width": value}
+            for value in (0.2, 0.4)
+            for frequency in (1e9, 2e9)
+        ],
+        _data_entries=[
+            SimpleNamespace(freq=frequency, Sp=[[complex(index, 0.5)]])
+            for index, frequency in enumerate((1e9, 2e9, 1e9, 2e9), start=1)
+        ],
+    )
+    simulation_data = tmp_path / "simdata.emerge"
+    loader = Mock(return_value=(object(), scalar_data, simulation_data))
+    show_chart = Mock()
+    window = SimpleNamespace(
+        _project_name="Model",
+        _project_tree=SimpleNamespace(get_settings=lambda: {
+            "simulations": [{
+                "name": "Simulation_2",
+                "type": "Parametric",
+                "ParamName": "width",
+                "ParamValues": "0.2,0.4",
+                "NumberOfPoints": 2,
+            }],
+        }),
+        _simulation_bundle_dir=Mock(return_value=tmp_path),
+        _load_sim_grid_from_results=loader,
+        _show_chart=show_chart,
+        _info_bar=SimpleNamespace(set_info=Mock()),
+        _append_sim_log=Mock(),
+    )
+
+    MainWindow._on_output_plot_requested(window, {
+        "name": "Output_2",
+        "simulation": "Simulation_2",
+        "plot_type": "plot_sp",
+        "params": {"s_parameters": ["S11"]},
+    })
+
+    loader.assert_called_once_with(
+        "Simulation_2", results_dir=None, allow_irregular=True
+    )
+    chart_key, chart_data = show_chart.call_args.args
+    assert chart_key == "Simulation_2::Output_2"
+    assert [series["file_name"] for series in chart_data["series"]] == [
+        "width=0.2", "width=0.4",
+    ]
+    assert [series["values"] for series in chart_data["series"]] == [
+        [1 + 0.5j, 2 + 0.5j], [3 + 0.5j, 4 + 0.5j],
+    ]
+
+
+def test_results_loader_can_return_raw_scalar_for_irregular_parametric_data(tmp_path):
+    result_dir = tmp_path / "Model_Simulation_2.EMResults"
+    result_dir.mkdir()
+    simdata = result_dir / "simdata.emerge"
+    simdata.write_text("", encoding="ascii")
+
+    class IrregularScalar:
+        _variables = [{"freq": 1e9}]
+        _data_entries = [SimpleNamespace(freq=1e9, Sp=[[1 + 0j]])]
+
+        @property
+        def grid(self):
+            raise ValueError("Data not in regular grid")
+
+    loaded_simulation = SimpleNamespace(
+        data=SimpleNamespace(mw=SimpleNamespace(scalar=IrregularScalar()))
+    )
+    window = SimpleNamespace(
+        _resolve_emerge_simulation_ctor=lambda: lambda *_args, **_kwargs: loaded_simulation,
+        _simdata_file_in_dir=lambda directory: (
+            Path(directory) / "simdata.emerge"
+            if (Path(directory) / "simdata.emerge").is_file()
+            else None
+        ),
+        _simulation_bundle_dir=lambda: tmp_path,
+    )
+
+    simulation, scalar, loaded_path = MainWindow._load_sim_grid_from_results(
+        window, "Simulation_2", result_dir, allow_irregular=True
+    )
+
+    assert simulation is loaded_simulation
+    assert isinstance(scalar, IrregularScalar)
+    assert loaded_path == simdata
+
+
+def test_completed_parametric_plot_uses_nested_touchstones_without_root_results(tmp_path):
+    touchstone_dir = (
+        tmp_path / "Model_Simulation_2" / "Step_001_width_0_2" / "Touchstone"
+    )
+    touchstone_dir.mkdir(parents=True)
+    (touchstone_dir / "Model_Simulation_2_width_0_2_20260930-120000.s1p").write_text(
+        "# HZ S RI R 50\n1000000000 0.2 0\n", encoding="ascii"
+    )
+    window = SimpleNamespace(
+        _project_tree=SimpleNamespace(get_settings=lambda: {
+            "simulations": [{"name": "Simulation_2", "type": "Parametric"}],
+            "outputs": [{
+                "name": "S-parameters",
+                "simulation": "Simulation_2",
+                "plot_type": "plot_sp",
+                "params": {"s_parameters": ["S11"]},
+            }],
+        }),
+        _candidate_results_dirs_for_sim=lambda _name: [],
+        _simdata_file_in_dir=lambda _path: None,
+        _simulation_bundle_dir=lambda: tmp_path,
+        _project_name="Model",
+        _append_sim_log=Mock(),
+        _on_output_plot_requested=Mock(),
+        _plot_views={},
+        _sim_progressive_plot_data=None,
+    )
+
+    MainWindow._plot_completed_simulation_outputs(window, "Simulation_2")
+
+    window._on_output_plot_requested.assert_called_once_with(
+        window._project_tree.get_settings()["outputs"][0],
+        results_dir=None,
+    )
+
+
+def test_final_parametric_plot_loads_every_touchstone_from_latest_run(tmp_path):
+    touchstone_dir = tmp_path / "Touchstone"
+    touchstone_dir.mkdir()
+    first = touchstone_dir / "Model_Parametric_width_0_2_20260929-120000.s1p"
+    second = touchstone_dir / "Model_Parametric_width_0_4_20260929-120000.s1p"
+    old = touchstone_dir / "Model_Parametric_width_0_2_20260928-120000.s1p"
+    for path, value in ((first, 0.2), (second, 0.4), (old, 0.9)):
+        path.write_text(f"# GHZ S RI R 50\n1 {value} 0\n", encoding="ascii")
+    show_chart = Mock()
+    window = SimpleNamespace(
+        _project_name="Model",
+        _simulation_bundle_dir=Mock(return_value=tmp_path),
+        _load_sim_grid_from_results=Mock(side_effect=AssertionError("EMERGE loader called")),
+        _show_chart=show_chart,
+        _info_bar=SimpleNamespace(set_info=Mock()),
+        _append_sim_log=Mock(),
+    )
+
+    MainWindow._on_output_plot_requested(window, {
+        "name": "Parametric S-parameters",
+        "simulation": "Parametric",
+        "plot_type": "plot_sp",
+        "params": {"s_parameters": ["S11"]},
+    })
+
+    chart_data = show_chart.call_args.args[1]
+    assert len(chart_data["series"]) == 2
+    assert {series["values"][0] for series in chart_data["series"]} == {0.2 + 0j, 0.4 + 0j}
+    assert {series["file_name"] for series in chart_data["series"]} == {first.name, second.name}
+
+
 def test_planar_face_pick_produces_centroid_and_unit_normal():
     plane = MainWindow._planar_face_sketch_plane({
         "points": [(2, 4, 1), (6, 4, 1), (6, 8, 1), (2, 8, 1)],
     })
 
     assert plane == ((4.0, 6.0, 1.0), (0.0, 0.0, 1.0))
+
+
+def test_measure_mode_temporarily_disables_cancel_drawing_shortcut():
+    cancel_action = Mock()
+    window = SimpleNamespace(_act_cancel_drawing=cancel_action)
+
+    MainWindow._set_cancel_drawing_enabled(window, True)
+    cancel_action.setEnabled.assert_called_with(False)
+
+    MainWindow._set_cancel_drawing_enabled(window, False)
+    cancel_action.setEnabled.assert_called_with(True)
+
+
+def test_copy_selected_object_by_vertices_preserves_orientation_and_moves_reference_vertex():
+    source_actor = Mock()
+    source = SimpleNamespace(name="Part", actor=source_actor)
+    clone_actor = Mock()
+    clone = SimpleNamespace(name="Part_Copy_2", actor=clone_actor)
+    scene = SimpleNamespace(
+        selection=[source],
+        objects=[source, SimpleNamespace(name="Part_Copy")],
+        add_object=Mock(),
+        deselect_all=Mock(),
+        select_add=Mock(),
+    )
+    pick_requests = []
+    viewport = SimpleNamespace(
+        scene=scene,
+        request_pick=lambda kind, callback, **kwargs: pick_requests.append((kind, callback, kwargs)),
+        _render=Mock(),
+        scene_changed=SimpleNamespace(emit=Mock()),
+        selection_changed=SimpleNamespace(emit=Mock()),
+    )
+    snapshot = {
+        "name": "Part",
+        "params": {"Name": "Part"},
+        "pattern_definition": {"pattern_id": "pattern"},
+        "pattern_instance": {"instance_index": 1},
+    }
+    window = SimpleNamespace(
+        _viewport=viewport,
+        _serialize_object_snapshot=Mock(return_value=snapshot),
+        _rebuild_object_from_snapshot=Mock(return_value=clone),
+        _refresh_materials=Mock(),
+        _sync_port_reference_state=Mock(),
+        _mark_simulation_dirty=Mock(),
+        _info_bar=SimpleNamespace(set_info=Mock()),
+    )
+
+    MainWindow._copy_selected_object_by_vertices(window)
+
+    assert len(pick_requests) == 1
+    kind, pick_reference, options = pick_requests[0]
+    assert kind == "vertex"
+    assert options == {"actor_filter": source_actor}
+    pick_reference((1.0, 2.0, 3.0))
+    assert len(pick_requests) == 2
+    target_kind, create_copy, target_options = pick_requests[1]
+    assert target_kind == "vertex"
+    assert target_options == {}
+
+    create_copy((4.5, -1.0, 5.0))
+
+    clone_actor.AddPosition.assert_called_once_with(3.5, -3.0, 2.0)
+    clone_data = window._rebuild_object_from_snapshot.call_args.args[0]
+    assert clone_data["name"] == "Part_Copy_2"
+    assert clone_data["params"]["Name"] == "Part_Copy_2"
+    assert clone_data["pattern_definition"] is None
+    assert clone_data["pattern_instance"] is None
+    scene.add_object.assert_called_once_with(clone)
+    scene.select_add.assert_called_once_with(clone)
+    viewport.scene_changed.emit.assert_called_once_with()
+    viewport.selection_changed.emit.assert_called_once_with([clone])
+    window._mark_simulation_dirty.assert_called_once_with(steps=True, script=True)
 
 
 def test_boolean_provenance_sync_only_serializes_changed_source():
@@ -349,6 +945,21 @@ def test_defined_plane_starts_pending_viewport_sketch_after_activation():
     assert window._sketch_after_plane_defined is False
 
 
+def test_scene_clear_resets_user_defined_reference_planes():
+    scene = SceneManager(vtk.vtkRenderer())
+    scene.add_reference_plane("Plane_Reference_Bottom", (0, 0, -5), (0, 0, 1))
+    scene.add_reference_plane("Plane_Reference_Top", (0, 0, 5), (0, 0, 1))
+
+    scene.clear()
+
+    assert [plane.name for plane in scene.reference_planes] == [
+        "XY (Z=0)",
+        "XZ (Y=0)",
+        "YZ (X=0)",
+    ]
+    assert scene.active_plane is scene.reference_planes[0]
+
+
 def test_sketch_start_and_finish_switch_toolbar_visibility():
     class _Toolbar:
         def __init__(self, visible=True):
@@ -463,9 +1074,12 @@ def test_sketch_toolbar_shows_select_delete_and_exit_actions():
     window._scale_selected_objects = Mock()
     window._move_selection_to_plane_origin = Mock()
     window._create_object_pattern = Mock()
+    window._copy_selected_object_by_vertices = Mock()
     window._bool_dissolve = Mock()
     window._import_step = Mock()
     window._open_simulation_window = Mock()
+    window._open_measure_tool = Mock()
+    window._open_project_parameters = Mock()
     window._on_check_simulation = Mock()
     window._on_selection_mode_changed = Mock()
     window._activate_sketch_toolbar_action = MethodType(

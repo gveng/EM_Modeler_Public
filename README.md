@@ -5,7 +5,7 @@ geometries and exporting them to the EMERGE simulation workflow. It combines a
 VTK viewport, parametric primitives, CAD import, material assignment, boolean
 modeling, and EMERGE-oriented project export in one application.
 
-Current version: `1.3.4b1`
+Current version: `1.4.0b2`
 
 ## What You Can Do
 
@@ -111,6 +111,22 @@ Dist/EM3D_Modeler_1.3.4_Beta/
 
 Run the executable inside that folder without installing the package into the
 target user's Python environment.
+
+## Publish a Public Snapshot
+
+To publish the current committed version to a separate public repository, run:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\scripts\publish_public.ps1 `
+	-RepositoryUrl https://github.com/your-account/your-public-repository.git `
+	-Branch main
+```
+
+The script publishes only the committed `HEAD` tree, requires tracked changes to
+be committed first, and uses a temporary clone. The public repository keeps its
+own history; this repository's remotes and Git configuration are not changed.
+Only files tracked by Git are included, so review the tracked files before the
+first public release. Git's configured credential helper is used for access.
 
 ## Project Layout
 

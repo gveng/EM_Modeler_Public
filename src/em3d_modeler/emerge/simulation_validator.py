@@ -155,6 +155,7 @@ def validate_simulation(
     objects: Iterable[Any],
     settings: dict[str, Any],
     material_catalog: dict[str, dict[str, Any]] | None = None,
+    exported_ports: Iterable[dict[str, Any]] | None = None,
 ) -> list[ValidationFinding]:
     """Validate project data and world-space port connectivity before export."""
     findings: list[ValidationFinding] = []
@@ -271,6 +272,31 @@ def validate_simulation(
         ))
 
     mesh_cfg = settings.get("mesh", {}) if isinstance(settings.get("mesh", {}), dict) else {}
+    try:
+        scale_factor = float(mesh_cfg.get("emerge_scale_factor", 1.0))
+        if not math.isfinite(scale_factor) or not 1.0 <= scale_factor <= 1_000_000.0:
+            raise ValueError
+    except (OverflowError, TypeError, ValueError):
+        findings.append(ValidationFinding(
+            "ERROR", "Mesh",
+            "EMERGE scale factor must be a finite value between 1 and 1,000,000.",
+        ))
+
+    for index, port in enumerate(exported_ports or (), start=1):
+        if not isinstance(port, dict) or str(port.get("type", "LumpedPort")) == "WaveguidePort":
+            continue
+        name = str(port.get("name", f"LumpedPort {index}"))
+        try:
+            width = float(port["width"])
+            height = float(port["height"])
+            if not math.isfinite(width) or not math.isfinite(height) or width <= 0.0 or height <= 0.0:
+                raise ValueError
+        except (KeyError, OverflowError, TypeError, ValueError):
+            findings.append(ValidationFinding(
+                "ERROR", "Ports",
+                f"{name}: exported LumpedPort must have finite positive width and height.",
+            ))
+
     try:
         default_fraction = float(mesh_cfg.get("default_fraction", 0.3))
         if not math.isfinite(default_fraction) or not 0.01 <= default_fraction <= 1.0:

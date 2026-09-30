@@ -16,12 +16,13 @@
 
 """Generate runnable Python script for EMERGE simulation."""
 from __future__ import annotations
+import ast
 from typing import Any, Dict, List
 import json
 import locale
+import math
 import re
 from em3d_modeler import __version__ as _em3d_modeler_version
-
 
 def _detect_emerge_version() -> str:
     """Best-effort resolution of the installed EMERGE version."""
@@ -119,7 +120,6 @@ def _to_float(value: Any, default: float) -> float:
                 s = s.replace(",", "")
         elif "," in s:
             s = s.replace(",", ".")
-
         try:
             return float(s)
         except Exception:
@@ -184,8 +184,15 @@ def _normalize_simulation_configs(settings: Dict[str, Any]) -> List[Dict[str, An
                     "Fmax_GHz": _to_float(item.get("Fmax_GHz", 10.0), 10.0),
                     "Fstep_GHz": _to_float(item.get("Fstep_GHz", 0.1), 0.1),
                     "EigenmodeCount": max(1, _to_int(item.get("EigenmodeCount", 5), 5)),
+                    "progressive_sparams_chunk_size": max(
+                        1, _to_int(item.get("progressive_sparams_chunk_size", 10), 10)
+                    ),
                     "ParamName": str(item.get("ParamName", "")).strip(),
                     "ParamValues": str(item.get("ParamValues", "")).strip(),
+                    **(
+                        {"progressive_sparams_enabled": _to_bool(item["progressive_sparams_enabled"])}
+                        if "progressive_sparams_enabled" in item else {}
+                    ),
                     "sparam_fitting": dict(item.get("sparam_fitting", {})) if isinstance(item.get("sparam_fitting", {}), dict) else {"enabled": False, "points": 1001},
                     "LogVerbosity": str(item.get("LogVerbosity", "Info")).strip().title(),
                 }
@@ -204,6 +211,9 @@ def _normalize_simulation_configs(settings: Dict[str, Any]) -> List[Dict[str, An
                 "Fmax_GHz": _to_float(legacy.get("Fmax_GHz", 10.0), 10.0),
                 "Fstep_GHz": _to_float(legacy.get("Fstep_GHz", 0.1), 0.1),
                 "EigenmodeCount": 5,
+                "progressive_sparams_chunk_size": max(
+                    1, _to_int(legacy.get("progressive_sparams_chunk_size", 10), 10)
+                ),
                 "ParamName": "",
                 "ParamValues": "",
                 "sparam_fitting": dict(legacy.get("sparam_fitting", {})) if isinstance(legacy.get("sparam_fitting", {}), dict) else {"enabled": False, "points": 1001},
@@ -232,6 +242,7 @@ def export_emerge_python_script(
     acc_threads: int = 10,
     mesh_resolution_fraction: float = 0.3,
     plot_sparams_after_sim: bool = True,
+    progressive_sparams_enabled: bool = False,
     export_sparams_after_sim: bool = True,
     simulation_override: Dict[str, Any] | None = None,
 ) -> str:
@@ -251,6 +262,12 @@ def export_emerge_python_script(
             "ParamValues": "",
             "LogVerbosity": "Info",
         }
+    progressive_sparams_enabled = bool(
+        sim.get("progressive_sparams_enabled", progressive_sparams_enabled)
+    )
+    progressive_sparams_chunk_size = max(
+        1, _to_int(sim.get("progressive_sparams_chunk_size", 10), 10)
+    )
 
     sim_name = str(sim.get("name", "Simulation_1")).strip() or "Simulation_1"
     sim_type = str(sim.get("type", "Sweep")).strip().lower() or "sweep"
@@ -279,6 +296,13 @@ def export_emerge_python_script(
 
     mesh_resolution = max(0.01, min(1.0, float(mesh_resolution_fraction)))
     mesh_cfg = settings.get("mesh", {}) if isinstance(settings, dict) else {}
+    if not isinstance(mesh_cfg, dict):
+        mesh_cfg = {}
+    emerge_scale_factor = _to_float(mesh_cfg.get("emerge_scale_factor", 1.0), 1.0)
+    if not math.isfinite(emerge_scale_factor):
+        emerge_scale_factor = 1.0
+    emerge_scale_factor = max(1.0, min(1_000_000.0, emerge_scale_factor))
+    coordinate_scale = 0.001 * emerge_scale_factor
     curved_boundary_resolution = max(
         3,
         _to_int(mesh_cfg.get("curved_boundary_resolution", 20), 20),
@@ -294,7 +318,7 @@ def export_emerge_python_script(
         if fraction is None:
             continue
         fraction_value = max(0.01, min(1.0, _to_float(fraction, mesh_resolution)))
-        object_mesh_sizes[object_name] = fraction_value * wavelength_at_fmax
+        object_mesh_sizes[object_name] = fraction_value * wavelength_at_fmax * emerge_scale_factor
     raw_local_refinements = mesh_cfg.get("local_refinements", []) if isinstance(mesh_cfg, dict) else []
     if not isinstance(raw_local_refinements, list):
         raw_local_refinements = []
@@ -469,12 +493,12 @@ def export_emerge_python_script(
         ] if isinstance(item.get("faces", []), list) else []
         if mode == "boundary" and not faces:
             continue
-        size_m = max(1e-9, _to_float(item.get("size_mm", 0.25 if mode == "boundary" else 0.1), 0.25)) * 0.001
+        size_m = max(1e-9, _to_float(item.get("size_mm", 0.25 if mode == "boundary" else 0.1), 0.25)) * coordinate_scale
         growth_rate = max(1.001, _to_float(item.get("growth_rate", 3.0), 3.0))
         raw_max_size = item.get("max_size_mm")
         max_size_m = None
         if raw_max_size not in (None, "", 0, 0.0):
-            max_size_m = max(1e-9, _to_float(raw_max_size, 0.0) * 0.001)
+            max_size_m = max(1e-9, _to_float(raw_max_size, 0.0) * coordinate_scale)
         local_mesh_refinements.append({
             "object": object_name,
             "mode": mode,
@@ -546,6 +570,8 @@ def export_emerge_python_script(
         "import os",
         "import re",
         "import math",
+        "import json",
+        "import numpy as np",
         "",
         "try:",
         "    import importlib.metadata as _importlib_metadata",
@@ -569,6 +595,10 @@ def export_emerge_python_script(
         "    pass",
         "",
         "import emerge as em",
+        "try:",
+        "    RUNTIME_EMERGE_VERSION = str(_importlib_metadata.version('emerge')) if _importlib_metadata is not None else str(getattr(em, '__version__', 'unknown'))",
+        "except Exception:",
+        "    RUNTIME_EMERGE_VERSION = str(getattr(em, '__version__', 'unknown'))",
         "",
         "from emerge_config import config",
         f"config.set_pardiso_threads({eff_pardiso_threads})",
@@ -586,6 +616,7 @@ def export_emerge_python_script(
         "print(f'[job] Results directory: {RESULTS_DIR}')",
         "",
         "mm = 0.001",
+        f"GEOMETRY_SCALE_FACTOR = {emerge_scale_factor!r}",
         f"FMIN_GHZ = {fmin}",
         f"FMAX_GHZ = {fmax}",
         f"FSTEP_GHZ = {fstep}",
@@ -597,18 +628,33 @@ def export_emerge_python_script(
         f"PARAM_NAME = {_q(param_name)}",
         f"PARAM_VALUES = {_q(param_values)}",
         f"PLOT_SPARAMS_AFTER_SIM = {bool(plot_sparams_after_sim)}",
+        f"PROGRESSIVE_SPARAMS_ENABLED = {bool(progressive_sparams_enabled)}",
+        f"PROGRESSIVE_SPARAMS_CHUNK_SIZE = {progressive_sparams_chunk_size}",
+        f"PROGRESSIVE_SPARAMS_HAVE_PORTS = {bool(ports)}",
         f"EXPORT_SPARAMS_AFTER_SIM = {bool(export_sparams_after_sim)}",
         f"SPARAM_FIT_ENABLED = {fit_enabled}",
         f"SPARAM_FIT_POINTS = {fit_points}",
         f"OUTPUT_CONFIGS = {repr(output_configs)}",
+        "if PROGRESSIVE_SPARAMS_ENABLED and PROGRESSIVE_SPARAMS_HAVE_PORTS and JOB_TYPE in ('sweep', 'parametric') and RUNTIME_EMERGE_VERSION != '3.0.0a16':",
+        "    raise RuntimeError(f'Progressive S-parameter plotting requires EMERGE 3.0.0a16 for verified mesh and result reuse; found {RUNTIME_EMERGE_VERSION}.')",
         "SAVE_FARFIELDS = any(output.get('plot_type') in ('plot_ff', 'plot_ff_polar', 'plot_ff_3d') for output in OUTPUT_CONFIGS)",
         "print(f\"[job] {JOB_NAME} | type={JOB_TYPE} | range={FMIN_GHZ}..{FMAX_GHZ} GHz step {FSTEP_GHZ}\")",
         "",
         "# =============================================================================",
         "# [3] EMERGE SETUP",
         "# =============================================================================",
-        "simulationObj = em.Simulation(PROJECT_NAME, save_file=True, write_log=True)",
+        f"simulationObj = em.Simulation(PROJECT_NAME, loglevel={_q(str(sim.get('LogVerbosity', 'Info')).strip().upper())}, save_file=True, write_log=True)",
+        "if GEOMETRY_SCALE_FACTOR != 1.0:",
+        "    simulationObj.set_scale_factor(GEOMETRY_SCALE_FACTOR)",
         f"simulationObj.set_solver(em.EMSolver.{str(solver).strip().upper()})",
+        "if JOB_TYPE == 'parametric' and PARAM_NAME:",
+        "    _initial_parametric_values = [value.strip() for value in PARAM_VALUES.split(',') if value.strip()]",
+        "    if len(_initial_parametric_values) == 1:",
+        "        try:",
+        "            _initial_parametric_value = float(_initial_parametric_values[0])",
+        "        except ValueError:",
+        "            _initial_parametric_value = _initial_parametric_values[0]",
+        "        setattr(simulationObj, PARAM_NAME, _initial_parametric_value)",
         "",
         "def _safe_token(v: str) -> str:",
         "    t = ''.join(ch if (ch.isalnum() or ch in ('-', '_')) else '_' for ch in str(v))",
@@ -679,6 +725,119 @@ def export_emerge_python_script(
         "    nports = _number_of_ports(grid)",
         "    return [(output_port, input_port, label) for output_port, input_port, label in selected if 1 <= output_port <= nports and 1 <= input_port <= nports] or [(1, 1, 'S11')]",
         "",
+        "def _validate_progressive_samples(expected_frequencies, expected_count):",
+        "    scalar = simulationObj.mw.data.scalar",
+        "    variables = list(scalar._variables)",
+        "    entries = list(scalar._data_entries)",
+        "    if len(variables) != len(entries) or len(entries) != expected_count:",
+        "        raise RuntimeError(f'Progressive sweep data count mismatch: expected {expected_count}, got {len(entries)} entries and {len(variables)} variable records.')",
+        "    recorded = []",
+        "    for variable, entry in zip(variables, entries):",
+        "        if 'freq' not in variable or entry.freq is None:",
+        "            raise RuntimeError('Progressive sweep returned a sample without a frequency.')",
+        "        variable_frequency = float(variable['freq'])",
+        "        entry_frequency = float(entry.freq)",
+        "        if not math.isfinite(variable_frequency) or not math.isfinite(entry_frequency) or not math.isclose(variable_frequency, entry_frequency, rel_tol=1e-12, abs_tol=1e-3):",
+        "            raise RuntimeError('Progressive sweep frequency metadata does not match its S-parameter entry.')",
+        "        recorded.append(variable_frequency)",
+        "    recorded = np.asarray(recorded, dtype=float)",
+        "    expected = np.asarray(expected_frequencies[:expected_count], dtype=float)",
+        "    if recorded.size != expected_count or np.unique(recorded).size != expected_count:",
+        "        raise RuntimeError('Progressive sweep contains duplicate or missing frequency samples.')",
+        "    if not np.allclose(recorded, expected, rtol=1e-12, atol=1e-3):",
+        "        raise RuntimeError('Progressive sweep frequencies are missing, reordered, or outside the configured grid.')",
+        "    return variables, entries",
+        "",
+        "def _emit_progressive_sparams(expected_frequencies, start, end):",
+        "    variables, entries = _validate_progressive_samples(expected_frequencies, end)",
+        "    chunk_frequencies = []",
+        "    chunk_matrices = []",
+        "    expected_shape = None",
+        "    for variable, entry in zip(variables[start:end], entries[start:end]):",
+        "        matrix = np.asarray(entry.Sp, dtype=np.complex128)",
+        "        if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[0] != matrix.shape[1]:",
+        "            raise RuntimeError('Progressive sweep returned an invalid S-parameter matrix shape.')",
+        "        if expected_shape is None:",
+        "            expected_shape = matrix.shape",
+        "        if matrix.shape != expected_shape or not np.isfinite(matrix.real).all() or not np.isfinite(matrix.imag).all():",
+        "            raise RuntimeError('Progressive sweep returned inconsistent or non-finite S-parameter values.')",
+        "        chunk_frequencies.append(float(variable['freq']))",
+        "        chunk_matrices.append([[[float(value.real), float(value.imag)] for value in row] for row in matrix])",
+        "    event = {",
+        "        'simulation': JOB_NAME,",
+        "        'frequencies': chunk_frequencies,",
+        "        's_matrices': chunk_matrices,",
+        "        'completed_samples': end,",
+        "        'expected_samples': len(expected_frequencies),",
+        "        'complete': end == len(expected_frequencies),",
+        "    }",
+        "    print('EM3D_SPARAM_PROGRESS:' + json.dumps(event, separators=(',', ':')), flush=True)",
+        "",
+        "def _run_progressive_sweep():",
+        "    if RUNTIME_EMERGE_VERSION != '3.0.0a16':",
+        "        raise RuntimeError(f'Progressive S-parameter plotting requires EMERGE 3.0.0a16 for verified mesh and result reuse; found {RUNTIME_EMERGE_VERSION}.')",
+        "    expected_frequencies = np.linspace(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, NPOINTS).tolist()",
+        "    simulationObj.mw.set_frequency_range(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, NPOINTS)",
+        "    simulation_result = None",
+        "    for start in range(0, NPOINTS, PROGRESSIVE_SPARAMS_CHUNK_SIZE):",
+        "        end = min(start + PROGRESSIVE_SPARAMS_CHUNK_SIZE, NPOINTS)",
+        "        simulationObj.mw.set_frequency(expected_frequencies[start:end])",
+        "        simulation_result = simulationObj.mw.run_sweep()",
+        "        if simulation_result is not simulationObj.mw.data:",
+        "            raise RuntimeError('This EMERGE version did not return the accumulated simulation dataset.')",
+        "        _emit_progressive_sparams(expected_frequencies, start, end)",
+        "        print(f'[job] Progressive S-parameter sweep: {end}/{NPOINTS} samples', flush=True)",
+        "    simulationObj.mw.set_frequency_range(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, NPOINTS)",
+        "    _validate_progressive_samples(expected_frequencies, NPOINTS)",
+        "    return simulation_result",
+        "",
+        "def _emit_progressive_parametric_sparams(sim_result, parameter_value, completed, total, start, end, sample_offset):",
+        "    if RUNTIME_EMERGE_VERSION != '3.0.0a16':",
+        "        raise RuntimeError(f'Progressive S-parameter plotting requires EMERGE 3.0.0a16 for verified mesh and result reuse; found {RUNTIME_EMERGE_VERSION}.')",
+        "    scalar = sim_result.scalar",
+        "    variables = list(scalar._variables)",
+        "    entries = list(scalar._data_entries)",
+        "    chunk_count = end - start",
+        "    if len(variables) != len(entries) or chunk_count < 1:",
+        "        raise RuntimeError('Parametric sweep returned invalid S-parameter sample data.')",
+        "    samples = list(zip(variables[sample_offset + start:sample_offset + end], entries[sample_offset + start:sample_offset + end]))",
+        "    if len(samples) != chunk_count:",
+        "        samples = list(zip(variables[-chunk_count:], entries[-chunk_count:]))",
+        "    if len(samples) != chunk_count:",
+        "        raise RuntimeError(f'Parametric sweep returned fewer than {chunk_count} S-parameter samples in the current chunk.')",
+        "    samples.sort(key=lambda sample: float(sample[1].freq))",
+        "    expected_frequencies = np.linspace(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, NPOINTS)[start:end]",
+        "    frequencies = [float(entry.freq) for _, entry in samples]",
+        "    if not np.allclose(frequencies, expected_frequencies, rtol=1e-12, atol=1e-3):",
+        "        raise RuntimeError('Parametric sweep chunk frequencies are missing, duplicated, or outside the configured grid.')",
+        "    matrices = []",
+        "    expected_shape = None",
+        "    for _, entry in samples:",
+        "        matrix = np.asarray(entry.Sp, dtype=np.complex128)",
+        "        if matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[0] != matrix.shape[1]:",
+        "            raise RuntimeError('Parametric sweep returned an invalid S-parameter matrix shape.')",
+        "        if expected_shape is None:",
+        "            expected_shape = matrix.shape",
+        "        matrix_is_finite = bool(np.isfinite(matrix.real).all() and np.isfinite(matrix.imag).all())",
+        "        if matrix.shape != expected_shape or not matrix_is_finite:",
+        "            raise RuntimeError(f'Parametric sweep returned inconsistent or non-finite S-parameter values: expected shape {expected_shape}, got {matrix.shape}, finite={matrix_is_finite}.')",
+        "        matrices.append([[[float(value.real), float(value.imag)] for value in row] for row in matrix])",
+        "    event = {",
+        "        'simulation': JOB_NAME,",
+        "        'frequencies': frequencies,",
+        "        's_matrices': matrices,",
+        "        'chunk_start': start,",
+        "        'completed_samples': end,",
+        "        'expected_samples': NPOINTS,",
+        "        'complete': end == NPOINTS,",
+        "        'parameter_name': PARAM_NAME,",
+        "        'parameter_value': str(parameter_value),",
+        "        'parameter_index': completed,",
+        "        'completed_parameters': completed,",
+        "        'expected_parameters': total,",
+        "    }",
+        "    print('EM3D_SPARAM_PROGRESS:' + json.dumps(event, separators=(',', ':')), flush=True)",
+        "",
         "def _boundary_faces(geometry_group):",
         "    geometry_objects = list(geometry_group.objects)",
         "    if not geometry_objects:",
@@ -688,11 +847,14 @@ def export_emerge_python_script(
         "        faces = faces + geometry_object.boundary()",
         "    return faces",
         "",
-        "def _write_sputility_touchstone(grid, fit_result=None):",
+        "def _write_sputility_touchstone(grid, fit_result=None, suffix=''):",
         "    nports = _number_of_ports(grid)",
         "    extension = f'.s{nports}p'",
-        "    timestamp = datetime.now().strftime('%Y%m%d-%H%M%S')",
-        "    output_base = os.path.join(SCRIPT_DIR, f'{_safe_token(PROJECT_NAME)}_{timestamp}')",
+        "    timestamp = os.environ.get('EM3D_RUN_ID') or globals().setdefault('_TOUCHSTONE_RUN_TIMESTAMP', datetime.now().strftime('%Y%m%d-%H%M%S'))",
+        "    touchstone_dir = os.path.join(SCRIPT_DIR, 'Touchstone')",
+        "    os.makedirs(touchstone_dir, exist_ok=True)",
+        "    suffix_token = f'_{_safe_token(suffix)}' if suffix else ''",
+        "    output_base = os.path.join(touchstone_dir, f'{_safe_token(PROJECT_NAME)}_{_safe_token(JOB_NAME)}{suffix_token}_{timestamp}')",
         "    def _write_touchstone(output_path, frequencies, curves):",
         "        with open(output_path, 'w', encoding='ascii', newline='\\n') as touchstone_file:",
         "            touchstone_file.write('# HZ S RI R 50.0\\n')",
@@ -705,7 +867,7 @@ def export_emerge_python_script(
         "                touchstone_file.write(' '.join(row) + '\\n')",
         "    original_frequencies = grid.freq",
         "    original_curves = {(i, j): grid.S(i, j) for i in range(1, nports + 1) for j in range(1, nports + 1)}",
-        "    output_path = output_base + '_fit' + extension",
+        "    output_path = output_base + ('_fit' if SPARAM_FIT_ENABLED else '') + extension",
         "    if SPARAM_FIT_ENABLED:",
         "        original_path = output_base + '_original' + extension",
         "        _write_touchstone(original_path, original_frequencies, original_curves)",
@@ -730,18 +892,105 @@ def export_emerge_python_script(
         "        print(f'[job] SPUtility Touchstone exported: {output_path}')",
         "    return output_path",
         "",
+        "def _parametric_result_grids(sim_result):",
+        "    scalar = sim_result.scalar",
+        "    variables = list(scalar._variables)",
+        "    entries = list(scalar._data_entries)",
+        "    values = [value.strip() for value in PARAM_VALUES.split(',') if value.strip()] or ['default']",
+        "    if len(variables) != len(entries) or len(entries) < NPOINTS:",
+        "        raise ValueError('parametric S-parameter samples are incomplete')",
+        "    groups = []",
+        "    if any(PARAM_NAME in variable for variable in variables):",
+        "        for value in values:",
+        "            try:",
+        "                numeric_value = float(value)",
+        "                selected = [(variable, entry) for variable, entry in zip(variables, entries) if PARAM_NAME in variable and math.isclose(float(variable[PARAM_NAME]), numeric_value, rel_tol=1e-12, abs_tol=1e-12)]",
+        "            except (TypeError, ValueError):",
+        "                selected = [(variable, entry) for variable, entry in zip(variables, entries) if str(variable.get(PARAM_NAME, '')).strip() == value]",
+        "            if selected:",
+        "                groups.append((value, selected))",
+        "    if not groups:",
+        "        if len(entries) == len(values) * NPOINTS:",
+        "            groups = [(value, list(zip(variables[index * NPOINTS:(index + 1) * NPOINTS], entries[index * NPOINTS:(index + 1) * NPOINTS]))) for index, value in enumerate(values)]",
+        "        elif len(entries) == NPOINTS:",
+        "            groups = [(values[-1], list(zip(variables, entries)))]",
+        "        else:",
+        "            raise ValueError(f'expected complete parameter sweeps, found {len(entries)} samples for {len(values)} values')",
+        "    expected_frequencies = np.linspace(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, NPOINTS)",
+        "    class _SampleGrid:",
+        "        def __init__(self, frequencies, matrices):",
+        "            self.freq = np.asarray(frequencies, dtype=float)",
+        "            self.Smat = np.asarray(matrices, dtype=np.complex128)",
+        "        def S(self, output_port, input_port):",
+        "            return self.Smat[:, output_port - 1, input_port - 1]",
+        "    grids = []",
+        "    for value, samples in groups:",
+        "        if len(samples) != NPOINTS:",
+        "            raise ValueError(f'parameter {value} has {len(samples)} samples; expected {NPOINTS}')",
+        "        samples.sort(key=lambda sample: float(sample[1].freq))",
+        "        frequencies = [float(entry.freq) for _, entry in samples]",
+        "        if not np.allclose(frequencies, expected_frequencies, rtol=1e-12, atol=1e-3):",
+        "            raise ValueError(f'parameter {value} has missing, duplicated, or out-of-range frequency samples')",
+        "        matrices = [np.asarray(entry.Sp, dtype=np.complex128) for _, entry in samples]",
+        "        if any(matrix.ndim != 2 or matrix.shape[0] == 0 or matrix.shape[0] != matrix.shape[1] for matrix in matrices):",
+        "            raise ValueError(f'parameter {value} has an invalid S-parameter matrix')",
+        "        if any(not np.isfinite(matrix.real).all() or not np.isfinite(matrix.imag).all() for matrix in matrices):",
+        "            raise ValueError(f'parameter {value} has non-finite S-parameter values')",
+        "        grids.append((value, _SampleGrid(frequencies, matrices)))",
+        "    return grids",
+        "",
         "def _postprocess_sparams(sim_obj, sim_result):",
         "    if JOB_TYPE not in ('sweep', 'parametric'):",
         "        return",
         "    out_base = os.path.join(SCRIPT_DIR, f\"{_safe_token(PROJECT_NAME)}_{_safe_token(JOB_NAME)}\")",
         "    fit_result = {'attempted': False}",
         "",
+        "    if JOB_TYPE == 'parametric':",
+        "        try:",
+        "            parametric_grids = _parametric_result_grids(sim_result)",
+        "        except (TypeError, ValueError, KeyError, AttributeError) as extraction_error:",
+        "            print(f'[warning] Parametric results could not be split into complete frequency sweeps; automatic Touchstone export and plotting were skipped: {extraction_error}')",
+        "            return",
+        "        for parameter_value, parameter_grid in parametric_grids:",
+        "            parameter_fit_result = {'attempted': False}",
+        "            if EXPORT_SPARAMS_AFTER_SIM:",
+        "                suffix = f'{PARAM_NAME}_{parameter_value}' if PARAM_NAME else str(parameter_value)",
+        "                _write_sputility_touchstone(parameter_grid, parameter_fit_result, suffix)",
+        "            if PLOT_SPARAMS_AFTER_SIM and os.environ.get('EM3D_RUN_IN_APP') != '1':",
+        "                from emerge.plot import plot_sp",
+        "                nports = _number_of_ports(parameter_grid)",
+        "                curves = [parameter_grid.S(i, j) for i in range(1, nports + 1) for j in range(1, nports + 1)]",
+        "                labels = [f'S{i}{j} {PARAM_NAME}={parameter_value}' for i in range(1, nports + 1) for j in range(1, nports + 1)]",
+        "                plot_sp(parameter_grid.freq, curves, labels=labels)",
+        "            if OUTPUT_CONFIGS and os.environ.get('EM3D_RUN_IN_APP') != '1':",
+        "                from emerge.plot import plot_sp, plot_vswr, smith, plot",
+        "                for output in OUTPUT_CONFIGS:",
+        "                    kind = output.get('plot_type')",
+        "                    selected = _selected_s_parameters(output, parameter_grid)",
+        "                    curves = [parameter_grid.S(i, j) for i, j, _ in selected]",
+        "                    labels = [label for _, _, label in selected]",
+        "                    if kind == 'plot_sp':",
+        "                        plot_sp(parameter_grid.freq, curves, labels=labels)",
+        "                    elif kind == 'plot_vswr':",
+        "                        plot_vswr(parameter_grid.freq, curves, labels=[f'VSWR{label[1:]}' for label in labels])",
+        "                    elif kind == 'smith':",
+        "                        smith(curves, f=parameter_grid.freq, labels=labels)",
+        "                    elif kind == 'plot':",
+        "                        magnitude_curves = [20.0 * np.log10(np.maximum(np.abs(curve), 1e-12)) for curve in curves]",
+        "                        plot(parameter_grid.freq, magnitude_curves, labels=[f'|{label}| dB' for label in labels], xlabel='Frequency (Hz)', ylabel='Magnitude (dB)')",
+        "                    print(f\"[job] Output plotted: {output.get('name', 'Output')} ({kind}) for {PARAM_NAME}={parameter_value}\")",
+        "        print(f'[info] Post-processed {len(parametric_grids)} complete parametric S-parameter sweeps.')",
+        "        return",
+        "",
+        "    try:",
+        "        grid = sim_result.scalar.grid",
+        "    except ValueError:",
+        "        raise",
+        "",
         "    if EXPORT_SPARAMS_AFTER_SIM:",
-        "        _write_sputility_touchstone(sim_result.scalar.grid, fit_result)",
+        "        _write_sputility_touchstone(grid, fit_result)",
         "",
-        "    grid = sim_result.scalar.grid",
-        "",
-        "    if PLOT_SPARAMS_AFTER_SIM:",
+        "    if PLOT_SPARAMS_AFTER_SIM and os.environ.get('EM3D_RUN_IN_APP') != '1':",
         "        from emerge.plot import plot_sp",
         "        nports = _number_of_ports(grid)",
         "        if SPARAM_FIT_ENABLED:",
@@ -766,7 +1015,7 @@ def export_emerge_python_script(
         "        plot_sp(frequencies, curves, labels=labels)",
         "        print('[job] S-parameters plotted')",
         "",
-        "    if OUTPUT_CONFIGS:",
+        "    if OUTPUT_CONFIGS and os.environ.get('EM3D_RUN_IN_APP') != '1':",
         "        from emerge.plot import plot_sp, plot_vswr, smith, plot",
         "        nports = _number_of_ports(grid)",
         "        frequencies = grid.freq",
@@ -808,10 +1057,10 @@ def export_emerge_python_script(
     ]
     if pml_setup is not None:
         air_bounds = pml_setup["air_bounds_mm"]
-        air_width = (air_bounds[1] - air_bounds[0]) * 0.001
-        air_depth = (air_bounds[3] - air_bounds[2]) * 0.001
-        air_height = (air_bounds[5] - air_bounds[4]) * 0.001
-        air_position = (air_bounds[0] * 0.001, air_bounds[2] * 0.001, air_bounds[4] * 0.001)
+        air_width = (air_bounds[1] - air_bounds[0]) * coordinate_scale
+        air_depth = (air_bounds[3] - air_bounds[2]) * coordinate_scale
+        air_height = (air_bounds[5] - air_bounds[4]) * coordinate_scale
+        air_position = (air_bounds[0] * coordinate_scale, air_bounds[2] * coordinate_scale, air_bounds[4] * coordinate_scale)
         lines += [
             "# Native EMerge PML volumes; the visual AIR/PML STEP boxes are not imported.",
             "_pml_geometry = em.geo.pmlbox(",
@@ -820,7 +1069,7 @@ def export_emerge_python_script(
             f"    height={air_height!r},",
             f"    position={air_position!r},",
             f"    material=materials[{_q(str(next((entry.get('material', 'AIR') for entry in step_entries if str(entry.get('object_name', '')).strip() == air_volume_name), 'AIR')))}],",
-            f"    thickness={pml_setup['thickness_m']!r},",
+            f"    thickness={pml_setup['thickness_m'] * emerge_scale_factor!r},",
             f"    Nlayers={pml_setup['layers']},",
             f"    N_mesh_layers={pml_setup['mesh_layers']},",
             f"    exponent={pml_setup['exponent']!r},",
@@ -842,7 +1091,7 @@ def export_emerge_python_script(
             priority = int(entry.get("priority", 5000))
 
             lines += [
-                f"geometry_group = em.geo.step.STEPItems(name={_q(obj_name)}, filename=os.path.join(SCRIPT_DIR, {_q(step_file)}), unit=mm)",
+                f"geometry_group = em.geo.step.STEPItems(name={_q(obj_name)}, filename=os.path.join(SCRIPT_DIR, {_q(step_file)}), unit=mm * GEOMETRY_SCALE_FACTOR)",
                 f"geometry_groups[{_q(obj_name)}] = geometry_group",
                 "for geometry_obj in geometry_group.objects:",
                 f"    geometry_obj.prio_set({priority})",
@@ -862,9 +1111,9 @@ def export_emerge_python_script(
         ]
         for plate in plates:
             plate_name = str(plate.get("object_name", "Plate"))
-            origin = tuple(float(value) * 0.001 for value in plate.get("origin", (0.0, 0.0, 0.0)))
-            u = tuple(float(value) * 0.001 for value in plate.get("u", (0.0, 0.0, 0.0)))
-            v = tuple(float(value) * 0.001 for value in plate.get("v", (0.0, 0.0, 0.0)))
+            origin = tuple(float(value) * coordinate_scale for value in plate.get("origin", (0.0, 0.0, 0.0)))
+            u = tuple(float(value) * coordinate_scale for value in plate.get("u", (0.0, 0.0, 0.0)))
+            v = tuple(float(value) * coordinate_scale for value in plate.get("v", (0.0, 0.0, 0.0)))
             lines += [
                 f"plate_objects[{_q(plate_name)}] = em.geo.Plate(name={_q(plate_name)}, origin={origin!r}, u={u!r}, v={v!r})",
                 f"plate_objects[{_q(plate_name)}].set_material(materials[{_q(str(plate.get('material', 'PEC')))}])",
@@ -885,9 +1134,9 @@ def export_emerge_python_script(
             idx = int(p.get("index", 1))
             name = str(p.get("name", f"Port_{idx}"))
             port_type = str(p.get("type", "LumpedPort"))
-            origin = [_to_float(v, 0.0) * 0.001 for v in p.get("origin", [0.0, 0.0, 0.0])]
-            u = [_to_float(v, 0.0) * 0.001 for v in p.get("u", [0.0, 0.0, 0.0])]
-            v = [_to_float(v, 0.0) * 0.001 for v in p.get("v", [0.0, 0.0, 0.0])]
+            origin = [_to_float(v, 0.0) * coordinate_scale for v in p.get("origin", [0.0, 0.0, 0.0])]
+            u = [_to_float(v, 0.0) * coordinate_scale for v in p.get("u", [0.0, 0.0, 0.0])]
+            v = [_to_float(v, 0.0) * coordinate_scale for v in p.get("v", [0.0, 0.0, 0.0])]
             width = abs(_to_float(p.get("width", 0.0), 0.0) * 0.001)
             height = abs(_to_float(p.get("height", 0.0), 0.0) * 0.001)
             direction = [_to_float(vd, 0.0) for vd in p.get("direction", [0.0, 0.0, 1.0])]
@@ -947,9 +1196,7 @@ def export_emerge_python_script(
             "raise SystemExit(0)",
         ]
     else:
-        lines += [
-            "simulationObj.commit_geometry()",
-        ]
+        lines += ["simulationObj.commit_geometry()"]
     for p in ports:
         idx = int(p.get("index", 1))
         if str(p.get("type", "LumpedPort")) == "WaveguidePort" and air_volume_name:
@@ -1074,9 +1321,39 @@ def export_emerge_python_script(
         "# [8] MESH GENERATION",
         "# =============================================================================",
         "simulationObj.mesher.set_curved_boundary_meshing(CURVED_BOUNDARY_RESOLUTION)",
-        "simulationObj.generate_mesh()",
-        "",
     ]
+    lumped_port_indices = [
+        int(port.get("index", 1))
+        for port in ports
+        if str(port.get("type", "LumpedPort")) != "WaveguidePort"
+    ]
+    if lumped_port_indices:
+        lines += [
+            "_scaled_lumped_port_dimensions = []",
+            "if GEOMETRY_SCALE_FACTOR != 1.0:",
+        ]
+        for port_index in lumped_port_indices:
+            lines += [
+                f"    _port_bc = port[{port_index}].get('bc')",
+                "    if _port_bc is not None and hasattr(_port_bc, 'width') and hasattr(_port_bc, 'height'):",
+                "        _scaled_lumped_port_dimensions.append((_port_bc, _port_bc.width, _port_bc.height))",
+                "        _port_bc.width *= GEOMETRY_SCALE_FACTOR",
+                "        _port_bc.height *= GEOMETRY_SCALE_FACTOR",
+            ]
+        lines += [
+            "try:",
+            "    simulationObj.generate_mesh()",
+            "finally:",
+            "    for _port_bc, _physical_width, _physical_height in _scaled_lumped_port_dimensions:",
+            "        _port_bc.width = _physical_width",
+            "        _port_bc.height = _physical_height",
+            "",
+        ]
+    else:
+        lines += [
+            "simulationObj.generate_mesh()",
+            "",
+        ]
     if show_model:
         lines += [
             "# Show geometry only after the configured mesh exists; this avoids EMerge quick_mesh().",
@@ -1121,7 +1398,12 @@ def export_emerge_python_script(
             "# =============================================================================",
             "simulationResult = None",
             "if JOB_TYPE == 'sweep':",
-            "    simulationResult = simulationObj.mw.run_sweep()",
+            "    if PROGRESSIVE_SPARAMS_ENABLED and PROGRESSIVE_SPARAMS_HAVE_PORTS:",
+            "        simulationResult = _run_progressive_sweep()",
+            "    else:",
+            "        if PROGRESSIVE_SPARAMS_ENABLED:",
+            "            print('[warning] Progressive S-parameter plotting requires at least one configured port; running a standard sweep.')",
+            "        simulationResult = simulationObj.mw.run_sweep()",
             "    print(f\"[job] Sweep completed: {JOB_NAME}\")",
             "elif JOB_TYPE == 'eigenmode':",
             "    simulationResult = simulationObj.mw.run_eigenmode(EIGENMODE_COUNT)",
@@ -1130,11 +1412,35 @@ def export_emerge_python_script(
             "    values = [v.strip() for v in PARAM_VALUES.split(',') if v.strip()]",
             "    if not values:",
             "        values = ['default']",
-            "    for _value in values:",
+            "    expected_parametric_frequencies = np.linspace(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, NPOINTS).tolist()",
+            "    simulationObj.mw.set_frequency_range(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, NPOINTS)",
+            "    _parametric_progressive_active = PROGRESSIVE_SPARAMS_ENABLED and PROGRESSIVE_SPARAMS_HAVE_PORTS",
+            "    _global_parameter_total = int(os.environ.get('EM3D_PARAMETRIC_TOTAL', len(values)))",
+            "    _global_parameter_offset = int(os.environ.get('EM3D_PARAMETRIC_INDEX', '0'))",
+            "    for _local_parameter_index, _value in enumerate(values, start=1):",
+            "        _parameter_index = _global_parameter_offset or _local_parameter_index",
+            "        try:",
+            "            _parameter_value = float(_value)",
+            "        except ValueError:",
+            "            _parameter_value = _value",
             "        if PARAM_NAME:",
-            "            setattr(simulationObj, PARAM_NAME, _value)",
-            "        simulationResult = simulationObj.mw.run_sweep()",
+            "            setattr(simulationObj, PARAM_NAME, _parameter_value)",
+            "        _parametric_sample_offset = len(simulationObj.mw.data.scalar._data_entries)",
+            "        if _parametric_progressive_active:",
+            "            for _start in range(0, NPOINTS, PROGRESSIVE_SPARAMS_CHUNK_SIZE):",
+            "                _end = min(_start + PROGRESSIVE_SPARAMS_CHUNK_SIZE, NPOINTS)",
+            "                simulationObj.mw.set_frequency(expected_parametric_frequencies[_start:_end])",
+            "                simulationResult = simulationObj.mw.run_sweep()",
+            "                if _parametric_progressive_active:",
+            "                    try:",
+            "                        _emit_progressive_parametric_sparams(simulationResult, _value, _parameter_index, _global_parameter_total, _start, _end, _parametric_sample_offset)",
+            "                    except (RuntimeError, ValueError, TypeError, AttributeError) as error:",
+            "                        _parametric_progressive_active = False",
+            "                        print(f'[warning] Progressive plot update skipped for {PARAM_NAME}={_value}; simulation will continue and final results will still be processed: {error}')",
+            "        else:",
+            "            simulationResult = simulationObj.mw.run_sweep()",
             "        print(f\"[job] Parametric sweep value={_value} completed\")",
+            "    simulationObj.mw.set_frequency_range(FMIN_GHZ * 1e9, FMAX_GHZ * 1e9, NPOINTS)",
             "else:",
             "    raise ValueError(f\"Unsupported job type: {JOB_TYPE}\")",
             "",
@@ -1157,3 +1463,292 @@ def export_emerge_python_script(
         ]
 
     return "\n".join(lines) + "\n"
+
+
+def build_clean_emerge_python_script(script: str, simulation_type: str) -> str:
+    """Create a clean worker with configuration decisions resolved before runtime."""
+    source_lines = script.splitlines()
+    tree = ast.parse(script)
+    removed_functions = {
+        "_safe_token",
+        "_number_of_ports",
+        "_selected_s_parameter",
+        "_selected_s_parameters",
+        "_validate_progressive_samples",
+        "_emit_progressive_sparams",
+        "_emit_progressive_parametric_sparams",
+        "_run_progressive_sweep",
+        "_write_sputility_touchstone",
+        "_parametric_result_grids",
+        "_postprocess_sparams",
+    }
+    removed_assignments = {
+        "JOB_NAME",
+        "JOB_TYPE",
+        "TARGET_EMERGE_VERSION",
+        "RUNTIME_EMERGE_VERSION",
+        "PLOT_SPARAMS_AFTER_SIM",
+        "PROGRESSIVE_SPARAMS_ENABLED",
+        "PROGRESSIVE_SPARAMS_CHUNK_SIZE",
+        "PROGRESSIVE_SPARAMS_HAVE_PORTS",
+        "EXPORT_SPARAMS_AFTER_SIM",
+        "SPARAM_FIT_ENABLED",
+        "SPARAM_FIT_POINTS",
+        "SAVE_FARFIELDS",
+        "simulationResult",
+        "_scaled_lumped_port_dimensions",
+    }
+    removed_lines: set[int] = set()
+    replacements: dict[int, list[str]] = {}
+
+    def _line_range(node: ast.AST) -> range:
+        return range(node.lineno, getattr(node, "end_lineno", node.lineno) + 1)
+
+    def _names(node: ast.AST) -> set[str]:
+        return {child.id for child in ast.walk(node) if isinstance(child, ast.Name)}
+
+    def _assigned_names(node: ast.AST) -> set[str]:
+        targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+        return {
+            child.id
+            for target in targets
+            for child in ast.walk(target)
+            if isinstance(child, ast.Name)
+        }
+
+    def _literal_assignment(name: str, default: Any) -> Any:
+        for node in tree.body:
+            if not isinstance(node, ast.Assign) or name not in _assigned_names(node):
+                continue
+            try:
+                return ast.literal_eval(node.value)
+            except (TypeError, ValueError):
+                return default
+        return default
+
+    def _port_mapping_target(target: ast.AST) -> tuple[int, str] | None:
+        if not isinstance(target, ast.Subscript) or not isinstance(target.value, ast.Subscript):
+            return None
+        port_ref = target.value
+        if not isinstance(port_ref.value, ast.Name) or port_ref.value.id != "port":
+            return None
+        try:
+            index = ast.literal_eval(port_ref.slice)
+            key = ast.literal_eval(target.slice)
+        except (TypeError, ValueError):
+            return None
+        if isinstance(index, int) and isinstance(key, str):
+            return index, key
+        return None
+
+    def _flatten_body(node: ast.If) -> list[str]:
+        if not node.body:
+            return []
+        body_indent = min(statement.col_offset for statement in node.body)
+        result = []
+        for statement in node.body:
+            for line_number in _line_range(statement):
+                line = source_lines[line_number - 1]
+                result.append(line[body_indent:] if line.strip() else "")
+        return result
+
+    scale_factor = float(_literal_assignment("GEOMETRY_SCALE_FACTOR", 1.0))
+    param_name = str(_literal_assignment("PARAM_NAME", "")).strip()
+    param_values = [
+        value.strip()
+        for value in str(_literal_assignment("PARAM_VALUES", "")).split(",")
+        if value.strip()
+    ] or ["default"]
+    output_configs = _literal_assignment("OUTPUT_CONFIGS", [])
+    save_farfields = any(
+        isinstance(output, dict)
+        and output.get("plot_type") in ("plot_ff", "plot_ff_polar", "plot_ff_3d")
+        for output in (output_configs if isinstance(output_configs, list) else [])
+    )
+
+    port_dimensions: dict[int, dict[str, float]] = {}
+    lumped_port_indices: set[int] = set()
+    for node in ast.walk(tree):
+        if isinstance(node, ast.Assign):
+            targets = node.targets
+            for target in targets:
+                key = _port_mapping_target(target)
+                if key is not None and key[1] in {"w", "h"}:
+                    try:
+                        port_dimensions.setdefault(key[0], {})[key[1]] = float(ast.literal_eval(node.value))
+                    except (TypeError, ValueError):
+                        pass
+                if key is not None and key[1] == "bc" and isinstance(node.value, ast.Call):
+                    if isinstance(node.value.func, ast.Attribute) and node.value.func.attr == "LumpedPort":
+                        lumped_port_indices.add(key[0])
+
+    mesh_block_start = None
+    mesh_block_end = None
+    for index, node in enumerate(tree.body):
+        if not isinstance(node, ast.Assign) or "_scaled_lumped_port_dimensions" not in _assigned_names(node):
+            continue
+        for following in tree.body[index + 1:]:
+            if isinstance(following, ast.Try) and any(
+                isinstance(child, ast.Call)
+                and isinstance(child.func, ast.Attribute)
+                and child.func.attr == "generate_mesh"
+                for child in ast.walk(following)
+            ):
+                mesh_block_start = node.lineno
+                mesh_block_end = getattr(following, "end_lineno", following.lineno)
+                break
+        break
+    if mesh_block_start is not None and mesh_block_end is not None:
+        mesh_lines = []
+        if scale_factor != 1.0:
+            for port_index in sorted(lumped_port_indices):
+                dimensions = port_dimensions.get(port_index, {})
+                if not {"w", "h"}.issubset(dimensions):
+                    raise ValueError(
+                        f"LumpedPort {port_index} must have width and height before clean export."
+                    )
+                mesh_lines.extend([
+                    f"port[{port_index}]['bc'].width = {dimensions['w'] * scale_factor!r}",
+                    f"port[{port_index}]['bc'].height = {dimensions['h'] * scale_factor!r}",
+                ])
+        mesh_lines.append("simulationObj.generate_mesh()")
+        if scale_factor != 1.0:
+            for port_index in sorted(lumped_port_indices):
+                dimensions = port_dimensions[port_index]
+                mesh_lines.extend([
+                    f"port[{port_index}]['bc'].width = {dimensions['w']!r}",
+                    f"port[{port_index}]['bc'].height = {dimensions['h']!r}",
+                ])
+        removed_lines.update(range(mesh_block_start, mesh_block_end + 1))
+        replacements[mesh_block_start] = mesh_lines
+
+    definitions = [
+        node for node in tree.body
+        if isinstance(node, (ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef))
+    ]
+    for definition in definitions:
+        definition_end = getattr(definition, "end_lineno", definition.lineno)
+        if definition.name not in {"_GeneratedGeometryGroup", "_select_single_port_face", "_boundary_faces"}:
+            continue
+        referenced_elsewhere = any(
+            isinstance(node, ast.Name)
+            and node.id == definition.name
+            and not definition.lineno <= node.lineno <= definition_end
+            for node in ast.walk(tree)
+        )
+        if not referenced_elsewhere:
+            removed_lines.update(range(definition.lineno, definition_end + 1))
+
+    for node in tree.body:
+        if node.lineno in removed_lines:
+            continue
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name in removed_functions:
+            removed_lines.update(_line_range(node))
+        elif isinstance(node, ast.Import):
+            if any(alias.name in {"re", "json"} for alias in node.names):
+                removed_lines.update(_line_range(node))
+        elif isinstance(node, ast.ImportFrom) and node.module == "datetime":
+            removed_lines.update(_line_range(node))
+        elif isinstance(node, ast.Try):
+            names = _names(node)
+            has_metadata_import = any(
+                (
+                    isinstance(child, ast.Import)
+                    and any(alias.name == "importlib.metadata" for alias in child.names)
+                )
+                or (isinstance(child, ast.ImportFrom) and child.module == "importlib.metadata")
+                for child in ast.walk(node)
+            )
+            if has_metadata_import or names & {"TARGET_EMERGE_VERSION", "RUNTIME_EMERGE_VERSION"}:
+                removed_lines.update(_line_range(node))
+        elif (
+            isinstance(node, ast.If)
+            and isinstance(node.test, ast.Compare)
+            and isinstance(node.test.left, ast.Name)
+            and node.test.left.id == "GEOMETRY_SCALE_FACTOR"
+            and len(node.test.ops) == 1
+            and isinstance(node.test.ops[0], ast.NotEq)
+            and len(node.test.comparators) == 1
+            and isinstance(node.test.comparators[0], ast.Constant)
+            and node.test.comparators[0].value == 1.0
+            and not node.orelse
+        ):
+            body_indent = min(statement.col_offset for statement in node.body)
+            flattened_body = []
+            for statement in node.body:
+                for line_number in _line_range(statement):
+                    line = source_lines[line_number - 1]
+                    flattened_body.append(line[body_indent:] if line.strip() else "")
+            removed_lines.update(_line_range(node))
+            replacements[node.lineno] = flattened_body
+        elif isinstance(node, (ast.Assign, ast.AnnAssign)):
+            if _assigned_names(node) & removed_assignments:
+                removed_lines.update(_line_range(node))
+        elif isinstance(node, ast.If) and "RUNTIME_EMERGE_VERSION" in _names(node):
+            removed_lines.update(_line_range(node))
+        elif isinstance(node, ast.If) and isinstance(node.test, ast.Name) and node.test.id == "SAVE_FARFIELDS":
+            removed_lines.update(_line_range(node))
+            if save_farfields:
+                replacements[node.lineno] = _flatten_body(node)
+        elif isinstance(node, ast.Expr):
+            value = node.value
+            if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "_postprocess_sparams":
+                removed_lines.update(_line_range(node))
+        elif isinstance(node, ast.If) and "JOB_TYPE" in _names(node):
+            kind = str(simulation_type).strip().lower()
+            if kind == "sweep":
+                runner = ["simulationObj.mw.run_sweep()"]
+            elif kind == "eigenmode":
+                runner = ["simulationObj.mw.run_eigenmode(EIGENMODE_COUNT)"]
+            elif kind == "parametric":
+                runner = []
+                for value in param_values:
+                    try:
+                        parameter_value = repr(float(value))
+                    except ValueError:
+                        parameter_value = repr(value)
+                    if param_name:
+                        runner.append(
+                            f"setattr(simulationObj, {param_name!r}, {parameter_value})"
+                        )
+                    runner.append("simulationObj.mw.run_sweep()")
+            else:
+                raise ValueError(f"Unsupported simulation type for clean export: {simulation_type}")
+            removed_lines.update(_line_range(node))
+            replacements[node.lineno] = runner
+
+    for node in ast.walk(tree):
+        if (
+            isinstance(node, ast.If)
+            and not node.orelse
+            and node.body
+            and all(isinstance(statement, ast.Raise) for statement in node.body)
+        ):
+            removed_lines.update(_line_range(node))
+
+    for node in ast.walk(tree):
+        if not isinstance(node, ast.Expr) or node.lineno in removed_lines:
+            continue
+        value = node.value
+        if isinstance(value, ast.Call) and isinstance(value.func, ast.Name) and value.func.id == "print":
+            line = source_lines[node.lineno - 1]
+            indentation = line[:len(line) - len(line.lstrip())]
+            removed_lines.update(_line_range(node))
+            if node.col_offset:
+                replacements[node.lineno] = [f"{indentation}pass"]
+
+    output_lines = []
+    for line_number, line in enumerate(source_lines, start=1):
+        if line_number in replacements:
+            output_lines.extend(replacements[line_number])
+        if line_number in removed_lines:
+            continue
+        if line.lstrip().startswith("#"):
+            continue
+        output_lines.append(line.rstrip())
+
+    compact_lines = []
+    for line in output_lines:
+        if line.strip() or not compact_lines or compact_lines[-1].strip():
+            compact_lines.append(line)
+    return "\n".join(compact_lines).strip() + "\n"

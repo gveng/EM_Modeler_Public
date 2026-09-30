@@ -33,6 +33,8 @@ from html import escape
 from pathlib import Path
 from copy import deepcopy
 import os
+import json
+import math
 import subprocess
 import traceback
 import sys
@@ -116,9 +118,9 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QFormLayout, QTextBrowser, QPlainTextEdit,
     QPushButton, QHBoxLayout, QGroupBox, QCheckBox,
     QProgressDialog, QApplication, QTabWidget, QDialogButtonBox, QGridLayout, QToolButton, QToolBar,
-    QRadioButton,
+    QRadioButton, QTabBar,
 )
-from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize, QUrl
+from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize, QUrl, QTimer
 from PySide6.QtGui  import QIcon, QKeySequence, QAction, QDesktopServices, QPainter, QPen, QColor
 
 def _add_toolbar_group(
@@ -263,7 +265,10 @@ from .project_tree_widget    import set_numeric_locale
 
 from ..emerge.project_file    import ProjectFile
 from ..emerge.script_exporter import export_emerge_script
-from ..emerge.python_script_exporter import export_emerge_python_script
+from ..emerge.python_script_exporter import (
+    build_clean_emerge_python_script,
+    export_emerge_python_script,
+)
 from ..emerge.step_bundle_exporter import export_debug_scene_step, export_objects_to_step_bundle
 from ..emerge.step_importer   import import_step
 from ..emerge.material_store  import MaterialStore
@@ -323,10 +328,15 @@ class MainWindow(QMainWindow):
         self._sim_step_bundle_cache: dict = {"entries": [], "skipped": []}
         self._sim_full_scene_step_dirty = True
         self._export_full_scene_step = False
+        self._sim_status_running = False
+        self._sim_status_completed_jobs = 0
+        self._sim_status_total_jobs = 0
+        self._sim_status_current_fraction = None
         self._boolean_decimation_enabled = False
         self._workspace_path = ""
         self._sim_cached_script = ""
         self._sim_cached_script_bundle: dict = {"master": "", "scripts": []}
+        self._plot_views: dict[str, QWidget] = {}
         self._sim_log_verbosity = "INFO"
         self._ui_locale = QLocale.c()
 
@@ -379,13 +389,15 @@ class MainWindow(QMainWindow):
 
         # ������ left column: project tree (top) + body props (bottom) ���������������������������������
         left_splitter = QSplitter(Qt.Vertical)
+        self._left_splitter = left_splitter
         left_splitter.addWidget(self._project_tree)
         left_splitter.addWidget(self._body_props)
         left_splitter.setSizes([350, 300])
         left_splitter.setStretchFactor(0, 1)
-        left_splitter.setStretchFactor(1, 1)
+        left_splitter.setStretchFactor(1, 0)
         left_splitter.setCollapsible(0, False)
-        left_splitter.setCollapsible(1, False)
+        left_splitter.setCollapsible(1, True)
+        self._body_props.content_changed.connect(self._schedule_left_splitter_layout)
         left_splitter.setMinimumWidth(210)
 
         # ������ centre column: viewport (top) + info bar (bottom) ���������������������������������������������������
@@ -393,7 +405,20 @@ class MainWindow(QMainWindow):
         centre_layout = QVBoxLayout(centre_widget)
         centre_layout.setContentsMargins(0, 0, 0, 0)
         centre_layout.setSpacing(0)
-        centre_layout.addWidget(self._viewport, stretch=1)
+        self._workspace_tabs = QTabWidget(centre_widget)
+        self._workspace_tabs.setObjectName("workspaceTabs")
+        self._workspace_tabs.setTabsClosable(True)
+        self._workspace_tabs.tabCloseRequested.connect(self._close_workspace_tab)
+        self._workspace_tabs.currentChanged.connect(self._on_workspace_tab_changed)
+        model_page = QWidget(self._workspace_tabs)
+        self._model_page = model_page
+        model_layout = QVBoxLayout(model_page)
+        model_layout.setContentsMargins(0, 0, 0, 0)
+        model_layout.setSpacing(0)
+        model_layout.addWidget(self._viewport, stretch=1)
+        self._workspace_tabs.addTab(model_page, "Model")
+        self._workspace_tabs.tabBar().setTabButton(0, QTabBar.ButtonPosition.RightSide, None)
+        centre_layout.addWidget(self._workspace_tabs)
         centre_layout.addWidget(self._info_bar)
 
         # ������ right column ������������������������������������������������������������������������������������������������������������������������������������������������������������������
@@ -407,6 +432,46 @@ class MainWindow(QMainWindow):
         main_splitter.setSizes([230, 900, 210])
 
         self.setCentralWidget(main_splitter)
+        self._update_left_splitter_layout()
+
+    def _schedule_left_splitter_layout(self, _has_content: bool = False) -> None:
+        QTimer.singleShot(0, self._update_left_splitter_layout)
+
+    def _update_left_splitter_layout(self) -> None:
+        splitter = getattr(self, "_left_splitter", None)
+        body_props = getattr(self, "_body_props", None)
+        if splitter is None or body_props is None:
+            return
+
+        if not body_props.has_content:
+            body_props.hide()
+            splitter.setSizes([max(1, splitter.height()), 0])
+            return
+
+        body_props.show()
+        available_height = max(1, splitter.height())
+        preferred_height = max(170, body_props.sizeHint().height())
+        bottom_height = min(
+            preferred_height,
+            max(170, int(available_height * 0.5)),
+        )
+        splitter.setSizes([max(1, available_height - bottom_height), bottom_height])
+
+    def _on_workspace_tab_changed(self, index: int) -> None:
+        current_widget = self._workspace_tabs.widget(index)
+        self._info_bar.set_model_view(current_widget is self._model_page)
+        self._rebuild_window_menu()
+
+    def _refresh_simulation_status(self) -> None:
+        info_bar = getattr(self, "_info_bar", None)
+        if info_bar is None:
+            return
+        info_bar.set_simulation_status(
+            bool(getattr(self, "_sim_status_running", False)),
+            completed_jobs=int(getattr(self, "_sim_status_completed_jobs", 0)),
+            total_jobs=int(getattr(self, "_sim_status_total_jobs", 0)),
+            current_fraction=getattr(self, "_sim_status_current_fraction", None),
+        )
 
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� menus
@@ -435,7 +500,12 @@ class MainWindow(QMainWindow):
         # Edit
         edit_menu = mb.addMenu("&Edit")
         self._act_del = edit_menu.addAction("&Delete Selected", self._delete_selected, QKeySequence.Delete)
-        edit_menu.addAction("&Cancel Drawing",    self._viewport.cancel_draw, Qt.Key_Escape)
+        self._act_cancel_drawing = edit_menu.addAction(
+            "&Cancel Drawing", self._viewport.cancel_draw, Qt.Key_Escape
+        )
+        self._viewport.measurement_mode_changed.connect(
+            self._set_cancel_drawing_enabled
+        )
         edit_menu.addSeparator()
         self._act_undo = edit_menu.addAction("&Undo", self._undo, QKeySequence.Undo)
         self._act_redo = edit_menu.addAction("&Redo", self._redo, QKeySequence.Redo)
@@ -448,12 +518,14 @@ class MainWindow(QMainWindow):
         act_view_top = view_menu.addAction("Top (XY)", lambda: self._set_view("top"))
         act_view_top.setShortcut(QKeySequence("Ctrl+1"))
         act_view_bottom = view_menu.addAction("Bottom (-XY)", lambda: self._set_view("bottom"))
-        act_view_bottom.setShortcut(QKeySequence("Ctrl+Shift+1"))
+        act_view_bottom.setShortcuts([
+            QKeySequence("Ctrl+6"),
+            QKeySequence("Ctrl+Shift+1"),
+        ])
         act_view_front = view_menu.addAction("Front (XZ)", lambda: self._set_view("front"))
         act_view_front.setShortcut(QKeySequence("Ctrl+2"))
         act_view_back = view_menu.addAction("Back (-XZ)", lambda: self._set_view("back"))
         act_view_back.setShortcuts([
-            QKeySequence("Ctrl+6"),
             QKeySequence("Ctrl+Shift+2"),
         ])
         act_view_right = view_menu.addAction("Right (YZ)", lambda: self._set_view("right"))
@@ -471,6 +543,9 @@ class MainWindow(QMainWindow):
         self._act_grid_toggle.setCheckable(True)
         self._act_grid_toggle.setChecked(True)
 
+        self._window_menu = mb.addMenu("&Window")
+        self._rebuild_window_menu()
+
         tools_menu = mb.addMenu("&Tools")
         tools_menu.addAction("&Settings", self._open_settings_dialog)
         tools_menu.addAction("Material &Library...", self._open_material_library_dialog)
@@ -481,6 +556,144 @@ class MainWindow(QMainWindow):
         help_menu.addAction("&Help", self._open_help)
         help_menu.addSeparator()
         help_menu.addAction("&About", self._show_about)
+
+    def _rebuild_window_menu(self) -> None:
+        menu = getattr(self, "_window_menu", None)
+        if menu is None:
+            return
+        menu.clear()
+        tabs = getattr(self, "_workspace_tabs", None)
+        if tabs is None:
+            return
+        for index in range(tabs.count()):
+            widget = tabs.widget(index)
+            action = menu.addAction(tabs.tabText(index))
+            action.setCheckable(True)
+            action.setChecked(widget is tabs.currentWidget())
+            action.triggered.connect(lambda _checked=False, page=widget: self._show_workspace_tab(page))
+        menu.addSeparator()
+        menu.addAction("Close All Charts", self._close_all_plot_windows)
+
+    def _show_workspace_tab(self, widget: QWidget) -> None:
+        tabs = getattr(self, "_workspace_tabs", None)
+        if tabs is not None:
+            index = tabs.indexOf(widget)
+            if index >= 0:
+                tabs.setCurrentIndex(index)
+
+    def _close_workspace_tab(self, index: int) -> None:
+        tabs = getattr(self, "_workspace_tabs", None)
+        if tabs is None or index <= 0:
+            return
+        widget = tabs.widget(index)
+        if widget is getattr(self, "_sim_dlg", None):
+            tabs.removeTab(index)
+        else:
+            tabs.removeTab(index)
+            for key, chart in list(self._plot_views.items()):
+                if chart is widget:
+                    self._plot_views.pop(key, None)
+                    break
+            widget.deleteLater()
+        self._rebuild_window_menu()
+
+    def _close_all_plot_windows(self) -> None:
+        for key, view in list(getattr(self, "_plot_views", {}).items()):
+            index = self._workspace_tabs.indexOf(view)
+            if index >= 0:
+                self._workspace_tabs.removeTab(index)
+            view.deleteLater()
+            self._plot_views.pop(key, None)
+        self._rebuild_window_menu()
+
+    def _show_chart(self, key: str, plot_data: dict, *, progressive: bool = False) -> None:
+        view = self._plot_views.get(key)
+        is_new = view is None or self._workspace_tabs.indexOf(view) < 0
+        if view is None:
+            from .chart_view import PlotView
+
+            title = str(plot_data.get("title", key)).strip() or key
+            view = PlotView(
+                str(plot_data.get("plot_type", "plot_sp")),
+                self._workspace_tabs,
+                settings_key=key,
+            )
+            view.touchstone_load_requested.connect(
+                lambda plot_key=key: self._load_touchstone_for_chart(plot_key)
+            )
+            self._plot_views[key] = view
+            self._workspace_tabs.addTab(view, title)
+
+        title = str(plot_data.get("title", key)).strip() or key
+        self._workspace_tabs.setTabText(self._workspace_tabs.indexOf(view), title)
+        if progressive and not is_new:
+            view.set_progressive_data(
+                plot_data["x_values"], plot_data["series"], title=plot_data["title"]
+            )
+        else:
+            view.set_plot_data(
+                plot_data["x_values"],
+                plot_data["series"],
+                title=plot_data["title"],
+                xlabel=plot_data.get("xlabel", ""),
+                ylabel=plot_data.get("ylabel", ""),
+            )
+        if is_new:
+            self._workspace_tabs.setCurrentWidget(view)
+        self._rebuild_window_menu()
+
+    def _load_touchstone_for_chart(self, source_chart_key: str) -> None:
+        from .chart_data import make_sparameter_plot_data
+        from .touchstone import prepare_touchstone_directory, read_touchstone_ri
+
+        try:
+            touchstone_dir = prepare_touchstone_directory(self._simulation_bundle_dir())
+        except OSError as exc:
+            QMessageBox.warning(self, "Touchstone", f"Unable to prepare Touchstone folder: {exc}")
+            return
+
+        path, _selected_filter = QFileDialog.getOpenFileName(
+            self,
+            "Load Touchstone Results",
+            str(touchstone_dir),
+            "Touchstone S-parameter files (*.s*p *.S*P)",
+        )
+        if not path:
+            return
+
+        touchstone_path = Path(path)
+        try:
+            parsed = read_touchstone_ri(touchstone_path)
+            parameters = [
+                f"S{output_port}{input_port}"
+                for output_port in range(1, parsed["port_count"] + 1)
+                for input_port in range(1, parsed["port_count"] + 1)
+            ]
+            plot_data = make_sparameter_plot_data(
+                {
+                    "name": touchstone_path.stem,
+                    "plot_type": "plot_sp",
+                    "params": {"s_parameters": parameters},
+                },
+                parsed["frequencies"],
+                parsed["s_matrices"],
+                include_all_parameters=True,
+                file_name=touchstone_path.name,
+                file_id=str(touchstone_path.resolve()),
+            )
+        except (OSError, UnicodeError, ValueError) as exc:
+            QMessageBox.warning(self, "Touchstone", f"Unable to load {touchstone_path.name}: {exc}")
+            return
+
+        view = self._plot_views.get(source_chart_key)
+        if view is None or not hasattr(view, "add_file_data"):
+            QMessageBox.warning(self, "Touchstone", "The source chart is no longer available.")
+            return
+        selected = view.selected_parameters() or view.configured_parameters()
+        for series in plot_data["series"]:
+            series["visible"] = series["label"] in selected
+            series["configured"] = series["visible"]
+        view.add_file_data(plot_data["x_values"], plot_data["series"])
 
     def _recent_project_paths(self) -> list[str]:
         raw = QSettings().value("recent_projects", [], type=list)
@@ -599,6 +812,10 @@ class MainWindow(QMainWindow):
         act_open_region.setToolTip("Generate an air region, PML shell, and open/radiation boundaries")
         act_open_region.triggered.connect(self._open_region_pml_wizard)
         primitive_actions.append(act_open_region)
+        act_step = QAction(_icon("Part_STEP"), "Import STEP", self)
+        act_step.setToolTip("Import a STEP file (.step / .stp)")
+        act_step.triggered.connect(self._import_step)
+        primitive_actions.append(act_step)
         add_group("3D", primitive_actions, columns=3)
 
         # Sketch tool
@@ -649,15 +866,20 @@ class MainWindow(QMainWindow):
         act_pattern.setToolTip("Create linear or circular instances of the selected object")
         act_pattern.triggered.connect(self._create_object_pattern)
 
+        act_copy_by_vertices = QAction(_icon("edit-copy"), "Copy by Vertices", self)
+        act_copy_by_vertices.setToolTip(
+            "Copy the selected object from a picked source vertex to a target vertex without changing its orientation"
+        )
+        act_copy_by_vertices.triggered.connect(self._copy_selected_object_by_vertices)
+
         act_dissolve_boolean = QAction(_icon("edit-delete"), "Dissolve Boolean", self)
         act_dissolve_boolean.setToolTip("Restore source objects from selected boolean result(s)")
         act_dissolve_boolean.triggered.connect(self._bool_dissolve)
-        add_group("Transform", [act_scale, act_move_plane, act_pattern, act_dissolve_boolean], columns=3)
-
-        # ������ STEP import ������������������������������������������������������������������������������������������������������������������������������������������
-        act_step = QAction(_icon("Part_STEP"), "Import STEP", self)
-        act_step.setToolTip("Import a STEP file (.step / .stp)")
-        act_step.triggered.connect(self._import_step)
+        add_group(
+            "Transform",
+            [act_scale, act_move_plane, act_pattern, act_copy_by_vertices, act_dissolve_boolean],
+            columns=3,
+        )
 
         act_play = QAction(_icon("media-playback-start"), "Play", self)
         act_play.setToolTip("Open simulation panel (EMERGE Python script + verbose output)")
@@ -666,7 +888,7 @@ class MainWindow(QMainWindow):
         act_check_simulation = QAction(_icon("dagViewPass"), "Check Simulation", self)
         act_check_simulation.setToolTip("Validate geometry, solver, boundaries, ports and port connectivity")
         act_check_simulation.triggered.connect(self._on_check_simulation)
-        add_group("Simulation", [act_step, act_check_simulation, act_play], columns=3)
+        add_group("Simulation", [act_check_simulation, act_play], columns=3)
 
         act_fit_all = QAction(_icon("zoom-all"), "Fit All", self)
         act_fit_all.setToolTip("Fit all visible objects while preserving the current view orientation")
@@ -695,16 +917,25 @@ class MainWindow(QMainWindow):
 
         # ������ Selection mode ���������������������������������������������������������������������������������������������������������������������������
         self._sel_mode_combo = QComboBox()
-        self._sel_mode_combo.addItems(["All", "Surface", "Edge", "Vertex"])
+        self._sel_mode_combo.addItems(["All", "Surface", "Edge", "Vertex", "Grid"])
         self._sel_mode_combo.setToolTip(
             "Selection mode:\n"
             "  All    - pick whole bodies\n"
             "  Surface- pick a single face/surface\n"
             "  Edge   - pick a single edge\n"
-            "  Vertex - pick a single vertex"
+            "  Vertex - pick a single vertex\n"
+            "  Grid   - use the active drawing grid instead of object geometry"
         )
         self._sel_mode_combo.currentTextChanged.connect(self._on_selection_mode_changed)
         add_group("Select", [self._sel_mode_combo], columns=1)
+
+        act_measure = QAction(_icon("view-measurement"), "Measure", self)
+        act_measure.setToolTip("Measure distances and axis projections between points and planar surfaces")
+        act_measure.triggered.connect(self._open_measure_tool)
+        act_parameters = QAction(_icon("table-grid"), "Parameters", self)
+        act_parameters.setToolTip("Open the project parameter table")
+        act_parameters.triggered.connect(self._open_project_parameters)
+        add_group("Tools", [act_measure, act_parameters], columns=2)
 
         sketch_tb = self.addToolBar("Sketch")
         self._sketch_context_toolbar = sketch_tb
@@ -948,6 +1179,7 @@ class MainWindow(QMainWindow):
         self._sim_script_dirty = True
         self._sim_step_bundle_ready = False
         self._sim_step_bundle_cache = {"entries": [], "skipped": []}
+        self._sim_full_scene_step_dirty = True
         self._sim_cached_script = ""
         self._sim_cached_script_bundle = {"master": "", "scripts": []}
 
@@ -1503,6 +1735,83 @@ class MainWindow(QMainWindow):
 
         dlg.accepted.connect(apply_transform)
         return
+
+    def _copy_selected_object_by_vertices(self) -> None:
+        scene = self._viewport.scene
+        selection = list(scene.selection)
+        if len(selection) != 1:
+            QMessageBox.information(
+                self,
+                "Copy by Vertices",
+                "Select exactly one object to copy.",
+            )
+            return
+
+        source = selection[0]
+        source_actor = getattr(source, "actor", None)
+        if source_actor is None:
+            QMessageBox.information(
+                self,
+                "Copy by Vertices",
+                "The selected object has no geometry to copy.",
+            )
+            return
+
+        def pick_target(reference_point: tuple[float, float, float]) -> None:
+            self._viewport.request_pick(
+                "vertex",
+                lambda target_point: create_copy(reference_point, target_point),
+            )
+
+        def create_copy(
+            reference_point: tuple[float, float, float],
+            target_point: tuple[float, float, float],
+        ) -> None:
+            if source not in scene.objects:
+                self._info_bar.set_info("Copy cancelled because the source object was removed.")
+                return
+
+            snapshot = deepcopy(self._serialize_object_snapshot(source))
+            clone_data = dict(snapshot)
+            clone_data["params"] = dict(snapshot.get("params", {}))
+            existing_names = {str(getattr(obj, "name", "")) for obj in scene.objects}
+            base_name = f"{source.name}_Copy"
+            clone_name = base_name
+            suffix = 2
+            while clone_name in existing_names:
+                clone_name = f"{base_name}_{suffix}"
+                suffix += 1
+            clone_data["name"] = clone_name
+            clone_data["params"]["Name"] = clone_name
+            clone_data["pattern_definition"] = None
+            clone_data["pattern_instance"] = None
+
+            clone = self._rebuild_object_from_snapshot(clone_data)
+            if clone is None or getattr(clone, "actor", None) is None:
+                self._info_bar.set_info("Could not create a copy of the selected object.")
+                return
+
+            offset = tuple(
+                float(target_point[index]) - float(reference_point[index])
+                for index in range(3)
+            )
+            clone.actor.AddPosition(*offset)
+            scene.add_object(clone)
+            scene.deselect_all()
+            scene.select_add(clone)
+            self._refresh_materials()
+            self._sync_port_reference_state()
+            self._viewport._render()
+            self._viewport.scene_changed.emit()
+            self._viewport.selection_changed.emit([clone])
+            self._mark_simulation_dirty(steps=True, script=True)
+            self._info_bar.set_info(f"Copied {source.name} to {clone_name}.")
+
+        self._viewport.request_pick(
+            "vertex",
+            pick_target,
+            actor_filter=source_actor,
+        )
 
     def _serialize_object_snapshot(self, obj, *, include_mesh: bool = True):
         item = {
@@ -2282,11 +2591,11 @@ class MainWindow(QMainWindow):
     def _on_project_selected(self) -> None:
         self._project_properties_active = True
         parameters = self._project_tree.get_settings().get("parameters", [])
-        self._body_props.set_project_parameters(parameters)
-        self._sync_project_variable_names(parameters)
         self._materials.highlight([])
         if hasattr(self._viewport.scene, "deselect_all"):
             self._viewport.scene.deselect_all()
+        self._body_props.set_project_parameters(parameters)
+        self._sync_project_variable_names(parameters)
         self._info_bar.set_info(f"Project: {self._project_name}")
 
     def _on_project_parameters_changed(self, parameters: list) -> None:
@@ -2337,6 +2646,12 @@ class MainWindow(QMainWindow):
         self._project_tree.settings_changed.emit()
         self._recompute_parametric_objects()
         self.recompute_sketch_dimensions()
+
+    def _open_measure_tool(self) -> None:
+        self._viewport.start_measurement()
+
+    def _set_cancel_drawing_enabled(self, measurement_active: bool) -> None:
+        self._act_cancel_drawing.setEnabled(not measurement_active)
 
     def _parameter_values(self) -> dict[str, float]:
         values = {}
@@ -2785,10 +3100,17 @@ class MainWindow(QMainWindow):
             self._refresh_materials()
         return changed
 
-    def _recompute_parametric_objects(self, *, _patterns_recomputed: bool = False) -> None:
+    def _recompute_parametric_objects(
+        self,
+        *,
+        _patterns_recomputed: bool = False,
+        parameter_values: dict[str, float] | None = None,
+    ) -> None:
         from ..scene.boolean_ops import boolean_dependency_order, boolean_many, fuse_many
 
         values = self._parameter_values()
+        if parameter_values:
+            values.update(parameter_values)
         self._sync_boolean_provenance()
         scene_objects = list(self._viewport.scene.objects)
         objects_by_name = {str(obj.name): obj for obj in scene_objects}
@@ -3502,20 +3824,9 @@ class MainWindow(QMainWindow):
     def _open_simulation_window(self) -> None:
         dlg = getattr(self, "_sim_dlg", None)
         if dlg is None:
-            dlg = QDialog(self)
-            dlg.setWindowTitle("EMERGE Simulation")
-            dlg.resize(1200, 760)
+            dlg = QWidget(self)
 
             root = QVBoxLayout(dlg)
-
-            script_box = QGroupBox("Python Script to run with EMERGE")
-            script_layout = QVBoxLayout(script_box)
-            self._sim_script_tabs = QTabWidget(script_box)
-            self._sim_script_view = QPlainTextEdit(script_box)
-            self._sim_script_view.setReadOnly(True)
-            self._sim_script_view.setLineWrapMode(QPlainTextEdit.NoWrap)
-            self._sim_script_tabs.addTab(self._sim_script_view, "Master")
-            script_layout.addWidget(self._sim_script_tabs)
 
             log_box = QGroupBox("Verbose execution log")
             log_layout = QVBoxLayout(log_box)
@@ -3532,7 +3843,21 @@ class MainWindow(QMainWindow):
             self._sim_log_view.setLineWrapMode(QPlainTextEdit.NoWrap)
             log_layout.addWidget(self._sim_log_view)
 
+            self._sim_output_tabs = QTabWidget(dlg)
+            self._sim_output_tabs.addTab(log_box, "Execution Log")
+
             btn_row = QHBoxLayout()
+            self._sim_chk_run_sweep = QCheckBox("Run Sweep")
+            self._sim_chk_run_sweep.setChecked(True)
+            self._sim_chk_run_sweep.setToolTip("Run the configured solver after mesh generation")
+            self._sim_chk_run_sweep.toggled.connect(self._on_sim_option_changed)
+            btn_row.addWidget(self._sim_chk_run_sweep)
+
+            self._sim_chk_show_mesh = QCheckBox("Show Mesh")
+            self._sim_chk_show_mesh.setChecked(False)
+            self._sim_chk_show_mesh.toggled.connect(self._on_sim_option_changed)
+            btn_row.addWidget(self._sim_chk_show_mesh)
+
             self._sim_chk_show_model = QCheckBox("Show Model")
             self._sim_chk_show_model.setChecked(False)
             self._sim_chk_show_model.toggled.connect(self._on_sim_option_changed)
@@ -3546,41 +3871,30 @@ class MainWindow(QMainWindow):
             self._sim_chk_preview_only.toggled.connect(self._on_sim_option_changed)
             btn_row.addWidget(self._sim_chk_preview_only)
 
-            self._sim_chk_show_mesh = QCheckBox("Show Mesh")
-            self._sim_chk_show_mesh.setChecked(False)
-            self._sim_chk_show_mesh.toggled.connect(self._on_sim_option_changed)
-            btn_row.addWidget(self._sim_chk_show_mesh)
-
-            self._sim_chk_run_sweep = QCheckBox("Run Sweep")
-            self._sim_chk_run_sweep.setChecked(True)
-            self._sim_chk_run_sweep.setToolTip("Run the configured solver after mesh generation")
-            self._sim_chk_run_sweep.toggled.connect(self._on_sim_option_changed)
-            btn_row.addWidget(self._sim_chk_run_sweep)
-
-            self._sim_chk_boolean_debug = QCheckBox("Boolean Debug")
+            self._sim_chk_boolean_debug = QCheckBox("Boolean Debug", dlg)
             self._sim_chk_boolean_debug.setChecked(False)
             self._sim_chk_boolean_debug.setToolTip("Export only boolean source objects, shifted apart for visual inspection")
             self._sim_chk_boolean_debug.toggled.connect(self._on_sim_option_changed)
-            btn_row.addWidget(self._sim_chk_boolean_debug)
-
-            btn_row.addWidget(QLabel("Log:"))
-            self._sim_log_level = QComboBox()
-            self._sim_log_level.addItems(["Trace", "Debug", "Info", "Warning", "Error"])
-            self._sim_log_level.setCurrentText(self._sim_log_verbosity.title())
-            self._sim_log_level.currentTextChanged.connect(self._on_sim_log_level_changed)
-            btn_row.addWidget(self._sim_log_level)
-
-            self._sim_btn_generate = QPushButton("Generate Script")
-            self._sim_btn_generate.clicked.connect(self._on_sim_generate)
-            btn_row.addWidget(self._sim_btn_generate)
+            self._sim_chk_boolean_debug.hide()
 
             self._sim_btn_check = QPushButton("Check Simulation")
             self._sim_btn_check.clicked.connect(self._on_check_simulation)
             btn_row.addWidget(self._sim_btn_check)
 
+            self._sim_btn_generate = QPushButton("Generate Script")
+            self._sim_btn_generate.clicked.connect(self._on_sim_generate)
+            btn_row.addWidget(self._sim_btn_generate)
+
             self._sim_btn_save = QPushButton("Save Script")
             self._sim_btn_save.clicked.connect(self._on_sim_save_script)
             btn_row.addWidget(self._sim_btn_save)
+
+            btn_row.addWidget(QLabel("LOG"))
+            self._sim_log_level = QComboBox()
+            self._sim_log_level.addItems(["Trace", "Debug", "Info", "Warning", "Error"])
+            self._sim_log_level.setCurrentText(self._sim_log_verbosity.title())
+            self._sim_log_level.currentTextChanged.connect(self._on_sim_log_level_changed)
+            btn_row.addWidget(self._sim_log_level)
 
             self._sim_btn_run = QPushButton("Run")
             self._sim_btn_run.clicked.connect(self._on_sim_run)
@@ -3593,11 +3907,18 @@ class MainWindow(QMainWindow):
 
             btn_row.addStretch(1)
 
-            root.addWidget(script_box, stretch=3)
             root.addLayout(btn_row)
-            root.addWidget(log_box, stretch=2)
+            script_box = QGroupBox("Generated Scripts", dlg)
+            script_layout = QVBoxLayout(script_box)
+            self._sim_script_tabs = QTabWidget(script_box)
+            script_layout.addWidget(self._sim_script_tabs)
+            root.addWidget(script_box, stretch=3)
+            root.addWidget(self._sim_output_tabs, stretch=2)
 
             self._sim_dlg = dlg
+
+        if self._workspace_tabs.indexOf(dlg) < 0:
+            self._workspace_tabs.insertTab(1, dlg, "Simulation")
 
         self._sim_log_view.clear()
         try:
@@ -3610,20 +3931,14 @@ class MainWindow(QMainWindow):
                 self._append_sim_log(f"[info] Scripts regenerated and saved: {script_path.parent}")
         except Exception as exc:
             self._append_sim_log(f"[error] Failed to generate script: {exc}")
-        dlg.show()
-        dlg.raise_()
-        dlg.activateWindow()
+        self._workspace_tabs.setCurrentWidget(dlg)
 
     def _on_sim_option_changed(self, _checked: bool) -> None:
         self._mark_simulation_dirty(steps=False, script=True)
         self._on_sim_generate(show_progress=False, force_script=True)
 
     def _on_check_simulation(self) -> None:
-        findings = validate_simulation(
-            self._viewport.scene.objects,
-            self._project_tree.get_settings(),
-            self._material_store.material_export_catalog(),
-        )
+        findings = self._simulation_validation_findings()
         counts = {
             severity: sum(1 for finding in findings if finding.severity == severity)
             for severity in ("ERROR", "WARNING", "OK")
@@ -3668,6 +3983,14 @@ class MainWindow(QMainWindow):
             f"{counts['WARNING']} warning(s), {counts['OK']} passed."
         )
         dlg.exec()
+
+    def _simulation_validation_findings(self):
+        return validate_simulation(
+            self._viewport.scene.objects,
+            self._project_tree.get_settings(),
+            self._material_store.material_export_catalog(),
+            self._collect_plate_lumped_ports(),
+        )
 
     def _normalize_log_level(self, value: str) -> str:
         level = str(value or "").strip().upper()
@@ -3910,6 +4233,10 @@ class MainWindow(QMainWindow):
                     "EigenmodeCount": item.get("EigenmodeCount", 5),
                     "ParamName": item.get("ParamName", ""),
                     "ParamValues": item.get("ParamValues", ""),
+                    "progressive_sparams_enabled": bool(item.get("progressive_sparams_enabled", False)),
+                    "progressive_sparams_chunk_size": max(
+                        1, int(item.get("progressive_sparams_chunk_size", 10))
+                    ),
                     "sparam_fitting": dict(item.get("sparam_fitting", {})) if isinstance(item.get("sparam_fitting", {}), dict) else {"enabled": False, "points": 1001},
                     "LogVerbosity": item.get("LogVerbosity", "Info"),
                 })
@@ -3936,6 +4263,10 @@ class MainWindow(QMainWindow):
             "EigenmodeCount": legacy.get("EigenmodeCount", 5),
             "ParamName": legacy.get("ParamName", ""),
             "ParamValues": legacy.get("ParamValues", ""),
+            "progressive_sparams_enabled": bool(legacy.get("progressive_sparams_enabled", False)),
+            "progressive_sparams_chunk_size": max(
+                1, int(legacy.get("progressive_sparams_chunk_size", 10))
+            ),
             "sparam_fitting": dict(legacy.get("sparam_fitting", {})) if isinstance(legacy.get("sparam_fitting", {}), dict) else {"enabled": False, "points": 1001},
             "LogVerbosity": legacy.get("LogVerbosity", "Info"),
         }]
@@ -3955,7 +4286,10 @@ class MainWindow(QMainWindow):
                 "        {"
                 f"'name': {repr(str(job.get('name', 'Simulation')))}, "
                 f"'type': {repr(str(job.get('type', 'Sweep')).strip().lower())}, "
-                f"'filename': {repr(str(job.get('filename', 'simulation_emerge_run.py')))}"
+                f"'filename': {repr(str(job.get('filename', 'simulation_emerge_run.py')))}, "
+                f"'completion_name': {repr(str(job.get('completion_name', job.get('name', 'Simulation'))))}, "
+                f"'parameter_index': {repr(job.get('parameter_index'))}, "
+                f"'parameter_total': {repr(job.get('parameter_total'))}"
                 "},"
             )
         jobs_literal = "\n".join(job_lines) if job_lines else ""
@@ -3963,16 +4297,21 @@ class MainWindow(QMainWindow):
             "# Auto-generated EMERGE master script\n"
             "import os\n"
             "import sys\n"
+            "import json\n"
             "import subprocess\n\n"
+            "import threading\n\n"
             "import time\n\n"
             "STOP_ON_ERROR = True\n\n"
             "def _run_children() -> int:\n"
             "    script_dir = os.path.dirname(os.path.abspath(__file__))\n"
             "    cancel_file = os.path.join(script_dir, '.em3d_simulation_cancel')\n"
             "    active_pid_file = os.path.join(script_dir, '.em3d_simulation_active.pid')\n"
+            "    if hasattr(sys.stdout, 'reconfigure'):\n"
+            "        sys.stdout.reconfigure(errors='replace')\n"
             "    jobs = [\n"
             f"{jobs_literal}\n"
             "    ]\n"
+            "    run_id = time.strftime('%Y%m%d-%H%M%S') + f'-{time.time_ns() % 1000000:06d}'\n"
             "    for job in jobs:\n"
             "        if os.path.exists(cancel_file):\n"
             "            print('[master] Cancellation requested; remaining jobs will not start.')\n"
@@ -3980,10 +4319,27 @@ class MainWindow(QMainWindow):
             "        child = str(job.get('filename', ''))\n"
             "        child_path = os.path.join(script_dir, child)\n"
             "        env = os.environ.copy()\n"
-            "        env.setdefault('PYTHONIOENCODING', 'utf-8')\n"
-            "        env.setdefault('PYTHONUTF8', '1')\n"
+            "        env['PYTHONIOENCODING'] = 'utf-8'\n"
+            "        env['PYTHONUTF8'] = '1'\n"
+            "        env['EM3D_RUN_IN_APP'] = '1'\n"
+            "        env['EM3D_RUN_ID'] = run_id\n"
+            "        if job.get('parameter_index') is not None:\n"
+            "            env['EM3D_PARAMETRIC_INDEX'] = str(job['parameter_index'])\n"
+            "            env['EM3D_PARAMETRIC_TOTAL'] = str(job['parameter_total'])\n"
             "        print(f\"[master] Running job '{job.get('name')}' from {child_path}\")\n"
-            "        process = subprocess.Popen([sys.executable, '-u', child_path], cwd=script_dir, env=env)\n"
+            "        command = ([sys.executable, '--em3d-run-script', child_path] if getattr(sys, 'frozen', False) else [sys.executable, '-u', child_path])\n"
+            "        process = subprocess.Popen(\n"
+            "            command, cwd=script_dir, env=env, stdout=subprocess.PIPE,\n"
+            "            stderr=subprocess.STDOUT, text=True, encoding='utf-8', errors='replace', bufsize=1,\n"
+            "        )\n"
+            "        def _forward_output():\n"
+            "            if process.stdout is None:\n"
+            "                return\n"
+            "            with process.stdout:\n"
+            "                for line in process.stdout:\n"
+            "                    print(line, end='', flush=True)\n"
+            "        output_thread = threading.Thread(target=_forward_output, daemon=True)\n"
+            "        output_thread.start()\n"
             "        with open(active_pid_file, 'w', encoding='ascii') as pid_file:\n"
             "            pid_file.write(str(process.pid))\n"
             "        while process.poll() is None:\n"
@@ -3994,8 +4350,10 @@ class MainWindow(QMainWindow):
             "                    process.wait(timeout=5)\n"
             "                except subprocess.TimeoutExpired:\n"
             "                    process.kill()\n"
+            "                output_thread.join()\n"
             "                return 130\n"
             "            time.sleep(0.2)\n"
+            "        output_thread.join()\n"
             "        try:\n"
             "            os.remove(active_pid_file)\n"
             "        except FileNotFoundError:\n"
@@ -4004,11 +4362,53 @@ class MainWindow(QMainWindow):
             "            print(f\"[master] Job failed ({process.returncode}): {job.get('name')}\")\n"
             "            if STOP_ON_ERROR:\n"
             "                return int(process.returncode)\n"
+            "        else:\n"
+            "            print('EM3D_JOB_COMPLETED:' + json.dumps({'name': str(job.get('completion_name', job.get('name', ''))), 'filename': child}, separators=(',', ':')), flush=True)\n"
             "    print('[master] All simulations completed successfully.')\n"
             "    return 0\n\n"
             "if __name__ == '__main__':\n"
             "    raise SystemExit(_run_children())\n"
         )
+
+    def _export_simulation_step_bundle(
+        self,
+        *,
+        objects: list,
+        bundle_dir: Path,
+        material_priorities: dict,
+        excluded_object_names: set[str],
+    ) -> dict:
+        def log_export(level: str, message: str) -> None:
+            normalized_level = self._normalize_log_level(level)
+            if normalized_level in {"WARNING", "ERROR"}:
+                self._append_step_export_log(
+                    f"[{normalized_level.lower()}] {message}",
+                    level=normalized_level,
+                )
+
+        result = export_objects_to_step_bundle(
+            objects=objects,
+            bundle_dir=bundle_dir,
+            material_priorities=material_priorities,
+            excluded_object_names=excluded_object_names,
+            log_callback=log_export,
+        )
+        skipped = list(result.get("skipped", []))
+        missing_files = [
+            str(entry.get("step_file", ""))
+            for entry in result.get("entries", [])
+            if not (bundle_dir / str(entry.get("step_file", ""))).is_file()
+        ]
+        if skipped or missing_files:
+            details = []
+            if skipped:
+                details.append(f"{len(skipped)} object(s) skipped: {', '.join(skipped)}")
+            if missing_files:
+                details.append(f"STEP file(s) missing: {', '.join(missing_files)}")
+            message = f"STEP export incomplete in {bundle_dir}: {'; '.join(details)}"
+            self._append_step_export_log(f"[error] {message}", level="ERROR")
+            raise RuntimeError(message)
+        return result
 
     def _build_simulation_script_bundle(self, step_entries: list[dict], show_model: bool, show_mesh: bool, run_sweep: bool, preview_only: bool = False) -> dict:
         settings = self._project_tree.get_settings()
@@ -4049,10 +4449,118 @@ class MainWindow(QMainWindow):
             safe_project = self._safe_script_token(self._project_name)
             safe_sim = self._safe_script_token(sim_name)
             filename = f"{safe_project}_{idx:02d}_{safe_sim}_emerge_run.py"
+
+            if str(sim_cfg.get("type", "Sweep")).strip().lower() == "parametric":
+                parameter_name = str(sim_cfg.get("ParamName", "")).strip()
+                parameter_values = [
+                    value.strip()
+                    for value in str(sim_cfg.get("ParamValues", "")).split(",")
+                    if value.strip()
+                ] or ["default"]
+                original_parameter_values = self._parameter_values()
+                simulation_root = self._simulation_bundle_dir() / f"{safe_project}_{safe_sim}"
+                for parameter_index, parameter_value in enumerate(parameter_values, start=1):
+                    value_token = self._safe_script_token(parameter_value)
+                    step_dir_name = f"Step_{parameter_index:03d}_{value_token}"
+                    step_dir = simulation_root / step_dir_name
+                    step_parameter_values = dict(original_parameter_values)
+                    if parameter_name:
+                        try:
+                            step_parameter_values[parameter_name] = float(parameter_value)
+                        except ValueError:
+                            pass
+
+                    try:
+                        self._recompute_parametric_objects(
+                            parameter_values=step_parameter_values
+                        )
+                        plate_names = {
+                            str(obj.name).strip()
+                            for obj in self._simulation_model_objects()
+                            if self._is_plate_role_object(obj)
+                        }
+                        step_bundle = self._export_simulation_step_bundle(
+                            objects=self._simulation_model_objects(),
+                            bundle_dir=step_dir,
+                            material_priorities=settings.get("material_priorities", {}),
+                            excluded_object_names=plate_names,
+                        )
+                        step_simulation = dict(sim_cfg)
+                        step_simulation["ParamValues"] = parameter_value
+                        child_settings = dict(child_settings)
+                        child_settings["simulations"] = [step_simulation]
+                        child_simulation_config = dict(child_settings["simulation"])
+                        child_simulation_config.update({
+                            "Fmin_GHz": step_simulation.get("Fmin_GHz", 0.1),
+                            "Fmax_GHz": step_simulation.get("Fmax_GHz", 10.0),
+                            "Fstep_GHz": step_simulation.get("Fstep_GHz", 0.1),
+                            "LogVerbosity": step_simulation.get("LogVerbosity", "Info"),
+                        })
+                        child_settings["simulation"] = child_simulation_config
+                        step_filename = f"{safe_project}_{idx:02d}_{safe_sim}_step_{parameter_index:03d}.py"
+                        relative_filename = str(Path(safe_project + "_" + safe_sim) / step_dir_name / step_filename)
+                        script_text = export_emerge_python_script(
+                            project_name=self._project_name,
+                            settings=child_settings,
+                            step_entries=step_bundle.get("entries", []),
+                            units=self._units,
+                            materials_catalog=self._material_store.material_export_catalog(),
+                            show_model=show_model,
+                            preview_only=preview_only,
+                            show_mesh=show_mesh,
+                            run_sweep=run_sweep,
+                            lumped_ports=self._collect_plate_lumped_ports(),
+                            plate_entries=self._collect_emerge_plates(),
+                            solver=runtime_solver,
+                            parallel_enabled=runtime_parallel,
+                            pardiso_threads=runtime_pardiso_threads,
+                            acc_threads=runtime_acc_threads,
+                            mesh_resolution_fraction=mesh_fraction,
+                            plot_sparams_after_sim=runtime_plot_sparams,
+                            progressive_sparams_enabled=bool(step_simulation.get("progressive_sparams_enabled", False)),
+                            export_sparams_after_sim=True,
+                            simulation_override=step_simulation,
+                        )
+                        clean_filename = f"{Path(step_filename).stem}_clean.py"
+                        clean_script_text = build_clean_emerge_python_script(
+                            script_text,
+                            "parametric",
+                        )
+                        scripts.append({
+                            "name": f"{sim_name} ({parameter_name}={parameter_value})" if parameter_name else f"{sim_name} ({parameter_value})",
+                            "job_name": sim_name,
+                            "type": "parametric",
+                            "index": idx,
+                            "parameter_index": parameter_index,
+                            "parameter_total": len(parameter_values),
+                            "completion_name": sim_name if parameter_index == len(parameter_values) else "",
+                            "filename": relative_filename,
+                            "content": script_text,
+                            "clean_filename": str(Path(relative_filename).with_name(clean_filename)),
+                            "clean_content": clean_script_text,
+                        })
+                    finally:
+                        self._recompute_parametric_objects(
+                            parameter_values=original_parameter_values
+                        )
+                continue
+
+            simulation_root = self._simulation_bundle_dir() / f"{safe_project}_{safe_sim}"
+            plate_names = {
+                str(obj.name).strip()
+                for obj in self._simulation_model_objects()
+                if self._is_plate_role_object(obj)
+            }
+            simulation_step_bundle = self._export_simulation_step_bundle(
+                objects=self._simulation_model_objects(),
+                bundle_dir=simulation_root,
+                material_priorities=settings.get("material_priorities", {}),
+                excluded_object_names=plate_names,
+            )
             script_text = export_emerge_python_script(
                 project_name=self._project_name,
                 settings=child_settings,
-                step_entries=step_entries,
+                step_entries=simulation_step_bundle.get("entries", []),
                 units=self._units,
                 materials_catalog=self._material_store.material_export_catalog(),
                 show_model=show_model,
@@ -4067,8 +4575,14 @@ class MainWindow(QMainWindow):
                 acc_threads=runtime_acc_threads,
                 mesh_resolution_fraction=mesh_fraction,
                 plot_sparams_after_sim=runtime_plot_sparams,
+                progressive_sparams_enabled=bool(sim_cfg.get("progressive_sparams_enabled", False)),
                 export_sparams_after_sim=runtime_export_sparams,
                 simulation_override=sim_cfg,
+            )
+            clean_filename = f"{Path(filename).stem}_clean.py"
+            clean_script_text = build_clean_emerge_python_script(
+                script_text,
+                str(sim_cfg.get("type", "Sweep")).strip().lower(),
             )
             scripts.append(
                 {
@@ -4076,8 +4590,11 @@ class MainWindow(QMainWindow):
                     "job_name": sim_name,
                     "type": str(sim_cfg.get("type", "Sweep")).strip().lower(),
                     "index": idx,
-                    "filename": filename,
+                    "completion_name": sim_name,
+                    "filename": str(Path(safe_project + "_" + safe_sim) / filename),
                     "content": script_text,
+                    "clean_filename": str(Path(safe_project + "_" + safe_sim) / clean_filename),
+                    "clean_content": clean_script_text,
                 }
             )
 
@@ -4118,18 +4635,18 @@ class MainWindow(QMainWindow):
         return [obj for obj in self._viewport.scene.objects if bool(getattr(obj, "is_model", True))]
 
     def _generate_simulation_assets(self, show_progress: bool = True, force_script: bool = False, force_step_export: bool = False) -> str | None:
+        need_script = force_script or self._sim_script_dirty or (not self._sim_cached_script_bundle.get("master", ""))
+        if need_script:
+            findings = self._simulation_validation_findings()
+            errors = [finding for finding in findings if finding.severity == "ERROR"]
+            for finding in errors:
+                self._append_sim_log(f"[error] Preflight {finding.category}: {finding.message}")
+            if errors:
+                self._append_sim_log("[error] Script generation stopped: resolve preflight errors first.")
+                return None
+
         progress = None
-        canceled = {"value": False}
         sim_objects = self._simulation_model_objects()
-        plate_names = {
-            str(obj.name).strip()
-            for obj in sim_objects
-            if self._is_plate_role_object(obj)
-        }
-        total_candidates = sum(
-            1 for obj in sim_objects
-            if str(getattr(obj, "name", "")).strip() not in plate_names
-        )
 
         need_step_export = force_step_export or self._sim_steps_dirty or (not self._sim_step_bundle_ready)
         need_full_scene_step_export = bool(
@@ -4137,84 +4654,21 @@ class MainWindow(QMainWindow):
             and (getattr(self, "_sim_full_scene_step_dirty", True) or need_step_export)
         )
 
-        if show_progress and need_step_export and total_candidates > 0:
-            progress = QProgressDialog("Exporting STEP objects...", "Cancel", 0, total_candidates, self)
-            progress.setWindowTitle("Preparing Simulation")
-            progress.setWindowModality(Qt.WindowModal)
-            progress.setMinimumDuration(0)
-            progress.setValue(0)
-
-        def _progress_cb(done: int, total: int, obj_name: str) -> None:
-            msg = f"Converting STEP {done}/{total}: {obj_name}"
-            self._info_bar.set_info(msg)
-            if progress is not None:
-                progress.setMaximum(max(total, 1))
-                progress.setValue(done)
-                progress.setLabelText(msg)
-                QApplication.processEvents()
-                if progress.wasCanceled():
-                    canceled["value"] = True
-
         try:
             if need_step_export:
                 self._reset_step_export_log()
-                self._append_step_export_log("[info] STEP export started.", level="INFO")
-
-                def _step_cb(level: str, message: str) -> None:
-                    lvl = self._normalize_log_level(level)
-                    if self._step_log_enabled(lvl):
-                        self._append_step_export_log(f"[{lvl.lower()}] {message}", level=lvl)
-
-                try:
-                    bundle = export_objects_to_step_bundle(
-                        objects=sim_objects,
-                        bundle_dir=self._simulation_bundle_dir(),
-                        progress_callback=_progress_cb,
-                        log_callback=_step_cb,
-                        debug_boolean_sources_only=bool(getattr(self, "_sim_chk_boolean_debug", None) and self._sim_chk_boolean_debug.isChecked()),
-                        material_priorities=self._project_tree.get_settings().get("material_priorities", {}),
-                        excluded_object_names=plate_names,
-                    )
-                except Exception as exc:
-                    self._append_step_export_log(f"[error] STEP export failed: {exc}", level="ERROR")
-                    self._append_step_export_log(traceback.format_exc().rstrip("\n"), level="ERROR")
-                    raise
-
-                if canceled["value"]:
-                    self._append_step_export_log("[warn] STEP export cancelled by user.", level="WARNING")
-                    self._append_sim_log("[warn] STEP export cancelled by user.")
-                    return None
-
+                self._append_step_export_log(
+                    "[info] Geometry export is performed inside each Project_SimulationN folder.",
+                    level="INFO",
+                )
+                bundle = {"entries": [], "skipped": []}
                 self._sim_step_bundle_cache = bundle
                 self._sim_step_bundle_ready = True
                 self._sim_steps_dirty = False
-
-                exported = len(bundle.get("entries", []))
-                skipped = bundle.get("skipped", [])
-                step_msg = f"[info] STEP exported: {exported} object(s) in {self._simulation_bundle_dir()}"
-                self._append_sim_log(step_msg)
-                self._append_step_export_log(step_msg, level="INFO")
-                for entry in bundle.get("entries", []):
-                    step_file = self._simulation_bundle_dir() / str(entry.get("step_file", ""))
-                    try:
-                        step_size = step_file.stat().st_size
-                    except OSError:
-                        step_size = -1
-                    detail = (
-                        f"[info] {entry.get('object_name')} | type={entry.get('object_type')} | "
-                        f"mode={entry.get('export_mode')} | file={entry.get('step_file')} | "
-                        f"size_bytes={step_size} | solids={entry.get('solid_count')} | material={entry.get('material')} | "
-                        f"boolean={entry.get('boolean_op')} | sources={entry.get('source_count')} | "
-                        f"poly_points={entry.get('poly_points')} | poly_polys={entry.get('poly_polys')}"
-                    )
-                    self._append_step_export_log(detail, level="INFO")
-                if skipped:
-                    skipped_msg = "[info] Skipped objects: " + ", ".join(skipped)
-                    self._append_sim_log(skipped_msg)
-                    self._append_step_export_log(skipped_msg, level="INFO")
-                    self._info_bar.set_info(f"STEP export done with skips: exported={exported}, skipped={len(skipped)}")
-                else:
-                    self._info_bar.set_info(f"STEP export done: {exported} object(s)")
+                self._append_sim_log(
+                    f"[info] Per-simulation STEP export prepared under {self._simulation_bundle_dir()}"
+                )
+                self._info_bar.set_info("Per-simulation geometry export prepared.")
             else:
                 bundle = self._sim_step_bundle_cache
 
@@ -4241,8 +4695,6 @@ class MainWindow(QMainWindow):
                     self._append_sim_log(warning)
                     self._append_step_export_log(warning, level="WARNING")
 
-            need_script = force_script or self._sim_script_dirty or (not self._sim_cached_script_bundle.get("master", ""))
-
             if need_script:
                 show_model = bool(getattr(self, "_sim_chk_show_model", None) and self._sim_chk_show_model.isChecked())
                 preview_only = bool(getattr(self, "_sim_chk_preview_only", None) and self._sim_chk_preview_only.isChecked())
@@ -4266,8 +4718,6 @@ class MainWindow(QMainWindow):
                 script = str(script_bundle.get("master", ""))
 
             self._update_simulation_script_tabs(script_bundle)
-            if need_step_export:
-                self._append_step_export_log("[info] STEP export finished.", level="INFO")
             return script
         finally:
             if progress is not None:
@@ -4342,7 +4792,14 @@ class MainWindow(QMainWindow):
         for item in bundle.get("scripts", []):
             child_name = str(item.get("filename", "simulation_emerge_run.py"))
             child_path = script_path.parent / child_name
+            child_path.parent.mkdir(parents=True, exist_ok=True)
             child_path.write_text(str(item.get("content", "")), encoding="utf-8")
+            clean_name = str(item.get("clean_filename", ""))
+            clean_content = str(item.get("clean_content", ""))
+            if clean_name and clean_content:
+                clean_path = script_path.parent / clean_name
+                clean_path.parent.mkdir(parents=True, exist_ok=True)
+                clean_path.write_text(clean_content, encoding="utf-8")
         return script_path
 
     def _on_sim_save_script(self) -> None:
@@ -4373,8 +4830,16 @@ class MainWindow(QMainWindow):
         for item in script_bundle.get("scripts", []):
             child_name = str(item.get("filename", "simulation_emerge_run.py"))
             child_path = target_dir / child_name
+            child_path.parent.mkdir(parents=True, exist_ok=True)
             child_path.write_text(str(item.get("content", "")), encoding="utf-8")
             self._append_sim_log(f"[info] Child script saved: {child_path}")
+            clean_name = str(item.get("clean_filename", ""))
+            clean_content = str(item.get("clean_content", ""))
+            if clean_name and clean_content:
+                clean_path = target_dir / clean_name
+                clean_path.parent.mkdir(parents=True, exist_ok=True)
+                clean_path.write_text(clean_content, encoding="utf-8")
+                self._append_sim_log(f"[info] Clean EMERGE script saved: {clean_path}")
 
     def _close_simulation_job(self) -> None:
         job_handle = getattr(self, "_sim_job_handle", None)
@@ -4441,6 +4906,19 @@ class MainWindow(QMainWindow):
         return terminated
 
     def _on_sim_run(self) -> None:
+        proc = getattr(self, "_sim_process", None)
+        if proc is not None and proc.state() != QProcess.NotRunning:
+            self._append_sim_log("[warn] A simulation process is already running.")
+            return
+
+        try:
+            if not self._save_project():
+                self._append_sim_log("[warn] Simulation not started because the project was not saved.")
+                return
+        except Exception as exc:
+            self._append_sim_log(f"[error] Simulation not started because project save failed: {exc}")
+            return
+
         try:
             master_script = self._generate_simulation_assets(show_progress=True, force_script=False)
         except Exception as exc:
@@ -4459,18 +4937,29 @@ class MainWindow(QMainWindow):
                 self._append_sim_log(f"[warn] Could not reset simulation control file {control_file.name}: {exc}")
         self._append_sim_log(f"[info] Running master script: {script_path}")
 
-        proc = getattr(self, "_sim_process", None)
-        if proc is not None and proc.state() != QProcess.NotRunning:
-            self._append_sim_log("[warn] A simulation process is already running.")
-            return
+        self._sim_status_total_jobs = max(
+            1,
+            len(getattr(self, "_sim_cached_script_bundle", {}).get("scripts", [])),
+        )
+        self._sim_status_completed_jobs = 0
+        self._sim_status_current_fraction = None
+        self._sim_status_running = True
+        MainWindow._refresh_simulation_status(self)
 
+        self._reset_progressive_sparams_plot()
         self._sim_process = QProcess(self)
         self._sim_process.setProgram(sys.executable)
-        self._sim_process.setArguments(["-u", str(script_path)])
+        if getattr(sys, "frozen", False):
+            self._sim_process.setArguments(["--em3d-run-script", str(script_path)])
+        else:
+            self._sim_process.setArguments(["-u", str(script_path)])
         self._sim_process.setWorkingDirectory(str(script_path.parent))
         self._sim_process.setProcessChannelMode(QProcess.MergedChannels)
         self._sim_process.readyReadStandardOutput.connect(self._on_sim_process_output)
         self._sim_process.finished.connect(self._on_sim_finished)
+        error_signal = getattr(self._sim_process, "errorOccurred", None)
+        if error_signal is not None:
+            error_signal.connect(self._on_sim_process_error)
         self._sim_process.started.connect(lambda process=self._sim_process: self._attach_simulation_job(process))
         self._sim_process.start()
 
@@ -4529,12 +5018,335 @@ class MainWindow(QMainWindow):
         if proc is None:
             return
         data = bytes(proc.readAllStandardOutput()).decode("utf-8", errors="replace")
-        if data:
-            self._append_sim_log(data.rstrip("\n"))
+        if not data:
+            return
+        lines = (getattr(self, "_sim_stdout_buffer", "") + data).split("\n")
+        self._sim_stdout_buffer = lines.pop()
+        for line in lines:
+            self._process_sim_stdout_line(line.rstrip("\r"))
+
+    def _process_sim_stdout_line(self, line: str) -> None:
+        prefix = "EM3D_SPARAM_PROGRESS:"
+        completed_prefix = "EM3D_JOB_COMPLETED:"
+        if line.startswith(completed_prefix):
+            try:
+                job = json.loads(line[len(completed_prefix):])
+                simulation_name = str(job.get("name", "")).strip()
+                if simulation_name:
+                    self._plot_completed_simulation_outputs(simulation_name)
+                self._sim_status_completed_jobs = min(
+                    int(getattr(self, "_sim_status_total_jobs", 0)),
+                    int(getattr(self, "_sim_status_completed_jobs", 0)) + 1,
+                )
+                self._sim_status_current_fraction = None
+                MainWindow._refresh_simulation_status(self)
+            except (TypeError, ValueError, KeyError) as exc:
+                self._append_sim_log(f"[warn] Invalid completed-job event: {exc}")
+            return
+        if not line.startswith(prefix):
+            self._append_sim_log(line)
+            return
+        try:
+            payload = json.loads(line[len(prefix):])
+            self._update_progressive_sparams_plot(payload)
+        except (TypeError, ValueError, KeyError) as exc:
+            self._append_sim_log(f"[warn] Invalid progressive S-parameter update: {exc}")
+
+    def _ensure_progressive_sparams_plot(self) -> bool:
+        if getattr(self, "_sim_live_plot_canvas", None) is not None:
+            return True
+        try:
+            from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
+            from matplotlib.figure import Figure
+        except ImportError as exc:
+            self._sim_live_plot_status.setText(f"Matplotlib plot unavailable: {exc}")
+            return False
+        self._sim_live_plot_figure = Figure(figsize=(7, 4))
+        self._sim_live_plot_axes = self._sim_live_plot_figure.add_subplot(111)
+        self._sim_live_plot_canvas = FigureCanvasQTAgg(self._sim_live_plot_figure)
+        self._sim_live_plot_layout.addWidget(self._sim_live_plot_canvas)
+        return True
+
+    def _reset_progressive_sparams_plot(self) -> None:
+        self._sim_progressive_plot_data = None
+        self._sim_stdout_buffer = ""
+        settings = self._project_tree.get_settings()
+        simulations = settings.get("simulations", [])
+        outputs = settings.get("outputs", [])
+        from .chart_data import supports_live_plot
+
+        progressive_simulations = {
+            str(simulation.get("name", "")).strip(): simulation
+            for simulation in simulations
+            if isinstance(simulation, dict)
+            and bool(simulation.get("progressive_sparams_enabled", False))
+        }
+        for output in outputs:
+            if not isinstance(output, dict):
+                continue
+            simulation_name = str(output.get("simulation", "")).strip()
+            simulation = progressive_simulations.get(simulation_name)
+            if simulation is None or not bool(output.get("enabled", True)):
+                continue
+            live_output = {**output, "plot_mode": "live"}
+            if not supports_live_plot(live_output, simulation):
+                continue
+            key = f"{simulation_name}::{output.get('name', 'Output')}"
+            view = self._plot_views.get(key)
+            if view is not None:
+                view.clear_data()
+
+    def _update_progressive_sparams_plot(self, payload: dict) -> None:
+        if "parameter_index" in payload:
+            self._update_progressive_parametric_sparams_plot(payload)
+            return
+
+        simulation = str(payload.get("simulation", "Simulation"))
+        frequencies = payload.get("frequencies")
+        matrices = payload.get("s_matrices")
+        expected = payload.get("expected_samples")
+        completed = payload.get("completed_samples")
+        if not isinstance(frequencies, list) or not frequencies or not isinstance(matrices, list) or len(frequencies) != len(matrices):
+            raise ValueError("frequency and S-matrix chunk sizes do not match")
+        if not isinstance(expected, int) or not isinstance(completed, int) or expected < 1 or completed > expected:
+            raise ValueError("sample progress metadata is invalid")
+
+        previous = getattr(self, "_sim_progressive_plot_data", None)
+        if previous is None or previous["simulation"] != simulation:
+            previous = {"simulation": simulation, "expected": expected, "frequencies": [], "curves": {}, "matrices": []}
+        if previous["expected"] != expected or completed != len(previous["frequencies"]) + len(frequencies):
+            raise ValueError("sample progress is not contiguous")
+
+        parsed_frequencies = [float(value) for value in frequencies]
+        if any(not math.isfinite(value) for value in parsed_frequencies):
+            raise ValueError("chunk contains a non-finite frequency")
+        if any(right <= left for left, right in zip(parsed_frequencies, parsed_frequencies[1:])):
+            raise ValueError("chunk frequencies are not strictly increasing")
+        if previous["frequencies"] and parsed_frequencies and parsed_frequencies[0] <= previous["frequencies"][-1]:
+            raise ValueError("chunk frequencies are not strictly increasing")
+        if bool(payload.get("complete")) != (completed == expected):
+            raise ValueError("completion state does not match sample progress")
+
+        parsed_matrices = []
+        port_count = None
+        for raw_matrix in matrices:
+            if not isinstance(raw_matrix, list) or not raw_matrix:
+                raise ValueError("chunk contains an empty S-matrix")
+            matrix = []
+            for row in raw_matrix:
+                if not isinstance(row, list) or len(row) != len(raw_matrix):
+                    raise ValueError("chunk contains a non-square S-matrix")
+                parsed_row = []
+                for pair in row:
+                    if not isinstance(pair, list) or len(pair) != 2:
+                        raise ValueError("S-matrix entry must contain real and imaginary values")
+                    real, imaginary = float(pair[0]), float(pair[1])
+                    if not math.isfinite(real) or not math.isfinite(imaginary):
+                        raise ValueError("chunk contains non-finite S-parameter values")
+                    parsed_row.append(complex(real, imaginary))
+                matrix.append(parsed_row)
+            if port_count is None:
+                port_count = len(matrix)
+            if len(matrix) != port_count:
+                raise ValueError("S-matrix port count changed within the chunk")
+            parsed_matrices.append(matrix)
+
+        if previous["curves"] and port_count != int(math.sqrt(len(previous["curves"]))):
+            raise ValueError("S-matrix port count changed between chunks")
+        if not previous["curves"] and port_count is not None:
+            previous["curves"] = {
+                f"S{output_port}{input_port}": []
+                for output_port in range(1, port_count + 1)
+                for input_port in range(1, port_count + 1)
+            }
+        previous["frequencies"].extend(parsed_frequencies)
+        for matrix in parsed_matrices:
+            previous["matrices"].append(matrix)
+            for output_port, row in enumerate(matrix, start=1):
+                for input_port, value in enumerate(row, start=1):
+                    previous["curves"][f"S{output_port}{input_port}"].append(value)
+
+        self._sim_progressive_plot_data = previous
+        self._sim_status_current_fraction = completed / expected
+        MainWindow._refresh_simulation_status(self)
+        from .chart_data import make_sparameter_plot_data, supports_live_plot
+
+        settings = self._project_tree.get_settings()
+        simulations = settings.get("simulations", [])
+        simulation_config = next(
+            (
+                item for item in simulations
+                if isinstance(item, dict) and str(item.get("name", "")).strip() == simulation
+            ),
+            {},
+        )
+        for output in settings.get("outputs", []):
+            if not isinstance(output, dict) or str(output.get("simulation", "")).strip() != simulation:
+                continue
+            if not bool(output.get("enabled", True)):
+                continue
+            if not supports_live_plot({**output, "plot_mode": "live"}, simulation_config):
+                continue
+            chart_data = make_sparameter_plot_data(
+                output,
+                previous["frequencies"],
+                previous["matrices"],
+                include_all_parameters=True,
+                file_name=str(output.get("name", "Results")),
+                file_id=f"{simulation}::{output.get('name', 'Output')}",
+            )
+            key = f"{simulation}::{output.get('name', 'Output')}"
+            self._show_chart(key, chart_data, progressive=True)
+
+    def _update_progressive_parametric_sparams_plot(self, payload: dict) -> None:
+        simulation = str(payload.get("simulation", "Simulation"))
+        parameter_name = str(payload.get("parameter_name", "parameter")).strip() or "parameter"
+        parameter_value = str(payload.get("parameter_value", "")).strip()
+        parameter_index = payload.get("parameter_index")
+        completed = payload.get("completed_parameters")
+        expected = payload.get("expected_parameters")
+        frequencies = payload.get("frequencies")
+        matrices = payload.get("s_matrices")
+        sample_start = payload.get("chunk_start")
+        completed_samples = payload.get("completed_samples")
+        expected_samples = payload.get("expected_samples")
+        if (
+            not parameter_value
+            or not isinstance(parameter_index, int)
+            or not isinstance(completed, int)
+            or not isinstance(expected, int)
+            or expected < 1
+            or completed != parameter_index
+            or not 1 <= parameter_index <= expected
+            or not isinstance(frequencies, list)
+            or not frequencies
+            or not isinstance(matrices, list)
+            or len(frequencies) != len(matrices)
+            or not isinstance(sample_start, int)
+            or not isinstance(completed_samples, int)
+            or not isinstance(expected_samples, int)
+            or expected_samples < 1
+            or sample_start < 0
+            or completed_samples != sample_start + len(frequencies)
+            or completed_samples > expected_samples
+            or bool(payload.get("complete")) != (completed_samples == expected_samples)
+        ):
+            raise ValueError("parametric S-parameter progress metadata is invalid")
+
+        previous = getattr(self, "_sim_progressive_plot_data", None)
+        if previous is None or previous.get("simulation") != simulation or "parameter_runs" not in previous:
+            previous = {
+                "simulation": simulation,
+                "expected_parameters": expected,
+                "expected_samples": expected_samples,
+                "parameter_runs": {},
+            }
+        if (
+            previous["expected_parameters"] != expected
+            or previous["expected_samples"] != expected_samples
+        ):
+            raise ValueError("parametric progress count changed during the run")
+
+        parsed_frequencies = [float(value) for value in frequencies]
+        if any(not math.isfinite(value) for value in parsed_frequencies):
+            raise ValueError("parametric sweep contains a non-finite frequency")
+        if any(right <= left for left, right in zip(parsed_frequencies, parsed_frequencies[1:])):
+            raise ValueError("parametric sweep frequencies are not strictly increasing")
+
+        from .chart_data import make_sparameter_plot_data, supports_live_plot
+
+        settings = self._project_tree.get_settings()
+        simulations = settings.get("simulations", [])
+        simulation_config = next(
+            (
+                item for item in simulations
+                if isinstance(item, dict) and str(item.get("name", "")).strip() == simulation
+            ),
+            {},
+        )
+        if str(simulation_config.get("type", "")).strip().lower() != "parametric":
+            raise ValueError("parametric progress event targets a non-parametric simulation")
+        run = previous["parameter_runs"].get(parameter_index)
+        if run is None:
+            if parameter_index != len(previous["parameter_runs"]) + 1 or sample_start != 0:
+                raise ValueError("parametric parameter values or frequency chunks are out of order")
+            if previous["parameter_runs"]:
+                prior_run = previous["parameter_runs"][parameter_index - 1]
+                if len(prior_run["frequencies"]) != expected_samples:
+                    raise ValueError("next parameter value started before the prior sweep completed")
+            run = {"value": parameter_value, "frequencies": [], "matrices": []}
+            previous["parameter_runs"][parameter_index] = run
+        if run["value"] != parameter_value or len(run["frequencies"]) != sample_start:
+            raise ValueError("parametric frequency chunks are not contiguous")
+        if run["frequencies"] and parsed_frequencies[0] <= run["frequencies"][-1]:
+            raise ValueError("parametric sweep frequencies are not strictly increasing")
+        run["frequencies"].extend(parsed_frequencies)
+        run["matrices"].extend(matrices)
+        if len(run["frequencies"]) != completed_samples:
+            raise ValueError("parametric frequency progress does not match accumulated data")
+        self._sim_progressive_plot_data = previous
+        self._sim_status_current_fraction = (
+            (completed - 1) + completed_samples / expected_samples
+        ) / expected
+        MainWindow._refresh_simulation_status(self)
+
+        for output in settings.get("outputs", []):
+            if not isinstance(output, dict) or str(output.get("simulation", "")).strip() != simulation:
+                continue
+            if not bool(output.get("enabled", True)):
+                continue
+            if not supports_live_plot({**output, "plot_mode": "live"}, simulation_config):
+                continue
+
+            all_series = []
+            chart_data = None
+            for index, run in sorted(previous["parameter_runs"].items()):
+                file_name = f"{parameter_name}={run['value']}"
+                run_data = make_sparameter_plot_data(
+                    output,
+                    run["frequencies"],
+                    run["matrices"],
+                    include_all_parameters=True,
+                    file_name=file_name,
+                    file_id=f"{simulation}::{output.get('name', 'Output')}::{index}",
+                )
+                if chart_data is None:
+                    chart_data = run_data
+                all_series.extend(
+                    {**series, "x_values": run_data["x_values"]}
+                    for series in run_data["series"]
+                )
+            if chart_data is None:
+                continue
+            chart_data["series"] = all_series
+            chart_data["title"] = str(output.get("name", "S-parameter Plot"))
+            key = f"{simulation}::{output.get('name', 'Output')}"
+            self._show_chart(key, chart_data, progressive=True)
 
     def _on_sim_finished(self, exit_code: int, _status) -> None:
+        self._on_sim_process_output()
+        pending = getattr(self, "_sim_stdout_buffer", "")
+        self._sim_stdout_buffer = ""
+        if pending:
+            self._process_sim_stdout_line(pending.rstrip("\r"))
         self._close_simulation_job()
+        self._sim_status_running = False
+        self._sim_status_current_fraction = None
+        MainWindow._refresh_simulation_status(self)
         self._append_sim_log(f"[info] Simulation finished with exit code {exit_code}.")
+        if hasattr(self, "_sim_btn_run"):
+            self._sim_btn_run.setEnabled(True)
+        if hasattr(self, "_sim_btn_stop"):
+            self._sim_btn_stop.setEnabled(False)
+
+    def _on_sim_process_error(self, _error) -> None:
+        process = getattr(self, "_sim_process", None)
+        if process is None or process.state() != QProcess.NotRunning:
+            return
+        self._sim_status_running = False
+        self._sim_status_current_fraction = None
+        MainWindow._refresh_simulation_status(self)
+        self._append_sim_log(f"[error] Simulation process error: {process.errorString()}")
         if hasattr(self, "_sim_btn_run"):
             self._sim_btn_run.setEnabled(True)
         if hasattr(self, "_sim_btn_stop"):
@@ -4979,18 +5791,27 @@ class MainWindow(QMainWindow):
     def _open_reference_plane_dialog(self, start_sketch: bool = False) -> None:
         vp = self._viewport
         self._sketch_after_plane_defined = bool(start_sketch)
+        active_plane = vp.scene.active_plane
+        current_origin = (
+            active_plane.origin if active_plane is not None else vp._custom_plane_origin
+        )
+        current_normal = (
+            active_plane.normal if active_plane is not None else vp._custom_plane_normal
+        )
         # Reuse a single dialog instance so it survives hide/show during 3D picking
         dlg = getattr(self, "_ref_plane_dlg", None)
         if dlg is None:
             dlg = ReferencePlaneDialog(
                 self,
-                current_origin=vp._custom_plane_origin,
-                current_normal=vp._custom_plane_normal,
+                current_origin=current_origin,
+                current_normal=current_normal,
                 viewport=vp,
             )
             dlg.plane_defined.connect(self._on_plane_defined)
             dlg.finished.connect(self._on_reference_plane_dialog_finished)
             self._ref_plane_dlg = dlg
+        else:
+            dlg.set_active_plane(current_origin, current_normal)
         dlg.show()
         dlg.raise_()
         dlg.activateWindow()
@@ -5524,6 +6345,18 @@ class MainWindow(QMainWindow):
                     break
 
         candidates: list[Path] = []
+        simulation_root = bundle_dir / f"{safe_project}_{safe_sim}"
+        if simulation_root.is_dir():
+            try:
+                candidates.extend(
+                    sorted(
+                        simulation_root.rglob("*.EMResults"),
+                        key=lambda path: path.stat().st_mtime,
+                        reverse=True,
+                    )
+                )
+            except OSError:
+                pass
         if sim_index is not None:
             candidates.append(bundle_dir / f"{safe_project}_{sim_index:02d}_{safe_sim}.EMResults")
         candidates.append(bundle_dir / f"{safe_project}.EMResults")
@@ -5669,16 +6502,26 @@ class MainWindow(QMainWindow):
         finally:
             sys.path[:] = old_path
 
-    def _load_sim_grid_from_results(self, simulation_name: str):
+    def _load_sim_grid_from_results(
+        self,
+        simulation_name: str,
+        results_dir: Path | None = None,
+        *,
+        allow_irregular: bool = False,
+    ):
         sim_ctor = self._resolve_emerge_simulation_ctor()
 
-        candidates = self._candidate_results_dirs_for_sim(simulation_name)
+        candidates = (
+            [Path(results_dir)]
+            if results_dir is not None
+            else self._candidate_results_dirs_for_sim(simulation_name)
+        )
         last_err = None
-        for results_dir in candidates:
-            simdata = self._simdata_file_in_dir(results_dir)
+        for candidate_dir in candidates:
+            simdata = self._simdata_file_in_dir(candidate_dir)
             if simdata is None:
                 continue
-            results_dir = results_dir.resolve()
+            results_dir = candidate_dir.resolve()
             model_name = str(results_dir.parent / results_dir.stem)
             cwd_prev = os.getcwd()
             try:
@@ -5697,7 +6540,12 @@ class MainWindow(QMainWindow):
                 if mw_data is None:
                     raise RuntimeError("Loaded simulation has no microwave data.")
                 scalar = getattr(mw_data, "scalar", None)
-                grid = getattr(scalar, "grid", None)
+                try:
+                    grid = getattr(scalar, "grid", None)
+                except ValueError:
+                    if not allow_irregular or not hasattr(scalar, "_data_entries"):
+                        raise
+                    grid = scalar
                 if grid is None:
                     raise RuntimeError("Loaded simulation has no scalar.grid data.")
                 return sim, grid, simdata
@@ -5786,7 +6634,7 @@ class MainWindow(QMainWindow):
         callback()
         self._track_output_plot_windows(existing_figures)
 
-    def _on_output_plot_requested(self, payload: dict) -> None:
+    def _on_output_plot_requested(self, payload: dict, *, results_dir: Path | None = None) -> None:
         name = str(payload.get("name", "Output")).strip() or "Output"
         sim_name = str(payload.get("simulation", "")).strip()
         plot_type = str(payload.get("plot_type", "plot_sp")).strip() or "plot_sp"
@@ -5795,33 +6643,150 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "Output", "Output has no simulation assigned.")
             return
 
+        if plot_type in {"plot_sp", "plot_vswr", "smith", "plot"}:
+            import re
+
+            from .chart_data import make_sparameter_plot_data
+            from .touchstone import find_touchstones, read_touchstone_ri
+
+            try:
+                saved_paths = find_touchstones(
+                    self._simulation_bundle_dir(), self._project_name, sim_name
+                )
+                if saved_paths:
+                    raw_parameters = plot_params.get("s_parameters", [])
+                    if not isinstance(raw_parameters, list) or not raw_parameters:
+                        raw_parameters = [plot_params.get("s_parameter", "S11")]
+                    parameters = []
+                    for raw_parameter in raw_parameters:
+                        parameter = str(raw_parameter).strip().upper()
+                        if not re.fullmatch(r"S\d+[,:/_-]?\d+", parameter):
+                            parameter = f"S{max(1, int(plot_params.get('port_i', 1)))}{max(1, int(plot_params.get('port_j', 1)))}"
+                        if parameter not in parameters:
+                            parameters.append(parameter)
+                    chart_data = None
+                    all_series = []
+                    for saved_path in saved_paths:
+                        parsed = read_touchstone_ri(saved_path)
+                        file_data = make_sparameter_plot_data(
+                            {
+                                "name": name,
+                                "plot_type": plot_type,
+                                "params": {"s_parameters": parameters},
+                            },
+                            parsed["frequencies"],
+                            parsed["s_matrices"],
+                            include_all_parameters=True,
+                            file_name=saved_path.name,
+                            file_id=str(saved_path.resolve()),
+                        )
+                        if chart_data is None:
+                            chart_data = file_data
+                        all_series.extend(file_data["series"])
+                    chart_data["series"] = all_series
+                    self._show_chart(f"{sim_name}::{name}", chart_data)
+                    source_names = ", ".join(path.name for path in saved_paths)
+                    self._info_bar.set_info(
+                        f"Output plotted: {name} ({plot_type}) from saved Touchstone {source_names}"
+                    )
+                    self._append_sim_log(
+                        f"[info] Output plotted: {name} ({plot_type}) from saved Touchstone {source_names}"
+                    )
+                    return
+            except (OSError, UnicodeError, ValueError) as exc:
+                self._append_sim_log(
+                    f"[warn] Saved Touchstone for '{name}' could not be used; loading EMERGE results: {exc}"
+                )
+
+        project_tree = getattr(self, "_project_tree", None)
+        project_settings = project_tree.get_settings() if project_tree is not None else {}
+        simulation_config = next(
+            (
+                item for item in project_settings.get("simulations", [])
+                if isinstance(item, dict)
+                and str(item.get("name", "")).strip() == sim_name
+            ),
+            {},
+        )
+        is_parametric_sparameter = (
+            str(simulation_config.get("type", "")).strip().lower() == "parametric"
+            and plot_type in {"plot_sp", "plot_vswr", "smith", "plot"}
+        )
         try:
-            loaded_sim, grid, simdata_path = self._load_sim_grid_from_results(sim_name)
+            loaded_sim, grid, simdata_path = self._load_sim_grid_from_results(
+                sim_name,
+                results_dir=results_dir,
+                allow_irregular=is_parametric_sparameter,
+            )
         except Exception as exc:
+            result_dirs = (
+                [Path(results_dir)]
+                if results_dir is not None
+                else self._candidate_results_dirs_for_sim(sim_name)
+            )
+            if not any(self._simdata_file_in_dir(path) is not None for path in result_dirs):
+                chart_key = f"{sim_name}::{name}"
+                self._show_chart(
+                    chart_key,
+                    {
+                        "title": name,
+                        "plot_type": plot_type,
+                        "xlabel": "Frequency (GHz)" if plot_type in {"plot_sp", "plot_vswr", "smith", "plot"} else "",
+                        "ylabel": "S-parameter" if plot_type in {"plot_sp", "plot_vswr", "smith", "plot"} else "",
+                        "x_values": [],
+                        "series": [],
+                    },
+                )
+                self._info_bar.set_info(
+                    f"Empty plot opened for {name}; it will populate when {sim_name} produces results."
+                )
+                self._append_sim_log(
+                    f"[info] Empty plot opened for {name}; waiting for the first {sim_name} result."
+                )
+                return
             QMessageBox.warning(self, "Output", str(exc))
             self._append_sim_log(f"[warn] Output '{name}' failed: {exc}")
             return
 
-        try:
-            import importlib
-            import numpy as np
-            self._import_installed_emerge()
-            emerge_plot = importlib.import_module("emerge.plot")
-            plot_sp = emerge_plot.plot_sp
-            plot_vswr = emerge_plot.plot_vswr
-            smith = emerge_plot.smith
-            plot = emerge_plot.plot
-            plot_ff = getattr(emerge_plot, "plot_ff", None)
-            plot_ff_polar = getattr(emerge_plot, "plot_ff_polar", None)
-        except Exception as exc:
-            QMessageBox.warning(self, "Output", f"Unable to import emerge.plot: {exc}")
-            return
+        import numpy as np
 
-        def _as_2d_curve(array):
-            arr = np.asarray(array)
-            if arr.ndim == 0:
-                return arr.reshape(1)
-            return arr.reshape(-1)
+        if is_parametric_sparameter and hasattr(grid, "_data_entries"):
+            from .chart_data import make_parametric_sparameter_plot_data
+
+            parameter_values = [
+                value.strip()
+                for value in str(simulation_config.get("ParamValues", "")).split(",")
+                if value.strip()
+            ]
+            try:
+                chart_data = make_parametric_sparameter_plot_data(
+                    {"name": name, "plot_type": plot_type, "params": plot_params},
+                    grid,
+                    str(simulation_config.get("ParamName", "")),
+                    parameter_values,
+                    expected_frequency_count=max(
+                        1, int(simulation_config.get("NumberOfPoints", 0))
+                    ),
+                    simulation_name=sim_name,
+                )
+            except (TypeError, ValueError, AttributeError) as exc:
+                QMessageBox.warning(
+                    self,
+                    "Output",
+                    f"Parametric S-parameter data could not be plotted: {exc}",
+                )
+                self._append_sim_log(
+                    f"[warn] Output '{name}' could not be built from raw Parametric data: {exc}"
+                )
+                return
+            self._show_chart(f"{sim_name}::{name}", chart_data)
+            self._info_bar.set_info(
+                f"Output plotted: {name} ({plot_type}) from raw Parametric results"
+            )
+            self._append_sim_log(
+                f"[info] Output plotted: {name} ({plot_type}) from raw Parametric results in {simdata_path}"
+            )
+            return
 
         if plot_type in {"plot_ff", "plot_ff_polar", "plot_ff_3d"}:
             plane = str(plot_params.get("plane", "XY")).strip().upper() or "XY"
@@ -5937,14 +6902,17 @@ class MainWindow(QMainWindow):
             if plot_type in {"plot_ff", "plot_ff_polar"}:
                 if theta_arr is None or values_arr.size == 0:
                     raise RuntimeError("Far-field result does not expose angle and magnitude data for a polar plot.")
-                if plot_type == "plot_ff":
-                    if plot_ff is None:
-                        raise RuntimeError("EMERGE does not expose plot_ff in this installation.")
-                    self._run_output_plot(lambda: plot_ff(theta_arr, values_arr, dB=True, labels=[name], xlabel="Theta (rad)", ylabel="Magnitude (dB)", title=f"{name} - {plane} plane"))
-                else:
-                    if plot_ff_polar is None:
-                        raise RuntimeError("EMERGE does not expose plot_ff_polar in this installation.")
-                    self._run_output_plot(lambda: plot_ff_polar(theta_arr, values_arr, dB=True, dBfloor=-80, labels=[name], title=f"{name} - {plane} plane", zero_location="N", clockwise=False))
+                self._show_chart(
+                    f"{sim_name}::{name}",
+                    {
+                        "plot_type": plot_type,
+                        "title": f"{name} - {plane} plane",
+                        "xlabel": "Theta (rad)",
+                        "ylabel": "Magnitude",
+                        "x_values": np.asarray(theta_arr).reshape(-1),
+                        "series": [{"label": name, "values": values_arr.reshape(-1)}],
+                    },
+                )
             self._info_bar.set_info(f"Output plotted: {name} ({plot_type}) from {simdata_path}")
             self._append_sim_log(f"[info] Output plotted: {name} ({plot_type}) from {simdata_path}")
             return
@@ -5980,22 +6948,33 @@ class MainWindow(QMainWindow):
                 f"S-parameter(s) {', '.join(invalid)} are not available for this simulation ({len(ports)} port(s)).",
             )
             return
-        curves = [grid.S(output_port, input_port) for output_port, input_port, _ in selected_parameters]
-        labels = [parameter for _, _, parameter in selected_parameters]
-
         try:
-            if plot_type == "plot_sp":
-                self._run_output_plot(lambda: plot_sp(freq, curves, labels=labels))
-            elif plot_type == "plot_vswr":
-                self._run_output_plot(lambda: plot_vswr(freq, curves, labels=[f"VSWR{label[1:]}" for label in labels]))
-            elif plot_type == "smith":
-                self._run_output_plot(lambda: smith(curves, f=freq, labels=labels))
-            elif plot_type == "plot":
-                magnitude_curves = [20.0 * np.log10(np.maximum(np.abs(curve), 1e-12)) for curve in curves]
-                self._run_output_plot(lambda: plot(freq, magnitude_curves, labels=[f"|{label}| dB" for label in labels], xlabel="Frequency (Hz)", ylabel="Magnitude (dB)"))
-            else:
+            if plot_type not in {"plot_sp", "plot_vswr", "smith", "plot"}:
                 QMessageBox.warning(self, "Output", f"Unsupported plot type: {plot_type}")
                 return
+            port_curves = {
+                (output_port, input_port): np.asarray(grid.S(output_port, input_port)).reshape(-1)
+                for output_port in ports
+                for input_port in ports
+            }
+            raw_matrices = [
+                [
+                    [port_curves[(output_port, input_port)][frequency_index] for input_port in ports]
+                    for output_port in ports
+                ]
+                for frequency_index in range(len(freq))
+            ]
+            from .chart_data import make_sparameter_plot_data
+
+            chart_data = make_sparameter_plot_data(
+                {"name": name, "plot_type": plot_type, "params": plot_params},
+                freq,
+                raw_matrices,
+                include_all_parameters=True,
+                file_name=Path(simdata_path).name,
+                file_id=f"{sim_name}::{name}",
+            )
+            self._show_chart(f"{sim_name}::{name}", chart_data)
         except Exception as exc:
             QMessageBox.warning(self, "Output", f"Failed to generate plot '{name}': {exc}")
             self._append_sim_log(f"[warn] Output '{name}' plot error: {exc}")
@@ -6003,6 +6982,93 @@ class MainWindow(QMainWindow):
 
         self._info_bar.set_info(f"Output plotted: {name} ({plot_type}) from {simdata_path}")
         self._append_sim_log(f"[info] Output plotted: {name} ({plot_type}) from {simdata_path}")
+
+    def _plot_completed_simulation_outputs(self, simulation_name: str) -> None:
+        settings = self._project_tree.get_settings()
+        outputs = settings.get("outputs", []) if isinstance(settings, dict) else []
+        simulations = settings.get("simulations", []) if isinstance(settings, dict) else []
+        simulation_config = next(
+            (
+                item for item in simulations
+                if isinstance(item, dict)
+                and str(item.get("name", "")).strip() == simulation_name
+            ),
+            {},
+        )
+        try:
+            candidates = self._candidate_results_dirs_for_sim(simulation_name)
+            result_dir = next(
+                (candidate for candidate in candidates if self._simdata_file_in_dir(candidate)),
+                None,
+            )
+            has_parametric_touchstones = False
+            if (
+                result_dir is None
+                and str(simulation_config.get("type", "")).strip().lower() == "parametric"
+            ):
+                from .touchstone import find_touchstones
+
+                has_parametric_touchstones = bool(
+                    find_touchstones(
+                        self._simulation_bundle_dir(),
+                        self._project_name,
+                        simulation_name,
+                    )
+                )
+            if result_dir is None and not has_parametric_touchstones:
+                raise RuntimeError(
+                    f"No EMERGE result data was found for '{simulation_name}' in {self._simulation_bundle_dir()}"
+                )
+        except Exception as exc:
+            self._append_sim_log(f"[warn] Could not locate results for '{simulation_name}': {exc}")
+            return
+
+        for output in outputs:
+            if not isinstance(output, dict) or not bool(output.get("enabled", True)):
+                continue
+            if str(output.get("simulation", "")).strip() != simulation_name:
+                continue
+            if str(output.get("plot_mode", "final")).strip().lower() == "live":
+                chart_key = f"{simulation_name}::{output.get('name', 'Output')}"
+                progressive_data = getattr(self, "_sim_progressive_plot_data", None)
+                parametric_runs = (
+                    progressive_data.get("parameter_runs", {})
+                    if isinstance(progressive_data, dict)
+                    else {}
+                )
+                if parametric_runs:
+                    expected_parameters = int(progressive_data.get("expected_parameters", 0))
+                    expected_samples = int(progressive_data.get("expected_samples", 0))
+                    progressive_complete = (
+                        len(parametric_runs) == expected_parameters
+                        and expected_parameters > 0
+                        and expected_samples > 0
+                        and all(
+                            len(run.get("frequencies", [])) == expected_samples
+                            for run in parametric_runs.values()
+                        )
+                    )
+                else:
+                    progressive_complete = (
+                        isinstance(progressive_data, dict)
+                        and len(progressive_data.get("frequencies", []))
+                        == int(progressive_data.get("expected", 0))
+                        and int(progressive_data.get("expected", 0)) > 0
+                    )
+                if (
+                    chart_key in getattr(self, "_plot_views", {})
+                    and isinstance(progressive_data, dict)
+                    and progressive_data.get("simulation") == simulation_name
+                    and progressive_complete
+                ):
+                    continue
+            payload = dict(output)
+            try:
+                self._on_output_plot_requested(payload, results_dir=result_dir)
+            except Exception as exc:
+                self._append_sim_log(
+                    f"[warn] Final plot for '{output.get('name', 'Output')}' failed: {exc}"
+                )
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� camera views
     def _set_view(self, view: str) -> None:
@@ -6035,8 +7101,7 @@ class MainWindow(QMainWindow):
             cam.SetPosition(150, -200, 150)
             cam.SetFocalPoint(0, 0, 0)
             cam.SetViewUp(0, 0, 1)
-        self._viewport._renderer.ResetCameraClippingRange()
-        self._viewport._render()
+        self._viewport.fit_all()
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� project file
     def _new_project(self) -> None:
@@ -6189,34 +7254,47 @@ class MainWindow(QMainWindow):
             self._refresh_materials()
             self._viewport._render()
             self._history_reset()
+            self._close_all_plot_windows()
             self._info_bar.set_info(f"Project loaded: {path}")
             self._remember_recent_project(path)
 
         except Exception as exc:
             QMessageBox.critical(self, "Load Error", str(exc))
 
-    def _save_project(self) -> None:
+    def _save_project(self) -> bool:
         if self._project_path is None:
-            self._save_project_as()
-        else:
-            self._do_save(self._project_path)
+            return self._save_project_as()
+        return self._do_save(self._project_path)
 
-    def _save_project_as(self) -> None:
+    def _save_project_as(self) -> bool:
         filename = f"{self._project_name}.em3d"
-        workspace_directory = self._workspace_dialog_directory()
-        initial_path = str(Path(workspace_directory) / filename) if workspace_directory else filename
+        project_path = str(getattr(self, "_project_path", "") or "").strip()
+        if project_path:
+            initial_path = str(Path(project_path).expanduser().resolve().parent / filename)
+        else:
+            workspace_directory = self._workspace_dialog_directory()
+            initial_path = str(Path(workspace_directory) / filename) if workspace_directory else filename
         path, _ = QFileDialog.getSaveFileName(
             self, "Save Project", initial_path,
             "EM3D Project (*.em3d);;All Files (*)"
         )
-        if path:
-            self._project_path = str(Path(path).expanduser().resolve())
-            self._project_name = Path(path).stem
-            self.setWindowTitle(f"EM 3D Modeler - {self._project_name}")
-            self._project_tree.set_project_name(self._project_name)
-            self._do_save(path)
+        if not path:
+            return False
+        target_path = Path(path).expanduser().resolve()
+        current_path = (
+            Path(self._project_path).expanduser().resolve()
+            if self._project_path
+            else None
+        )
+        if target_path != current_path:
+            self._reset_simulation_cache()
+        self._project_path = str(target_path)
+        self._project_name = Path(path).stem
+        self.setWindowTitle(f"EM 3D Modeler - {self._project_name}")
+        self._project_tree.set_project_name(self._project_name)
+        return self._do_save(path)
 
-    def _do_save(self, path: str) -> None:
+    def _do_save(self, path: str) -> bool:
         try:
             self._project_name = Path(path).stem
             ProjectFile.save(
@@ -6248,8 +7326,10 @@ class MainWindow(QMainWindow):
             self.setWindowTitle(f"EM 3D Modeler - {self._project_name}")
             self._info_bar.set_info(f"Saved: {path}")
             self._remember_recent_project(path)
+            return True
         except Exception as exc:
             QMessageBox.critical(self, "Save Error", str(exc))
+            return False
 
     def _export_emerge(self) -> None:
         path, _ = QFileDialog.getSaveFileName(

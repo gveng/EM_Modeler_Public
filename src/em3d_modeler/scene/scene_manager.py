@@ -575,3 +575,4 @@ class SceneManager:
     def clear(self) -> None:
         for obj in list(self.objects):
             self.remove_object(obj)
+        self.reference_planes_from_json([])

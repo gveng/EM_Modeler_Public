@@ -1,6 +1,7 @@
 numpy
 scipy
 matplotlib
+pyqtgraph>=0.13.3
 PySide6
 vtk
 shapely

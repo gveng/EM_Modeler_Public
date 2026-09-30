@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
     QFormLayout, QDoubleSpinBox, QComboBox, QCheckBox, QDialogButtonBox,
 )
 from PySide6.QtCore    import Signal, Qt
-from PySide6.QtGui     import QIcon, QAction
+from PySide6.QtGui     import QIcon, QAction, QKeySequence, QShortcut
 
 try:
     from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
@@ -65,7 +65,8 @@ from ..scene.em_objects         import (
     PlateObject, PyramidObject, WedgeObject, TorusObject, EllipsoidObject
 )
 from ..scene import em_objects as scene_objects
-from ..scene.grid_actor         import build_axes_widget
+from ..scene.grid_actor         import build_axes_widget, plane_basis_from_normal
+from .measurement import measurement_arrow_size, normal_for_planar_points
 
 
 _ICONS_DIR = Path(__file__).parent.parent.parent.parent / "Icons"
@@ -115,6 +116,7 @@ class Viewport3DWidget(QWidget):
     # Emitted when the scene changes (add/remove objects)
     scene_changed     = Signal()
     projection_changed = Signal(bool)
+    measurement_mode_changed = Signal(bool)
     # Status-bar message
     status_message    = Signal(str)
     # Coordinates for sub-element pick display (X,Y,Z,units)
@@ -194,7 +196,7 @@ class Viewport3DWidget(QWidget):
         self._grid_spacing = 10.0
         self._units        = "mm"
 
-        # Selection mode: 'object' | 'face' | 'edge' | 'vertex'
+        # Selection mode also controls drawing snap: 'grid' bypasses geometry picks.
         self._selection_mode: str = "object"
         self._sub_pick_actor: Optional[vtk.vtkActor] = None
         self._last_face_pick: dict | None = None
@@ -204,6 +206,14 @@ class Viewport3DWidget(QWidget):
         # One-shot pick request from external dialogs
         # tuple (kind, callback) where kind ∈ {'point','vertex','face_normal','face_origin_normal'}
         self._pick_request = None
+        self._measurement_active = False
+        self._measurement_features: list[dict] = []
+        self._measurement_highlights: list = []
+        self._measurement_actors: list = []
+        self._measurement_escape_shortcut = QShortcut(QKeySequence(Qt.Key_Escape), self)
+        self._measurement_escape_shortcut.setContext(Qt.WidgetWithChildrenShortcut)
+        self._measurement_escape_shortcut.setEnabled(False)
+        self._measurement_escape_shortcut.activated.connect(self._finish_measurement)
 
         # ── Sketch state ──────────────────────────────────────────────────────
         self._sketch_engine: Optional[SketchEngine] = None
@@ -572,12 +582,12 @@ class Viewport3DWidget(QWidget):
 
     # ─────────────────────────────────────────────────── selection mode
     def set_selection_mode(self, mode: str) -> None:
-        """Set sub-element selection: 'object' | 'face' | 'edge' | 'vertex'."""
-        if mode not in ("object", "face", "edge", "vertex"):
+        """Set selection and drawing-snap mode, including a geometry-independent grid snap."""
+        if mode not in ("object", "face", "edge", "vertex", "grid"):
             return
         self._selection_mode = mode
         self._clear_sub_pick_marker()
-        if mode == "object":
+        if mode in ("object", "grid"):
             self.clear_coords_requested.emit()
         self._render()
 
@@ -585,29 +595,337 @@ class Viewport3DWidget(QWidget):
         if self._sub_pick_actor is not None:
             self._renderer.RemoveActor(self._sub_pick_actor)
             self._sub_pick_actor = None
+
+    def start_measurement(self) -> None:
+        """Activate direct viewport measurement using the current selection snap mode."""
+        if self._sketch_engine is not None:
+            self.status_message.emit("Finish or exit the sketch before measuring.")
+            return
+        self._cancel_draw()
+        self._clear_measurement_actors()
+        self._measurement_features.clear()
+        self._measurement_active = True
+        self._measurement_escape_shortcut.setEnabled(True)
+        self.measurement_mode_changed.emit(True)
+        self.setFocus(Qt.OtherFocusReason)
+        self.setCursor(Qt.CrossCursor)
+        self.status_message.emit(self._measurement_prompt(1))
+
+    def _finish_measurement(self) -> None:
+        if not (
+            self._measurement_active
+            or self._measurement_highlights
+            or self._measurement_actors
+        ):
+            return
+        self._measurement_active = False
+        self._measurement_escape_shortcut.setEnabled(False)
+        self._clear_measurement_actors()
+        self._measurement_features.clear()
+        self.unsetCursor()
+        self._render()
+        self.measurement_mode_changed.emit(False)
+        self.status_message.emit("Measurement finished; annotations cleared.")
+
+    def _measurement_prompt(self, index: int) -> str:
+        prompts = {
+            "vertex": "pick a snapped vertex",
+            "edge": "pick a snapped edge point",
+            "face": "pick a planar surface",
+            "object": "pick a point on geometry",
+            "grid": "pick a snapped point on the drawing grid",
+        }
+        prompt = prompts.get(self._selection_mode, prompts["object"])
+        return f"Measure: {prompt} ({index}/2). Esc to cancel and clear."
+
+    def _clear_measurement_actors(self) -> None:
+        for actor in (*self._measurement_highlights, *self._measurement_actors):
+            self._renderer.RemoveActor(actor)
+        self._measurement_highlights.clear()
+        self._measurement_actors.clear()
+
+    def _measurement_click(self, sx: int, sy: int) -> None:
+        feature, highlight, error = self._pick_measurement_feature(sx, sy)
+        if error:
+            self.status_message.emit(error)
+            return
+        if feature is None:
+            return
+
+        if highlight is not None:
+            self._renderer.AddActor(highlight)
+            self._measurement_highlights.append(highlight)
+        self._measurement_features.append(feature)
+        self._add_measurement_text(
+            f"{'A' if len(self._measurement_features) == 1 else 'B'}",
+            feature.get("point", feature.get("origin")),
+            (1.0, 0.65, 0.12),
+        )
+        self._render()
+
+        if len(self._measurement_features) == 1:
+            self.status_message.emit(self._measurement_prompt(2))
+            return
+
+        from .measurement import calculate_measurement
+
+        try:
+            result = calculate_measurement(*self._measurement_features)
+        except (KeyError, TypeError, ValueError) as exc:
+            self.status_message.emit(f"Measurement failed: {exc}")
+            return
+        self._draw_measurement_result(*self._measurement_features, result)
+        self._measurement_active = False
+        self.unsetCursor()
+        self.status_message.emit(self._measurement_result_text(result))
+
+    def _pick_measurement_feature(self, sx: int, sy: int):
+        mode = self._selection_mode
+        if mode == "grid":
+            plane_point = self._ray_plane_intersect(sx, sy)
+            if plane_point is None:
+                return None, None, "Could not project cursor onto the active drawing plane."
+            point = self._snap(plane_point)
+            return {"kind": "point", "point": point}, self._build_vertex_marker(point, None), None
+        if mode == "vertex":
+            picker = vtk.vtkPointPicker()
+            picker.SetTolerance(self._pick_tolerance_for_mode("vertex"))
+            picker.Pick(sx, sy, 0, self._renderer)
+            actor = picker.GetActor()
+            dataset = picker.GetDataSet()
+            point_id = picker.GetPointId()
+            if actor is None or dataset is None or point_id < 0:
+                return None, None, "No snapped vertex under cursor; try again."
+            point = self._actor_point_to_world(actor, dataset.GetPoint(point_id))
+            return {"kind": "point", "point": point}, self._build_vertex_marker(point, actor), None
+
+        picker = vtk.vtkCellPicker()
+        picker.SetTolerance(self._pick_tolerance_for_mode(mode if mode in ("face", "edge") else "face"))
+        picker.Pick(sx, sy, 0, self._renderer)
+        actor = picker.GetActor()
+        dataset = picker.GetDataSet()
+        cell_id = picker.GetCellId()
+        if actor is None or dataset is None or cell_id < 0:
+            return None, None, "No geometry under cursor; try again."
+        position = tuple(float(value) for value in picker.GetPickPosition())
+
+        if mode == "face":
+            region_ids = self._face_region_cell_ids(dataset, cell_id)
+            points = self._face_region_points_world(dataset, region_ids, actor)
+            normal = normal_for_planar_points(points)
+            if normal is None:
+                return None, None, "That face is not planar; pick a planar surface."
+            owner = self._owner_for_actor(actor)
+            feature = {
+                "kind": "surface",
+                "origin": position,
+                "normal": normal,
+                "name": str(owner.name) if owner is not None else "Surface",
+            }
+            highlight = self._build_face_region_marker(dataset, cell_id, actor, region_ids)
+            return feature, highlight, None
+
+        if mode == "edge":
+            edge_pick = self._pick_edge_segment_local(dataset, cell_id, actor, position)
+            if edge_pick is None:
+                return None, None, "No edge snap found under cursor; try again."
+            edge_points, local_point = edge_pick
+            point = self._actor_point_to_world(actor, local_point)
+            return {"kind": "point", "point": point}, self._build_edge_marker(edge_points, actor), None
+
+        return {"kind": "point", "point": position}, self._build_vertex_marker(position, actor), None
+
+    def _add_measurement_vector(
+        self, start, end, label: str, color, label_offset=(0, 18), arrow_size=None
+    ) -> None:
+        start = tuple(float(value) for value in start)
+        end = tuple(float(value) for value in end)
+        delta = tuple(end[index] - start[index] for index in range(3))
+        length = math.sqrt(sum(value * value for value in delta))
+        if length <= 1e-10:
+            return
+
+        line = vtk.vtkLineSource()
+        line.SetPoint1(*start)
+        line.SetPoint2(*end)
+        line.Update()
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputConnection(line.GetOutputPort())
+        actor = vtk.vtkActor()
+        actor.SetMapper(mapper)
+        actor.GetProperty().SetColor(*color)
+        actor.GetProperty().SetLineWidth(2.5)
+        actor.PickableOff()
+        self._renderer.AddActor(actor)
+        self._measurement_actors.append(actor)
+
+        direction = tuple(value / length for value in delta)
+        tip_height = arrow_size if arrow_size is not None else length / 50.0
+        for tip_position, tip_direction in (
+            (start, tuple(-value for value in direction)),
+            (end, direction),
+        ):
+            tip_center = tuple(
+                tip_position[index] - tip_direction[index] * tip_height * 0.5
+                for index in range(3)
+            )
+            cone = vtk.vtkConeSource()
+            cone.SetCenter(*tip_center)
+            cone.SetDirection(*tip_direction)
+            cone.SetHeight(tip_height)
+            cone.SetRadius(tip_height * 0.32)
+            cone.SetResolution(12)
+            cone.Update()
+            cone_mapper = vtk.vtkPolyDataMapper()
+            cone_mapper.SetInputConnection(cone.GetOutputPort())
+            cone_actor = vtk.vtkActor()
+            cone_actor.SetMapper(cone_mapper)
+            cone_actor.GetProperty().SetColor(*color)
+            cone_actor.PickableOff()
+            self._renderer.AddActor(cone_actor)
+            self._measurement_actors.append(cone_actor)
+
+        midpoint = tuple((start[index] + end[index]) * 0.5 for index in range(3))
+        self._add_measurement_text(label, midpoint, color, display_offset=label_offset)
+
+    def _add_measurement_text(
+        self, text: str, position, color, display_offset=(0, 14)
+    ) -> None:
+        if position is None:
+            return
+        actor = vtk.vtkBillboardTextActor3D()
+        actor.SetInput(str(text))
+        actor.SetPosition(*position)
+        actor.SetDisplayOffset(*display_offset)
+        text_property = actor.GetTextProperty()
+        text_property.SetColor(*color)
+        text_property.SetFontSize(16)
+        text_property.SetBold(True)
+        text_property.SetShadow(True)
+        text_property.SetBackgroundColor(0.08, 0.1, 0.12)
+        text_property.SetBackgroundOpacity(0.82)
+        text_property.SetFrame(True)
+        text_property.SetFrameColor(*color)
+        actor.PickableOff()
+        self._renderer.AddActor(actor)
+        self._measurement_actors.append(actor)
+
+    def _draw_measurement_result(self, first, second, result) -> None:
+        kind = result["kind"]
+        if kind == "point-point":
+            start, end = first["point"], second["point"]
+            distance = result["distance"]
+            arrow_size = measurement_arrow_size(result["components"])
+            self._add_measurement_vector(
+                start, end, f"d = {distance:.6g} {self._units}",
+                (1.0, 0.9, 0.2), (0, 24), arrow_size
+            )
+            x_end = (end[0], start[1], start[2])
+            y_end = (end[0], end[1], start[2])
+            component_colors = ((0.95, 0.3, 0.3), (0.3, 0.85, 0.45), (0.3, 0.65, 1.0))
+            axes = (
+                (start, x_end, result["components"][0], "X", component_colors[0]),
+                (x_end, y_end, result["components"][1], "Y", component_colors[1]),
+                (y_end, end, result["components"][2], "Z", component_colors[2]),
+            )
+            for axis_start, axis_end, component, axis, color in axes:
+                label = f"d{axis} = {component:+.6g} {self._units}"
+                if abs(component) > 1e-10:
+                    label_offset = (0, -18) if axis in ("X", "Z") else (0, 20)
+                    self._add_measurement_vector(
+                        axis_start, axis_end, label, color, label_offset, arrow_size
+                    )
+                else:
+                    self._add_measurement_text(
+                        label, start, color, display_offset=(0, -20)
+                    )
+            return
+
+        if kind == "point-surface":
+            if first["kind"] == "point":
+                point_feature = first
+            else:
+                point_feature = second
+            point = point_feature["point"]
+            foot = result["projected_point"]
+            label = f"d = {result['distance']:.6g} {self._units}"
+            arrow_size = measurement_arrow_size(result["components"])
+            self._add_measurement_vector(
+                point, foot, label, (1.0, 0.35, 0.85), (0, 22), arrow_size
+            )
+            self._add_measurement_text(
+                f"X/Y/Z = {self._format_measurement_components(result['components'])}",
+                point,
+                (1.0, 0.75, 0.95),
+                display_offset=(0, -24),
+            )
+            return
+
+        if not result["parallel"]:
+            midpoint = tuple(
+                (first["origin"][index] + second["origin"][index]) * 0.5
+                for index in range(3)
+            )
+            self._add_measurement_text(
+                "Surfaces are not parallel", midpoint, (1.0, 0.75, 0.2),
+                display_offset=(0, 20)
+            )
+            return
+
+        origin = first["origin"]
+        normal = tuple(float(value) for value in first["normal"])
+        signed_distance = result["signed_distance"]
+        arrow_size = measurement_arrow_size(result["components"])
+        foot = tuple(origin[index] + normal[index] * signed_distance for index in range(3))
+        self._add_measurement_vector(
+            foot,
+            second["origin"],
+            f"d = {result['distance']:.6g} {self._units}",
+            (1.0, 0.35, 0.85),
+            (0, 22),
+            arrow_size,
+        )
+        self._add_measurement_text(
+            f"X/Y/Z = {self._format_measurement_components(result['components'])}",
+            second["origin"],
+            (1.0, 0.75, 0.95),
+            display_offset=(0, -24),
+        )
+
+    def _format_measurement_components(self, components) -> str:
+        return ", ".join(f"{value:+.5g}" for value in components) + f" {self._units}"
+
+    def _measurement_result_text(self, result) -> str:
+        if result["kind"] == "surface-surface" and not result["parallel"]:
+            return "Surfaces are not parallel; result shown in the viewer. Esc to clear."
+        return f"Measurement: {result['distance']:.6g} {self._units}; vectors and dimensions shown in the viewer. Esc to clear."
     # ────────────────────────────────────────────────── one-shot pick API
-    def request_pick(self, kind: str, callback) -> None:
+    def request_pick(self, kind: str, callback, *, actor_filter=None) -> None:
         """Arm a one-shot pick. The next left-click will invoke *callback*.
 
         Parameters
         ----------
-        kind : 'point' | 'vertex' | 'face_normal' | 'face_origin_normal'
+        kind : 'point' | 'vertex' | 'face_normal' | 'face_origin_normal' | 'plane'
             - 'point'              : callback(world_xyz)
             - 'vertex'             : callback(world_xyz)  (snaps to nearest mesh vertex)
             - 'face_normal'        : callback(world_normal_xyz)
             - 'face_origin_normal' : callback(world_xyz, world_normal_xyz)
+            - 'plane'              : callback(surface_plane_dict) for a planar face
         callback : callable
+        actor_filter : vtk.vtkActor, optional
+            If provided, only accept a pick on this actor.
         """
-        if kind not in ("point", "vertex", "face_normal", "face_origin_normal"):
+        if kind not in ("point", "vertex", "face_normal", "face_origin_normal", "plane"):
             raise ValueError(f"Unknown pick kind: {kind}")
         self._cancel_draw()
-        self._pick_request = (kind, callback)
+        self._pick_request = (kind, callback, actor_filter)
         self.setCursor(Qt.CrossCursor)
         msg = {
             "point":              "Click on geometry to pick a point",
             "vertex":             "Click near a vertex to snap to it",
             "face_normal":        "Click on a face to capture its normal",
             "face_origin_normal": "Click on a face to set origin + normal",
+            "plane":              "Click on a planar surface",
         }[kind]
         self.status_message.emit(f"{msg}  (Esc to cancel)")
 
@@ -621,7 +939,7 @@ class Viewport3DWidget(QWidget):
         """If a pick request is armed, fulfil it. Returns True if consumed."""
         if self._pick_request is None:
             return False
-        kind, callback = self._pick_request
+        kind, callback, actor_filter = self._pick_request
 
         picker = vtk.vtkCellPicker()
         mode = "vertex" if kind == "vertex" else "face"
@@ -631,6 +949,9 @@ class Viewport3DWidget(QWidget):
         if actor is None:
             self.status_message.emit("Nothing under cursor – try again.")
             return True   # keep request armed
+        if actor_filter is not None and actor is not actor_filter:
+            self.status_message.emit("Pick a vertex on the selected object.")
+            return True
 
         pos = picker.GetPickPosition()
 
@@ -638,6 +959,23 @@ class Viewport3DWidget(QWidget):
         normal_world = None
         cell_id = picker.GetCellId()
         ds = picker.GetDataSet()
+        plane_feature = None
+        if kind == "plane" and (cell_id < 0 or ds is None):
+            self.status_message.emit("Could not identify a planar surface. Pick a planar face.")
+            return True
+        if kind == "plane":
+            region_ids = self._face_region_cell_ids(ds, cell_id)
+            face_points = self._face_region_points_world(ds, region_ids, actor)
+            normal = normal_for_planar_points(face_points)
+            if normal is None:
+                self.status_message.emit("The picked surface is not planar. Pick a planar face.")
+                return True
+            plane_feature = {
+                "kind": "surface",
+                "origin": tuple(pos),
+                "normal": normal,
+                "name": "Surface",
+            }
         if cell_id >= 0 and ds is not None:
             cell = ds.GetCell(cell_id)
             if cell is not None and cell.GetNumberOfPoints() >= 3:
@@ -685,6 +1023,8 @@ class Viewport3DWidget(QWidget):
                     self.status_message.emit("Could not compute face normal.")
                     return True
                 callback(tuple(pos), normal_world)
+            elif kind == "plane":
+                callback(plane_feature)
         except Exception as exc:
             self.status_message.emit(f"Pick callback error: {exc}")
         return True
@@ -724,9 +1064,24 @@ class Viewport3DWidget(QWidget):
         return tuple(cam_pos[i] + t * rd[i] for i in range(3))
 
     def _snap(self, pt: tuple) -> tuple:
-        """Snap world point to grid."""
-        s = self._grid_spacing
-        return tuple(round(v / s) * s for v in pt)
+        """Snap a point to the active drawing grid, including custom-plane grids."""
+        spacing = abs(float(self._grid_spacing))
+        if spacing <= 1e-12:
+            return tuple(float(value) for value in pt)
+        if hasattr(self, "_active_draw_origin_normal"):
+            origin, normal = self._active_draw_origin_normal()
+        else:
+            if getattr(self, "_custom_plane_active", False):
+                origin, normal = self._custom_plane_origin, self._custom_plane_normal
+            else:
+                origin, normal = PLANE_ORIGIN[self._draw_plane], PLANE_NORMAL[self._draw_plane]
+        u_axis, v_axis = plane_basis_from_normal(normal)
+        uv = world_to_uv(pt, origin, u_axis, v_axis)
+        snapped_uv = (
+            round(uv[0] / spacing) * spacing,
+            round(uv[1] / spacing) * spacing,
+        )
+        return uv_to_world(snapped_uv, origin, u_axis, v_axis)
 
     def _project_point_to_draw_plane(self, pt: tuple) -> tuple:
         """Project a world point onto the current drawing plane."""
@@ -861,7 +1216,14 @@ class Viewport3DWidget(QWidget):
         return None
 
     def _drawing_snap_point(self, sx: int, sy: int) -> Optional[tuple]:
-        """Return a drawing point on the active plane using Select filter for snap."""
+        """Return a drawing point using either the selected geometry filter or grid only."""
+        if self._selection_mode == "grid":
+            plane_pt = self._ray_plane_intersect(sx, sy)
+            if plane_pt is None:
+                return None
+            self._last_drawing_snap_kind = "grid"
+            return self._snap(plane_pt)
+
         snap_mode = self._selection_mode if self._selection_mode != "object" else "all"
         geometry_pt = self._snap_to_visible_geometry(sx, sy, None, snap_mode=snap_mode)
         if geometry_pt is not None:
@@ -903,6 +1265,42 @@ class Viewport3DWidget(QWidget):
         self, screen_x: int, screen_y: int, base_z: float
     ) -> float:
         """For height step: project cursor to vertical axis through base."""
+        if self._selection_mode == "grid":
+            axis_idx = self._active_plane_axis_index()
+            base_point = list(getattr(self, "_draw_pts", [])[0]) if getattr(self, "_draw_pts", None) else [0.0, 0.0, 0.0]
+            base_point[axis_idx] = float(base_z)
+            renderer = self._renderer
+            renderer.SetDisplayPoint(float(screen_x), float(screen_y), 0.0)
+            renderer.DisplayToWorld()
+            near = renderer.GetWorldPoint()
+            renderer.SetDisplayPoint(float(screen_x), float(screen_y), 1.0)
+            renderer.DisplayToWorld()
+            far = renderer.GetWorldPoint()
+            near_w = near[3] if abs(near[3]) > 1e-12 else 1.0
+            far_w = far[3] if abs(far[3]) > 1e-12 else 1.0
+            ray_origin = [float(near[i]) / near_w for i in range(3)]
+            ray_end = [float(far[i]) / far_w for i in range(3)]
+            ray = [ray_end[i] - ray_origin[i] for i in range(3)]
+            ray_length = math.sqrt(sum(value * value for value in ray))
+            if ray_length <= 1e-12:
+                return 0.0
+            ray = [value / ray_length for value in ray]
+            axis = [0.0, 0.0, 0.0]
+            axis[axis_idx] = 1.0
+            offset = [ray_origin[i] - base_point[i] for i in range(3)]
+            ray_axis_dot = sum(ray[i] * axis[i] for i in range(3))
+            ray_offset_dot = sum(ray[i] * offset[i] for i in range(3))
+            axis_offset_dot = sum(axis[i] * offset[i] for i in range(3))
+            denominator = 1.0 - ray_axis_dot * ray_axis_dot
+            if denominator <= 1e-10:
+                return 0.0
+            height = (axis_offset_dot - ray_axis_dot * ray_offset_dot) / denominator
+            spacing = abs(float(self._grid_spacing))
+            if spacing > 1e-12:
+                height = round(height / spacing) * spacing
+            self._last_drawing_snap_kind = "grid"
+            return height
+
         snap_mode = self._selection_mode if self._selection_mode != "object" else "all"
         geometry_pt = self._snap_to_visible_geometry(
             screen_x, screen_y, None, snap_mode=snap_mode
@@ -1080,6 +1478,9 @@ class Viewport3DWidget(QWidget):
         # One-shot pick takes priority over everything else
         if self._handle_pick_request(sx, sy):
             return
+        if getattr(self, "_measurement_active", False):
+            self._measurement_click(sx, sy)
+            return
         if self._sketch_engine is not None:
             self._sketch_left_press(sx, sy, ctrl=ctrl)
             return
@@ -1111,7 +1512,7 @@ class Viewport3DWidget(QWidget):
     # ──────────────────────────────────────────────────────── selection
     def _selection_click(self, sx: int, sy: int, ctrl: bool = False) -> None:
         # Object-level selection (default)
-        if self._selection_mode == "object":
+        if self._selection_mode in ("object", "grid"):
             self._clear_sub_pick_marker()
             self.clear_coords_requested.emit()
             obj = self.scene.pick_at(sx, sy)
@@ -2366,6 +2767,10 @@ class Viewport3DWidget(QWidget):
             self._render_window.SetSize(self.width(), self.height())
 
     def keyPressEvent(self, event):
+        if event.key() == Qt.Key_Escape and getattr(self, "_measurement_active", False):
+            self._finish_measurement()
+            event.accept()
+            return
         if event.key() == Qt.Key_Escape and self._sketch_engine is not None:
             eng = self._sketch_engine
             if (eng.tool is not None or eng.pending or self._sketch_axis_pick_mode

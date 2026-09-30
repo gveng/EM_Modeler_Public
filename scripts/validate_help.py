@@ -4,6 +4,7 @@ from __future__ import annotations
 from html.parser import HTMLParser
 from pathlib import Path
 from urllib.parse import unquote, urlparse
+import xml.etree.ElementTree as ET
 
 ROOT = Path(__file__).resolve().parents[1]
 HELP = ROOT / "docs" / "HELP.html"
@@ -47,10 +48,18 @@ def validate() -> list[str]:
         if parsed.fragment and target == HELP and unquote(parsed.fragment) not in parser.ids:
             errors.append(f"Missing in-page anchor: #{unquote(parsed.fragment)}")
         if kind == "src":
-            if target.suffix.lower() != ".png":
-                errors.append(f"Help screenshot is not a PNG capture: {reference}")
-            elif target.read_bytes()[:8] != PNG_SIGNATURE:
-                errors.append(f"Invalid PNG screenshot: {reference}")
+            if target.suffix.lower() == ".png":
+                if target.read_bytes()[:8] != PNG_SIGNATURE:
+                    errors.append(f"Invalid PNG screenshot: {reference}")
+            elif target.suffix.lower() == ".svg":
+                try:
+                    root = ET.parse(target).getroot()
+                    if root.tag not in {"svg", "{http://www.w3.org/2000/svg}svg"}:
+                        errors.append(f"Invalid SVG image: {reference}")
+                except ET.ParseError:
+                    errors.append(f"Invalid SVG image: {reference}")
+            else:
+                errors.append(f"Unsupported help image format: {reference}")
 
     return errors
 

@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<svg id="svg4" xmlns="http://www.w3.org/2000/svg" xmlns:svg="http://www.w3.org/2000/svg" xmlns:rdf="http://www.w3.org/1999/02/22-rdf-syntax-ns#" xmlns:dc="http://purl.org/dc/elements/1.1/" xmlns:cc="http://creativecommons.org/ns#" version="1.1" viewBox="0 0 160 160">
+  <defs>
+    <style>
+      .cls-1 {
+        fill: #ff585d;
+      }
+
+      .cls-1, .cls-2, .cls-3, .cls-4 {
+        fill-rule: evenodd;
+        stroke-width: 0px;
+      }
+
+      .cls-2 {
+        fill: #cb333b;
+      }
+
+      .cls-3 {
+        fill: #fefefe;
+      }
+
+      .cls-4 {
+        fill: #418fde;
+      }
+    </style>
+  </defs>
+  <path id="path8" class="cls-4" d="M146.7,26.7l-26.7,26.7h-53.3v20h26.7v26.7h-26.7v33.3l-26.7,26.7h27c2,0,3.8-1.3,4.4-3.2l4.8-14.9c.5-1.4,1.6-2.5,3-3l3.7-1.2c1.4-.5,3-.2,4.2.7l12.6,9.2c1.6,1.2,3.9,1.2,5.5,0l11.3-8.2c1.6-1.2,2.3-3.3,1.7-5.2l-4.8-14.9c-.5-1.4-.2-3,.7-4.2l2.3-3.2c.9-1.2,2.3-1.9,3.8-1.9h15.6c2,0,3.8-1.3,4.4-3.2l4.3-13.3c.6-1.9,0-4-1.7-5.2l-12.6-9.2c-1.2-.9-1.9-2.3-1.9-3.8v-3.9c0-1.5.7-2.9,1.9-3.8l14.5-10.5c1.2-.9,1.9-2.3,1.9-3.8v-26.6Z"/>
+  <path id="path7" class="cls-1" d="M120,0l-26.7,26.7h26.7v26.7l26.7-26.7V0h-26.7ZM40,106.7l-26.7,26.7v26.7h26.7l26.7-26.7h-26.7v-26.7Z"/>
+  <path id="path3" class="cls-2" d="M40,0L13.3,26.7v106.7l26.7-26.7V26.7h53.3L120,0H40Z"/>
+  <path id="path9" class="cls-3" d="M40,133.3h26.7v-33.3h26.7v-26.7h-26.7v-20h53.3v-26.7H40v106.7Z"/>
+</svg>

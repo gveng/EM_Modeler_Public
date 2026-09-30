@@ -63,6 +63,7 @@ def _bare_viewport(**attributes):
         "_render_window": None,
         "_snap_records": [],
         "_selection_mode": "object",
+        "_draw_plane": "XY",
         "_last_drawing_snap_kind": "grid",
         "scene": SimpleNamespace(objects=[]),
     }
@@ -78,6 +79,7 @@ def _bare_viewport(**attributes):
     viewport._drawing_snap_point = MethodType(
         Viewport3DWidget._drawing_snap_point, viewport
     )
+    viewport._snap = MethodType(Viewport3DWidget._snap, viewport)
     viewport._height_from_cursor = MethodType(
         Viewport3DWidget._height_from_cursor, viewport
     )
@@ -160,6 +162,196 @@ def test_sub_element_vertex_pick_uses_point_picker_actor_transform(monkeypatch):
 
     assert coordinates[0] == pytest.approx((11.0, 22.0, 33.0, "mm"))
     assert markers == [((11.0, 22.0, 33.0), actor)]
+
+
+def test_vertex_pick_actor_filter_keeps_request_armed_for_other_objects(monkeypatch):
+    expected_actor = vtk.vtkActor()
+    other_actor = vtk.vtkActor()
+    callback = Mock()
+    status_message = Mock()
+    viewport = _bare_viewport(
+        _pick_request=None,
+        status_message=status_message,
+        setCursor=Mock(),
+        unsetCursor=Mock(),
+        _cancel_draw=Mock(),
+    )
+    viewport.request_pick = MethodType(Viewport3DWidget.request_pick, viewport)
+    viewport._handle_pick_request = MethodType(
+        Viewport3DWidget._handle_pick_request, viewport
+    )
+    monkeypatch.setattr(
+        viewport_module.vtk,
+        "vtkCellPicker",
+        lambda: _CellPicker(other_actor, None, (0.0, 0.0, 0.0)),
+    )
+
+    viewport.request_pick("vertex", callback, actor_filter=expected_actor)
+
+    assert viewport._handle_pick_request(100, 100)
+
+    callback.assert_not_called()
+    assert viewport._pick_request == ("vertex", callback, expected_actor)
+    assert status_message.emit.call_args.args == (
+        "Pick a vertex on the selected object.",
+    )
+
+
+def test_measurement_direct_picks_highlight_features_and_draw_result():
+    first = {"kind": "point", "point": (0.0, 0.0, 0.0)}
+    second = {"kind": "point", "point": (3.0, 4.0, 0.0)}
+    highlights = [object(), object()]
+    added_actors = []
+
+    class _Renderer:
+        def AddActor(self, actor):
+            added_actors.append(actor)
+
+        def RemoveActor(self, _actor):
+            pass
+
+    class _Signal:
+        def __init__(self):
+            self.messages = []
+            self.values = []
+
+        def emit(self, message):
+            self.messages.append(message)
+            self.values.append(message)
+
+    status = _Signal()
+    draw_result = Mock()
+    viewport = _bare_viewport(
+        _measurement_active=True,
+        _measurement_features=[],
+        _measurement_highlights=[],
+        _measurement_actors=[],
+        _measurement_escape_shortcut=Mock(),
+        _renderer=_Renderer(),
+        _units="mm",
+        status_message=status,
+        _render=Mock(),
+        _add_measurement_text=Mock(),
+        _draw_measurement_result=draw_result,
+        unsetCursor=Mock(),
+    )
+    features = iter(((first, highlights[0], None), (second, highlights[1], None)))
+    viewport._pick_measurement_feature = lambda *_args: next(features)
+    viewport._measurement_prompt = MethodType(Viewport3DWidget._measurement_prompt, viewport)
+    viewport._measurement_result_text = MethodType(
+        Viewport3DWidget._measurement_result_text, viewport
+    )
+
+    Viewport3DWidget._measurement_click(viewport, 10, 20)
+    assert viewport._measurement_active is True
+    assert added_actors == [highlights[0]]
+    assert status.messages[-1].startswith("Measure: pick")
+
+    Viewport3DWidget._measurement_click(viewport, 30, 40)
+
+    assert viewport._measurement_active is False
+    assert added_actors == highlights
+    draw_result.assert_called_once()
+    assert draw_result.call_args.args[2]["distance"] == pytest.approx(5.0)
+
+
+def test_escape_clears_completed_measurement_and_disables_shortcut():
+    class _Signal:
+        def __init__(self):
+            self.messages = []
+
+        def emit(self, message):
+            self.messages.append(message)
+
+    status = _Signal()
+    mode_changes = _Signal()
+    shortcut = Mock()
+    removed_actors = []
+
+    class _Renderer:
+        def RemoveActor(self, actor):
+            removed_actors.append(actor)
+
+    highlight = object()
+    annotation = object()
+    viewport = SimpleNamespace(
+        _measurement_active=False,
+        _measurement_highlights=[highlight],
+        _measurement_actors=[annotation],
+        _measurement_features=[{"kind": "point", "point": (1, 2, 3)}],
+        _renderer=_Renderer(),
+        _measurement_escape_shortcut=shortcut,
+        unsetCursor=Mock(),
+        _render=Mock(),
+        status_message=status,
+        measurement_mode_changed=mode_changes,
+    )
+    viewport._clear_measurement_actors = MethodType(
+        Viewport3DWidget._clear_measurement_actors, viewport
+    )
+
+    Viewport3DWidget._finish_measurement(viewport)
+
+    assert viewport._measurement_active is False
+    shortcut.setEnabled.assert_called_once_with(False)
+    assert removed_actors == [highlight, annotation]
+    assert viewport._measurement_features == []
+    viewport.unsetCursor.assert_called_once_with()
+    viewport._render.assert_called_once_with()
+    assert status.messages == ["Measurement finished; annotations cleared."]
+    assert mode_changes.messages == [False]
+
+
+def test_measurement_draws_distance_and_axis_vectors_in_viewer():
+    first = {"kind": "point", "point": (0.0, 0.0, 0.0)}
+    second = {"kind": "point", "point": (3.0, 4.0, 12.0)}
+    added_actors = []
+
+    class _Renderer:
+        def AddActor(self, actor):
+            added_actors.append(actor)
+
+    viewport = _bare_viewport(
+        _renderer=_Renderer(),
+        _measurement_actors=[],
+        _units="mm",
+    )
+    viewport._add_measurement_text = MethodType(
+        Viewport3DWidget._add_measurement_text, viewport
+    )
+    viewport._add_measurement_vector = MethodType(
+        Viewport3DWidget._add_measurement_vector, viewport
+    )
+    viewport._draw_measurement_result = MethodType(
+        Viewport3DWidget._draw_measurement_result, viewport
+    )
+    from em3d_modeler.ui.measurement import calculate_measurement
+
+    result = calculate_measurement(first, second)
+    viewport._draw_measurement_result(first, second, result)
+
+    assert len(viewport._measurement_actors) == 16
+    assert len(added_actors) == 16
+    labels = [
+        actor for actor in viewport._measurement_actors
+        if isinstance(actor, vtk.vtkBillboardTextActor3D)
+    ]
+    assert len(labels) == 4
+    assert all(actor.GetDisplayOffset() != (0, 0) for actor in labels)
+    assert all(actor.GetTextProperty().GetBackgroundOpacity() > 0.8 for actor in labels)
+    arrowheads = [
+        actor for actor in viewport._measurement_actors
+        if isinstance(actor, vtk.vtkActor)
+        and actor.GetMapper().GetInput().GetNumberOfPoints() > 2
+    ]
+    assert len(arrowheads) == 8
+    for arrowhead in arrowheads:
+        bounds = arrowhead.GetMapper().GetInput().GetBounds()
+        diagonal = sum(
+            (bounds[index + 1] - bounds[index]) ** 2
+            for index in (0, 2, 4)
+        ) ** 0.5
+        assert diagonal < 0.1
 
 
 def test_surface_pick_tracks_full_coplanar_region_for_plate_creation(monkeypatch):
@@ -344,6 +536,71 @@ def test_drawing_snap_uses_selection_mode_at_each_call():
 
     assert modes == ["face", "edge"]
     assert viewport._last_drawing_snap_kind == "edge"
+
+
+def test_grid_drawing_snap_bypasses_geometry_and_uses_active_grid():
+    viewport = _bare_viewport(
+        _selection_mode="grid",
+        _grid_spacing=2.0,
+        _ray_plane_intersect=lambda *_args: (3.1, 4.9, 0.0),
+    )
+    viewport._snap_to_visible_geometry = lambda *_args, **_kwargs: pytest.fail(
+        "Grid mode must not pick geometry"
+    )
+
+    assert viewport._drawing_snap_point(20, 30) == (4.0, 4.0, 0.0)
+    assert viewport._last_drawing_snap_kind == "grid"
+
+
+def test_grid_snap_stays_on_custom_reference_plane():
+    origin = (1.0, 2.0, 3.0)
+    normal = (0.0, 1.0, 1.0)
+    u_axis, v_axis = viewport_module.plane_basis_from_normal(normal)
+    point = tuple(
+        origin[index] + 3.1 * u_axis[index] + 4.9 * v_axis[index]
+        for index in range(3)
+    )
+    expected = tuple(
+        origin[index] + 4.0 * u_axis[index] + 4.0 * v_axis[index]
+        for index in range(3)
+    )
+    viewport = _bare_viewport(
+        _grid_spacing=2.0,
+        _custom_plane_active=True,
+        _custom_plane_origin=origin,
+        _custom_plane_normal=normal,
+    )
+
+    assert viewport._snap(point) == pytest.approx(expected)
+
+
+def test_grid_height_snap_uses_cursor_ray_not_underlying_geometry(monkeypatch):
+    class _Renderer:
+        def __init__(self):
+            self.display = None
+
+        def SetDisplayPoint(self, *point):
+            self.display = point
+
+        def DisplayToWorld(self):
+            pass
+
+        def GetWorldPoint(self):
+            depth = self.display[2]
+            return (5.0 - 5.0 * depth, 0.0, 10.0 * depth, 1.0)
+
+    viewport = _bare_viewport(
+        _selection_mode="grid",
+        _grid_spacing=2.0,
+        _renderer=_Renderer(),
+        _draw_plane="XY",
+    )
+    viewport._snap_to_visible_geometry = lambda *_args, **_kwargs: pytest.fail(
+        "Grid mode must not pick geometry"
+    )
+
+    assert viewport._height_from_cursor(20, 30, 0.0) == pytest.approx(10.0)
+    assert viewport._last_drawing_snap_kind == "grid"
 
 
 def test_height_stage_uses_current_geometry_snap_and_preserves_cursor_fallback(monkeypatch):
