@@ -226,9 +226,10 @@ class ProjectTreeWidget(QWidget):
         header = self._tree.header()
         header.setDefaultSectionSize(180)
         header.setMinimumSectionSize(70)
-        header.setSectionResizeMode(0, QHeaderView.Interactive)
+        header.setSectionResizeMode(0, QHeaderView.Stretch)
         header.setSectionResizeMode(1, QHeaderView.Interactive)
         header.setStretchLastSection(False)
+        header.resizeSection(1, 90)
         self._tree.setHeaderHidden(False)
         header.setVisible(True)
         

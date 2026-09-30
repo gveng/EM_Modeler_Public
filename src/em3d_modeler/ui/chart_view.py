@@ -8,7 +8,7 @@ from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, Signal, QSettings
+from PySide6.QtCore import Qt, Signal, QSettings, QEvent
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -183,6 +183,7 @@ class PlotView(QWidget):
         self._y_auto_range = True
         self._x_range = None
         self._y_range = None
+        self._progressive_x_range: tuple[float, float] | None = None
         self._has_pg_data = False
         self._title = ""
         self._xlabel = ""
@@ -354,7 +355,12 @@ class PlotView(QWidget):
             self.canvas = FigureCanvasQTAgg(self.figure)
             self._canvas_scroll.setWidget(self.canvas)
             root_layout.addWidget(self._canvas_scroll, 1)
-        self.canvas.setFixedSize(self.plot_width_spin.value(), self.plot_height_spin.value())
+        self._requested_canvas_size = (
+            self.plot_width_spin.value(),
+            self.plot_height_spin.value(),
+        )
+        self.canvas.setFixedSize(*self._requested_canvas_size)
+        self._canvas_scroll.viewport().installEventFilter(self)
         self.plot_width_spin.valueChanged.connect(self._apply_plot_size)
         self.plot_height_spin.valueChanged.connect(self._apply_plot_size)
 
@@ -365,6 +371,14 @@ class PlotView(QWidget):
         elif not self._use_pyqtgraph:
             self.x_scale_combo.currentTextChanged.connect(self._redraw)
 
+    def eventFilter(self, watched, event):
+        if (
+            watched is self._canvas_scroll.viewport()
+            and event.type() == QEvent.Type.Resize
+        ):
+            self._fit_canvas_to_viewport()
+        return super().eventFilter(watched, event)
+
     def set_plot_data(
         self,
         x_values: Sequence[float],
@@ -374,6 +388,7 @@ class PlotView(QWidget):
         xlabel: str,
         ylabel: str,
     ) -> None:
+        self._progressive_x_range = None
         self._update_data(x_values, series)
         self._title = str(title)
         self._xlabel = str(xlabel)
@@ -385,6 +400,7 @@ class PlotView(QWidget):
         x_values: Sequence[float],
         series: Sequence[dict[str, Any]],
     ) -> None:
+        self._progressive_x_range = None
         incoming_ids = {str(item.get("file_id", "default")) for item in series}
         existing = [
             item for item in self._series_data
@@ -410,12 +426,25 @@ class PlotView(QWidget):
         series: Sequence[dict[str, Any]],
         *,
         title: str,
+        xlabel: str = "",
+        ylabel: str = "",
+        x_range: tuple[float, float] | None = None,
     ) -> None:
+        if x_range is None:
+            self._progressive_x_range = None
+        else:
+            low, high = float(x_range[0]), float(x_range[1])
+            if not math.isfinite(low) or not math.isfinite(high) or low >= high:
+                raise ValueError("progressive x range must be finite and increasing")
+            self._progressive_x_range = (low, high)
         self._update_data(x_values, series)
         self._title = str(title)
+        self._xlabel = str(xlabel)
+        self._ylabel = str(ylabel)
         self._redraw()
 
     def clear_data(self) -> None:
+        self._progressive_x_range = None
         self._x_values = np.asarray([], dtype=float)
         self._series_data = []
         if self._use_pyqtgraph:
@@ -601,10 +630,26 @@ class PlotView(QWidget):
     def _apply_plot_size(self, _value: int = 0) -> None:
         width = self.plot_width_spin.value()
         height = self.plot_height_spin.value()
-        self.canvas.setFixedSize(width, height)
+        self._requested_canvas_size = (width, height)
         self._trace_color_settings.setValue(f"{self._plot_size_setting_key}/width", width)
         self._trace_color_settings.setValue(f"{self._plot_size_setting_key}/height", height)
         self._trace_color_settings.sync()
+        self._fit_canvas_to_viewport()
+
+    def _fit_canvas_to_viewport(self) -> None:
+        available = self._canvas_scroll.viewport().size()
+        if available.width() <= 0 or available.height() <= 0:
+            return
+        requested_width, requested_height = self._requested_canvas_size
+        scale = min(
+            1.0,
+            available.width() / requested_width,
+            available.height() / requested_height,
+        )
+        self.canvas.setFixedSize(
+            max(1, int(requested_width * scale)),
+            max(1, int(requested_height * scale)),
+        )
 
     def _open_axis_settings(self) -> None:
         dialog = _AxisRangeDialog(
@@ -772,7 +817,12 @@ class PlotView(QWidget):
                 yRange=previous_range[1],
                 padding=0.0,
             )
-        if self._x_auto_range:
+        if self._progressive_x_range is not None:
+            view_box.disableAutoRange(axis=view_box.XAxis)
+            self.plot_widget.setXRange(
+                *self._range_in_view(self._progressive_x_range, x_log), padding=0.0
+            )
+        elif self._x_auto_range:
             view_box.enableAutoRange(axis=view_box.XAxis, enable=True)
         elif self._x_range is not None:
             self.plot_widget.setXRange(

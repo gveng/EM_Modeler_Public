@@ -85,6 +85,16 @@ PLANE_NORMAL = {"XY": (0, 0, 1), "XZ": (0, 1, 0), "YZ": (1, 0, 0)}
 PLANE_ORIGIN = {"XY": (0, 0, 0), "XZ": (0, 0, 0), "YZ": (0, 0, 0)}
 
 
+class _PersistentQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        if parent is not None:
+            parent.destroyed.connect(self.Finalize, Qt.DirectConnection)
+
+    def closeEvent(self, event) -> None:
+        event.accept()
+
+
 class Viewport3DWidget(QWidget):
     @staticmethod
     def _axis_plane_from_normal(normal) -> str:
@@ -133,7 +143,7 @@ class Viewport3DWidget(QWidget):
         self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         # ── VTK setup ──────────────────────────────────────────────────────────
-        self._vtk_widget   = QVTKRenderWindowInteractor(self)
+        self._vtk_widget   = _PersistentQVTKRenderWindowInteractor(self)
         self._renderer     = vtk.vtkRenderer()
         self._render_window = self._vtk_widget.GetRenderWindow()
         self._render_window.SetAlphaBitPlanes(1)

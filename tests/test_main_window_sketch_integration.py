@@ -16,7 +16,9 @@ from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMainWind
 import em3d_modeler.ui.main_window as main_window_module
 from em3d_modeler.ui.main_window import MainWindow
 from em3d_modeler.drawing.sketch_engine import SketchEngine
-from em3d_modeler.scene.em_objects import BoxObject, ExtrudedObject, MeshObject, RevolvedObject
+from em3d_modeler.scene.em_objects import (
+    BoxObject, CylinderObject, ExtrudedObject, MeshObject, RevolvedObject,
+)
 from em3d_modeler.scene.scene_manager import SceneManager
 
 
@@ -27,6 +29,49 @@ def _main_window_stub(viewport):
         _start_embedded_sketch=Mock(),
         _open_reference_plane_dialog=Mock(),
     )
+
+
+def test_cylinder_center_values_survive_regeneration_without_snap():
+    cylinder = CylinderObject("Cylinder", cx=8, cy=9, cz=10)
+    cylinder.creation_history = {
+        "mode": "cylinder",
+        "points": [{"value": [1, 2, 3], "snap": {"kind": "grid"}}],
+    }
+    window = SimpleNamespace(
+        _resolve_creation_snap=lambda _snap, _objects: None,
+    )
+
+    MainWindow._regenerate_snap_dependent_objects(window, [cylinder])
+
+    assert cylinder.get_parameters()["CenterX"] == pytest.approx(8)
+    assert cylinder.get_parameters()["CenterY"] == pytest.approx(9)
+    assert cylinder.get_parameters()["CenterZ"] == pytest.approx(10)
+
+
+def test_snapped_cylinder_center_follows_source_without_accumulating():
+    cylinder = CylinderObject("Cylinder", cx=1, cy=2, cz=8, height=10)
+    cylinder.creation_history = {
+        "mode": "cylinder",
+        "points": [{
+            "value": [1, 2, 3],
+            "snap": {"kind": "vertex", "object": "Source"},
+        }],
+    }
+    window = SimpleNamespace(
+        _resolve_creation_snap=lambda _snap, _objects: [4, 5, 6],
+    )
+
+    MainWindow._regenerate_snap_dependent_objects(window, [cylinder])
+    first_center = tuple(
+        cylinder.get_parameters()[key] for key in ("CenterX", "CenterY", "CenterZ")
+    )
+    MainWindow._regenerate_snap_dependent_objects(window, [cylinder])
+    second_center = tuple(
+        cylinder.get_parameters()[key] for key in ("CenterX", "CenterY", "CenterZ")
+    )
+
+    assert first_center == pytest.approx((4, 5, 11))
+    assert second_center == pytest.approx(first_center)
 
 
 def test_progressive_stdout_parser_buffers_split_json_lines():
@@ -83,6 +128,8 @@ def test_progressive_plot_preserves_s_output_input_orientation():
                 "name": "Sweep",
                 "type": "Sweep",
                 "progressive_sparams_enabled": True,
+                "Fmin_GHz": 0.1,
+                "Fmax_GHz": 10.0,
             }],
             "outputs": [{
                 "name": "Selected Sij",
@@ -112,6 +159,8 @@ def test_progressive_plot_preserves_s_output_input_orientation():
         "S22": [0.4 + 0.0j],
     }
     assert [item["visible"] for item in series] == [False, True, True, False]
+    assert show_chart.call_args.args[1]["x_range"] == (0.1, 10.0)
+    assert show_chart.call_args.args[1]["title"] == "Selected Sij (1/1 samples)"
     assert show_chart.call_args.kwargs == {"progressive": True}
 
 
@@ -125,6 +174,8 @@ def test_parametric_progressive_events_add_one_trace_per_parameter_value(monkeyp
                 "name": "Parametric",
                 "type": "Parametric",
                 "progressive_sparams_enabled": True,
+                "Fmin_GHz": 0.1,
+                "Fmax_GHz": 10.0,
             }],
             "outputs": [{
                 "name": "Width sweep",
@@ -163,6 +214,8 @@ def test_parametric_progressive_events_add_one_trace_per_parameter_value(monkeyp
                 assert [item["x_values"] for item in partial_chart["series"]] == [
                     [1.0, 2.0], [1.0],
                 ]
+                assert partial_chart["x_range"] == (0.1, 10.0)
+                assert "width=0.4, 1/2 samples" in partial_chart["title"]
 
     chart_data = show_chart.call_args.args[1]
     assert [item["file_name"] for item in chart_data["series"]] == [
@@ -1238,6 +1291,56 @@ def test_scaling_box_keeps_its_center_fixed():
     assert MainWindow._scale_by_attributes(SimpleNamespace(), box, 2.0)
 
     assert box.actor.GetBounds() == pytest.approx((5, 25, 15, 35, 25, 45))
+
+
+def test_changing_units_converts_geometry_parameters_and_formulas():
+    box = BoxObject("Box", 0, 1, 0, 1, 2, 1)
+    box.param_formulas = {"X2": "width"}
+    box.sketch_definition = {
+        "plane_origin": [1, 2, 3],
+        "entities": [{"geometry": [1, 2, 3]}],
+        "dimensions": [
+            {"kind": "linear", "value": 1, "resolved_value": 1, "expression": "width"},
+            {"kind": "angular", "value": 90, "resolved_value": 90},
+        ],
+    }
+    settings = {"parameters": [{"name": "width", "value": 1, "unit": "inch"}]}
+    project_tree = SimpleNamespace(
+        get_settings=lambda: settings,
+        load_settings=lambda value: settings.update(value),
+        settings_changed=SimpleNamespace(emit=Mock()),
+    )
+    viewport = SimpleNamespace(
+        scene=SimpleNamespace(objects=[box], scene_changed=SimpleNamespace(emit=Mock())),
+        scene_changed=SimpleNamespace(emit=Mock()),
+        _render=Mock(),
+    )
+    window = SimpleNamespace(
+        _history_record=Mock(),
+        _project_tree=project_tree,
+        _viewport=viewport,
+        _info_bar=SimpleNamespace(set_info=Mock()),
+        _sync_boolean_provenance=Mock(),
+        _recompute_parametric_objects=Mock(),
+        recompute_sketch_dimensions=Mock(),
+        _refresh_materials=Mock(),
+        _mark_simulation_dirty=Mock(),
+    )
+    window._scale_by_attributes = lambda obj, factor, *, preserve_center: MainWindow._scale_by_attributes(
+        window, obj, factor, preserve_center=preserve_center
+    )
+
+    MainWindow._convert_scene_units(window, "inch", "mm")
+
+    assert box.get_parameters()["X2"] == pytest.approx(25.4)
+    assert box.actor.GetBounds() == pytest.approx((0, 25.4, 25.4, 50.8, 0, 25.4))
+    assert settings["parameters"] == [{"name": "width", "value": 25.4, "unit": "mm"}]
+    assert main_window_module.evaluate_expression(
+        box.param_formulas["X2"], {"width": 25.4}
+    ) == pytest.approx(25.4)
+    assert box.sketch_definition["plane_origin"] == pytest.approx([25.4, 50.8, 76.2])
+    assert box.sketch_definition["dimensions"][0]["resolved_value"] == pytest.approx(25.4)
+    assert box.sketch_definition["dimensions"][1]["resolved_value"] == 90
 
 
 def test_scaling_step_mesh_uses_actor_transform_and_keeps_center_fixed():

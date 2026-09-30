@@ -57,6 +57,8 @@ class InfoBarWidget(QWidget):
         self._model_view = True
         self._model_message = "Ready."
         self._sim_running = False
+        self._sim_preparing = False
+        self._preparation_message = ""
         self._sim_status.hide()
         self._sim_progress.hide()
         self._sim_progress_label.hide()
@@ -99,6 +101,9 @@ class InfoBarWidget(QWidget):
         current_fraction: float | None = None,
     ) -> None:
         self._sim_running = bool(running)
+        self._sim_preparing = False
+        self._sim_status.setText("RUN")
+        self._sim_progress.setRange(0, 100)
         self._sim_status.setVisible(self._sim_running)
         self._sim_progress.setVisible(self._sim_running)
         self._sim_progress_label.setVisible(self._sim_running)
@@ -117,9 +122,48 @@ class InfoBarWidget(QWidget):
             self._sim_progress_label.setText("...")
         self._refresh_message()
 
+    def set_preparation_progress(
+        self,
+        message: str,
+        *,
+        completed: int = 0,
+        total: int = 0,
+        current_fraction: float | None = None,
+    ) -> None:
+        self._preparation_message = str(message)
+        self._sim_preparing = bool(self._preparation_message)
+        if self._sim_preparing:
+            self._sim_status.setText("PREP")
+            self._sim_status.setVisible(True)
+            self._sim_progress.setVisible(True)
+            self._sim_progress_label.setVisible(True)
+            if total > 0:
+                fraction = max(0.0, min(1.0, float(completed) / total))
+                if current_fraction is not None and completed < total:
+                    fraction = max(
+                        fraction,
+                        min(1.0, (completed + max(0.0, current_fraction)) / total),
+                    )
+                percentage = round(fraction * 100)
+                self._sim_progress.setRange(0, 100)
+                self._sim_progress.setValue(percentage)
+                self._sim_progress_label.setText(f"{percentage}%")
+            else:
+                self._sim_progress.setRange(0, 0)
+                self._sim_progress_label.setText("...")
+        else:
+            self._sim_status.setText("RUN")
+            self._sim_progress.setRange(0, 100)
+            self._sim_status.setVisible(self._sim_running)
+            self._sim_progress.setVisible(self._sim_running)
+            self._sim_progress_label.setVisible(self._sim_running)
+        self._refresh_message()
+
     def _refresh_message(self) -> None:
         if self._model_view:
             self._msg.setText(self._model_message)
+        elif self._sim_preparing:
+            self._msg.setText(self._preparation_message)
         elif self._sim_running:
             self._msg.setText("Simulation RUN")
         else:

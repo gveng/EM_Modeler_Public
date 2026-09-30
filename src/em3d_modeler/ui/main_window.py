@@ -63,6 +63,112 @@ def _scale_profile_coordinates(profile, factor: float):
     return profile
 
 
+def _scale_formula_expression(expression: str, factor: float, parameter_names) -> str:
+    import re
+
+    scaled = str(expression)
+    factors = (
+        parameter_names.items()
+        if isinstance(parameter_names, dict)
+        else ((name, 1.0) for name in parameter_names)
+    )
+    for name, parameter_factor in sorted(factors, key=lambda item: len(str(item[0])), reverse=True):
+        pattern = rf"(?<![\w.]){re.escape(str(name))}(?!\w)"
+        scaled = re.sub(pattern, f"({name} / {float(parameter_factor)!r})", scaled)
+    return f"({factor!r} * ({scaled}))"
+
+
+def _scale_numeric_tree(value, factor: float):
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return float(value) * factor
+    if isinstance(value, list):
+        return [_scale_numeric_tree(item, factor) for item in value]
+    if isinstance(value, tuple):
+        return tuple(_scale_numeric_tree(item, factor) for item in value)
+    if isinstance(value, dict):
+        return {key: _scale_numeric_tree(item, factor) for key, item in value.items()}
+    return value
+
+
+def _scale_sketch_definition(definition: dict, factor: float, parameter_names) -> dict:
+    scaled = deepcopy(definition)
+    if isinstance(scaled.get("plane_origin"), (list, tuple)):
+        scaled["plane_origin"] = _scale_numeric_tree(scaled["plane_origin"], factor)
+    for entity in scaled.get("entities", []):
+        if isinstance(entity, dict) and isinstance(entity.get("geometry"), (list, tuple)):
+            entity["geometry"] = _scale_numeric_tree(entity["geometry"], factor)
+    if isinstance(scaled.get("selected_region_anchors"), list):
+        scaled["selected_region_anchors"] = _scale_numeric_tree(
+            scaled["selected_region_anchors"], factor
+        )
+    for dimension in scaled.get("dimensions", []):
+        if not isinstance(dimension, dict) or str(dimension.get("kind", "")).lower() in {"angle", "angular"}:
+            continue
+        for key in ("value", "resolved_value"):
+            if isinstance(dimension.get(key), (int, float)):
+                dimension[key] = float(dimension[key]) * factor
+        expression = dimension.get("expression")
+        if expression:
+            dimension["expression"] = _scale_formula_expression(
+                expression, factor, parameter_names
+            )
+    return scaled
+
+
+def _scale_creation_history(history: dict, factor: float) -> dict:
+    scaled = deepcopy(history)
+    for point in scaled.get("points", []):
+        if not isinstance(point, dict):
+            continue
+        value = point.get("value")
+        if isinstance(value, (list, tuple)) and len(value) == 3:
+            point["value"] = _scale_numeric_tree(value, factor)
+        snap = point.get("snap")
+        if isinstance(snap, dict):
+            local = snap.get("local")
+            if isinstance(local, (list, tuple)) and len(local) == 3:
+                snap["local"] = _scale_numeric_tree(local, factor)
+    for key in ("source_face", "source_edge"):
+        source = scaled.get(key)
+        if isinstance(source, dict) and isinstance(source.get("points"), list):
+            source["points"] = _scale_numeric_tree(source["points"], factor)
+    return scaled
+
+
+def _scale_pattern_settings(settings: dict, factor: float, parameter_names) -> dict:
+    scaled = deepcopy(settings)
+    spatial_keys = {
+        "offset_x", "offset_y", "offset_z", "center_x", "center_y", "center_z",
+        "axis_start_x", "axis_start_y", "axis_start_z",
+        "axis_end_x", "axis_end_y", "axis_end_z", "radius",
+    }
+    for key in spatial_keys:
+        if isinstance(scaled.get("resolved"), dict) and isinstance(scaled["resolved"].get(key), (int, float)):
+            scaled["resolved"][key] = float(scaled["resolved"][key]) * factor
+        if isinstance(scaled.get("expressions"), dict) and scaled["expressions"].get(key):
+            scaled["expressions"][key] = _scale_formula_expression(
+                scaled["expressions"][key], factor, parameter_names
+            )
+        entry = scaled.get("inputs", {}).get(key) if isinstance(scaled.get("inputs"), dict) else None
+        if isinstance(entry, dict):
+            if entry.get("type") == "formula" and entry.get("formula"):
+                entry["formula"] = _scale_formula_expression(
+                    entry["formula"], factor, parameter_names
+                )
+            if isinstance(entry.get("value"), (int, float)):
+                entry["value"] = float(entry["value"]) * factor
+    if isinstance(scaled.get("parameter_values"), dict):
+        scaled["parameter_values"] = {
+            key: float(value) * float(parameter_names.get(key, factor))
+            if isinstance(value, (int, float)) and not isinstance(value, bool)
+            else value
+            for key, value in scaled["parameter_values"].items()
+        }
+    return scaled
+
+
 _JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE = 0x00002000
 _JOB_OBJECT_EXTENDED_LIMIT_INFORMATION = 9
 _PROCESS_TERMINATE = 0x0001
@@ -115,13 +221,13 @@ from PySide6.QtWidgets import (
     QMainWindow, QWidget, QSplitter,
     QFileDialog, QMessageBox, QComboBox, QSpinBox, QDoubleSpinBox, QLineEdit,
     QLabel, QDialog, QInputDialog,
-    QVBoxLayout, QFormLayout, QTextBrowser, QPlainTextEdit,
+    QVBoxLayout, QStackedLayout, QFormLayout, QTextBrowser, QPlainTextEdit,
     QPushButton, QHBoxLayout, QGroupBox, QCheckBox,
     QProgressDialog, QApplication, QTabWidget, QDialogButtonBox, QGridLayout, QToolButton, QToolBar,
-    QRadioButton, QTabBar,
+    QRadioButton, QTabBar, QMdiArea, QMdiSubWindow,
 )
-from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize, QUrl, QTimer
-from PySide6.QtGui  import QIcon, QKeySequence, QAction, QDesktopServices, QPainter, QPen, QColor
+from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize, QUrl, QTimer, QEventLoop, Signal
+from PySide6.QtGui  import QIcon, QKeySequence, QAction, QDesktopServices, QPainter, QPen, QColor, QBrush
 
 def _add_toolbar_group(
     toolbar, title: str, actions: list, columns: int = 3, *, compact: bool = False
@@ -173,6 +279,37 @@ def _add_toolbar_group(
     alignment = Qt.AlignVCenter if compact else Qt.AlignTop
     toolbar.layout().setAlignment(toolbar.widgetForAction(group_action), alignment)
     toolbar.addSeparator()
+
+
+class _PlotMdiArea(QMdiArea):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setFrameShape(QMdiArea.NoFrame)
+        self.setViewMode(QMdiArea.SubWindowView)
+        self.setActivationOrder(QMdiArea.ActivationHistoryOrder)
+        self.setOption(QMdiArea.DontMaximizeSubWindowOnActivation, True)
+        self.setBackground(QBrush(QColor("#20242b")))
+
+
+class _PlotSubWindow(QMdiSubWindow):
+    closed = Signal(object)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowFlags(
+            Qt.SubWindow
+            | Qt.WindowTitleHint
+            | Qt.WindowSystemMenuHint
+            | Qt.WindowMinimizeButtonHint
+            | Qt.WindowMaximizeButtonHint
+            | Qt.WindowCloseButtonHint
+        )
+
+    def closeEvent(self, event) -> None:
+        super().closeEvent(event)
+        if event.isAccepted():
+            self.closed.emit(self)
+
 
 # Undo/Redo CommandStack
 
@@ -260,6 +397,7 @@ from .material_assign_dialog import MaterialAssignDialog
 from .material_library_dialog import MaterialLibraryDialog
 from .settings_dialog        import SettingsDialog
 from .parameters_dialog      import ParametersDialog
+from .unit_options           import UNIT_OPTIONS
 from .formula_widgets        import FormulaDoubleSpinBox as QDoubleSpinBox, FormulaIntSpinBox
 from .project_tree_widget    import set_numeric_locale
 
@@ -279,7 +417,7 @@ from .. import __version__, __release_date__, __license__
 
 
 # ������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������
-_UNITS  = ["mm", "um", "cm", "m", "mil", "inch"]
+_UNITS  = UNIT_OPTIONS
 _EMERGE_SOLVERS = frozenset({
     "PARDISO", "SUPERLU", "UMFPACK", "CUDSS", "AASDS", "MUMPS",
 })
@@ -326,17 +464,21 @@ class MainWindow(QMainWindow):
         self._sim_script_dirty = True
         self._sim_step_bundle_ready = False
         self._sim_step_bundle_cache: dict = {"entries": [], "skipped": []}
+        self._simulation_step_export_cache: dict[tuple, dict] = {}
         self._sim_full_scene_step_dirty = True
         self._export_full_scene_step = False
         self._sim_status_running = False
         self._sim_status_completed_jobs = 0
         self._sim_status_total_jobs = 0
-        self._sim_status_current_fraction = None
         self._boolean_decimation_enabled = False
         self._workspace_path = ""
         self._sim_cached_script = ""
         self._sim_cached_script_bundle: dict = {"master": "", "scripts": []}
+        self._workspace_windows: dict[str, _PlotSubWindow] = {}
+        self._model_window: _PlotSubWindow | None = None
+        self._sim_subwindow: _PlotSubWindow | None = None
         self._plot_views: dict[str, QWidget] = {}
+        self._plot_subwindows: dict[str, _PlotSubWindow] = {}
         self._sim_log_verbosity = "INFO"
         self._ui_locale = QLocale.c()
 
@@ -400,26 +542,36 @@ class MainWindow(QMainWindow):
         self._body_props.content_changed.connect(self._schedule_left_splitter_layout)
         left_splitter.setMinimumWidth(210)
 
-        # ������ centre column: viewport (top) + info bar (bottom) ���������������������������������������������������
+        # ������ centre column: floating workspace + info bar ����������������������������
         centre_widget = QWidget()
         centre_layout = QVBoxLayout(centre_widget)
         centre_layout.setContentsMargins(0, 0, 0, 0)
         centre_layout.setSpacing(0)
-        self._workspace_tabs = QTabWidget(centre_widget)
-        self._workspace_tabs.setObjectName("workspaceTabs")
-        self._workspace_tabs.setTabsClosable(True)
-        self._workspace_tabs.tabCloseRequested.connect(self._close_workspace_tab)
-        self._workspace_tabs.currentChanged.connect(self._on_workspace_tab_changed)
-        model_page = QWidget(self._workspace_tabs)
+        self._workspace_area = _PlotMdiArea(centre_widget)
+        self._workspace_area.setObjectName("workspaceArea")
+        self._plot_mdi_area = self._workspace_area
+        self._workspace_area.subWindowActivated.connect(
+            self._on_workspace_window_activated
+        )
+        model_page = QWidget()
         self._model_page = model_page
         model_layout = QVBoxLayout(model_page)
         model_layout.setContentsMargins(0, 0, 0, 0)
         model_layout.setSpacing(0)
         model_layout.addWidget(self._viewport, stretch=1)
-        self._workspace_tabs.addTab(model_page, "Model")
-        self._workspace_tabs.tabBar().setTabButton(0, QTabBar.ButtonPosition.RightSide, None)
-        centre_layout.addWidget(self._workspace_tabs)
+        self._model_window = _PlotSubWindow(self._workspace_area)
+        self._model_window.setWindowTitle("Model")
+        self._model_window.setMinimumSize(480, 360)
+        self._model_window.setWidget(model_page)
+        self._model_window.closed.connect(self._on_workspace_subwindow_closed)
+        self._workspace_area.addSubWindow(self._model_window)
+        self._workspace_windows["Model"] = self._model_window
+        self._model_window.resize(700, 520)
+        self._model_window.move(24, 24)
+        centre_layout.addWidget(self._workspace_area, stretch=1)
         centre_layout.addWidget(self._info_bar)
+        self._workspace_area.show()
+        self._model_window.show()
 
         # ������ right column ������������������������������������������������������������������������������������������������������������������������������������������������������������������
         self._materials.setMinimumWidth(190)
@@ -457,9 +609,10 @@ class MainWindow(QMainWindow):
         )
         splitter.setSizes([max(1, available_height - bottom_height), bottom_height])
 
-    def _on_workspace_tab_changed(self, index: int) -> None:
-        current_widget = self._workspace_tabs.widget(index)
-        self._info_bar.set_model_view(current_widget is self._model_page)
+    def _on_workspace_window_activated(self, window) -> None:
+        self._info_bar.set_model_view(
+            window is self._model_window or window in self._plot_subwindows.values()
+        )
         self._rebuild_window_menu()
 
     def _refresh_simulation_status(self) -> None:
@@ -550,6 +703,7 @@ class MainWindow(QMainWindow):
         tools_menu.addAction("&Settings", self._open_settings_dialog)
         tools_menu.addAction("Material &Library...", self._open_material_library_dialog)
         tools_menu.addAction("&Parameters...", self._open_project_parameters)
+        tools_menu.addAction("Export Model as &STEP...", self._export_model_step)
 
         # Help
         help_menu = mb.addMenu("&Help")
@@ -562,73 +716,126 @@ class MainWindow(QMainWindow):
         if menu is None:
             return
         menu.clear()
-        tabs = getattr(self, "_workspace_tabs", None)
-        if tabs is None:
+        area = getattr(self, "_workspace_area", None)
+        if area is None:
             return
-        for index in range(tabs.count()):
-            widget = tabs.widget(index)
-            action = menu.addAction(tabs.tabText(index))
+        active_window = area.activeSubWindow()
+        windows = list(getattr(self, "_workspace_windows", {}).items())
+        for key, window in windows:
+            action = menu.addAction(key)
             action.setCheckable(True)
-            action.setChecked(widget is tabs.currentWidget())
-            action.triggered.connect(lambda _checked=False, page=widget: self._show_workspace_tab(page))
+            action.setChecked(window is active_window)
+            action.triggered.connect(
+                lambda _checked=False, name=key: self._show_workspace_window(name)
+            )
+        plot_windows = list(getattr(self, "_plot_subwindows", {}).items())
+        if windows or plot_windows:
+            menu.addSeparator()
+        for key, window in plot_windows:
+            action = menu.addAction(window.windowTitle())
+            action.setCheckable(True)
+            action.setChecked(window is active_window)
+            action.triggered.connect(
+                lambda _checked=False, plot_key=key: self._show_plot_window(plot_key)
+            )
+        menu.addAction("Tile Windows", self._tile_plot_windows)
+        menu.addAction("Cascade Windows", self._cascade_plot_windows)
         menu.addSeparator()
         menu.addAction("Close All Charts", self._close_all_plot_windows)
 
-    def _show_workspace_tab(self, widget: QWidget) -> None:
-        tabs = getattr(self, "_workspace_tabs", None)
-        if tabs is not None:
-            index = tabs.indexOf(widget)
-            if index >= 0:
-                tabs.setCurrentIndex(index)
-
-    def _close_workspace_tab(self, index: int) -> None:
-        tabs = getattr(self, "_workspace_tabs", None)
-        if tabs is None or index <= 0:
+    def _show_workspace_window(self, key: str) -> None:
+        window = self._workspace_windows.get(key)
+        if window is None:
             return
-        widget = tabs.widget(index)
-        if widget is getattr(self, "_sim_dlg", None):
-            tabs.removeTab(index)
-        else:
-            tabs.removeTab(index)
-            for key, chart in list(self._plot_views.items()):
-                if chart is widget:
-                    self._plot_views.pop(key, None)
-                    break
-            widget.deleteLater()
+        self._workspace_area.show()
+        window.showNormal()
+        self._workspace_area.setActiveSubWindow(window)
+        window.raise_()
+        self._info_bar.set_model_view(window is self._model_window)
+        if window is self._model_window:
+            self._model_page.show()
+            self._viewport.show()
+            self._viewport._vtk_widget.show()
+            QTimer.singleShot(0, self._viewport._render)
+        elif window is getattr(self, "_sim_subwindow", None):
+            simulation_dialog = getattr(self, "_sim_dlg", None)
+            if simulation_dialog is not None:
+                simulation_dialog.show()
+
+    def _on_workspace_subwindow_closed(self, _window) -> None:
         self._rebuild_window_menu()
 
     def _close_all_plot_windows(self) -> None:
-        for key, view in list(getattr(self, "_plot_views", {}).items()):
-            index = self._workspace_tabs.indexOf(view)
-            if index >= 0:
-                self._workspace_tabs.removeTab(index)
-            view.deleteLater()
-            self._plot_views.pop(key, None)
+        for window in list(getattr(self, "_plot_subwindows", {}).values()):
+            window.close()
         self._rebuild_window_menu()
+
+    def _on_plot_subwindow_closed(self, key: str, window: _PlotSubWindow) -> None:
+        if self._plot_subwindows.get(key) is not window:
+            return
+        self._plot_subwindows.pop(key, None)
+        self._plot_views.pop(key, None)
+        self._rebuild_window_menu()
+
+    def _show_plot_window(self, key: str) -> None:
+        window = self._plot_subwindows.get(key)
+        if window is None:
+            return
+        self._plot_mdi_area.show()
+        window.showNormal()
+        self._plot_mdi_area.setActiveSubWindow(window)
+        window.raise_()
+
+    def _tile_plot_windows(self) -> None:
+        self._plot_mdi_area.tileSubWindows()
+
+    def _cascade_plot_windows(self) -> None:
+        self._plot_mdi_area.cascadeSubWindows()
 
     def _show_chart(self, key: str, plot_data: dict, *, progressive: bool = False) -> None:
         view = self._plot_views.get(key)
-        is_new = view is None or self._workspace_tabs.indexOf(view) < 0
-        if view is None:
+        window = self._plot_subwindows.get(key)
+        is_new = view is None or window is None
+        if is_new:
             from .chart_view import PlotView
 
             title = str(plot_data.get("title", key)).strip() or key
             view = PlotView(
                 str(plot_data.get("plot_type", "plot_sp")),
-                self._workspace_tabs,
                 settings_key=key,
             )
             view.touchstone_load_requested.connect(
                 lambda plot_key=key: self._load_touchstone_for_chart(plot_key)
             )
             self._plot_views[key] = view
-            self._workspace_tabs.addTab(view, title)
+            window = _PlotSubWindow(self._plot_mdi_area)
+            window.setAttribute(Qt.WA_DeleteOnClose, True)
+            window.setMinimumSize(360, 280)
+            window.setWindowTitle(title)
+            window.setWidget(view)
+            self._plot_mdi_area.addSubWindow(window)
+            window.closed.connect(
+                lambda closed_window, plot_key=key: self._on_plot_subwindow_closed(
+                    plot_key, closed_window
+                )
+            )
+            offset = 36 * (len(self._plot_subwindows) % 6 + 1)
+            width = min(760, max(420, int(self._plot_mdi_area.width() * 0.72)))
+            height = min(560, max(320, int(self._plot_mdi_area.height() * 0.72)))
+            window.resize(width, height)
+            window.move(24 + offset, 24 + offset)
+            self._plot_subwindows[key] = window
 
         title = str(plot_data.get("title", key)).strip() or key
-        self._workspace_tabs.setTabText(self._workspace_tabs.indexOf(view), title)
-        if progressive and not is_new:
+        window.setWindowTitle(title)
+        if progressive:
             view.set_progressive_data(
-                plot_data["x_values"], plot_data["series"], title=plot_data["title"]
+                plot_data["x_values"],
+                plot_data["series"],
+                title=plot_data["title"],
+                xlabel=plot_data.get("xlabel", ""),
+                ylabel=plot_data.get("ylabel", ""),
+                x_range=plot_data.get("x_range"),
             )
         else:
             view.set_plot_data(
@@ -639,7 +846,9 @@ class MainWindow(QMainWindow):
                 ylabel=plot_data.get("ylabel", ""),
             )
         if is_new:
-            self._workspace_tabs.setCurrentWidget(view)
+            self._plot_mdi_area.show()
+            window.show()
+            self._plot_mdi_area.setActiveSubWindow(window)
         self._rebuild_window_menu()
 
     def _load_touchstone_for_chart(self, source_chart_key: str) -> None:
@@ -1179,6 +1388,7 @@ class MainWindow(QMainWindow):
         self._sim_script_dirty = True
         self._sim_step_bundle_ready = False
         self._sim_step_bundle_cache = {"entries": [], "skipped": []}
+        self._simulation_step_export_cache = {}
         self._sim_full_scene_step_dirty = True
         self._sim_cached_script = ""
         self._sim_cached_script_bundle = {"master": "", "scripts": []}
@@ -1187,6 +1397,7 @@ class MainWindow(QMainWindow):
         if steps:
             self._sim_steps_dirty = True
             self._sim_step_bundle_ready = False
+            self._simulation_step_export_cache = {}
             self._sim_full_scene_step_dirty = True
         if script:
             self._sim_script_dirty = True
@@ -1390,21 +1601,27 @@ class MainWindow(QMainWindow):
         actor.SetScale(*(float(value) * factor for value in scale))
         return True
 
-    def _scale_by_attributes(self, obj, factor: float) -> bool:
+    def _scale_by_attributes(self, obj, factor: float, *, preserve_center: bool = True) -> bool:
         t = type(obj).__name__
         actor = getattr(obj, "actor", None)
         bounds_before = actor.GetBounds() if actor is not None else None
+        position_before = actor.GetPosition() if actor is not None else None
+        origin_before = actor.GetOrigin() if actor is not None else None
 
         def finish_scale() -> bool:
             if actor is not None and bounds_before is not None:
-                bounds_after = actor.GetBounds()
-                delta = tuple(
-                    (float(bounds_before[axis * 2]) + float(bounds_before[axis * 2 + 1])
-                     - float(bounds_after[axis * 2]) - float(bounds_after[axis * 2 + 1])) * 0.5
-                    for axis in range(3)
-                )
-                position = actor.GetPosition()
-                actor.SetPosition(*(float(position[axis]) + delta[axis] for axis in range(3)))
+                if preserve_center:
+                    bounds_after = actor.GetBounds()
+                    delta = tuple(
+                        (float(bounds_before[axis * 2]) + float(bounds_before[axis * 2 + 1])
+                         - float(bounds_after[axis * 2]) - float(bounds_after[axis * 2 + 1])) * 0.5
+                        for axis in range(3)
+                    )
+                    position = actor.GetPosition()
+                    actor.SetPosition(*(float(position[axis]) + delta[axis] for axis in range(3)))
+                elif position_before is not None:
+                    actor.SetPosition(*(float(value) * factor for value in position_before))
+                    actor.SetOrigin(*(float(value) * factor for value in origin_before))
             return True
 
         if t in {"BoxObject", "PlateObject"}:
@@ -1499,6 +1716,8 @@ class MainWindow(QMainWindow):
             )
 
             def scale_world_point(point):
+                if not preserve_center:
+                    return tuple(float(value) * factor for value in point)
                 return tuple(center[axis] + (float(point[axis]) - center[axis]) * factor
                              for axis in range(3))
 
@@ -1868,7 +2087,10 @@ class MainWindow(QMainWindow):
                 if mesh_blob is None and str(p.get("StepSourcePath", "") or "").strip():
                     from ..emerge.step_importer import import_step
 
-                    imported_solids = import_step(str(p["StepSourcePath"]))
+                    imported_solids = import_step(
+                        str(p["StepSourcePath"]),
+                        mm_per_unit=_MM_PER_UNIT.get(self._units, 1.0),
+                    )
                     solid_name = str(p.get("StepSolidName", "") or "")
                     solid = next(
                         (entry for entry in imported_solids if entry.get("name") == solid_name),
@@ -2606,6 +2828,7 @@ class MainWindow(QMainWindow):
         self._recompute_simulation_parameters(settings)
         self._recompute_parametric_objects()
         self.recompute_sketch_dimensions()
+        self._mark_simulation_dirty(steps=True, script=True)
 
     def _recompute_simulation_parameters(self, settings: dict | None = None) -> None:
         settings = settings if isinstance(settings, dict) else self._project_tree.get_settings()
@@ -2638,7 +2861,7 @@ class MainWindow(QMainWindow):
 
     def _open_project_parameters(self) -> None:
         settings = self._project_tree.get_settings()
-        dialog = ParametersDialog(settings.get("parameters", []), self)
+        dialog = ParametersDialog(settings.get("parameters", []), self, units=self._units)
         if dialog.exec() != QDialog.Accepted:
             return
         settings["parameters"] = dialog.result_parameters()
@@ -2646,6 +2869,7 @@ class MainWindow(QMainWindow):
         self._project_tree.settings_changed.emit()
         self._recompute_parametric_objects()
         self.recompute_sketch_dimensions()
+        self._mark_simulation_dirty(steps=True, script=True)
 
     def _open_measure_tool(self) -> None:
         self._viewport.start_measurement()
@@ -2712,15 +2936,28 @@ class MainWindow(QMainWindow):
             raw_points = history.get("points", []) if isinstance(history, dict) else []
             if not raw_points:
                 continue
+            if not any(
+                isinstance(item, dict)
+                and isinstance(item.get("snap"), dict)
+                and str(item["snap"].get("object", "")).strip()
+                for item in raw_points
+            ):
+                continue
             points = []
+            resolved_points = []
+            point_items = []
             for item in raw_points:
                 if not isinstance(item, dict):
                     continue
                 point = item.get("value")
                 snap = item.get("snap", {})
                 resolved = self._resolve_creation_snap(snap, objects_by_name) if isinstance(snap, dict) else None
-                points.append(resolved or point)
-            points = [point for point in points if isinstance(point, (list, tuple)) and len(point) == 3]
+                current_point = resolved if resolved is not None else point
+                if not isinstance(current_point, (list, tuple)) or len(current_point) != 3:
+                    continue
+                points.append(current_point)
+                resolved_points.append(resolved)
+                point_items.append(item)
             if not points:
                 continue
             params = obj.get_parameters()
@@ -2741,10 +2978,18 @@ class MainWindow(QMainWindow):
                         if key not in formulas:
                             params[key] = float(point[axis_index])
             elif mode in {"cylinder", "cone", "sphere", "ellipsoid", "torus"}:
-                first = points[0]
-                for key, value in zip(("CenterX", "CenterY", "CenterZ"), first):
+                resolved = resolved_points[0]
+                original = point_items[0].get("value")
+                if (
+                    resolved is None
+                    or not isinstance(original, (list, tuple))
+                    or len(original) != 3
+                ):
+                    continue
+                for axis_index, key in enumerate(("CenterX", "CenterY", "CenterZ")):
                     if key in params and key not in formulas:
-                        params[key] = float(value)
+                        params[key] = float(params[key]) + float(resolved[axis_index]) - float(original[axis_index])
+                point_items[0]["value"] = [float(value) for value in resolved]
             else:
                 continue
             obj.set_parameters(params)
@@ -3104,6 +3349,7 @@ class MainWindow(QMainWindow):
         self,
         *,
         _patterns_recomputed: bool = False,
+        _regenerate_snaps: bool = True,
         parameter_values: dict[str, float] | None = None,
     ) -> None:
         from ..scene.boolean_ops import boolean_dependency_order, boolean_many, fuse_many
@@ -3189,13 +3435,16 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 formula_failures.add(id(obj))
                 self._info_bar.set_info(f"{obj.name}: {exc}")
+            self._process_simulation_preparation_events()
 
         for obj in objects:
             definition = getattr(obj, "sketch_definition", None)
-            if not isinstance(definition, dict):
-                continue
-            self._recompute_persisted_sketch(obj, definition, values)
-        self._regenerate_snap_dependent_objects(objects)
+            if isinstance(definition, dict):
+                self._recompute_persisted_sketch(obj, definition, values)
+            self._process_simulation_preparation_events()
+        if _regenerate_snaps:
+            self._regenerate_snap_dependent_objects(objects)
+        self._process_simulation_preparation_events()
 
         try:
             ordered_booleans = boolean_dependency_order(objects)
@@ -3209,6 +3458,7 @@ class MainWindow(QMainWindow):
             ordered_sources = list(getattr(result, "source_objects", []) or [])
             if len(ordered_sources) < 2:
                 self._info_bar.set_info(f"{result.name}: at least two boolean sources are required")
+                self._process_simulation_preparation_events()
                 continue
             failed_sources = [
                 source for source in ordered_sources
@@ -3220,6 +3470,7 @@ class MainWindow(QMainWindow):
                     f"{result.name}: recomputation skipped because a source failed: "
                     + ", ".join(str(source.name) for source in failed_sources)
                 )
+                self._process_simulation_preparation_events()
                 continue
             try:
                 reduction = float(getattr(result, "boolean_mesh_reduction", 0.0) or 0.0)
@@ -3240,13 +3491,18 @@ class MainWindow(QMainWindow):
             except Exception as exc:
                 boolean_failures.add(id(result))
                 self._info_bar.set_info(f"{result.name}: boolean recompute failed: {exc}")
+            self._process_simulation_preparation_events()
         pattern_recompute = getattr(self, "_recompute_pattern_instances", None)
         if (
             not _patterns_recomputed
             and callable(pattern_recompute)
             and pattern_recompute(values)
         ):
-            self._recompute_parametric_objects(_patterns_recomputed=True)
+            self._process_simulation_preparation_events()
+            self._recompute_parametric_objects(
+                _patterns_recomputed=True,
+                _regenerate_snaps=_regenerate_snaps,
+            )
             return
         self._viewport._render()
 
@@ -3364,7 +3620,7 @@ class MainWindow(QMainWindow):
         self._refresh_materials()
         self._materials.highlight(objects)  # Now includes signal emit
         self._info_bar.set_info(f"Material '{material}' applied to {len(objects)} objects")
-        self._mark_simulation_dirty(steps=False, script=True)
+        self._mark_simulation_dirty(steps=True, script=True)
 
     def _on_bulk_style(self, material: str, color_hex: str, objects: list) -> None:
         self._history_record()
@@ -3375,7 +3631,7 @@ class MainWindow(QMainWindow):
         self._info_bar.set_info(
             f"Applied material '{material}' and color {color_hex} to {len(objects)} objects"
         )
-        self._mark_simulation_dirty(steps=False, script=True)
+        self._mark_simulation_dirty(steps=True, script=True)
 
     def _on_material_added(self, name: str) -> None:
         if not name:
@@ -3423,7 +3679,7 @@ class MainWindow(QMainWindow):
             self._viewport._render()
             self._refresh_materials()
             self._info_bar.set_info(f"Material '{name}' applied to {len(selected_objects)} objects")
-            self._mark_simulation_dirty(steps=False, script=True)
+            self._mark_simulation_dirty(steps=True, script=True)
             return
 
         self._body_props.set_selected_material(name)
@@ -3784,7 +4040,10 @@ class MainWindow(QMainWindow):
         if not path:
             return
         try:
-            solids = import_step(path)
+            solids = import_step(
+                path,
+                mm_per_unit=_MM_PER_UNIT.get(self._units, 1.0),
+            )
         except RuntimeError as exc:
             QMessageBox.warning(
                 self, "STEP Import",
@@ -3916,26 +4175,37 @@ class MainWindow(QMainWindow):
             root.addWidget(self._sim_output_tabs, stretch=2)
 
             self._sim_dlg = dlg
-
-        if self._workspace_tabs.indexOf(dlg) < 0:
-            self._workspace_tabs.insertTab(1, dlg, "Simulation")
+            self._sim_subwindow = _PlotSubWindow(self._workspace_area)
+            self._sim_subwindow.setWindowTitle("Simulation")
+            self._sim_subwindow.setMinimumSize(500, 360)
+            self._sim_subwindow.setWidget(dlg)
+            self._sim_subwindow.closed.connect(self._on_workspace_subwindow_closed)
+            self._workspace_area.addSubWindow(self._sim_subwindow)
+            self._workspace_windows["Simulation"] = self._sim_subwindow
+            self._sim_subwindow.resize(680, 520)
+            self._sim_subwindow.move(72, 72)
 
         self._sim_log_view.clear()
-        try:
-            master_script = self._generate_simulation_assets(
-                show_progress=True,
-                force_script=True,
-            )
-            if master_script:
-                script_path = self._write_cached_simulation_scripts()
-                self._append_sim_log(f"[info] Scripts regenerated and saved: {script_path.parent}")
-        except Exception as exc:
-            self._append_sim_log(f"[error] Failed to generate script: {exc}")
-        self._workspace_tabs.setCurrentWidget(dlg)
+        self._show_workspace_window("Simulation")
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+        cached_script = getattr(self, "_sim_cached_script_bundle", {}).get("master", "")
+        if getattr(self, "_sim_script_dirty", True) or not cached_script:
+            try:
+                master_script = self._generate_simulation_assets(
+                    show_progress=True,
+                    force_script=False,
+                )
+                if master_script:
+                    script_path = self._write_cached_simulation_scripts()
+                    self._append_sim_log(f"[info] Scripts regenerated and saved: {script_path.parent}")
+            except Exception as exc:
+                self._append_sim_log(f"[error] Failed to generate script: {exc}")
 
     def _on_sim_option_changed(self, _checked: bool) -> None:
         self._mark_simulation_dirty(steps=False, script=True)
-        self._on_sim_generate(show_progress=False, force_script=True)
+        info_bar = getattr(self, "_info_bar", None)
+        if info_bar is not None:
+            info_bar.set_info("Simulation options changed. Generate Script or Run to apply.")
 
     def _on_check_simulation(self) -> None:
         findings = self._simulation_validation_findings()
@@ -4377,9 +4647,18 @@ class MainWindow(QMainWindow):
         bundle_dir: Path,
         material_priorities: dict,
         excluded_object_names: set[str],
+        progress_callback=None,
+        mm_per_unit: float = 1.0,
     ) -> dict:
         def log_export(level: str, message: str) -> None:
             normalized_level = self._normalize_log_level(level)
+            if (
+                normalized_level == "DEBUG"
+                and message.startswith("object_start")
+                and progress_callback is not None
+            ):
+                object_name = message.partition("name=")[2].partition(" type=")[0]
+                progress_callback(0, len(objects), object_name)
             if normalized_level in {"WARNING", "ERROR"}:
                 self._append_step_export_log(
                     f"[{normalized_level.lower()}] {message}",
@@ -4391,7 +4670,9 @@ class MainWindow(QMainWindow):
             bundle_dir=bundle_dir,
             material_priorities=material_priorities,
             excluded_object_names=excluded_object_names,
+            progress_callback=progress_callback,
             log_callback=log_export,
+            mm_per_unit=mm_per_unit,
         )
         skipped = list(result.get("skipped", []))
         missing_files = [
@@ -4410,7 +4691,82 @@ class MainWindow(QMainWindow):
             raise RuntimeError(message)
         return result
 
-    def _build_simulation_script_bundle(self, step_entries: list[dict], show_model: bool, show_mesh: bool, run_sweep: bool, preview_only: bool = False) -> dict:
+    def _cached_simulation_step_bundle(
+        self,
+        *,
+        objects: list,
+        bundle_dir: Path,
+        material_priorities: dict,
+        excluded_object_names: set[str],
+        cache_token: tuple | None = None,
+        progress_callback=None,
+        mm_per_unit: float = 1.0,
+    ) -> dict:
+        cache = getattr(self, "_simulation_step_export_cache", None)
+        if not isinstance(cache, dict):
+            cache = {}
+            self._simulation_step_export_cache = cache
+        cache_key = self._simulation_step_cache_key(
+            bundle_dir=bundle_dir,
+            material_priorities=material_priorities,
+            excluded_object_names=excluded_object_names,
+            cache_token=cache_token,
+            mm_per_unit=mm_per_unit,
+        )
+        cached = self._get_cached_simulation_step_bundle(cache_key, bundle_dir)
+        if cached is not None:
+            return cached
+
+        result = self._export_simulation_step_bundle(
+            objects=objects,
+            bundle_dir=bundle_dir,
+            material_priorities=material_priorities,
+            excluded_object_names=excluded_object_names,
+            progress_callback=progress_callback,
+            mm_per_unit=mm_per_unit,
+        )
+        cache[cache_key] = result
+        return result
+
+    def _simulation_step_cache_key(
+        self,
+        *,
+        bundle_dir: Path,
+        material_priorities: dict,
+        excluded_object_names: set[str],
+        cache_token: tuple | None = None,
+        mm_per_unit: float = 1.0,
+    ) -> tuple:
+        priority_key = tuple(
+            sorted((str(name), repr(value)) for name, value in material_priorities.items())
+        ) if isinstance(material_priorities, dict) else ()
+        return (
+            str(bundle_dir.expanduser().resolve()),
+            tuple(sorted(str(name) for name in excluded_object_names)),
+            priority_key,
+            float(mm_per_unit),
+            cache_token,
+        )
+
+    def _get_cached_simulation_step_bundle(
+        self, cache_key: tuple, bundle_dir: Path
+    ) -> dict | None:
+        cache = getattr(self, "_simulation_step_export_cache", None)
+        if not isinstance(cache, dict):
+            return None
+        cached = cache.get(cache_key)
+        if isinstance(cached, dict):
+            entries = cached.get("entries", [])
+            if isinstance(entries, list) and all(
+                isinstance(entry, dict)
+                and str(entry.get("step_file", "")).strip()
+                and (bundle_dir / str(entry["step_file"])).is_file()
+                for entry in entries
+            ):
+                return cached
+        return None
+
+    def _build_simulation_script_bundle(self, step_entries: list[dict], show_model: bool, show_mesh: bool, run_sweep: bool, preview_only: bool = False, progress_callback=None) -> dict:
         settings = self._project_tree.get_settings()
         mesh_cfg = settings.get("mesh", {}) if isinstance(settings, dict) else {}
         runtime_cfg = settings.get("runtime", {}) if isinstance(settings, dict) else {}
@@ -4432,6 +4788,27 @@ class MainWindow(QMainWindow):
                 pass
 
         enabled_sims = self._enabled_simulations(settings)
+        work_total = sum(
+            max(1, len([
+                value for value in str(sim_cfg.get("ParamValues", "")).split(",")
+                if value.strip()
+            ]))
+            if str(sim_cfg.get("type", "Sweep")).strip().lower() == "parametric"
+            else 1
+            for sim_cfg in enabled_sims
+        ) or 1
+        work_completed = 0
+
+        def report_progress(message: str, current_fraction: float | None = None, *, log: bool = False) -> None:
+            if progress_callback is not None:
+                progress_callback(
+                    message,
+                    work_completed,
+                    work_total,
+                    current_fraction,
+                    log,
+                )
+
         scripts: list[dict] = []
         for idx, sim_cfg in enumerate(enabled_sims, start=1):
             sim_name = str(sim_cfg.get("name", f"Simulation_{idx}")).strip() or f"Simulation_{idx}"
@@ -4458,33 +4835,99 @@ class MainWindow(QMainWindow):
                     if value.strip()
                 ] or ["default"]
                 original_parameter_values = self._parameter_values()
+                port_metadata_key = json.dumps(
+                    settings.get("ports", []), sort_keys=True, default=str
+                )
                 simulation_root = self._simulation_bundle_dir() / f"{safe_project}_{safe_sim}"
-                for parameter_index, parameter_value in enumerate(parameter_values, start=1):
-                    value_token = self._safe_script_token(parameter_value)
-                    step_dir_name = f"Step_{parameter_index:03d}_{value_token}"
-                    step_dir = simulation_root / step_dir_name
-                    step_parameter_values = dict(original_parameter_values)
-                    if parameter_name:
-                        try:
-                            step_parameter_values[parameter_name] = float(parameter_value)
-                        except ValueError:
-                            pass
-
-                    try:
-                        self._recompute_parametric_objects(
-                            parameter_values=step_parameter_values
+                geometry_recomputed = False
+                try:
+                    for parameter_index, parameter_value in enumerate(parameter_values, start=1):
+                        report_progress(
+                            f"Preparing STEP {parameter_index}/{len(parameter_values)}: {sim_name} ({parameter_name}={parameter_value})",
+                            0.0,
+                            log=True,
                         )
+                        value_token = self._safe_script_token(parameter_value)
+                        step_dir_name = f"Step_{parameter_index:03d}_{value_token}"
+                        step_dir = simulation_root / step_dir_name
+                        step_parameter_values = dict(original_parameter_values)
+                        if parameter_name:
+                            try:
+                                step_parameter_values[parameter_name] = float(parameter_value)
+                            except ValueError:
+                                pass
+
+                        material_priorities = settings.get("material_priorities", {})
                         plate_names = {
                             str(obj.name).strip()
                             for obj in self._simulation_model_objects()
                             if self._is_plate_role_object(obj)
                         }
-                        step_bundle = self._export_simulation_step_bundle(
-                            objects=self._simulation_model_objects(),
+                        cache_token = (parameter_name, parameter_value)
+                        cache_key = self._simulation_step_cache_key(
                             bundle_dir=step_dir,
-                            material_priorities=settings.get("material_priorities", {}),
+                            material_priorities=material_priorities,
                             excluded_object_names=plate_names,
+                            cache_token=cache_token,
+                            mm_per_unit=_MM_PER_UNIT.get(getattr(self, "_units", "mm"), 1.0),
                         )
+                        step_bundle = self._get_cached_simulation_step_bundle(
+                            cache_key, step_dir
+                        )
+                        metadata = (
+                            step_bundle.get("_parametric_port_metadata", {})
+                            if isinstance(step_bundle, dict)
+                            else {}
+                        )
+                        port_metadata = metadata.get(port_metadata_key) if isinstance(metadata, dict) else None
+                        if (
+                            not isinstance(port_metadata, dict)
+                            or not isinstance(port_metadata.get("lumped_ports"), list)
+                            or not isinstance(port_metadata.get("plate_entries"), list)
+                            or step_bundle is None
+                        ):
+                            def report_step_progress(done: int, total: int, object_name: str) -> None:
+                                fraction = done / total if total else None
+                                report_progress(
+                                    f"STEP {parameter_index}/{len(parameter_values)}: {object_name} ({done}/{total})",
+                                    fraction,
+                                )
+
+                            report_progress(
+                                f"Recomputing geometry {parameter_index}/{len(parameter_values)}: {parameter_name}={parameter_value}",
+                                0.0,
+                                log=True,
+                            )
+                            geometry_recomputed = True
+                            self._recompute_parametric_objects(
+                                parameter_values=step_parameter_values
+                            )
+                            port_metadata = {
+                                "lumped_ports": self._collect_plate_lumped_ports(),
+                                "plate_entries": self._collect_emerge_plates(),
+                            }
+                            if step_bundle is None:
+                                report_progress("Parametric geometry ready; exporting STEP...", 0.0, log=True)
+                                step_objects = self._simulation_model_objects()
+                                plate_names = {
+                                    str(obj.name).strip()
+                                    for obj in step_objects
+                                    if self._is_plate_role_object(obj)
+                                }
+                                step_bundle = self._cached_simulation_step_bundle(
+                                    objects=step_objects,
+                                    bundle_dir=step_dir,
+                                    material_priorities=material_priorities,
+                                    excluded_object_names=plate_names,
+                                    cache_token=cache_token,
+                                    progress_callback=report_step_progress,
+                                    mm_per_unit=_MM_PER_UNIT.get(getattr(self, "_units", "mm"), 1.0),
+                                )
+                            metadata = step_bundle.setdefault("_parametric_port_metadata", {})
+                            metadata[port_metadata_key] = port_metadata
+                        else:
+                            report_progress("Reusing cached STEP and port geometry", 1.0)
+
                         step_simulation = dict(sim_cfg)
                         step_simulation["ParamValues"] = parameter_value
                         child_settings = dict(child_settings)
@@ -4499,6 +4942,11 @@ class MainWindow(QMainWindow):
                         child_settings["simulation"] = child_simulation_config
                         step_filename = f"{safe_project}_{idx:02d}_{safe_sim}_step_{parameter_index:03d}.py"
                         relative_filename = str(Path(safe_project + "_" + safe_sim) / step_dir_name / step_filename)
+                        report_progress(
+                            f"Generating script {parameter_index}/{len(parameter_values)}: {sim_name}",
+                            0.9,
+                            log=True,
+                        )
                         script_text = export_emerge_python_script(
                             project_name=self._project_name,
                             settings=child_settings,
@@ -4509,8 +4957,8 @@ class MainWindow(QMainWindow):
                             preview_only=preview_only,
                             show_mesh=show_mesh,
                             run_sweep=run_sweep,
-                            lumped_ports=self._collect_plate_lumped_ports(),
-                            plate_entries=self._collect_emerge_plates(),
+                            lumped_ports=port_metadata["lumped_ports"],
+                            plate_entries=port_metadata["plate_entries"],
                             solver=runtime_solver,
                             parallel_enabled=runtime_parallel,
                             pardiso_threads=runtime_pardiso_threads,
@@ -4539,24 +4987,37 @@ class MainWindow(QMainWindow):
                             "clean_filename": str(Path(relative_filename).with_name(clean_filename)),
                             "clean_content": clean_script_text,
                         })
-                    finally:
+                        work_completed += 1
+                        report_progress(
+                            f"Generated script {parameter_index}/{len(parameter_values)}: {sim_name}",
+                            log=True,
+                        )
+                finally:
+                    if geometry_recomputed:
                         self._recompute_parametric_objects(
                             parameter_values=original_parameter_values
                         )
                 continue
 
             simulation_root = self._simulation_bundle_dir() / f"{safe_project}_{safe_sim}"
+            report_progress(f"Preparing STEP: {sim_name}", 0.0, log=True)
             plate_names = {
                 str(obj.name).strip()
                 for obj in self._simulation_model_objects()
                 if self._is_plate_role_object(obj)
             }
-            simulation_step_bundle = self._export_simulation_step_bundle(
+            simulation_step_bundle = self._cached_simulation_step_bundle(
                 objects=self._simulation_model_objects(),
                 bundle_dir=simulation_root,
                 material_priorities=settings.get("material_priorities", {}),
                 excluded_object_names=plate_names,
+                progress_callback=lambda done, total, object_name: report_progress(
+                    f"STEP: {object_name} ({done}/{total})",
+                    done / total if total else None,
+                ),
+                mm_per_unit=_MM_PER_UNIT.get(getattr(self, "_units", "mm"), 1.0),
             )
+            report_progress(f"Generating script: {sim_name}", 0.9, log=True)
             script_text = export_emerge_python_script(
                 project_name=self._project_name,
                 settings=child_settings,
@@ -4597,7 +5058,8 @@ class MainWindow(QMainWindow):
                     "clean_content": clean_script_text,
                 }
             )
-
+            work_completed += 1
+            report_progress(f"Generated script: {sim_name}", log=True)
         master_script = self._build_master_simulation_script(
             scripts,
         )
@@ -4634,6 +5096,31 @@ class MainWindow(QMainWindow):
     def _simulation_model_objects(self) -> list:
         return [obj for obj in self._viewport.scene.objects if bool(getattr(obj, "is_model", True))]
 
+    def _set_simulation_preparation_progress(
+        self,
+        message: str,
+        completed: int = 0,
+        total: int = 0,
+        current_fraction: float | None = None,
+        log: bool = False,
+    ) -> None:
+        if log and message:
+            self._append_sim_log(f"[prep] {message}")
+        info_bar = getattr(self, "_info_bar", None)
+        update_progress = getattr(info_bar, "set_preparation_progress", None)
+        if callable(update_progress):
+            update_progress(
+                message,
+                completed=completed,
+                total=total,
+                current_fraction=current_fraction,
+            )
+        QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+
+    def _process_simulation_preparation_events(self) -> None:
+        if getattr(self, "_sim_preparation_active", False):
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+
     def _generate_simulation_assets(self, show_progress: bool = True, force_script: bool = False, force_step_export: bool = False) -> str | None:
         need_script = force_script or self._sim_script_dirty or (not self._sim_cached_script_bundle.get("master", ""))
         if need_script:
@@ -4645,7 +5132,9 @@ class MainWindow(QMainWindow):
                 self._append_sim_log("[error] Script generation stopped: resolve preflight errors first.")
                 return None
 
-        progress = None
+        progress_callback = self._set_simulation_preparation_progress if show_progress else None
+        if progress_callback is not None:
+            progress_callback("Preparing simulation assets...", log=True)
         sim_objects = self._simulation_model_objects()
 
         need_step_export = force_step_export or self._sim_steps_dirty or (not self._sim_step_bundle_ready)
@@ -4654,8 +5143,12 @@ class MainWindow(QMainWindow):
             and (getattr(self, "_sim_full_scene_step_dirty", True) or need_step_export)
         )
 
+        previous_preparation_active = getattr(self, "_sim_preparation_active", False)
+        if show_progress:
+            self._sim_preparation_active = True
         try:
             if need_step_export:
+                self._simulation_step_export_cache = {}
                 self._reset_step_export_log()
                 self._append_step_export_log(
                     "[info] Geometry export is performed inside each Project_SimulationN folder.",
@@ -4679,9 +5172,12 @@ class MainWindow(QMainWindow):
                 ) or "Project"
                 debug_step_path = self._simulation_bundle_dir() / f"{safe_project_name}_Debug_All.step"
                 try:
+                    if progress_callback is not None:
+                        progress_callback("Exporting complete-scene STEP...", log=True)
                     debug_result = export_debug_scene_step(
                         objects=sim_objects,
                         step_path=debug_step_path,
+                        mm_per_unit=_MM_PER_UNIT.get(getattr(self, "_units", "mm"), 1.0),
                         log_callback=lambda level, message: self._append_step_export_log(
                             f"[{level.lower()}] {message}", level=self._normalize_log_level(level)
                         ),
@@ -4689,6 +5185,8 @@ class MainWindow(QMainWindow):
                     self._append_sim_log(
                         f"[info] Complete scene STEP exported: {debug_result['exported']} object(s) to {debug_step_path}"
                     )
+                    if progress_callback is not None:
+                        progress_callback("Complete-scene STEP export finished.", log=True)
                     self._sim_full_scene_step_dirty = False
                 except Exception as exc:
                     warning = f"[warn] Debug STEP export failed: {exc}"
@@ -4707,6 +5205,7 @@ class MainWindow(QMainWindow):
                     preview_only=preview_only,
                     show_mesh=show_mesh,
                     run_sweep=run_sweep,
+                    progress_callback=progress_callback,
                 )
                 self._sim_cached_script_bundle = script_bundle
                 script = str(script_bundle.get("master", ""))
@@ -4720,8 +5219,9 @@ class MainWindow(QMainWindow):
             self._update_simulation_script_tabs(script_bundle)
             return script
         finally:
-            if progress is not None:
-                progress.close()
+            self._sim_preparation_active = previous_preparation_active
+            if progress_callback is not None:
+                progress_callback("")
 
     def _on_sim_generate(self, show_progress: bool = True, force_script: bool = True) -> None:
         try:
@@ -4804,9 +5304,9 @@ class MainWindow(QMainWindow):
 
     def _on_sim_save_script(self) -> None:
         script_bundle = self._sim_cached_script_bundle
-        if not str(script_bundle.get("master", "")).strip():
+        if getattr(self, "_sim_script_dirty", False) or not str(script_bundle.get("master", "")).strip():
             try:
-                master_script = self._generate_simulation_assets(show_progress=True)
+                master_script = self._generate_simulation_assets()
                 if not master_script:
                     return
                 script_bundle = self._sim_cached_script_bundle
@@ -4920,7 +5420,7 @@ class MainWindow(QMainWindow):
             return
 
         try:
-            master_script = self._generate_simulation_assets(show_progress=True, force_script=False)
+            master_script = self._generate_simulation_assets(force_script=False)
         except Exception as exc:
             self._append_sim_log(f"[error] Failed to prepare simulation assets: {exc}")
             return
@@ -5195,6 +5695,11 @@ class MainWindow(QMainWindow):
                 file_name=str(output.get("name", "Results")),
                 file_id=f"{simulation}::{output.get('name', 'Output')}",
             )
+            chart_data["x_range"] = (
+                float(simulation_config.get("Fmin_GHz", 0.1)),
+                float(simulation_config.get("Fmax_GHz", 10.0)),
+            )
+            chart_data["title"] = f"{chart_data['title']} ({completed}/{expected} samples)"
             key = f"{simulation}::{output.get('name', 'Output')}"
             self._show_chart(key, chart_data, progressive=True)
 
@@ -5319,7 +5824,16 @@ class MainWindow(QMainWindow):
             if chart_data is None:
                 continue
             chart_data["series"] = all_series
-            chart_data["title"] = str(output.get("name", "S-parameter Plot"))
+            chart_data["x_range"] = (
+                float(simulation_config.get("Fmin_GHz", 0.1)),
+                float(simulation_config.get("Fmax_GHz", 10.0)),
+            )
+            chart_data["title"] = (
+                f"{output.get('name', 'S-parameter Plot')} "
+                f"({parameter_name}={parameter_value}, "
+                f"{completed_samples}/{expected_samples} samples; "
+                f"value {parameter_index}/{expected})"
+            )
             key = f"{simulation}::{output.get('name', 'Output')}"
             self._show_chart(key, chart_data, progressive=True)
 
@@ -6167,6 +6681,105 @@ class MainWindow(QMainWindow):
             workspace_path=self._workspace_path,
         )
 
+    def _convert_scene_units(self, old_units: str, new_units: str) -> None:
+        if old_units not in _MM_PER_UNIT or new_units not in _MM_PER_UNIT:
+            return
+        factor = _MM_PER_UNIT[old_units] / _MM_PER_UNIT[new_units]
+        if math.isclose(factor, 1.0, rel_tol=0.0, abs_tol=1e-15):
+            return
+
+        self._history_record()
+        settings = self._project_tree.get_settings()
+        parameters = settings.get("parameters", [])
+        parameter_factors = {}
+        for entry in parameters if isinstance(parameters, list) else []:
+            if not isinstance(entry, dict):
+                continue
+            name = str(entry.get("name", "")).strip()
+            if not name:
+                continue
+            source_units = str(entry.get("unit", "") or old_units)
+            if source_units not in _MM_PER_UNIT:
+                source_units = old_units
+            parameter_factor = _MM_PER_UNIT[source_units] / _MM_PER_UNIT[new_units]
+            parameter_factors[name] = parameter_factor
+            try:
+                entry["value"] = float(entry.get("value", 0.0)) * parameter_factor
+            except (TypeError, ValueError):
+                pass
+            entry["unit"] = new_units
+        settings["parameters"] = parameters
+
+        scene_objects = list(self._viewport.scene.objects)
+        for obj in scene_objects:
+            try:
+                if not self._scale_by_attributes(obj, factor, preserve_center=False):
+                    continue
+                if hasattr(obj, "creation_plane_origin"):
+                    obj.creation_plane_origin = tuple(
+                        float(value) * factor for value in obj.creation_plane_origin
+                    )
+                history = getattr(obj, "creation_history", None)
+                if isinstance(history, dict):
+                    obj.creation_history = _scale_creation_history(history, factor)
+                formulas = getattr(obj, "param_formulas", None)
+                if isinstance(formulas, dict):
+                    obj.param_formulas = {
+                        key: _scale_formula_expression(value, factor, parameter_factors)
+                        for key, value in formulas.items()
+                    }
+                definition = getattr(obj, "sketch_definition", None)
+                if isinstance(definition, dict):
+                    obj.sketch_definition = _scale_sketch_definition(
+                        definition, factor, parameter_factors
+                    )
+                pattern = getattr(obj, "pattern_definition", None)
+                if isinstance(pattern, dict):
+                    pattern = deepcopy(pattern)
+                    pattern["settings"] = _scale_pattern_settings(
+                        pattern.get("settings", {}), factor, parameter_factors
+                    )
+                    obj.pattern_definition = pattern
+                instance = getattr(obj, "pattern_instance", None)
+                if isinstance(instance, dict) and isinstance(instance.get("settings"), dict):
+                    instance = deepcopy(instance)
+                    instance["settings"] = _scale_pattern_settings(
+                        instance["settings"], factor, parameter_factors
+                    )
+                    obj.pattern_instance = instance
+            except Exception as exc:
+                self._info_bar.set_info(
+                    f"{getattr(obj, 'name', 'Object')}: unit conversion failed: {exc}"
+                )
+
+        objects_by_name = {str(getattr(obj, "name", "")): obj for obj in scene_objects}
+        for obj in scene_objects:
+            definition = getattr(obj, "pattern_definition", None)
+            if not isinstance(definition, dict) or not isinstance(definition.get("sources"), list):
+                continue
+            definition = deepcopy(definition)
+            definition["sources"] = [
+                self._serialize_object_snapshot(objects_by_name[str(snapshot.get("name", ""))])
+                if isinstance(snapshot, dict)
+                and str(snapshot.get("name", "")) in objects_by_name
+                else snapshot
+                for snapshot in definition["sources"]
+            ]
+            obj.pattern_definition = definition
+
+        self._project_tree.load_settings(settings)
+        self._project_tree.settings_changed.emit()
+        self._sync_boolean_provenance()
+        self._recompute_parametric_objects(_regenerate_snaps=False)
+        self.recompute_sketch_dimensions()
+        selection = list(getattr(self._viewport.scene, "selection", []) or [])
+        if selection:
+            self._body_props.set_selection(selection)
+        self._viewport.scene_changed.emit()
+        self._refresh_materials()
+        self._viewport._render()
+        self._mark_simulation_dirty(steps=True, script=True)
+
     def _apply_display_settings(self, values: dict) -> None:
         units = str(values.get("units", self._units))
         decimal_separator = str(values.get("decimal_separator", self._decimal_separator))
@@ -6181,7 +6794,11 @@ class MainWindow(QMainWindow):
         old_curved_boundary_resolution = self._curved_boundary_resolution
         old_export_full_scene_step = self._export_full_scene_step
 
+        if units != old_units:
+            self._convert_scene_units(old_units, units)
         self._units = units
+        if units != old_units:
+            self._reset_simulation_cache()
         self._decimal_separator = decimal_separator
         self._ui_locale = self._make_numeric_locale(decimal_separator)
         QLocale.setDefault(self._ui_locale)
@@ -7105,6 +7722,7 @@ class MainWindow(QMainWindow):
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� project file
     def _new_project(self) -> None:
+        self._close_simulation_panel()
         self._project_name = "Untitled"
         self._project_path = None
         self._material_store = MaterialStore()
@@ -7131,6 +7749,21 @@ class MainWindow(QMainWindow):
         self._viewport._render()
         self._history_reset()
         self._info_bar.set_info("New project created.")
+
+    def _close_simulation_panel(self) -> None:
+        simulation_window = getattr(self, "_sim_subwindow", None)
+        if simulation_window is None:
+            return
+
+        self._shutdown_simulation_process()
+        self._workspace_windows.pop("Simulation", None)
+        self._sim_log_level = None
+        simulation_window.setAttribute(Qt.WA_DeleteOnClose, True)
+        simulation_window.close()
+        simulation_window.deleteLater()
+        self._sim_subwindow = None
+        self._sim_dlg = None
+        self._rebuild_window_menu()
 
     def _close_project(self) -> None:
         has_project = self._project_path is not None or bool(self._viewport.scene.objects)
@@ -7351,6 +7984,40 @@ class MainWindow(QMainWindow):
             self._info_bar.set_info(f"EMERGE script exported: {path}")
         except Exception as exc:
             QMessageBox.critical(self, "Export Error", str(exc))
+
+    def _export_model_step(self) -> None:
+        initial_path = f"{self._project_name}.step"
+        project_path = str(getattr(self, "_project_path", "") or "").strip()
+        if project_path:
+            initial_path = str(Path(project_path).expanduser().resolve().parent / initial_path)
+        else:
+            workspace_directory = self._workspace_dialog_directory()
+            if workspace_directory:
+                initial_path = str(Path(workspace_directory) / initial_path)
+
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Export Model as STEP",
+            initial_path,
+            "STEP Files (*.step *.stp);;All Files (*)",
+        )
+        if not path:
+            return
+        step_path = Path(path).expanduser().resolve()
+        if step_path.suffix.lower() not in {".step", ".stp"}:
+            step_path = step_path.with_suffix(".step")
+
+        try:
+            result = export_debug_scene_step(
+                objects=self._viewport.scene.objects,
+                step_path=step_path,
+                mm_per_unit=_MM_PER_UNIT.get(getattr(self, "_units", "mm"), 1.0),
+            )
+            self._info_bar.set_info(
+                f"STEP model exported: {step_path} ({result['exported']} object(s))"
+            )
+        except Exception as exc:
+            QMessageBox.critical(self, "STEP Export Error", str(exc))
 
     def _set_global_material_db(self) -> None:
         suggested = self._material_store.global_db_path or str(Path.home() / "em3d_materials_global.json")

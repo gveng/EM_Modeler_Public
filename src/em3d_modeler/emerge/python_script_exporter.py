@@ -302,7 +302,16 @@ def export_emerge_python_script(
     if not math.isfinite(emerge_scale_factor):
         emerge_scale_factor = 1.0
     emerge_scale_factor = max(1.0, min(1_000_000.0, emerge_scale_factor))
+    mm_per_scene_unit = {
+        "mm": 1.0,
+        "um": 0.001,
+        "cm": 10.0,
+        "m": 1000.0,
+        "mil": 0.0254,
+        "inch": 25.4,
+    }.get(str(units).strip().lower(), 1.0)
     coordinate_scale = 0.001 * emerge_scale_factor
+    scene_coordinate_scale = mm_per_scene_unit * coordinate_scale
     curved_boundary_resolution = max(
         3,
         _to_int(mesh_cfg.get("curved_boundary_resolution", 20), 20),
@@ -1111,9 +1120,9 @@ def export_emerge_python_script(
         ]
         for plate in plates:
             plate_name = str(plate.get("object_name", "Plate"))
-            origin = tuple(float(value) * coordinate_scale for value in plate.get("origin", (0.0, 0.0, 0.0)))
-            u = tuple(float(value) * coordinate_scale for value in plate.get("u", (0.0, 0.0, 0.0)))
-            v = tuple(float(value) * coordinate_scale for value in plate.get("v", (0.0, 0.0, 0.0)))
+            origin = tuple(float(value) * scene_coordinate_scale for value in plate.get("origin", (0.0, 0.0, 0.0)))
+            u = tuple(float(value) * scene_coordinate_scale for value in plate.get("u", (0.0, 0.0, 0.0)))
+            v = tuple(float(value) * scene_coordinate_scale for value in plate.get("v", (0.0, 0.0, 0.0)))
             lines += [
                 f"plate_objects[{_q(plate_name)}] = em.geo.Plate(name={_q(plate_name)}, origin={origin!r}, u={u!r}, v={v!r})",
                 f"plate_objects[{_q(plate_name)}].set_material(materials[{_q(str(plate.get('material', 'PEC')))}])",
@@ -1134,11 +1143,12 @@ def export_emerge_python_script(
             idx = int(p.get("index", 1))
             name = str(p.get("name", f"Port_{idx}"))
             port_type = str(p.get("type", "LumpedPort"))
-            origin = [_to_float(v, 0.0) * coordinate_scale for v in p.get("origin", [0.0, 0.0, 0.0])]
-            u = [_to_float(v, 0.0) * coordinate_scale for v in p.get("u", [0.0, 0.0, 0.0])]
-            v = [_to_float(v, 0.0) * coordinate_scale for v in p.get("v", [0.0, 0.0, 0.0])]
-            width = abs(_to_float(p.get("width", 0.0), 0.0) * 0.001)
-            height = abs(_to_float(p.get("height", 0.0), 0.0) * 0.001)
+            origin = [_to_float(v, 0.0) * scene_coordinate_scale for v in p.get("origin", [0.0, 0.0, 0.0])]
+            u = [_to_float(v, 0.0) * scene_coordinate_scale for v in p.get("u", [0.0, 0.0, 0.0])]
+            v = [_to_float(v, 0.0) * scene_coordinate_scale for v in p.get("v", [0.0, 0.0, 0.0])]
+            port_dimension_scale = mm_per_scene_unit * 0.001
+            width = abs(_to_float(p.get("width", 0.0), 0.0) * port_dimension_scale)
+            height = abs(_to_float(p.get("height", 0.0), 0.0) * port_dimension_scale)
             direction = [_to_float(vd, 0.0) for vd in p.get("direction", [0.0, 0.0, 1.0])]
             z0 = _to_float(p.get("z0", 50.0), 50.0)
             power = _to_float(p.get("power", 1.0), 1.0)

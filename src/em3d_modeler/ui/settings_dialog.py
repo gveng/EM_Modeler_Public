@@ -40,6 +40,7 @@ from PySide6.QtWidgets import (
     QCheckBox,
 )
 from .formula_widgets import FormulaDoubleSpinBox as QDoubleSpinBox
+from .unit_options import UNIT_OPTIONS
 
 
 _SELECTION_COLOR_PRESETS: Dict[str, Tuple[float, float, float]] = {
@@ -77,7 +78,7 @@ class SettingsDialog(QDialog):
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
 
         self._units_combo = QComboBox(self._display_tab)
-        self._units_combo.addItems(["mm", "um", "cm", "m", "mil", "inch"])
+        self._units_combo.addItems(UNIT_OPTIONS)
         self._units_combo.currentTextChanged.connect(self._on_units_changed)
         form.addRow("Units", self._units_combo)
 

@@ -23,6 +23,7 @@ from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QDialog,
     QDialogButtonBox,
+    QComboBox,
     QHBoxLayout,
     QLabel,
     QPushButton,
@@ -30,15 +31,31 @@ from PySide6.QtWidgets import (
     QTableWidgetItem,
     QVBoxLayout,
 )
+from .unit_options import UNIT_OPTIONS
+
+_MM_PER_UNIT = {
+    "mm": 1.0,
+    "um": 0.001,
+    "cm": 10.0,
+    "m": 1000.0,
+    "mil": 0.0254,
+    "inch": 25.4,
+}
 
 
 class ParametersDialog(QDialog):
     """Standalone editor for project variables."""
 
-    def __init__(self, parameters: List[Dict[str, Any]] | None = None, parent=None):
+    def __init__(
+        self,
+        parameters: List[Dict[str, Any]] | None = None,
+        parent=None,
+        units: str = "mm",
+    ):
         super().__init__(parent)
         self.setWindowTitle("Parameters")
         self.resize(560, 360)
+        self._default_unit = units if units in UNIT_OPTIONS else UNIT_OPTIONS[0]
 
         layout = QVBoxLayout(self)
         layout.addWidget(QLabel("Define named variables for formulas used by object dimensions."))
@@ -83,9 +100,41 @@ class ParametersDialog(QDialog):
     def _append_row(self, name: str = "", value: str = "", unit: str = "") -> int:
         row = self._table.rowCount()
         self._table.insertRow(row)
-        for column, text in enumerate((name, value, unit)):
+        for column, text in enumerate((name, value)):
             self._table.setItem(row, column, QTableWidgetItem(text))
+        unit_combo = QComboBox(self._table)
+        unit_combo.addItems(UNIT_OPTIONS)
+        initial_unit = unit if unit in UNIT_OPTIONS else self._default_unit
+        unit_combo.setCurrentText(initial_unit)
+        unit_combo.setProperty("previous_unit", initial_unit)
+        unit_combo.currentTextChanged.connect(
+            lambda new_unit, combo=unit_combo: self._on_unit_changed(combo, new_unit)
+        )
+        self._table.setCellWidget(row, 2, unit_combo)
         return row
+
+    def _on_unit_changed(self, unit_combo: QComboBox, new_unit: str) -> None:
+        old_unit = str(unit_combo.property("previous_unit") or "")
+        unit_combo.setProperty("previous_unit", new_unit)
+        if old_unit not in _MM_PER_UNIT or new_unit not in _MM_PER_UNIT:
+            return
+        row = next(
+            (index for index in range(self._table.rowCount())
+             if self._table.cellWidget(index, 2) is unit_combo),
+            -1,
+        )
+        if row < 0:
+            return
+        value_item = self._table.item(row, 1)
+        if value_item is None:
+            return
+        raw_value = value_item.text().strip()
+        try:
+            value = float(raw_value.replace(",", "."))
+        except ValueError:
+            return
+        factor = _MM_PER_UNIT[old_unit] / _MM_PER_UNIT[new_unit]
+        value_item.setText(str(value * factor))
 
     def _add_row(self) -> None:
         row = self._append_row()
@@ -96,7 +145,9 @@ class ParametersDialog(QDialog):
         row = self._table.currentRow()
         if row < 0:
             return
-        values = [self._table.item(row, column).text() for column in range(3)]
+        values = [self._table.item(row, column).text() for column in range(2)]
+        unit_combo = self._table.cellWidget(row, 2)
+        values.append(unit_combo.currentText() if isinstance(unit_combo, QComboBox) else self._default_unit)
         new_row = self._append_row(*values)
         self._table.selectRow(new_row)
 
@@ -112,7 +163,7 @@ class ParametersDialog(QDialog):
             if name_item is None or not name_item.text().strip():
                 continue
             value_item = self._table.item(row, 1)
-            unit_item = self._table.item(row, 2)
+            unit_combo = self._table.cellWidget(row, 2)
             raw_value = value_item.text().strip() if value_item else "0"
             try:
                 value: Any = float(raw_value.replace(",", "."))
@@ -121,6 +172,6 @@ class ParametersDialog(QDialog):
             result.append({
                 "name": name_item.text().strip(),
                 "value": value,
-                "unit": unit_item.text().strip() if unit_item else "",
+                "unit": unit_combo.currentText() if isinstance(unit_combo, QComboBox) else self._default_unit,
             })
         return result

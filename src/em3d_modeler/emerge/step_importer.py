@@ -28,14 +28,16 @@ Usage
     # solids: List[dict]  with keys "name", "polydata" (vtkPolyData)
 """
 from __future__ import annotations
+
+import math
 from typing import List, Dict, Any
 from pathlib import Path
 
 import vtk
 
 
-def import_step(filepath: str) -> List[Dict[str, Any]]:
-    """Import a STEP file and return a list of solid dicts.
+def import_step(filepath: str, mm_per_unit: float = 1.0) -> List[Dict[str, Any]]:
+    """Import STEP geometry and scale its millimetre coordinates for the scene.
 
     Each dict has:
       - "name"     : str          – auto-generated solid name
@@ -48,6 +50,9 @@ def import_step(filepath: str) -> List[Dict[str, Any]]:
     FileNotFoundError if the file does not exist.
     """
     path = Path(filepath)
+    mm_per_unit = float(mm_per_unit)
+    if not math.isfinite(mm_per_unit) or mm_per_unit <= 0.0:
+        raise ValueError("STEP import scale factor must be finite and positive")
     if not path.exists():
         raise FileNotFoundError(f"STEP file not found: {filepath}")
 
@@ -57,30 +62,25 @@ def import_step(filepath: str) -> List[Dict[str, Any]]:
 
     last_err: Exception | None = None
 
-    # ── 1. Try OCP (modern, ships with cadquery) ──────────────────────────────
     try:
-        # First try with XDE color support
         result = _import_via_ocp_with_colors(filepath)
         if result is not None:
-            return result
-    except (ImportError, Exception):
+            return _scale_imported_solids(result, 1.0 / mm_per_unit)
+    except Exception:
         pass
-    
+
     try:
-        # Fallback to standard OCP import
-        return _import_via_ocp(filepath)
+        return _scale_imported_solids(_import_via_ocp(filepath), 1.0 / mm_per_unit)
     except ImportError as e:
         last_err = e
 
-    # ── 2. Try pythonOCC-core (classic) ───────────────────────────────────────
     try:
-        return _import_via_occ(filepath)
+        return _scale_imported_solids(_import_via_occ(filepath), 1.0 / mm_per_unit)
     except ImportError as e:
         last_err = e
 
-    # ── 3. Try cadquery STL round-trip ────────────────────────────────────────
     try:
-        return _import_via_cadquery(filepath)
+        return _scale_imported_solids(_import_via_cadquery(filepath), 1.0 / mm_per_unit)
     except ImportError as e:
         last_err = e
 
@@ -91,6 +91,25 @@ def import_step(filepath: str) -> List[Dict[str, Any]]:
         "    conda install -c conda-forge pythonocc-core\n\n"
         f"Last error: {last_err}"
     )
+
+
+def _scale_imported_solids(solids: List[Dict[str, Any]], scale_factor: float) -> List[Dict[str, Any]]:
+    if scale_factor == 1.0:
+        return solids
+    transform = vtk.vtkTransform()
+    transform.Scale(scale_factor, scale_factor, scale_factor)
+    scaled_solids: List[Dict[str, Any]] = []
+    for solid in solids:
+        filter_ = vtk.vtkTransformPolyDataFilter()
+        filter_.SetTransform(transform)
+        filter_.SetInputData(solid["polydata"])
+        filter_.Update()
+        polydata = vtk.vtkPolyData()
+        polydata.DeepCopy(filter_.GetOutput())
+        scaled_solid = dict(solid)
+        scaled_solid["polydata"] = polydata
+        scaled_solids.append(scaled_solid)
+    return scaled_solids
 
 
 # ──────────────────────────────────────────────── OCP backend ───────────────

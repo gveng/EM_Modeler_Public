@@ -77,6 +77,7 @@ def test_plot_size_is_user_controlled_and_d_b_mode_forces_linear_y(monkeypatch):
 
     monkeypatch.setattr(chart_view, "QSettings", MemorySettings)
     view = PlotView("plot_sp")
+    view.resize(1600, 1100)
     view.show()
     app.processEvents()
     initial_size = view.canvas.size()
@@ -93,6 +94,18 @@ def test_plot_size_is_user_controlled_and_d_b_mode_forces_linear_y(monkeypatch):
     assert view.canvas.size().height() == 750
     assert stored_settings[f"{view._plot_size_setting_key}/width"] == 1250
     assert stored_settings[f"{view._plot_size_setting_key}/height"] == 750
+
+    view.resize(600, 450)
+    app.processEvents()
+    compact_size = view.canvas.size()
+    assert compact_size.width() < 1250
+    assert compact_size.height() < 750
+    assert compact_size.width() / compact_size.height() == pytest.approx(1250 / 750, rel=0.01)
+
+    view.resize(1600, 1100)
+    app.processEvents()
+    assert view.canvas.size().width() == 1250
+    assert view.canvas.size().height() == 750
 
     view.display_mode_combo.setCurrentText("Magnitude (linear)")
     assert view.y_scale_combo.isEnabled()
@@ -125,6 +138,24 @@ def test_progressive_update_preserves_series_style():
     assert view._series_data[0]["marker"] == "s"
     assert view._series_data[0]["visible"] is False
     assert len(view.findChildren(QCheckBox)) == 1
+    assert app is not None
+
+
+def test_progressive_plot_keeps_configured_band_visible():
+    app = QApplication.instance() or QApplication([])
+    view = PlotView("plot_sp")
+
+    view.set_progressive_data(
+        [0.1, 0.595, 1.09],
+        [{"label": "S11", "values": [1.0 + 0j, 0.99 + 0j, 0.98 + 0j]}],
+        title="Sweep (3/21 samples)",
+        xlabel="Frequency (GHz)",
+        ylabel="S-parameter",
+        x_range=(0.1, 10.0),
+    )
+
+    assert view.plot_widget.getViewBox().viewRange()[0] == pytest.approx([0.1, 10.0])
+    assert view._title == "Sweep (3/21 samples)"
     assert app is not None
 
 

@@ -17,6 +17,7 @@
 """Export scene objects to per-object STEP files for EMERGE simulation bundles."""
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Tuple
 import re
@@ -106,6 +107,39 @@ def _translate_shape(shape: Any, dx: float, dy: float, dz: float) -> Any:
         except Exception:
             return shape
     return shape
+
+def _scale_shape(shape: Any, scale_factor: float) -> Any:
+    if scale_factor == 1.0:
+        return shape
+    for pkg in ("OCP", "OCC.Core"):
+        try:
+            if pkg == "OCP":
+                from OCP.gp import gp_Pnt, gp_Trsf
+                from OCP.BRepBuilderAPI import BRepBuilderAPI_Transform
+            else:
+                from OCC.Core.gp import gp_Pnt, gp_Trsf
+                from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_Transform
+            transform = gp_Trsf()
+            transform.SetScale(gp_Pnt(0.0, 0.0, 0.0), scale_factor)
+            return BRepBuilderAPI_Transform(shape, transform, True).Shape()
+        except ImportError:
+            continue
+    raise RuntimeError("STEP geometry scaling requires OCP or pythonOCC-core")
+
+def _scale_polydata(poly: vtk.vtkPolyData, scale_factor: float) -> vtk.vtkPolyData:
+    if scale_factor == 1.0:
+        scaled = vtk.vtkPolyData()
+        scaled.DeepCopy(poly)
+        return scaled
+    transform = vtk.vtkTransform()
+    transform.Scale(scale_factor, scale_factor, scale_factor)
+    filter_ = vtk.vtkTransformPolyDataFilter()
+    filter_.SetTransform(transform)
+    filter_.SetInputData(poly)
+    filter_.Update()
+    scaled = vtk.vtkPolyData()
+    scaled.DeepCopy(filter_.GetOutput())
+    return scaled
 
 
 def _count_open_or_nonmanifold_edges(poly: vtk.vtkPolyData) -> int:
@@ -339,8 +373,12 @@ def export_debug_scene_step(
     objects: Iterable[Any],
     step_path: Path,
     log_callback: Callable[[str, str], None] | None = None,
+    mm_per_unit: float = 1.0,
 ) -> Dict[str, Any]:
     """Export simulation objects as one colored, named STEP assembly for inspection."""
+    mm_per_unit = float(mm_per_unit)
+    if not math.isfinite(mm_per_unit) or mm_per_unit <= 0.0:
+        raise ValueError("STEP export scale factor must be finite and positive")
     candidates = [obj for obj in objects if bool(getattr(obj, "is_model", True))]
     if not candidates:
         raise RuntimeError("No simulation model objects are available for the debug STEP export")
@@ -384,7 +422,10 @@ def export_debug_scene_step(
                 if shape is None:
                     actor = getattr(obj, "actor", None)
                     poly = _world_polydata_from_actor(actor) if actor is not None else vtk.vtkPolyData()
+                    poly = _scale_polydata(poly, mm_per_unit)
                     shape = _build_occ_faceted_shape_from_polydata(poly)
+                elif mm_per_unit != 1.0:
+                    shape = _scale_shape(shape, mm_per_unit)
                 if shape is None:
                     skipped.append(object_name)
                     continue
@@ -636,6 +677,7 @@ def export_objects_to_step_bundle(
     debug_boolean_sources_only: bool = False,
     material_priorities: Dict[str, int] | None = None,
     excluded_object_names: set[str] | None = None,
+    mm_per_unit: float = 1.0,
 ) -> Dict[str, Any]:
     """Export one STEP file per model object, excluding only named port plates.
 
@@ -653,6 +695,9 @@ def export_objects_to_step_bundle(
     """
     if material_priorities is None:
         material_priorities = {}
+    mm_per_unit = float(mm_per_unit)
+    if not math.isfinite(mm_per_unit) or mm_per_unit <= 0.0:
+        raise ValueError("STEP export scale factor must be finite and positive")
     excluded_object_names = excluded_object_names or set()
     bundle_dir.mkdir(parents=True, exist_ok=True)
 
@@ -700,7 +745,7 @@ def export_objects_to_step_bundle(
                 progress_callback(done, total, export_name)
             return
 
-        poly = _world_polydata_from_actor(actor)
+        poly = _scale_polydata(_world_polydata_from_actor(actor), mm_per_unit)
         if poly.GetNumberOfPoints() <= 0:
             skipped.append(f"{export_name} ({obj_type}: empty geometry)")
             if log_callback is not None:
@@ -730,6 +775,8 @@ def export_objects_to_step_bundle(
             )
 
             if shape is not None:
+                if mm_per_unit != 1.0:
+                    shape = _scale_shape(shape, mm_per_unit)
                 recovered = getattr(export_obj, "_step_export_offset_recovered", None)
                 if recovered is not None and log_callback is not None:
                     try:

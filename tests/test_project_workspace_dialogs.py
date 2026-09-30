@@ -3,13 +3,14 @@ from unittest.mock import Mock
 
 import pytest
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QCheckBox, QDialog, QDialogButtonBox, QSplitter
+from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QHeaderView, QSplitter
 from PySide6.QtWidgets import QWidget
 
 from em3d_modeler.ui import main_window as main_window_module
 from em3d_modeler.ui.main_window import MainWindow
 from em3d_modeler.ui.body_properties_widget import BodyPropertiesWidget
 from em3d_modeler.ui.project_tree_widget import ProjectTreeWidget, _parametric_range_values
+from em3d_modeler.ui.parameters_dialog import ParametersDialog
 
 
 def test_open_project_uses_configured_workspace_directory(monkeypatch, tmp_path):
@@ -196,6 +197,17 @@ def test_new_simulation_defaults_to_21_points_and_keeps_user_value(monkeypatch):
 
     assert editor_initial["NumberOfPoints"] == 21
     assert tree.get_settings()["simulations"][-1]["NumberOfPoints"] == 37
+
+
+def test_project_tree_fits_value_column_to_left_panel():
+    app = QApplication.instance() or QApplication([])
+    tree = ProjectTreeWidget()
+    header = tree._tree.header()
+
+    assert header.sectionResizeMode(0) == QHeaderView.Stretch
+    assert header.sectionResizeMode(1) == QHeaderView.Interactive
+    assert header.sectionSize(1) == 90
+    assert app is not None
 
 
 def test_project_tree_migrates_legacy_progressive_setting_per_simulation():
@@ -450,4 +462,60 @@ def test_parametric_name_selects_a_project_parameter(monkeypatch):
 
     assert choices == ["width", "height"]
     assert result["ParamName"] == "height"
+    assert app is not None
+
+
+def test_parameters_dialog_unit_uses_settings_choices_and_default():
+    app = QApplication.instance() or QApplication([])
+    dialog = ParametersDialog(
+        [{"name": "width", "value": 1.0, "unit": "cm"}],
+        units="inch",
+    )
+
+    existing_unit = dialog._table.cellWidget(0, 2)
+    assert isinstance(existing_unit, QComboBox)
+    assert [existing_unit.itemText(index) for index in range(existing_unit.count())] == [
+        "mm", "um", "cm", "m", "mil", "inch"
+    ]
+    assert existing_unit.currentText() == "cm"
+
+    dialog._add_row()
+    new_row = dialog._table.rowCount() - 1
+    new_unit = dialog._table.cellWidget(new_row, 2)
+    assert isinstance(new_unit, QComboBox)
+    assert new_unit.currentText() == "inch"
+    dialog._table.item(new_row, 0).setText("height")
+    dialog._table.item(new_row, 1).setText("0")
+    new_unit.setCurrentText("mil")
+
+    assert dialog.result_parameters() == [
+        {"name": "width", "value": 1.0, "unit": "cm"},
+        {"name": "height", "value": 0.0, "unit": "mil"},
+    ]
+    dialog.close()
+    assert app is not None
+
+
+def test_parameters_dialog_converts_numeric_value_when_unit_changes():
+    app = QApplication.instance() or QApplication([])
+    dialog = ParametersDialog(
+        [
+            {"name": "length", "value": 1000.0, "unit": "mil"},
+            {"name": "formula", "value": "length * 2", "unit": "mil"},
+        ],
+    )
+    length_unit = dialog._table.cellWidget(0, 2)
+    formula_unit = dialog._table.cellWidget(1, 2)
+
+    length_unit.setCurrentText("inch")
+    assert dialog._table.item(0, 1).text() == "1.0"
+    length_unit.setCurrentText("mm")
+    assert dialog._table.item(0, 1).text() == "25.4"
+    formula_unit.setCurrentText("inch")
+    assert dialog._table.item(1, 1).text() == "length * 2"
+    assert dialog.result_parameters() == [
+        {"name": "length", "value": 25.4, "unit": "mm"},
+        {"name": "formula", "value": "length * 2", "unit": "inch"},
+    ]
+    dialog.close()
     assert app is not None

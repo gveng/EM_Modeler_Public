@@ -637,6 +637,32 @@ def test_generated_script_keeps_geometry_at_project_scale(monkeypatch):
     assert "port[1]['h'] = 0.002" in script
 
 
+def test_generated_script_converts_imperial_port_coordinates_to_millimeters(monkeypatch):
+    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "unknown")
+    script = python_script_exporter.export_emerge_python_script(
+        project_name="ImperialGeometryTest",
+        settings={},
+        step_entries=[],
+        units="inch",
+        lumped_ports=[{
+            "index": 1,
+            "name": "Port_1",
+            "type": "LumpedPort",
+            "origin": (1.0, 0.0, 0.0),
+            "u": (1.0, 0.0, 0.0),
+            "v": (0.0, 1.0, 0.0),
+            "width": 1.0,
+            "height": 1.0,
+        }],
+        run_sweep=False,
+    )
+
+    ast.parse(script)
+    assert "0.0254" in script
+    assert "port[1]['w'] = 0.0254" in script
+    assert "port[1]['h'] = 0.0254" in script
+
+
 def test_generated_script_applies_emerge_scale_and_keeps_physical_port_dimensions(monkeypatch):
     monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "3.0.0")
     script = python_script_exporter.export_emerge_python_script(
