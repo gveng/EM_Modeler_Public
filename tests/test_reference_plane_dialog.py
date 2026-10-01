@@ -68,3 +68,42 @@ def test_perpendicular_choices_refresh_when_active_plane_changes(application):
         (6.0, 7.0, 8.0)
     )
     dialog.close()
+
+
+def test_parallel_choice_picks_origin_and_uses_current_active_normal(application):
+    class Viewport:
+        def request_pick(self, kind, callback):
+            self.kind = kind
+            self.callback = callback
+
+    dialog = ReferencePlaneDialog(
+        current_origin=(1.0, 2.0, 3.0),
+        current_normal=(0.0, 0.0, 1.0),
+        viewport=Viewport(),
+    )
+    viewport = dialog._viewport
+    dialog.set_active_plane((6.0, -4.0, 8.0), (1.0, 2.0, 3.0))
+    dialog._set_origin((100.0, 200.0, 300.0))
+    dialog._set_normal((0.0, 0.0, 1.0))
+    dialog._rot_spin.setValue(45.0)
+    defined = []
+    dialog.plane_defined.connect(lambda origin, normal, name: defined.append((origin, normal, name)))
+
+    dialog._parallel_button.click()
+    assert viewport.kind == "point"
+    viewport.callback((100.0, 200.0, 300.0))
+    dialog._accept()
+
+    assert defined == [
+        (
+            pytest.approx((
+                6.0 + 1378.0 / 14.0,
+                -4.0 + 2.0 * 1378.0 / 14.0,
+                8.0 + 3.0 * 1378.0 / 14.0,
+            )),
+            pytest.approx((1.0 / 14**0.5, 2.0 / 14**0.5, 3.0 / 14**0.5)),
+            "Plane",
+        )
+    ]
+    assert dialog._rot_spin.value() == pytest.approx(0.0)
+    dialog.close()

@@ -89,6 +89,16 @@ class ReferencePlaneDialog(QDialog):
             preset_form.addWidget(btn)
         layout.addWidget(preset_group)
 
+        parallel_group = QGroupBox("Parallel to active plane")
+        parallel_layout = QVBoxLayout(parallel_group)
+        self._parallel_button = QPushButton("Pick origin for parallel plane")
+        self._parallel_button.setToolTip(
+            "Click geometry to set the offset along the active normal; the in-plane origin stays aligned."
+        )
+        self._parallel_button.clicked.connect(self._set_parallel_to_active)
+        parallel_layout.addWidget(self._parallel_button)
+        layout.addWidget(parallel_group)
+
         perpendicular_group = QGroupBox("Perpendicular to active plane")
         perpendicular_layout = QHBoxLayout(perpendicular_group)
         self._perpendicular_buttons = {}
@@ -172,6 +182,8 @@ class ReferencePlaneDialog(QDialog):
         self._nx = self._make_spin(current_normal[0], lo=-1.0, hi=1.0, step=0.01)
         self._ny = self._make_spin(current_normal[1], lo=-1.0, hi=1.0, step=0.01)
         self._nz = self._make_spin(current_normal[2], lo=-1.0, hi=1.0, step=0.01)
+        for spin in (self._nx, self._ny, self._nz):
+            spin.setDecimals(8)
         normal_form.addRow("NX:", self._nx)
         normal_form.addRow("NY:", self._ny)
         normal_form.addRow("NZ:", self._nz)
@@ -249,6 +261,24 @@ class ReferencePlaneDialog(QDialog):
         self._set_origin(self._active_origin)
         self._set_preset(normal)
         self._rot_spin.setValue(0.0)
+
+    def _set_parallel_to_active(self) -> None:
+        self._set_normal(self._active_normal)
+        self._rot_spin.setValue(0.0)
+
+        def cb(pt):
+            offset = sum(
+                (float(pt[index]) - self._active_origin[index]) * self._active_normal[index]
+                for index in range(3)
+            )
+            origin = tuple(
+                self._active_origin[index] + offset * self._active_normal[index]
+                for index in range(3)
+            )
+            self._set_origin(origin)
+            self.show(); self.raise_(); self.activateWindow()
+
+        self._arm_pick("point", cb)
 
     # ─────────────────────────────────────────────────── 3D pick handlers
     def _arm_pick(self, kind: str, callback) -> None:

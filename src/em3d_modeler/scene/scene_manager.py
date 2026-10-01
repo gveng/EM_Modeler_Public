@@ -18,6 +18,7 @@
 from __future__ import annotations
 from copy import deepcopy
 from dataclasses import dataclass
+import re
 from typing import Any, Dict, List, Optional, Tuple
 
 import vtk
@@ -156,7 +157,16 @@ class SceneManager:
         return self._grid_spacing
 
     # ─────────────────────────────────────────────────── object management
-    def add_object(self, obj: EMObject) -> None:
+    def add_object(self, obj: EMObject, *, preserve_name: bool = False) -> None:
+        used_names = {str(existing.name).strip() for existing in self.objects}
+        requested_name = str(getattr(obj, "name", "")).strip() or type(obj).__name__
+        match = re.fullmatch(r"(.+?)_(\d+)", requested_name)
+        if requested_name in used_names or (match and not preserve_name):
+            prefix = match.group(1) if match else requested_name
+            index = 1
+            while f"{prefix}_{index}" in used_names:
+                index += 1
+            obj.name = f"{prefix}_{index}"
         self.objects.append(obj)
         for actor in obj.all_actors:
             self.renderer.AddActor(actor)
@@ -541,7 +551,7 @@ class SceneManager:
                 history = item.get("creation_history", {})
                 obj.creation_history = dict(history) if isinstance(history, dict) else {}
                 obj.creation_reference_error = str(item.get("creation_reference_error", ""))
-                self.add_object(obj)
+                self.add_object(obj, preserve_name=True)
                 transform = item.get("actor_transform", {})
                 if isinstance(transform, dict) and obj.actor is not None:
                     origin = transform.get("origin")
@@ -570,6 +580,8 @@ class SceneManager:
         if pending_boolean_sources:
             by_name = {o.name: o for o in self.objects}
             for mesh_obj, names in pending_boolean_sources:
+                if len(names) != len(set(names)):
+                    continue
                 mesh_obj.source_objects = [by_name[n] for n in names if n in by_name]
 
     def clear(self) -> None:

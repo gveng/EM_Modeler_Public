@@ -60,6 +60,40 @@ def test_lumped_port_touching_one_conductor_is_error():
     assert any(item.severity == "ERROR" and "only one conductor" in item.message for item in findings)
 
 
+def test_missing_model_material_priority_adds_warning():
+    signal = BoxObject("Signal", 0, 0, 0, 1, 1, 1, "Copper Alloy")
+
+    findings = validate_simulation([signal], _settings())
+
+    assert any(
+        item.severity == "WARNING"
+        and item.category == "Materials"
+        and "Copper Alloy" in item.message
+        for item in findings
+    )
+
+
+def test_explicit_zero_material_priority_counts_as_set():
+    signal = BoxObject("Signal", 0, 0, 0, 1, 1, 1, "Copper Alloy")
+    settings = _settings()
+    settings["material_priorities"] = {"Copper Alloy": 0}
+
+    findings = validate_simulation([signal], settings)
+
+    assert any(
+        item.severity == "OK"
+        and item.category == "Materials"
+        and "priorities are set" in item.message
+        for item in findings
+    )
+    assert not any(
+        item.severity == "WARNING"
+        and item.category == "Materials"
+        and "priority" in item.message.lower()
+        for item in findings
+    )
+
+
 def test_port_outside_air_region_is_error():
     signal = BoxObject("Signal", 0, 0, 0, 1, 1, 1, "COPPER")
     ground = BoxObject("Ground", 0, 2, 0, 1, 3, 1, "PEC")

@@ -229,6 +229,37 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize, QUrl, QTimer, QEventLoop, Signal
 from PySide6.QtGui  import QIcon, QKeySequence, QAction, QDesktopServices, QPainter, QPen, QColor, QBrush
 
+
+class _SimulationPreparationCancelled(Exception):
+    pass
+
+
+def _boolean_step_export_issues(bundle: dict) -> list[str]:
+    issues = []
+    entries = bundle.get("entries", []) if isinstance(bundle, dict) else []
+    for entry in entries:
+        if not isinstance(entry, dict):
+            continue
+        operation = str(entry.get("boolean_op") or "").strip().lower()
+        mode = str(entry.get("export_mode") or "unknown")
+        try:
+            polygon_count = int(entry.get("poly_polys", 0) or 0)
+            solid_count = int(entry.get("solid_count", 0) or 0)
+        except (TypeError, ValueError):
+            polygon_count = 0
+            solid_count = 0
+        if operation in {"fuse", "cut", "common"} and (mode != "brep_direct" or solid_count < 1):
+            issues.append(
+                f"{entry.get('object_name', 'Boolean object')}: {mode}, "
+                f"{polygon_count:,} source triangles, {solid_count} STEP solids"
+            )
+        elif mode != "brep_direct" and polygon_count >= 1000:
+            issues.append(
+                f"{entry.get('object_name', 'Object')}: {mode}, "
+                f"{polygon_count:,} triangles"
+            )
+    return issues
+
 def _add_toolbar_group(
     toolbar, title: str, actions: list, columns: int = 3, *, compact: bool = False
 ) -> None:
@@ -1118,10 +1149,14 @@ class MainWindow(QMainWindow):
         act_projection.toggled.connect(self._viewport.set_parallel_projection)
         self._viewport.projection_changed.connect(self._sync_projection_action)
         self._sync_projection_action(act_projection.isChecked())
+        act_recompute_model = QAction(_icon("view-refresh"), "", self)
+        act_recompute_model.setToolTip("Recompute Model")
+        act_recompute_model.setWhatsThis("Recompute parameter-driven geometry and sketch dimensions.")
+        act_recompute_model.triggered.connect(self._recompute_model)
         add_group(
             "View",
-            [act_fit_all, act_fit_selection, act_isometric, act_projection],
-            columns=4,
+            [act_fit_all, act_fit_selection, act_isometric, act_projection, act_recompute_model],
+            columns=5,
         )
 
         # ������ Selection mode ���������������������������������������������������������������������������������������������������������������������������
@@ -1282,8 +1317,8 @@ class MainWindow(QMainWindow):
         )
         add_group(
             "View",
-            [act_fit_all, act_fit_selection, act_isometric, act_projection],
-            columns=4,
+            [act_fit_all, act_fit_selection, act_isometric, act_projection, act_recompute_model],
+            columns=5,
             toolbar=sketch_tb,
             compact=True,
         )
@@ -1555,9 +1590,15 @@ class MainWindow(QMainWindow):
         settings.setdefault("boundaries", {})
         for key in ("Xmin", "Xmax", "Ymin", "Ymax", "Zmin", "Zmax"):
             settings["boundaries"][key] = boundary.currentText()
-        settings["open_region"] = {"enabled": True, "object": air_name}
+        settings["open_region"] = {
+            "enabled": True,
+            "object": air_name,
+            "auto_update": True,
+            "distance_mm": gap,
+        }
         settings["pml"] = {
             "enabled": boundary.currentText() == "PML",
+            "auto_update": pml_obj is not None,
             "air_object": air_name,
             "outer_object": pml_name if pml_obj is not None else "",
             "thickness_mm": pml,
@@ -2703,15 +2744,29 @@ class MainWindow(QMainWindow):
         restored = []
         restored_ids = {id(obj) for obj in scene.objects}
 
-        existing_names = {str(getattr(o, "name", "")) for o in scene.objects}
-
         for result_obj, sources, source_data in candidates:
+            live_sources_by_name = {}
+            for source_obj in sources:
+                if source_obj is result_obj:
+                    continue
+                live_sources_by_name.setdefault(
+                    str(getattr(source_obj, "name", "")), []
+                ).append(source_obj)
+            source_occurrences = {}
+            snapshot_sources = []
+            for item in source_data:
+                source_name = str(item.get("name", "")).strip() if isinstance(item, dict) else ""
+                occurrence = source_occurrences.get(source_name, 0)
+                source_occurrences[source_name] = occurrence + 1
+                live_matches = live_sources_by_name.get(source_name, [])
+                snapshot_sources.append(
+                    live_matches[occurrence] if occurrence < len(live_matches) else None
+                )
+
             # Remove result first so source names equal to result name can be restored.
             result_name = str(getattr(result_obj, "name", ""))
             scene.remove_object(result_obj)
             restored_ids.discard(id(result_obj))
-            if result_name:
-                existing_names.discard(result_name)
 
             added_this_result = 0
             if sources:
@@ -2730,25 +2785,20 @@ class MainWindow(QMainWindow):
                     source_obj.refresh_appearance()
                     restored.append(source_obj)
                     restored_ids.add(id(source_obj))
-                    existing_names.add(str(getattr(source_obj, "name", "")))
                     added_this_result += 1
 
             # Rebuild each missing source from its snapshot. After reopening a
             # project, retained tools may be live while the removed base is not.
-            live_names = {
-                str(getattr(source_obj, "name", ""))
-                for source_obj in sources
-                if source_obj is not result_obj
-            }
-            for item in source_data:
+            for source_index, item in enumerate(source_data):
                 if not isinstance(item, dict):
                     continue
-                source_name = str(item.get("name", "")).strip()
-                if source_name in live_names or source_name in existing_names:
-                    for existing_obj in scene.objects:
-                        if getattr(existing_obj, "name", "") == source_name and existing_obj not in restored:
-                            restored.append(existing_obj)
-                            break
+                source_obj = (
+                    snapshot_sources[source_index]
+                    if source_index < len(snapshot_sources) else None
+                )
+                if source_obj is not None:
+                    if source_obj in scene.objects and source_obj not in restored:
+                        restored.append(source_obj)
                     continue
                 rebuilt = self._rebuild_object_from_snapshot(item)
                 if rebuilt is None:
@@ -2756,7 +2806,6 @@ class MainWindow(QMainWindow):
                 scene.add_object(rebuilt)
                 restored.append(rebuilt)
                 restored_ids.add(id(rebuilt))
-                existing_names.add(str(rebuilt.name))
 
         # Rebuild the tree FIRST so that highlight() can find the restored objects.
         self._viewport.scene_changed.emit()
@@ -2908,29 +2957,64 @@ class MainWindow(QMainWindow):
         """Re-resolve active sketch dimensions against project parameters."""
         return self._viewport.recompute_sketch_dimensions(self._resolve_formula_text)
 
+    def _recompute_model(self) -> None:
+        """Recalculate formula-driven geometry and invalidate generated simulation assets."""
+        settings = self._project_tree.get_settings()
+        self._recompute_simulation_parameters(settings)
+        self._recompute_parametric_objects()
+        self.recompute_sketch_dimensions()
+        self._mark_simulation_dirty(steps=True, script=True)
+        self._info_bar.set_info("Model recomputed.")
+
     def _resolve_creation_snap(self, snap: dict, objects_by_name: dict) -> list[float] | None:
-        source = objects_by_name.get(str(snap.get("object", "")))
-        if source is None or source.actor is None:
+        sources = objects_by_name.get(str(snap.get("object", "")))
+        if sources is None:
             return None
-        mapper = source.actor.GetMapper()
-        dataset = mapper.GetInput() if mapper is not None else None
-        if dataset is None:
-            return None
+        if not isinstance(sources, (list, tuple)):
+            sources = [sources]
         kind = str(snap.get("kind", "")).lower()
-        if kind == "vertex":
-            point_id = snap.get("point_id")
-            if not isinstance(point_id, int) or not (0 <= point_id < dataset.GetNumberOfPoints()):
-                return None
-            local = dataset.GetPoint(point_id)
-        else:
-            local = snap.get("local")
-            if not isinstance(local, (list, tuple)) or len(local) != 3:
-                return None
-        world = source.actor.GetMatrix().MultiplyPoint([float(local[0]), float(local[1]), float(local[2]), 1.0])
-        return [float(world[i]) for i in range(3)]
+        local = snap.get("local")
+        point_id = snap.get("point_id")
+        if kind != "vertex" and (not isinstance(local, (list, tuple)) or len(local) != 3):
+            return None
+
+        resolved = []
+        for source in sources:
+            actor = getattr(source, "actor", None)
+            if actor is None:
+                continue
+            if kind == "vertex":
+                mapper = actor.GetMapper()
+                dataset = mapper.GetInput() if mapper is not None else None
+                if (
+                    dataset is None
+                    or not isinstance(point_id, int)
+                    or not (0 <= point_id < dataset.GetNumberOfPoints())
+                ):
+                    continue
+                source_local = dataset.GetPoint(point_id)
+            else:
+                source_local = local
+            world = actor.GetMatrix().MultiplyPoint([
+                float(source_local[0]), float(source_local[1]), float(source_local[2]), 1.0,
+            ])
+            resolved.append([float(world[index]) for index in range(3)])
+        if not resolved:
+            return None
+
+        reference = snap.get("point")
+        if not isinstance(reference, (list, tuple)) or len(reference) != 3:
+            return resolved[0]
+        target = tuple(float(value) for value in reference)
+        return min(
+            resolved,
+            key=lambda point: sum((point[index] - target[index]) ** 2 for index in range(3)),
+        )
 
     def _regenerate_snap_dependent_objects(self, objects: list) -> None:
-        objects_by_name = {str(obj.name): obj for obj in objects}
+        objects_by_name = {}
+        for obj in objects:
+            objects_by_name.setdefault(str(obj.name), []).append(obj)
         for obj in objects:
             history = getattr(obj, "creation_history", {})
             raw_points = history.get("points", []) if isinstance(history, dict) else []
@@ -2999,15 +3083,19 @@ class MainWindow(QMainWindow):
         for result in list(self._viewport.scene.objects):
             if str(getattr(result, "boolean_op", "") or "").strip().lower() not in {"fuse", "cut", "common"}:
                 continue
-            live_sources = {
-                str(getattr(source, "name", "")): source
-                for source in list(getattr(result, "source_objects", []) or [])
-            }
+            live_sources = {}
+            for source in list(getattr(result, "source_objects", []) or []):
+                live_sources.setdefault(str(getattr(source, "name", "")), []).append(source)
             snapshots = list(getattr(result, "boolean_sources_data", []) or [])
+            source_occurrences = {}
             for index, snapshot in enumerate(snapshots):
                 if not isinstance(snapshot, dict):
                     continue
-                source = live_sources.get(str(snapshot.get("name", "")).strip())
+                source_name = str(snapshot.get("name", "")).strip()
+                occurrence = source_occurrences.get(source_name, 0)
+                source_occurrences[source_name] = occurrence + 1
+                candidates = live_sources.get(source_name, [])
+                source = candidates[occurrence] if occurrence < len(candidates) else None
                 if source is None or (changed_source is not None and source is not changed_source):
                     continue
                 actor = getattr(source, "actor", None)
@@ -3373,27 +3461,49 @@ class MainWindow(QMainWindow):
             try:
                 operation = str(getattr(obj, "boolean_op", "") or "").strip().lower()
                 if operation in {"fuse", "cut", "common"}:
-                    live_sources = {
-                        str(getattr(source, "name", "")): source
-                        for source in list(getattr(obj, "source_objects", []) or [])
-                    }
-                    snapshots = {
-                        str(snapshot.get("name", "")).strip(): snapshot
+                    live_sources = list(getattr(obj, "source_objects", []) or [])
+                    snapshots = [
+                        snapshot
                         for snapshot in list(getattr(obj, "boolean_sources_data", []) or [])
                         if isinstance(snapshot, dict) and str(snapshot.get("name", "")).strip()
-                    }
+                    ]
                     source_names = list(getattr(obj, "boolean_source_names", []) or [])
                     if not source_names:
-                        source_names = [str(source.name) for source in live_sources.values()]
-                        source_names.extend(name for name in snapshots if name not in source_names)
+                        source_names = [str(source.name) for source in live_sources]
+                        if not source_names:
+                            source_names = [str(snapshot.get("name", "")) for snapshot in snapshots]
 
                     ordered_sources = []
-                    for source_name in source_names:
-                        source = live_sources.get(source_name) or objects_by_name.get(source_name)
-                        if source is None and source_name in snapshots:
-                            source = self._rebuild_object_from_snapshot(snapshots[source_name])
-                            if source is not None:
-                                objects_by_name[source_name] = source
+                    name_counts = {
+                        name: source_names.count(name) for name in set(source_names)
+                    }
+                    for source_index, source_name in enumerate(source_names):
+                        snapshot = (
+                            snapshots[source_index]
+                            if source_index < len(snapshots)
+                            and str(snapshots[source_index].get("name", "")).strip() == source_name
+                            else next((
+                                item for item in snapshots
+                                if str(item.get("name", "")).strip() == source_name
+                            ), None)
+                        )
+                        source = None
+                        if name_counts[source_name] > 1 and snapshot is not None:
+                            source = self._rebuild_object_from_snapshot(snapshot)
+                        elif source_index < len(live_sources) and str(
+                            getattr(live_sources[source_index], "name", "")
+                        ) == source_name:
+                            source = live_sources[source_index]
+                        else:
+                            source = next((
+                                item for item in live_sources
+                                if str(getattr(item, "name", "")) == source_name
+                            ), None)
+                            source = source or objects_by_name.get(source_name)
+                        if source is None and snapshot is not None:
+                            source = self._rebuild_object_from_snapshot(snapshot)
+                            if source is not None and name_counts[source_name] == 1:
+                                objects_by_name.setdefault(source_name, source)
                         if source is None:
                             raise ValueError(
                                 f"{obj.name}: boolean source '{source_name}' could not be restored"
@@ -3502,9 +3612,109 @@ class MainWindow(QMainWindow):
             self._recompute_parametric_objects(
                 _patterns_recomputed=True,
                 _regenerate_snaps=_regenerate_snaps,
+                parameter_values=values,
             )
             return
+        self._update_generated_open_region()
         self._viewport._render()
+
+    def _update_generated_open_region(self) -> None:
+        from ..scene.em_objects import BoxObject
+
+        settings = self._project_tree.get_settings()
+        open_region = settings.get("open_region", {})
+        if not isinstance(open_region, dict) or not open_region.get("enabled"):
+            return
+
+        scene_objects = list(self._viewport.scene.objects)
+        objects_by_name = {str(obj.name): obj for obj in scene_objects}
+        air_name = str(open_region.get("object", "")).strip()
+        air = objects_by_name.get(air_name)
+        if not isinstance(air, BoxObject):
+            return
+
+        pml_settings = settings.get("pml", {})
+        pml_settings = pml_settings if isinstance(pml_settings, dict) else {}
+        auto_update = bool(open_region.get("auto_update", False))
+        if not auto_update:
+            auto_update = (
+                air_name.startswith("Air_Region")
+                and str(pml_settings.get("air_object", "")) == air_name
+            )
+        if not auto_update:
+            return
+
+        models = [
+            obj for obj in scene_objects
+            if bool(getattr(obj, "is_model", True))
+            and str(getattr(obj, "material", "")).strip().upper() not in {"AIR", "PML"}
+            and getattr(obj, "actor", None) is not None
+        ]
+        if not models:
+            return
+
+        bounds = [obj.actor.GetBounds() for obj in models]
+        model_bounds = (
+            min(item[0] for item in bounds), max(item[1] for item in bounds),
+            min(item[2] for item in bounds), max(item[3] for item in bounds),
+            min(item[4] for item in bounds), max(item[5] for item in bounds),
+        )
+        try:
+            gap = float(open_region["distance_mm"])
+            if not math.isfinite(gap) or gap < 0.0:
+                raise ValueError("invalid open-region distance")
+        except (KeyError, TypeError, ValueError):
+            previous_air_bounds = air.actor.GetBounds()
+            extensions = (
+                model_bounds[0] - previous_air_bounds[0],
+                previous_air_bounds[1] - model_bounds[1],
+                model_bounds[2] - previous_air_bounds[2],
+                previous_air_bounds[3] - model_bounds[3],
+                model_bounds[4] - previous_air_bounds[4],
+                previous_air_bounds[5] - model_bounds[5],
+            )
+            gap = max(0.0, sum(extensions) / len(extensions))
+            open_region["distance_mm"] = gap
+            settings["open_region"] = open_region
+            self._project_tree.load_settings(settings)
+            self._project_tree.settings_changed.emit()
+        air_bounds = (
+            model_bounds[0] - gap, model_bounds[1] + gap,
+            model_bounds[2] - gap, model_bounds[3] + gap,
+            model_bounds[4] - gap, model_bounds[5] + gap,
+        )
+        air.set_parameters(dict(zip(
+            ("X1", "X2", "Y1", "Y2", "Z1", "Z2"),
+            air_bounds,
+        )))
+
+        if not pml_settings.get("enabled"):
+            return
+        outer_name = str(pml_settings.get("outer_object", "")).strip()
+        update_pml = bool(pml_settings.get("auto_update", False))
+        if not update_pml:
+            update_pml = (
+                outer_name.startswith("PML_Region")
+                and str(pml_settings.get("air_object", "")) == air_name
+            )
+        if not update_pml:
+            return
+        outer = objects_by_name.get(outer_name)
+        if not isinstance(outer, BoxObject):
+            return
+        try:
+            thickness = max(0.0, float(pml_settings.get("thickness_mm", 10.0)))
+        except (TypeError, ValueError):
+            thickness = 10.0
+        outer_bounds = (
+            air_bounds[0] - thickness, air_bounds[1] + thickness,
+            air_bounds[2] - thickness, air_bounds[3] + thickness,
+            air_bounds[4] - thickness, air_bounds[5] + thickness,
+        )
+        outer.set_parameters(dict(zip(
+            ("X1", "X2", "Y1", "Y2", "Z1", "Z2"),
+            outer_bounds,
+        )))
 
     def _on_object_selected(self, obj) -> None:
         self._project_properties_active = False
@@ -3774,6 +3984,20 @@ class MainWindow(QMainWindow):
     def _on_materials_rename(self, obj, new_name: str) -> None:
         if obj is None or not new_name:
             return
+        new_name = new_name.strip()
+        if not new_name:
+            return
+        if any(
+            candidate is not obj
+            and str(getattr(candidate, "name", "")).strip() == new_name
+            for candidate in self._viewport.scene.objects
+        ):
+            QMessageBox.warning(
+                self,
+                "Object Name Already Used",
+                f"An object named '{new_name}' already exists. Choose a different name.",
+            )
+            return
         old_name = obj.name
         obj.name = new_name
         self._project_tree.rename_object_references(old_name, new_name)
@@ -3789,9 +4013,30 @@ class MainWindow(QMainWindow):
     def _on_materials_bulk_rename(self, objects: list, base_name: str, start_index: int) -> None:
         if not objects or not base_name:
             return
+        selected_ids = {id(obj) for obj in objects}
+        occupied_names = {
+            str(getattr(obj, "name", "")).strip()
+            for obj in self._viewport.scene.objects
+            if id(obj) not in selected_ids
+        }
+        proposed_names = [
+            f"{base_name.strip()}_{start_index + index}"
+            for index in range(len(objects))
+        ]
+        if (
+            len(proposed_names) != len(set(proposed_names))
+            or any(name in occupied_names for name in proposed_names)
+        ):
+            QMessageBox.warning(
+                self,
+                "Object Name Already Used",
+                "At least one proposed name is already used by another object. "
+                "No objects were renamed.",
+            )
+            return
         for i, obj in enumerate(objects):
             old_name = obj.name
-            new_name = f"{base_name}_{start_index + i}"
+            new_name = proposed_names[i]
             obj.name = new_name
             self._project_tree.rename_object_references(old_name, new_name)
         self._history_record()
@@ -4714,8 +4959,13 @@ class MainWindow(QMainWindow):
             mm_per_unit=mm_per_unit,
         )
         cached = self._get_cached_simulation_step_bundle(cache_key, bundle_dir)
-        if cached is not None:
+        if cached is not None and not _boolean_step_export_issues(cached):
             return cached
+        if cached is not None:
+            self._append_step_export_log(
+                "[warning] Cached STEP bundle contains faceted geometry; rebuilding after geometry recomputation.",
+                level="WARNING",
+            )
 
         result = self._export_simulation_step_bundle(
             objects=objects,
@@ -4766,6 +5016,93 @@ class MainWindow(QMainWindow):
                 return cached
         return None
 
+    def _missing_boolean_source_links(self) -> list[str]:
+        from collections import Counter
+
+        missing = []
+        for obj in self._simulation_model_objects():
+            operation = str(getattr(obj, "boolean_op", "") or "").strip().lower()
+            if operation not in {"fuse", "cut", "common"}:
+                continue
+            live_sources = list(getattr(obj, "source_objects", []) or [])
+            unique_live_sources = list({id(source): source for source in live_sources}.values())
+            live_names = Counter(
+                str(getattr(source, "name", "")).strip()
+                for source in unique_live_sources
+                if str(getattr(source, "name", "")).strip()
+            )
+            expected_names = [
+                str(name).strip()
+                for name in list(getattr(obj, "boolean_source_names", []) or [])
+                if str(name).strip()
+            ]
+            if not expected_names:
+                expected_names = [
+                    str(snapshot.get("name", "")).strip()
+                    for snapshot in list(getattr(obj, "boolean_sources_data", []) or [])
+                    if isinstance(snapshot, dict) and str(snapshot.get("name", "")).strip()
+                ]
+            expected_counts = Counter(expected_names)
+            linked_count = len(unique_live_sources)
+            expected_count = max(2, len(expected_names))
+            if linked_count < expected_count or any(
+                live_names[name] < count for name, count in expected_counts.items()
+            ):
+                missing.append(
+                    f"{getattr(obj, 'name', 'Boolean object')} "
+                    f"({linked_count}/{expected_count} sources linked)"
+                )
+        return missing
+
+    def _ask_missing_boolean_source_links(
+        self, missing: list[str], *, allow_retry: bool
+    ) -> QMessageBox.StandardButton:
+        choices = QMessageBox.Ignore | QMessageBox.Cancel
+        if allow_retry:
+            choices |= QMessageBox.Retry
+        retry_text = "Retry rebuilds the Boolean geometry. " if allow_retry else ""
+        text = (
+            "Some Boolean objects still have missing source links after geometry recomputation:\n\n"
+            + "\n".join(missing)
+            + "\n\n"
+            + retry_text
+            + "Continue keeps the scene mesh and may create a "
+            "faceted STEP that meshes slowly. Cancel stops script generation so the Boolean sources "
+            "can be repaired in the project."
+        )
+        return QMessageBox.warning(
+            self,
+            "Boolean Source Links Missing",
+            text,
+            choices,
+            QMessageBox.Cancel,
+        )
+
+    def _confirm_faceted_step_export(self, issues: list[str]) -> bool:
+        self._append_step_export_log(
+            "[warning] STEP export validation found faceted or non-solid geometry: "
+            + "; ".join(issues),
+            level="WARNING",
+        )
+        self._append_sim_log(
+            "[warn] STEP validation found faceted/non-solid geometry: " + "; ".join(issues)
+        )
+        reply = QMessageBox.warning(
+            self,
+            "STEP Export Validation",
+            "The sweep STEP bundle contains faceted or non-solid geometry:\n\n"
+            + "\n".join(issues)
+            + "\n\nContinue may make EMerge 2D meshing very slow. Continue with this STEP export, "
+            "or cancel and repair/rebuild the Boolean geometry first?",
+            QMessageBox.Ignore | QMessageBox.Cancel,
+            QMessageBox.Cancel,
+        )
+        if reply == QMessageBox.Ignore:
+            self._append_sim_log("[warn] User accepted the faceted STEP export for sweep preparation.")
+            return True
+        self._append_sim_log("[info] Sweep preparation cancelled after STEP export validation.")
+        return False
+
     def _build_simulation_script_bundle(self, step_entries: list[dict], show_model: bool, show_mesh: bool, run_sweep: bool, preview_only: bool = False, progress_callback=None) -> dict:
         settings = self._project_tree.get_settings()
         mesh_cfg = settings.get("mesh", {}) if isinstance(settings, dict) else {}
@@ -4810,6 +5147,7 @@ class MainWindow(QMainWindow):
                 )
 
         scripts: list[dict] = []
+        sweep_geometry_recomputed = False
         for idx, sim_cfg in enumerate(enabled_sims, start=1):
             sim_name = str(sim_cfg.get("name", f"Simulation_{idx}")).strip() or f"Simulation_{idx}"
             child_settings = dict(settings)
@@ -5000,6 +5338,26 @@ class MainWindow(QMainWindow):
                 continue
 
             simulation_root = self._simulation_bundle_dir() / f"{safe_project}_{safe_sim}"
+            if not sweep_geometry_recomputed:
+                report_progress("Recomputing geometry before sweep STEP export...", 0.0, log=True)
+                self._recompute_parametric_objects(parameter_values=self._parameter_values())
+                sweep_geometry_recomputed = True
+                missing_sources = self._missing_boolean_source_links()
+                if missing_sources:
+                    choice = self._ask_missing_boolean_source_links(missing_sources, allow_retry=True)
+                    if choice == QMessageBox.Retry:
+                        self._recompute_parametric_objects(parameter_values=self._parameter_values())
+                        missing_sources = self._missing_boolean_source_links()
+                        if missing_sources:
+                            choice = self._ask_missing_boolean_source_links(missing_sources, allow_retry=False)
+                        else:
+                            choice = QMessageBox.Retry
+                    if choice != QMessageBox.Retry and choice != QMessageBox.Ignore:
+                        raise _SimulationPreparationCancelled
+                    if choice == QMessageBox.Ignore:
+                        self._append_sim_log(
+                            "[warn] Continuing sweep preparation with unresolved Boolean source links; STEP may be faceted."
+                        )
             report_progress(f"Preparing STEP: {sim_name}", 0.0, log=True)
             plate_names = {
                 str(obj.name).strip()
@@ -5017,6 +5375,9 @@ class MainWindow(QMainWindow):
                 ),
                 mm_per_unit=_MM_PER_UNIT.get(getattr(self, "_units", "mm"), 1.0),
             )
+            export_issues = _boolean_step_export_issues(simulation_step_bundle)
+            if export_issues and not self._confirm_faceted_step_export(export_issues):
+                raise _SimulationPreparationCancelled
             report_progress(f"Generating script: {sim_name}", 0.9, log=True)
             script_text = export_emerge_python_script(
                 project_name=self._project_name,
@@ -5218,6 +5579,9 @@ class MainWindow(QMainWindow):
 
             self._update_simulation_script_tabs(script_bundle)
             return script
+        except _SimulationPreparationCancelled:
+            self._append_sim_log("[info] Simulation asset preparation cancelled by user.")
+            return None
         finally:
             self._sim_preparation_active = previous_preparation_active
             if progress_callback is not None:

@@ -12,7 +12,7 @@ from PySide6.QtCore import QPoint, Qt
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QGroupBox, QMainWindow, QMenu, QTabWidget,
+    QApplication, QCheckBox, QComboBox, QGroupBox, QMainWindow, QMenu, QMessageBox, QTabWidget,
     QVBoxLayout, QWidget,
 )
 
@@ -454,12 +454,14 @@ def test_sweep_bundle_places_worker_and_geometry_under_simulation_folder(monkeyp
         "material_priorities": {},
     }
     model_object = SimpleNamespace(name="Body")
+    preparation_order = []
     export_calls = []
     worker_calls = []
 
     def export_steps(*, objects, bundle_dir, **_kwargs):
         step_dir = Path(bundle_dir)
         step_dir.mkdir(parents=True, exist_ok=True)
+        preparation_order.append("export")
         export_calls.append((step_dir, objects))
         (step_dir / "Body.step").write_text("STEP", encoding="utf-8")
         return {"entries": [{"step_file": "Body.step"}], "skipped": []}
@@ -496,6 +498,15 @@ def test_sweep_bundle_places_worker_and_geometry_under_simulation_folder(monkeyp
             SimpleNamespace(), value
         ),
         _simulation_model_objects=lambda: [model_object],
+        _missing_boolean_source_links=lambda: main_window.MainWindow._missing_boolean_source_links(window),
+        _ask_missing_boolean_source_links=lambda missing, allow_retry: main_window.MainWindow._ask_missing_boolean_source_links(
+            window, missing, allow_retry=allow_retry
+        ),
+        _confirm_faceted_step_export=lambda issues: main_window.MainWindow._confirm_faceted_step_export(
+            window, issues
+        ),
+        _parameter_values=lambda: {},
+        _recompute_parametric_objects=lambda **_kwargs: preparation_order.append("recompute"),
         _is_plate_role_object=lambda _obj: False,
         _collect_plate_lumped_ports=lambda: [],
         _collect_emerge_plates=lambda: [],
@@ -511,6 +522,7 @@ def test_sweep_bundle_places_worker_and_geometry_under_simulation_folder(monkeyp
     bundle = main_window.MainWindow._build_simulation_script_bundle(
         window, [], show_model=False, show_mesh=False, run_sweep=True
     )
+    assert preparation_order[:2] == ["recompute", "export"]
     main_window.MainWindow._mark_simulation_dirty(window, steps=False)
     main_window.MainWindow._build_simulation_script_bundle(
         window, [], show_model=False, show_mesh=False, run_sweep=True
@@ -529,6 +541,127 @@ def test_sweep_bundle_places_worker_and_geometry_under_simulation_folder(monkeyp
         window, [], show_model=False, show_mesh=False, run_sweep=True
     )
     assert len(export_calls) == 2
+
+
+def test_boolean_step_export_issues_detect_faceted_boolean_and_large_mesh():
+    issues = main_window._boolean_step_export_issues({
+        "entries": [
+            {
+                "object_name": "Fuse_1",
+                "boolean_op": "fuse",
+                "export_mode": "mesh_roundtrip",
+                "solid_count": -1,
+                "poly_polys": 5024,
+            },
+            {
+                "object_name": "ImportedMesh",
+                "export_mode": "mesh_roundtrip",
+                "poly_polys": 2000,
+            },
+            {
+                "object_name": "CompactBody",
+                "export_mode": "brep_direct",
+                "solid_count": 1,
+                "poly_polys": 5024,
+            },
+        ]
+    })
+
+    assert len(issues) == 2
+    assert "Fuse_1" in issues[0]
+    assert "ImportedMesh" in issues[1]
+
+
+def test_missing_boolean_link_prompt_can_retry_geometry_rebuild(monkeypatch):
+    source_a = SimpleNamespace(name="Source_A")
+    source_b = SimpleNamespace(name="Source_B")
+    boolean_object = SimpleNamespace(
+        name="Fuse_1",
+        boolean_op="fuse",
+        boolean_source_names=["Source_A", "Source_B"],
+        boolean_sources_data=[],
+        source_objects=[],
+    )
+    warning_calls = []
+
+    def warning(_parent, _title, text, buttons, _default):
+        warning_calls.append((text, buttons))
+        return main_window.QMessageBox.Retry
+
+    monkeypatch.setattr(main_window.QMessageBox, "warning", warning)
+    window = SimpleNamespace(_simulation_model_objects=lambda: [boolean_object])
+
+    missing = main_window.MainWindow._missing_boolean_source_links(window)
+    choice = main_window.MainWindow._ask_missing_boolean_source_links(
+        window, missing, allow_retry=True
+    )
+
+    assert missing == ["Fuse_1 (0/2 sources linked)"]
+    assert choice == QMessageBox.Retry
+    assert "repair" in warning_calls[0][0]
+    assert warning_calls[0][1] & QMessageBox.Ignore
+    assert warning_calls[0][1] & QMessageBox.Cancel
+
+
+def test_duplicate_named_boolean_source_instances_count_as_distinct_links():
+    sources = [SimpleNamespace(name="Cylinder_1") for _ in range(3)]
+    boolean_object = SimpleNamespace(
+        name="Fuse_Cylinder_1",
+        boolean_op="fuse",
+        boolean_source_names=["Cylinder_1"] * 3,
+        boolean_sources_data=[{"name": "Cylinder_1"} for _ in range(3)],
+        source_objects=sources,
+    )
+    window = SimpleNamespace(_simulation_model_objects=lambda: [boolean_object])
+
+    missing = main_window.MainWindow._missing_boolean_source_links(window)
+
+    assert missing == []
+
+
+def test_missing_duplicate_named_boolean_instance_is_still_reported():
+    boolean_object = SimpleNamespace(
+        name="Fuse_Cylinder_1",
+        boolean_op="fuse",
+        boolean_source_names=["Cylinder_1"] * 3,
+        boolean_sources_data=[{"name": "Cylinder_1"} for _ in range(3)],
+        source_objects=[SimpleNamespace(name="Cylinder_1") for _ in range(2)],
+    )
+    window = SimpleNamespace(_simulation_model_objects=lambda: [boolean_object])
+
+    missing = main_window.MainWindow._missing_boolean_source_links(window)
+
+    assert missing == ["Fuse_Cylinder_1 (2/3 sources linked)"]
+
+
+@pytest.mark.parametrize(
+    ("reply", "accepted"),
+    [(QMessageBox.Ignore, True), (QMessageBox.Cancel, False)],
+)
+def test_faceted_step_validation_prompts_before_simulation(monkeypatch, reply, accepted):
+    warning_calls = []
+    monkeypatch.setattr(
+        main_window.QMessageBox,
+        "warning",
+        lambda *args: warning_calls.append(args) or reply,
+    )
+    append_step_log = Mock()
+    append_sim_log = Mock()
+    window = SimpleNamespace(
+        _append_step_export_log=append_step_log,
+        _append_sim_log=append_sim_log,
+    )
+
+    result = main_window.MainWindow._confirm_faceted_step_export(
+        window, ["Fuse_1: mesh_roundtrip, 5,024 source triangles, -1 STEP solids"]
+    )
+
+    assert result is accepted
+    assert len(warning_calls) == 1
+    assert "very slow" in warning_calls[0][2]
+    assert warning_calls[0][3] == QMessageBox.Ignore | QMessageBox.Cancel
+    append_step_log.assert_called_once()
+    append_sim_log.assert_called()
 
 
 def test_enabled_simulations_preserves_per_job_progressive_setting():

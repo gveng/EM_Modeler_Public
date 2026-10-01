@@ -164,6 +164,30 @@ def validate_simulation(
     model_objects = [obj for obj in objects if bool(getattr(obj, "is_model", True))]
     object_by_name = {str(getattr(obj, "name", "")).strip(): obj for obj in objects}
 
+    material_priorities = settings.get("material_priorities", {})
+    material_priorities = material_priorities if isinstance(material_priorities, dict) else {}
+    used_materials = {
+        str(getattr(obj, "material", "")).strip()
+        for obj in model_objects
+        if str(getattr(obj, "material", "")).strip()
+    }
+    missing_priorities = sorted(
+        material for material in used_materials
+        if material not in material_priorities
+    )
+    if missing_priorities:
+        findings.append(ValidationFinding(
+            "WARNING",
+            "Materials",
+            "Material priorities are not set for: " + ", ".join(missing_priorities) + ".",
+        ))
+    elif used_materials:
+        findings.append(ValidationFinding(
+            "OK",
+            "Materials",
+            "Material priorities are set for all MODEL materials.",
+        ))
+
     volume_objects = [
         obj for obj in model_objects
         if type(obj).__name__ != "PlateObject" and not bool(getattr(obj, "plate_role", False))

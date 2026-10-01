@@ -17,7 +17,7 @@ import em3d_modeler.ui.main_window as main_window_module
 from em3d_modeler.ui.main_window import MainWindow
 from em3d_modeler.drawing.sketch_engine import SketchEngine
 from em3d_modeler.scene.em_objects import (
-    BoxObject, CylinderObject, ExtrudedObject, MeshObject, RevolvedObject,
+    BoxObject, CylinderObject, ExtrudedObject, MeshObject, PlateObject, RevolvedObject,
 )
 from em3d_modeler.scene.scene_manager import SceneManager
 
@@ -29,6 +29,31 @@ def _main_window_stub(viewport):
         _start_embedded_sketch=Mock(),
         _open_reference_plane_dialog=Mock(),
     )
+
+
+def test_recompute_model_updates_geometry_and_invalidates_simulation_assets():
+    calls = []
+    settings = {"parameters": []}
+    window = SimpleNamespace(
+        _project_tree=SimpleNamespace(get_settings=lambda: settings),
+        _recompute_simulation_parameters=lambda passed_settings: calls.append(
+            ("simulation parameters", passed_settings)
+        ),
+        _recompute_parametric_objects=lambda: calls.append(("geometry",)),
+        recompute_sketch_dimensions=lambda: calls.append(("sketch dimensions",)),
+        _mark_simulation_dirty=lambda **kwargs: calls.append(("dirty", kwargs)),
+        _info_bar=SimpleNamespace(set_info=lambda message: calls.append(("info", message))),
+    )
+
+    MainWindow._recompute_model(window)
+
+    assert calls == [
+        ("simulation parameters", settings),
+        ("geometry",),
+        ("sketch dimensions",),
+        ("dirty", {"steps": True, "script": True}),
+        ("info", "Model recomputed."),
+    ]
 
 
 def test_cylinder_center_values_survive_regeneration_without_snap():
@@ -72,6 +97,311 @@ def test_snapped_cylinder_center_follows_source_without_accumulating():
 
     assert first_center == pytest.approx((4, 5, 11))
     assert second_center == pytest.approx(first_center)
+
+
+def test_snap_resolution_uses_matching_duplicate_name_source():
+    target = [0.023301949171014445, -0.0022979770003264126, 1.55]
+    sources = []
+    for position_z in (0.0, 1.35, -1.3):
+        actor = vtk.vtkActor()
+        actor.SetOrientation(90.0, 0.0, 0.0)
+        actor.SetPosition(0.0, 0.0, position_z)
+        sources.append(SimpleNamespace(name="Cylinder_1", actor=actor))
+
+    resolved = MainWindow._resolve_creation_snap(
+        SimpleNamespace(),
+        {
+            "kind": "surface",
+            "object": "Cylinder_1",
+            "local": [0.02330194917101444, 0.2, 0.002297977000326412],
+            "point": target,
+        },
+        {"Cylinder_1": sources},
+    )
+
+    assert resolved == pytest.approx(target)
+
+    plate = PlateObject(
+        "Plate_2",
+        0.023301949171014445,
+        -0.0022979770003264126,
+        1.55,
+        -0.027,
+        -0.0061,
+        1.625,
+    )
+    plate.creation_history = {
+        "mode": "planar",
+        "plane": "XZ",
+        "points": [
+            {
+                "value": target,
+                "snap": {
+                    "kind": "surface",
+                    "object": "Cylinder_1",
+                    "local": [0.02330194917101444, 0.2, 0.002297977000326412],
+                    "point": target,
+                },
+            },
+            {"value": [-0.027, -0.0061, 1.625], "snap": {"kind": "grid"}},
+        ],
+    }
+    window = SimpleNamespace()
+    window._resolve_creation_snap = MethodType(MainWindow._resolve_creation_snap, window)
+    MainWindow._regenerate_snap_dependent_objects(window, [plate, *sources])
+
+    assert plate.get_parameters()["Z1"] == pytest.approx(1.55)
+
+
+def test_boolean_recompute_restores_same_named_sources_individually(monkeypatch):
+    from em3d_modeler.scene import boolean_ops
+
+    sources = [
+        CylinderObject("Cylinder_1", 0, 0, center_z, 0.1, height)
+        for center_z, height in ((0.0, 2.3), (1.35, 0.4), (-1.3, 0.3))
+    ]
+    scene = SceneManager(vtk.vtkRenderer())
+    window = SimpleNamespace(
+        _viewport=SimpleNamespace(scene=scene, _render=Mock()),
+        _project_tree=SimpleNamespace(get_settings=lambda: {}),
+        _parameter_values=lambda: {},
+        _sync_boolean_provenance=lambda: None,
+        _process_simulation_preparation_events=Mock(),
+        _update_generated_open_region=Mock(),
+        _info_bar=SimpleNamespace(set_info=Mock()),
+    )
+    window._serialize_object_snapshot = MethodType(MainWindow._serialize_object_snapshot, window)
+    window._rebuild_object_from_snapshot = MethodType(MainWindow._rebuild_object_from_snapshot, window)
+    snapshots = [window._serialize_object_snapshot(source) for source in sources]
+    result = MeshObject(
+        "Fused",
+        vtk.vtkPolyData(),
+        boolean_op="fuse",
+        boolean_source_names=["Cylinder_1"] * 3,
+        boolean_sources_data=snapshots,
+    )
+    scene.add_object(result)
+    recomputed_sources = []
+    window._replace_boolean_result_object = lambda _result, _polydata, restored: recomputed_sources.extend(restored)
+    monkeypatch.setattr(boolean_ops, "fuse_many", lambda _sources, **_kwargs: vtk.vtkPolyData())
+    window._recompute_pattern_instances = Mock(return_value=False)
+
+    MainWindow._recompute_parametric_objects(window, _regenerate_snaps=False)
+
+    assert len(recomputed_sources) == 3
+    assert len({id(source) for source in recomputed_sources}) == 3
+    assert [source.get_parameters()["CenterZ"] for source in recomputed_sources] == pytest.approx(
+        [0.0, 1.35, -1.3]
+    )
+
+
+@pytest.mark.parametrize("keep_live_sources", [False, True])
+def test_dissolve_restores_all_same_named_boolean_snapshots(monkeypatch, keep_live_sources):
+    from PySide6.QtWidgets import QMessageBox
+
+    sources = [
+        CylinderObject("Cylinder_1", 0, 0, center_z, 0.1, height)
+        for center_z, height in ((0.0, 2.3), (1.35, 0.4), (-1.3, 0.3))
+    ]
+    scene = SceneManager(vtk.vtkRenderer())
+    result = MeshObject(
+        "Fused",
+        vtk.vtkPolyData(),
+        boolean_op="fuse",
+        boolean_source_names=["Cylinder_1"] * 3,
+        boolean_sources_data=[
+            {
+                "type": type(source).__name__,
+                "name": source.name,
+                "params": source.get_parameters(),
+                "visible": True,
+                "is_model": True,
+                "param_formulas": {},
+                "creation_history": {},
+                "actor_transform": {
+                    "origin": list(source.actor.GetOrigin()),
+                    "position": list(source.actor.GetPosition()),
+                    "orientation": list(source.actor.GetOrientation()),
+                    "scale": list(source.actor.GetScale()),
+                },
+            }
+            for source in sources
+        ],
+    )
+    result.source_objects = sources if keep_live_sources else []
+    scene.add_object(result)
+    scene.select(result)
+    viewport = SimpleNamespace(
+        scene=scene,
+        object_selected=SimpleNamespace(emit=Mock()),
+        selection_changed=SimpleNamespace(emit=Mock()),
+        scene_changed=SimpleNamespace(emit=Mock()),
+        _render=Mock(),
+    )
+    window = SimpleNamespace(
+        _viewport=viewport,
+        _rebuild_object_from_snapshot=MethodType(
+            MainWindow._rebuild_object_from_snapshot, SimpleNamespace(_viewport=viewport)
+        ),
+        _refresh_materials=Mock(),
+        _mark_broken_creation_references=Mock(),
+        _info_bar=SimpleNamespace(set_info=Mock()),
+    )
+    monkeypatch.setattr(main_window_module.QMessageBox, "question", lambda *_args: QMessageBox.Yes)
+
+    MainWindow._bool_dissolve(window)
+
+    assert len(scene.objects) == 3
+    assert len({id(source) for source in scene.objects}) == 3
+    assert {source.name for source in scene.objects} == {
+        "Cylinder_1", "Cylinder_2", "Cylinder_3",
+    }
+
+
+def test_scene_add_object_uses_the_first_available_name_index():
+    scene = SceneManager(vtk.vtkRenderer())
+    first = CylinderObject("Cylinder_1", 0, 0, 0, 1, 1)
+    third = CylinderObject("Cylinder_3", 0, 0, 0, 1, 1)
+    new_object = CylinderObject("Cylinder_9", 0, 0, 0, 1, 1)
+    scene.add_object(first)
+    scene.add_object(third)
+    scene.add_object(new_object)
+
+    assert third.name == "Cylinder_2"
+    assert new_object.name == "Cylinder_3"
+    scene.remove_object(third)
+    replacement = CylinderObject("Cylinder_1", 0, 0, 0, 1, 1)
+    scene.add_object(replacement)
+
+    assert replacement.name == "Cylinder_2"
+
+
+def test_object_rename_conflict_warns_without_changing_name_or_references(monkeypatch):
+    existing = SimpleNamespace(name="Cylinder_1")
+    target = SimpleNamespace(name="Cylinder_2")
+    warnings = []
+    window = SimpleNamespace(
+        _viewport=SimpleNamespace(scene=SimpleNamespace(objects=[existing, target])),
+        _project_tree=SimpleNamespace(rename_object_references=Mock()),
+        _history_record=Mock(),
+        _refresh_materials=Mock(),
+        _materials=SimpleNamespace(highlight=Mock()),
+        _body_props=SimpleNamespace(set_object=Mock()),
+        _info_bar=SimpleNamespace(set_info=Mock()),
+        _mark_simulation_dirty=Mock(),
+    )
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "warning",
+        lambda *_args: warnings.append(_args),
+    )
+
+    MainWindow._on_materials_rename(window, target, "Cylinder_1")
+
+    assert target.name == "Cylinder_2"
+    assert len(warnings) == 1
+    window._project_tree.rename_object_references.assert_not_called()
+    window._history_record.assert_not_called()
+
+
+def test_bulk_rename_conflict_warns_without_renaming_any_object(monkeypatch):
+    existing = SimpleNamespace(name="Body_2")
+    first = SimpleNamespace(name="Old_A")
+    second = SimpleNamespace(name="Old_B")
+    warnings = []
+    window = SimpleNamespace(
+        _viewport=SimpleNamespace(scene=SimpleNamespace(objects=[existing, first, second])),
+        _project_tree=SimpleNamespace(rename_object_references=Mock()),
+        _history_record=Mock(),
+        _refresh_materials=Mock(),
+        _materials=SimpleNamespace(highlight=Mock()),
+        _info_bar=SimpleNamespace(set_info=Mock()),
+        _mark_simulation_dirty=Mock(),
+    )
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "warning",
+        lambda *_args: warnings.append(_args),
+    )
+
+    MainWindow._on_materials_bulk_rename(window, [first, second], "Body", 1)
+
+    assert (first.name, second.name) == ("Old_A", "Old_B")
+    assert len(warnings) == 1
+    window._project_tree.rename_object_references.assert_not_called()
+
+
+def test_parametric_recompute_recenters_generated_air_and_pml_regions():
+    model = BoxObject("Model", 10, 20, 30, 40, 60, 80, "Copper")
+    air = BoxObject("Air_Region", -10, -10, -10, 60, 70, 90, "AIR")
+    outer = BoxObject("PML_Region", -20, -20, -20, 70, 80, 100, "PML")
+    settings = {
+        "open_region": {
+            "enabled": True,
+            "object": "Air_Region",
+            "auto_update": True,
+            "distance_mm": 5,
+        },
+        "pml": {
+            "enabled": True,
+            "auto_update": True,
+            "air_object": "Air_Region",
+            "outer_object": "PML_Region",
+            "thickness_mm": 3,
+        },
+    }
+    window = SimpleNamespace(
+        _project_tree=SimpleNamespace(get_settings=lambda: settings),
+        _viewport=SimpleNamespace(
+            scene=SimpleNamespace(objects=[model, air, outer]),
+        ),
+    )
+
+    MainWindow._update_generated_open_region(window)
+
+    assert (air.x1, air.x2, air.y1, air.y2, air.z1, air.z2) == pytest.approx(
+        (5, 45, 15, 65, 25, 85)
+    )
+    assert (outer.x1, outer.x2, outer.y1, outer.y2, outer.z1, outer.z2) == pytest.approx(
+        (2, 48, 12, 68, 22, 88)
+    )
+
+
+def test_legacy_open_region_extension_is_inferred_saved_and_reused():
+    model = BoxObject("Model", 10, 20, 30, 40, 60, 80, "Copper")
+    air = BoxObject("Air_Region", 3, 13, 23, 47, 67, 87, "AIR")
+    stored_settings = {
+        "open_region": {"enabled": True, "object": "Air_Region"},
+        "pml": {
+            "enabled": False,
+            "air_object": "Air_Region",
+        },
+    }
+    tree = SimpleNamespace(
+        get_settings=lambda: deepcopy(stored_settings),
+        load_settings=lambda settings: stored_settings.update(deepcopy(settings)),
+        settings_changed=SimpleNamespace(emit=Mock()),
+    )
+    window = SimpleNamespace(
+        _project_tree=tree,
+        _viewport=SimpleNamespace(scene=SimpleNamespace(objects=[model, air])),
+    )
+
+    MainWindow._update_generated_open_region(window)
+
+    assert stored_settings["open_region"]["distance_mm"] == pytest.approx(7)
+    assert (air.x1, air.x2, air.y1, air.y2, air.z1, air.z2) == pytest.approx(
+        (3, 47, 13, 67, 23, 87)
+    )
+
+    model.set_parameters({"X1": 0, "X2": 100, "Y1": 5, "Y2": 45, "Z1": 8, "Z2": 88})
+    MainWindow._update_generated_open_region(window)
+
+    assert stored_settings["open_region"]["distance_mm"] == pytest.approx(7)
+    assert (air.x1, air.x2, air.y1, air.y2, air.z1, air.z2) == pytest.approx(
+        (-7, 107, -2, 52, 1, 95)
+    )
+    tree.settings_changed.emit.assert_called_once_with()
 
 
 def test_progressive_stdout_parser_buffers_split_json_lines():
@@ -804,6 +1134,55 @@ def test_source_parameter_edit_rebuilds_pattern_copies_before_history_record():
     ]
 
 
+def test_parametric_pattern_recompute_preserves_temporary_parameter_values():
+    scene = SceneManager(vtk.vtkRenderer())
+    source = BoxObject("Source", x2=1)
+    source.param_formulas = {"X2": "pitch"}
+    scene.add_object(source)
+    window = SimpleNamespace(
+        _viewport=SimpleNamespace(scene=scene, _render=Mock()),
+        _project_tree=SimpleNamespace(get_settings=lambda: {}),
+        _parameter_values=lambda: {"pitch": 1.0},
+        _sync_boolean_provenance=Mock(),
+        _refresh_materials=Mock(),
+        _process_simulation_preparation_events=Mock(),
+        _update_generated_open_region=Mock(),
+        _info_bar=SimpleNamespace(set_info=Mock()),
+    )
+    window._serialize_object_snapshot = MethodType(MainWindow._serialize_object_snapshot, window)
+    window._rebuild_object_from_snapshot = MethodType(MainWindow._rebuild_object_from_snapshot, window)
+    window._recompute_parametric_objects = MethodType(MainWindow._recompute_parametric_objects, window)
+    window._recompute_pattern_instances = MethodType(MainWindow._recompute_pattern_instances, window)
+
+    definition = {
+        "pattern_id": "parametric-pitch",
+        "sources": [window._serialize_object_snapshot(source)],
+        "settings": {
+            "mode": "Linear",
+            "axis_enabled": [True, False, False],
+            "expressions": {
+                "axis_count_x": "2",
+                "offset_x": "pitch",
+            },
+            "resolved": {},
+        },
+    }
+    clone = BoxObject("Source_Pattern_2", x2=1)
+    clone.actor.AddPosition(1, 0, 0)
+    clone.pattern_definition = deepcopy(definition)
+    clone.pattern_instance = {"instance_index": 1, "source_index": 0}
+    scene.add_object(clone)
+
+    window._recompute_parametric_objects(
+        _regenerate_snaps=False,
+        parameter_values={"pitch": 0.8},
+    )
+
+    assert source.x2 == pytest.approx(0.8)
+    regenerated = next(obj for obj in scene.objects if getattr(obj, "pattern_instance", None))
+    assert regenerated.actor.GetPosition()[0] == pytest.approx(0.8)
+
+
 def test_unrelated_parameter_edit_does_not_recompute_patterns():
     pattern_source = {"name": "PatternSource"}
     pattern = SimpleNamespace(pattern_definition={"sources": [pattern_source]})
@@ -1133,6 +1512,7 @@ def test_sketch_toolbar_shows_select_delete_and_exit_actions():
     window._open_simulation_window = Mock()
     window._open_measure_tool = Mock()
     window._open_project_parameters = Mock()
+    window._recompute_model = Mock()
     window._on_check_simulation = Mock()
     window._on_selection_mode_changed = Mock()
     window._activate_sketch_toolbar_action = MethodType(
