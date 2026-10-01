@@ -49,6 +49,45 @@ class _FailingFitGrid(_FakeGrid):
         raise RuntimeError("SVD did not converge")
 
 
+def test_object_conductor_boundaries_export_with_material_and_si_thickness(monkeypatch):
+    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "unknown")
+    script = python_script_exporter.export_emerge_python_script(
+        project_name="ConductorBoundaryTest",
+        settings={"object_boundaries": [
+            {"object": "CopperWall", "type": "Surface Impedance"},
+            {
+                "object": "CopperSheet",
+                "type": "Thin Conductor",
+                "params": {"Thickness_mm": 0.035},
+            },
+        ]},
+        step_entries=[{
+            "object_name": "CopperWall",
+            "step_file": "copper-wall.step",
+            "material": "Copper",
+        }],
+        plate_entries=[{
+            "object_name": "CopperSheet",
+            "origin": (0.0, 0.0, 0.0),
+            "u": (0.01, 0.0, 0.0),
+            "v": (0.0, 0.01, 0.0),
+            "material": "Copper",
+        }],
+        materials_catalog={"Copper": {"sigma": 5.8e7}},
+        run_sweep=False,
+    )
+
+    ast.parse(script)
+    assert (
+        'simulationObj.mw.bc.SurfaceImpedance('
+        '_boundary_faces(geometry_groups["CopperWall"]), material=materials["Copper"])'
+    ) in script
+    assert (
+        'simulationObj.mw.bc.ThinConductor('
+        'plate_objects["CopperSheet"], material=materials["Copper"], thickness=3.5e-05)'
+    ) in script
+
+
 def _generated_namespace(tmp_path, fit_enabled, monkeypatch, export_enabled=False, plot_enabled=False):
     monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "unknown")
     script = python_script_exporter.export_emerge_python_script(

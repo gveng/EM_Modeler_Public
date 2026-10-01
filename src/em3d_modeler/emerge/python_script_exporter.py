@@ -516,19 +516,34 @@ def export_emerge_python_script(
             "growth_rate": growth_rate,
             "max_size_m": max_size_m,
         })
-    boundary_assignments = [
-        {
-            "object": str(item.get("object", "")).strip(),
-            "type": str(item.get("type", "")).strip(),
-        }
-        for item in object_boundaries
+    object_materials = {
+        str(entry.get("object_name", "")).strip(): str(entry.get("material", "PEC"))
+        for entry in step_entries
+        if str(entry.get("object_name", "")).strip()
+    }
+    object_materials.update({
+        str(plate.get("object_name", "")).strip(): str(plate.get("material", "PEC"))
+        for plate in plates
+        if str(plate.get("object_name", "")).strip()
+    })
+    boundary_assignments = []
+    for item in object_boundaries:
+        if not isinstance(item, dict):
+            continue
+        object_name = str(item.get("object", "")).strip()
         if (
-            isinstance(item, dict)
-            and str(item.get("object", "")).strip() in valid_boundary_names
-            and str(item.get("object", "")).strip() not in port_surface_names
-            and str(item.get("object", "")).strip() != air_volume_name
-        )
-    ]
+            object_name not in valid_boundary_names
+            or object_name in port_surface_names
+            or object_name == air_volume_name
+        ):
+            continue
+        params = item.get("params", {})
+        boundary_assignments.append({
+            "object": object_name,
+            "type": str(item.get("type", "")).strip(),
+            "params": dict(params) if isinstance(params, dict) else {},
+            "material": object_materials.get(object_name, "PEC"),
+        })
     eff_pardiso_threads = max(1, int(pardiso_threads if parallel_enabled else 1))
     eff_acc_threads = max(1, int(acc_threads if parallel_enabled else 1))
     used_materials = sorted({
@@ -1399,6 +1414,20 @@ def export_emerge_python_script(
                 lines.append(f"simulationObj.mw.bc.AbsorbingBoundary({boundary_target})")
             elif boundary_type == "PML":
                 lines.append(f"print({_q(f'[warn] Object boundary PML on {object_name} requires volumetric PML geometry and was not exported')})")
+            elif boundary_type == "Surface Impedance":
+                lines.append(
+                    f"simulationObj.mw.bc.SurfaceImpedance({boundary_target}, material=materials[{_q(assignment['material'])}])"
+                )
+            elif boundary_type == "Thin Conductor":
+                thickness_mm = _to_float(
+                    assignment["params"].get("Thickness_mm", 0.035), 0.035
+                )
+                if not math.isfinite(thickness_mm) or thickness_mm <= 0.0:
+                    thickness_mm = 0.035
+                thickness_m = thickness_mm * coordinate_scale
+                lines.append(
+                    f"simulationObj.mw.bc.ThinConductor({boundary_target}, material=materials[{_q(assignment['material'])}], thickness={thickness_m:.12g})"
+                )
         lines.append("")
 
     if run_sweep:

@@ -13,6 +13,7 @@ from em3d_modeler.drawing.sketch_engine import SketchEngine
 from em3d_modeler.drawing.interactor_style import EMInteractorStyle
 from em3d_modeler.scene import boolean_ops, em_objects
 from em3d_modeler.ui.body_properties_widget import BodyPropertiesWidget
+from em3d_modeler.ui import main_window as main_window_module
 from em3d_modeler.ui import viewport_widget as viewport_module
 from em3d_modeler.ui.main_window import MainWindow, _add_toolbar_group, _icon
 from em3d_modeler.ui.viewport_widget import Viewport3DWidget
@@ -645,12 +646,14 @@ def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions(
         "_bool_dissolve", "_import_step",
         "_open_simulation_window", "_on_check_simulation", "_on_selection_mode_changed",
         "_sync_projection_action", "_open_measure_tool", "_open_project_parameters",
+        "_recompute_model",
     ):
         setattr(window, name, Mock())
 
     MainWindow._build_toolbar(window)
     window.show()
     window._main_toolbar.hide()
+    window._workspace_toolbar.hide()
     window._sketch_context_toolbar.show()
     application.processEvents()
 
@@ -666,7 +669,12 @@ def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions(
         return groups
 
     main_groups = groups_by_title(window._main_toolbar)
+    main_groups.update(groups_by_title(window._workspace_toolbar))
     sketch_groups = groups_by_title(window._sketch_context_toolbar)
+    assert max(
+        window._main_toolbar.sizeHint().width(),
+        window._workspace_toolbar.sizeHint().width(),
+    ) < 900
     main_3d_buttons = main_groups["3D"].findChildren(QToolButton)
     assert [button.defaultAction().text() for button in main_3d_buttons] == [
         "Box", "Cylinder", "Cone", "Sphere", "Open Region / PML", "Import STEP",
@@ -704,7 +712,7 @@ def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions(
             "Vertex Snap", "Circle", "3-Point Arc", "Center Arc",
         ],
         "Dimensions": ["Linear", "Angular", "Radius", "Diameter", "Aligned"],
-        "View": ["Fit All", "Fit Selection", "Isometric View", "Projection"],
+        "View": ["Fit All", "Fit Selection", "Isometric View", "Projection", ""],
         "Edit": ["Select", "Delete", "Exit Sketch"],
     }
     for title, group in sketch_groups.items():
@@ -739,16 +747,17 @@ def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions(
     assert dimensions_grid.rowCount() == 2
     assert dimensions_grid.columnCount() == 3
 
-    expected_zoom = ("Fit All", "Fit Selection", "Isometric View", "Projection")
+    expected_zoom = ("Fit All", "Fit Selection", "Isometric View", "Projection", "")
     main_zoom = [button.defaultAction() for button in main_groups["View"].findChildren(QToolButton)]
     sketch_zoom = [button.defaultAction() for button in sketch_groups["View"].findChildren(QToolButton)]
     assert tuple(action.text() for action in sketch_zoom) == expected_zoom
     assert sketch_zoom == main_zoom
     assert all(action.toolTip() for action in sketch_zoom)
-    assert sketch_zoom[-1].isCheckable()
-    assert not sketch_zoom[-1].isChecked()
-    assert not sketch_zoom[-1].icon().isNull()
-    sketch_zoom[-1].setChecked(True)
+    projection_action = sketch_zoom[3]
+    assert projection_action.isCheckable()
+    assert not projection_action.isChecked()
+    assert not projection_action.icon().isNull()
+    projection_action.setChecked(True)
     window._viewport.set_parallel_projection.assert_called_with(True)
     assert not window._sketch_context_actions["Extrude"].icon().isNull()
     assert not window._sketch_context_actions["Revolve"].icon().isNull()
@@ -776,6 +785,50 @@ def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions(
     sketch_zoom[1].trigger()
     window._viewport.fit_selection.assert_called_once()
     assert application is not None
+
+
+def test_materials_panel_cannot_collapse_at_narrow_window_width(monkeypatch):
+    application = QApplication.instance() or QApplication([])
+
+    class ViewportStub(QWidget):
+        def set_plane_triad_size(self, _size):
+            pass
+
+        def set_adaptive_grid(self, _enabled, _margin):
+            pass
+
+    def make_body_properties():
+        widget = QWidget()
+        widget.has_content = False
+        widget.content_changed = SimpleNamespace(connect=Mock())
+        return widget
+
+    monkeypatch.setattr(main_window_module, "ProjectTreeWidget", QWidget)
+    monkeypatch.setattr(main_window_module, "BodyPropertiesWidget", make_body_properties)
+    monkeypatch.setattr(main_window_module, "Viewport3DWidget", ViewportStub)
+    monkeypatch.setattr(main_window_module, "MaterialsWidget", QWidget)
+    monkeypatch.setattr(main_window_module, "InfoBarWidget", QWidget)
+
+    window = QMainWindow()
+    window._workspace_windows = {}
+    window._plot_subwindows = {}
+    window._plane_triad_size = 25.0
+    window._adaptive_grid_enabled = False
+    window._adaptive_grid_margin = 20.0
+    window._on_workspace_window_activated = Mock()
+    window._on_workspace_subwindow_closed = Mock()
+    window._update_left_splitter_layout = Mock()
+    window._schedule_left_splitter_layout = Mock()
+    MainWindow._build_ui(window)
+    window.resize(1280, 720)
+    window.show()
+    application.processEvents()
+
+    assert window._main_splitter.isCollapsible(2) is False
+    window._main_splitter.setSizes([360, 900, 0])
+    application.processEvents()
+    assert window._main_splitter.sizes()[2] >= 190
+    window.close()
 
 
 def test_circular_plate_uses_grid_snapped_radius_and_active_plane():

@@ -14,7 +14,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMainWindow, QToolButton
 
 import em3d_modeler.ui.main_window as main_window_module
-from em3d_modeler.ui.main_window import MainWindow
+from em3d_modeler.ui.main_window import MainWindow, _BooleanCutSetupDialog
 from em3d_modeler.drawing.sketch_engine import SketchEngine
 from em3d_modeler.scene.em_objects import (
     BoxObject, CylinderObject, ExtrudedObject, MeshObject, PlateObject, RevolvedObject,
@@ -329,6 +329,104 @@ def test_bulk_rename_conflict_warns_without_renaming_any_object(monkeypatch):
     assert (first.name, second.name) == ("Old_A", "Old_B")
     assert len(warnings) == 1
     window._project_tree.rename_object_references.assert_not_called()
+
+
+def test_boolean_cut_dialog_starts_with_first_base_and_moves_multiple_objects():
+    application = QApplication.instance() or QApplication([])
+    objects = [
+        SimpleNamespace(name=f"Body_{index}")
+        for index in range(1, 5)
+    ]
+    dialog = _BooleanCutSetupDialog(objects)
+
+    assert dialog.base_objects == [objects[0]]
+    assert dialog.tool_objects == objects[1:]
+    assert dialog.keep_tools is False
+    dialog.keep_tools_checkbox.setChecked(True)
+    assert dialog.keep_tools is True
+    dialog.keep_tools_checkbox.setChecked(False)
+
+    dialog.tools_list.item(0).setSelected(True)
+    dialog.tools_list.item(1).setSelected(True)
+    dialog.to_base_button.click()
+
+    assert dialog.base_objects == [objects[0], objects[1], objects[2]]
+    assert dialog.tool_objects == [objects[3]]
+
+    dialog.base_list.item(1).setSelected(True)
+    dialog.base_list.item(2).setSelected(True)
+    dialog.to_tools_button.click()
+
+    assert dialog.base_objects == [objects[0]]
+    assert dialog.tool_objects == [objects[3], objects[1], objects[2]]
+    dialog.close()
+    assert application is not None
+
+
+@pytest.mark.parametrize("keep_tools", [False, True])
+def test_boolean_cut_applies_each_tool_to_every_base(monkeypatch, keep_tools):
+    from em3d_modeler.scene import boolean_ops
+
+    bases = [
+        BoxObject("Base_1", 0, 0, 0, 2, 2, 2),
+        BoxObject("Base_2", 4, 0, 0, 6, 2, 2),
+    ]
+    tools = [BoxObject("Tool", 1, 0, 0, 3, 2, 2)]
+    scene = SceneManager(vtk.vtkRenderer())
+    for obj in bases + tools:
+        scene.add_object(obj)
+    scene.select(bases[0])
+    scene.select_add(bases[1])
+    scene.select_add(tools[0])
+    boolean_calls = []
+
+    class CutDialog:
+        def __init__(self, _objects, _parent):
+            self.base_objects = bases
+            self.tool_objects = tools
+            self.keep_tools = keep_tools
+
+        def exec_(self):
+            return QDialog.Accepted
+
+    monkeypatch.setattr(main_window_module, "_BooleanCutSetupDialog", CutDialog)
+    monkeypatch.setattr(
+        boolean_ops,
+        "boolean_many",
+        lambda op, objects, **_kwargs: (
+            boolean_calls.append((op, list(objects))) or vtk.vtkPolyData()
+        ),
+    )
+    window = SimpleNamespace(
+        _viewport=SimpleNamespace(
+            scene=scene,
+            object_selected=SimpleNamespace(emit=Mock()),
+            selection_changed=SimpleNamespace(emit=Mock()),
+            scene_changed=SimpleNamespace(emit=Mock()),
+            _render=Mock(),
+        ),
+        _boolean_decimation_enabled=False,
+        _is_plate_role_object=lambda _obj: False,
+        _serialize_object_snapshot=lambda _obj: {},
+        _refresh_materials=Mock(),
+        _info_bar=SimpleNamespace(set_info=Mock()),
+    )
+    window._serialize_object_snapshot = lambda obj: {
+        "name": obj.name,
+        "type": type(obj).__name__,
+        "params": obj.get_parameters(),
+    }
+
+    MainWindow._do_boolean(window, "cut", "Cut")
+
+    assert boolean_calls == [
+        ("cut", [bases[0], tools[0]]),
+        ("cut", [bases[1], tools[0]]),
+    ]
+    results = [obj for obj in scene.objects if getattr(obj, "boolean_op", None) == "cut"]
+    assert len(results) == 2
+    assert all(result.source_objects[1] is tools[0] for result in results)
+    assert (tools[0] in scene.objects) is keep_tools
 
 
 def test_parametric_recompute_recenters_generated_air_and_pml_regions():
@@ -1414,10 +1512,12 @@ def test_sketch_start_and_finish_switch_toolbar_visibility():
 
     viewport = _Viewport()
     main_toolbar = _Toolbar()
+    workspace_toolbar = _Toolbar()
     sketch_toolbar = _Toolbar(visible=False)
     window = SimpleNamespace(
         _viewport=viewport,
         _main_toolbar=main_toolbar,
+        _workspace_toolbar=workspace_toolbar,
         _sketch_context_toolbar=sketch_toolbar,
     )
 
@@ -1426,11 +1526,13 @@ def test_sketch_start_and_finish_switch_toolbar_visibility():
     assert viewport.start_args == ((0, 0, 1), (0, 0, 1))
     assert viewport._sketch_toolbar.visible is False
     assert main_toolbar.visible is False
+    assert workspace_toolbar.visible is False
     assert sketch_toolbar.visible is True
 
     MainWindow._on_viewport_sketch_finished(window)
 
     assert main_toolbar.visible is True
+    assert workspace_toolbar.visible is True
     assert sketch_toolbar.visible is False
 
 
@@ -1458,6 +1560,7 @@ def test_sketch_tree_edit_restores_saved_definition():
         _info_bar=SimpleNamespace(set_info=Mock()),
         _sketch_context_toolbar=SimpleNamespace(setVisible=Mock()),
         _main_toolbar=SimpleNamespace(setVisible=Mock()),
+        _workspace_toolbar=SimpleNamespace(setVisible=Mock()),
     )
 
     MainWindow._edit_sketch_definition(window, feature)

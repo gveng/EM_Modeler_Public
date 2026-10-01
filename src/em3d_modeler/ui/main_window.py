@@ -224,7 +224,8 @@ from PySide6.QtWidgets import (
     QVBoxLayout, QStackedLayout, QFormLayout, QTextBrowser, QPlainTextEdit,
     QPushButton, QHBoxLayout, QGroupBox, QCheckBox,
     QProgressDialog, QApplication, QTabWidget, QDialogButtonBox, QGridLayout, QToolButton, QToolBar,
-    QRadioButton, QTabBar, QMdiArea, QMdiSubWindow,
+    QRadioButton, QTabBar, QMdiArea, QMdiSubWindow, QListWidget, QListWidgetItem,
+    QAbstractItemView, QStyle,
 )
 from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize, QUrl, QTimer, QEventLoop, Signal
 from PySide6.QtGui  import QIcon, QKeySequence, QAction, QDesktopServices, QPainter, QPen, QColor, QBrush
@@ -232,6 +233,103 @@ from PySide6.QtGui  import QIcon, QKeySequence, QAction, QDesktopServices, QPain
 
 class _SimulationPreparationCancelled(Exception):
     pass
+
+
+class _BooleanCutSetupDialog(QDialog):
+    def __init__(self, objects: list, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Configure Boolean Cut")
+        self.resize(620, 360)
+
+        layout = QVBoxLayout(self)
+        lists_layout = QHBoxLayout()
+
+        base_layout = QVBoxLayout()
+        base_layout.addWidget(QLabel("Objects to cut (Base)", self))
+        self.base_list = QListWidget(self)
+        self.base_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        base_layout.addWidget(self.base_list)
+        lists_layout.addLayout(base_layout, 1)
+
+        move_layout = QVBoxLayout()
+        move_layout.addStretch(1)
+        self.to_tools_button = QToolButton(self)
+        self.to_tools_button.setIcon(self.style().standardIcon(QStyle.SP_ArrowRight))
+        self.to_tools_button.setToolTip("Move selected base objects to cutting tools")
+        self.to_tools_button.setAccessibleName("Move selected objects to tools")
+        self.to_tools_button.clicked.connect(
+            lambda: self._move_selected(self.base_list, self.tools_list)
+        )
+        move_layout.addWidget(self.to_tools_button)
+        self.to_base_button = QToolButton(self)
+        self.to_base_button.setIcon(self.style().standardIcon(QStyle.SP_ArrowLeft))
+        self.to_base_button.setToolTip("Move selected tools to objects being cut")
+        self.to_base_button.setAccessibleName("Move selected tools to base")
+        self.to_base_button.clicked.connect(
+            lambda: self._move_selected(self.tools_list, self.base_list)
+        )
+        move_layout.addWidget(self.to_base_button)
+        move_layout.addStretch(1)
+        lists_layout.addLayout(move_layout)
+
+        tools_layout = QVBoxLayout()
+        tools_layout.addWidget(QLabel("Cutting tools (Tools)", self))
+        self.tools_list = QListWidget(self)
+        self.tools_list.setSelectionMode(QAbstractItemView.ExtendedSelection)
+        tools_layout.addWidget(self.tools_list)
+        lists_layout.addLayout(tools_layout, 1)
+        layout.addLayout(lists_layout)
+
+        for index, obj in enumerate(objects):
+            item = QListWidgetItem(str(obj.name))
+            item.setData(Qt.UserRole, obj)
+            (self.base_list if index == 0 else self.tools_list).addItem(item)
+
+        self.keep_tools_checkbox = QCheckBox("Keep cutting tools in project", self)
+        layout.addWidget(self.keep_tools_checkbox)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    @staticmethod
+    def _move_selected(source: QListWidget, destination: QListWidget) -> None:
+        rows = sorted({source.row(item) for item in source.selectedItems()}, reverse=True)
+        moved_items = []
+        for row in rows:
+            moved_items.append(source.takeItem(row))
+        for item in reversed(moved_items):
+            destination.addItem(item)
+
+    @staticmethod
+    def _objects_in(widget: QListWidget) -> list:
+        return [
+            widget.item(index).data(Qt.UserRole)
+            for index in range(widget.count())
+        ]
+
+    @property
+    def base_objects(self) -> list:
+        return self._objects_in(self.base_list)
+
+    @property
+    def tool_objects(self) -> list:
+        return self._objects_in(self.tools_list)
+
+    @property
+    def keep_tools(self) -> bool:
+        return self.keep_tools_checkbox.isChecked()
+
+    def _accept(self) -> None:
+        if not self.base_objects or not self.tool_objects:
+            QMessageBox.warning(
+                self,
+                "Boolean Cut",
+                "Assign at least one object to cut and one cutting tool.",
+            )
+            return
+        self.accept()
 
 
 def _boolean_step_export_issues(bundle: dict) -> list[str]:
@@ -609,9 +707,11 @@ class MainWindow(QMainWindow):
 
         # ������ main horizontal splitter ������������������������������������������������������������������������������������������������������������������������������
         main_splitter = QSplitter(Qt.Horizontal)
+        self._main_splitter = main_splitter
         main_splitter.addWidget(left_splitter)
         main_splitter.addWidget(centre_widget)
         main_splitter.addWidget(self._materials)
+        main_splitter.setCollapsible(2, False)
         main_splitter.setSizes([230, 900, 210])
 
         self.setCentralWidget(main_splitter)
@@ -771,6 +871,7 @@ class MainWindow(QMainWindow):
             )
         menu.addAction("Tile Windows", self._tile_plot_windows)
         menu.addAction("Cascade Windows", self._cascade_plot_windows)
+        menu.addAction("Restore Workspace Defaults", self._restore_workspace_defaults)
         menu.addSeparator()
         menu.addAction("Close All Charts", self._close_all_plot_windows)
 
@@ -822,6 +923,35 @@ class MainWindow(QMainWindow):
 
     def _cascade_plot_windows(self) -> None:
         self._plot_mdi_area.cascadeSubWindows()
+
+    def _restore_workspace_defaults(self) -> None:
+        area = getattr(self, "_workspace_area", None)
+        if area is None:
+            return
+
+        model_window = getattr(self, "_model_window", None)
+        if model_window is not None:
+            model_window.showNormal()
+            model_window.resize(700, 520)
+            model_window.move(24, 24)
+
+        simulation_window = getattr(self, "_sim_subwindow", None)
+        if simulation_window is not None:
+            simulation_window.showNormal()
+            simulation_window.resize(680, 520)
+            simulation_window.move(72, 72)
+
+        plot_windows = list(getattr(self, "_plot_subwindows", {}).values())
+        for index, window in enumerate(plot_windows):
+            window.showNormal()
+            offset = 36 * (index % 6 + 1)
+            width = min(760, max(420, int(area.width() * 0.72)))
+            height = min(560, max(320, int(area.height() * 0.72)))
+            window.resize(width, height)
+            window.move(24 + offset, 24 + offset)
+
+        if model_window is not None:
+            self._show_workspace_window("Model")
 
     def _show_chart(self, key: str, plot_data: dict, *, progressive: bool = False) -> None:
         view = self._plot_views.get(key)
@@ -1120,6 +1250,14 @@ class MainWindow(QMainWindow):
             [act_scale, act_move_plane, act_pattern, act_copy_by_vertices, act_dissolve_boolean],
             columns=3,
         )
+
+        self.addToolBarBreak(Qt.TopToolBarArea)
+        tb = self.addToolBar("Workspace")
+        self._workspace_toolbar = tb
+        tb.setObjectName("workspace_toolbar")
+        tb.setMovable(False)
+        tb.setIconSize(QSize(22, 22))
+        tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
 
         act_play = QAction(_icon("media-playback-start"), "Play", self)
         act_play.setToolTip("Open simulation panel (EMERGE Python script + verbose output)")
@@ -2577,35 +2715,23 @@ class MainWindow(QMainWindow):
             )
             return
 
-        base = sel[0]
-        tools = sel[1:]
+        if op == "cut":
+            setup = _BooleanCutSetupDialog(sel, self)
+            if setup.exec_() != QDialog.Accepted:
+                self._info_bar.set_info(f"Boolean {label} cancelled.")
+                return
+            bases = setup.base_objects
+            tools = setup.tool_objects
+            keep_tools = setup.keep_tools
+        else:
+            bases = [sel[0]]
+            tools = sel[1:]
+        base = bases[0]
         names = ", ".join(o.name for o in tools[:8])
         if len(tools) > 8:
             names += f", ... (+{len(tools)-8} more)"
 
-        keep_tools = False
-        if op == "cut":
-            confirm = QMessageBox(self)
-            confirm.setIcon(QMessageBox.Question)
-            confirm.setWindowTitle(f"Confirm Boolean {label}")
-            confirm.setText(
-                f"Perform Boolean {label}?\n\n"
-                f"Base : {base.name}\n"
-                f"Tools: {len(tools)} object(s)\n"
-                f"{names}\n\n"
-                "Choose whether the tool objects remain in the project."
-            )
-            keep_button = confirm.addButton("Keep Tools", QMessageBox.ActionRole)
-            remove_button = confirm.addButton("Remove Tools", QMessageBox.AcceptRole)
-            confirm.addButton(QMessageBox.Cancel)
-            confirm.setDefaultButton(remove_button)
-            confirm.exec_()
-            clicked = confirm.clickedButton()
-            if clicked not in {keep_button, remove_button}:
-                self._info_bar.set_info(f"Boolean {label} cancelled.")
-                return
-            keep_tools = clicked is keep_button
-        else:
+        if op != "cut":
             reply = QMessageBox.question(
                 self,
                 f"Confirm Boolean {label}",
@@ -2637,49 +2763,58 @@ class MainWindow(QMainWindow):
                 return
             mesh_reduction = int(reduction_choice[:-1]) / 100.0
 
-        current_poly = None
+        result_polys = []
         try:
-            if op == "fuse":
-                current_poly = fuse_many(sel, target_reduction=mesh_reduction)
-            elif mesh_reduction > 0.0:
-                current_poly = boolean_many(op, sel, target_reduction=mesh_reduction)
-            else:
-                current_poly = boolean_many(op, sel)
+            for current_base in bases:
+                operands = [current_base] + tools
+                if op == "fuse":
+                    current_poly = fuse_many(operands, target_reduction=mesh_reduction)
+                elif mesh_reduction > 0.0:
+                    current_poly = boolean_many(op, operands, target_reduction=mesh_reduction)
+                else:
+                    current_poly = boolean_many(op, operands)
+                result_polys.append(current_poly)
         except Exception as exc:
             QMessageBox.critical(self, f"Boolean {label} failed", str(exc))
             self._info_bar.set_info(f"Boolean {label} failed: {exc}")
             return
 
-        result = MeshObject(
-            name=f"{label}_{base.name}",
-            polydata=current_poly,
-            material=base.material,
-            plate_role=(op == "cut" and self._is_plate_role_object(base)),
-            boolean_op=op,
-            boolean_source_names=[o.name for o in ([base] + tools)],
-        )
-        result.source_objects = list([base] + tools)
-        result.boolean_mesh_reduction = mesh_reduction
-        result.boolean_sources_data = [
-            self._serialize_object_snapshot(o)
-            for o in ([base] + tools)
-        ]
-        result.refresh_appearance()
-
         scene = self._viewport.scene
-        scene.add_object(result)
-        objects_to_remove = [base] + ([] if keep_tools else tools)
+        results = []
+        for current_base, current_poly in zip(bases, result_polys):
+            sources = [current_base] + tools
+            result = MeshObject(
+                name=f"{label}_{current_base.name}",
+                polydata=current_poly,
+                material=current_base.material,
+                plate_role=(op == "cut" and self._is_plate_role_object(current_base)),
+                boolean_op=op,
+                boolean_source_names=[obj.name for obj in sources],
+            )
+            result.source_objects = list(sources)
+            result.boolean_mesh_reduction = mesh_reduction
+            result.boolean_sources_data = [
+                self._serialize_object_snapshot(obj) for obj in sources
+            ]
+            result.refresh_appearance()
+            scene.add_object(result)
+            results.append(result)
+
+        objects_to_remove = list(bases) + ([] if keep_tools else tools)
         for obj in objects_to_remove:
             scene.remove_object(obj)
-        scene.select(result)
+        scene.deselect_all()
+        for result in results:
+            scene.select_add(result)
 
-        self._viewport.object_selected.emit(result)
-        self._viewport.selection_changed.emit([result])
+        self._viewport.object_selected.emit(results[-1])
+        self._viewport.selection_changed.emit(results)
         self._viewport.scene_changed.emit()
         self._refresh_materials()
         self._viewport._render()
         self._info_bar.set_info(
-            f"Boolean {label}: created {result.name} from {len(sel)} objects"
+            f"Boolean {label}: created {len(results)} result(s) from "
+            f"{len(bases)} base object(s) and {len(tools)} tool(s)"
             + ("; tools retained" if keep_tools else "")
         )
 
@@ -6313,6 +6448,7 @@ class MainWindow(QMainWindow):
             self._viewport.start_sketch(tuple(origin), tuple(normal), sketch_definition)
         self._viewport._sketch_toolbar.hide()
         self._main_toolbar.setVisible(False)
+        self._workspace_toolbar.setVisible(False)
         self._sketch_context_toolbar.setVisible(True)
 
     def _edit_sketch_definition(self, obj) -> None:
@@ -6349,6 +6485,7 @@ class MainWindow(QMainWindow):
     def _on_viewport_sketch_finished(self) -> None:
         self._sketch_context_toolbar.setVisible(False)
         self._main_toolbar.setVisible(True)
+        self._workspace_toolbar.setVisible(True)
         for obj, was_visible in getattr(self, "_sketch_edit_visibility", []):
             obj.set_visible(was_visible)
         self._sketch_edit_visibility = []

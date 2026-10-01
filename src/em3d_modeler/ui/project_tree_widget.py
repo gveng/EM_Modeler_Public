@@ -47,7 +47,7 @@ from PySide6.QtWidgets import (
     QTableWidget, QTableWidgetItem,
     QStyle,
 )
-from PySide6.QtCore import Qt, Signal, QLocale
+from PySide6.QtCore import Qt, Signal, QLocale, QSize
 from PySide6.QtGui import QColor, QBrush, QAction, QIcon
 from .formula_widgets import FormulaDoubleSpinBox as QDoubleSpinBox
 from ..scene.param_expr import evaluate_expression
@@ -65,7 +65,10 @@ _PORT_TYPE_DEFAULT_PARAMS = {
     "PlaneWave": {"Theta_Deg": 0.0, "Phi_Deg": 0.0, "Polarization": "Ex"},
 }
 
-_OBJECT_BC_TYPES = ["PML", "PEC", "PMC", "Open", "Periodic", "Radiation"]
+_OBJECT_BC_TYPES = [
+    "PML", "PEC", "PMC", "Open", "Periodic", "Radiation",
+    "Surface Impedance", "Thin Conductor",
+]
 _OBJECT_BC_DEFAULT_PARAMS = {
     "PML": {"Layers": 8},
     "PEC": {},
@@ -73,6 +76,8 @@ _OBJECT_BC_DEFAULT_PARAMS = {
     "Open": {},
     "Periodic": {"PairAxis": "X"},
     "Radiation": {"Order": 1},
+    "Surface Impedance": {},
+    "Thin Conductor": {"Thickness_mm": 0.035},
 }
 
 _LOG_VERBOSITY_LEVELS = ["Trace", "Debug", "Info", "Warning", "Error"]
@@ -623,6 +628,8 @@ class ProjectTreeWidget(QWidget):
     def _make_section(self, parent: QTreeWidgetItem,
                       label: str) -> QTreeWidgetItem:
         item = QTreeWidgetItem([label, ""])
+        if parent.parent() is None:
+            item.setSizeHint(0, QSize(0, max(24, self._tree.fontMetrics().height() + 10)))
         font = item.font(0)
         font.setBold(True)
         item.setFont(0, font)

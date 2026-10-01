@@ -9,8 +9,19 @@ from PySide6.QtWidgets import QWidget
 from em3d_modeler.ui import main_window as main_window_module
 from em3d_modeler.ui.main_window import MainWindow
 from em3d_modeler.ui.body_properties_widget import BodyPropertiesWidget
-from em3d_modeler.ui.project_tree_widget import ProjectTreeWidget, _parametric_range_values
+from em3d_modeler.ui.project_tree_widget import (
+    ProjectTreeWidget,
+    _OBJECT_BC_DEFAULT_PARAMS,
+    _OBJECT_BC_TYPES,
+    _parametric_range_values,
+)
 from em3d_modeler.ui.parameters_dialog import ParametersDialog
+
+
+def test_object_boundary_choices_include_finite_conductor_models():
+    assert "Surface Impedance" in _OBJECT_BC_TYPES
+    assert "Thin Conductor" in _OBJECT_BC_TYPES
+    assert _OBJECT_BC_DEFAULT_PARAMS["Thin Conductor"]["Thickness_mm"] == 0.035
 
 
 def test_open_project_uses_configured_workspace_directory(monkeypatch, tmp_path):
@@ -208,6 +219,24 @@ def test_project_tree_fits_value_column_to_left_panel():
     assert header.sectionResizeMode(1) == QHeaderView.Interactive
     assert header.sectionSize(1) == 90
     assert app is not None
+
+
+def test_project_tree_adds_spacing_only_between_main_sections():
+    app = QApplication.instance() or QApplication([])
+    tree = ProjectTreeWidget()
+    root = tree._tree.topLevelItem(0)
+
+    section_heights = [
+        root.child(index).sizeHint(0).height()
+        for index in range(root.childCount())
+    ]
+    nested_height = tree._b_node.child(0).sizeHint(0).height()
+
+    assert len(section_heights) == 5
+    assert min(section_heights) >= max(24, tree._tree.fontMetrics().height() + 10)
+    assert nested_height == -1
+    assert app is not None
+    tree.close()
 
 
 def test_project_tree_migrates_legacy_progressive_setting_per_simulation():

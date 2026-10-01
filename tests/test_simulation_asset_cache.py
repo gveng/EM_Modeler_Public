@@ -740,6 +740,7 @@ def test_window_menu_lists_workspace_windows_and_close_chart_action():
     window._close_all_plot_windows = Mock()
     window._tile_plot_windows = Mock()
     window._cascade_plot_windows = Mock()
+    window._restore_workspace_defaults = Mock()
 
     main_window.MainWindow._rebuild_window_menu(window)
 
@@ -749,11 +750,48 @@ def test_window_menu_lists_workspace_windows_and_close_chart_action():
         "",
         "Tile Windows",
         "Cascade Windows",
+        "Restore Workspace Defaults",
         "",
         "Close All Charts",
     ]
+    actions = {action.text(): action for action in window._window_menu.actions()}
+    actions["Restore Workspace Defaults"].trigger()
+    window._restore_workspace_defaults.assert_called_once_with()
     assert app is not None
     window.close()
+
+
+def test_restore_workspace_defaults_resets_mdi_window_sizes_and_positions():
+    app = QApplication.instance() or QApplication([])
+    host = QMainWindow()
+    area = _workspace_area_stub(host)
+    area.resize(900, 700)
+
+    simulation_window = main_window._PlotSubWindow(area)
+    simulation_window.setWindowTitle("Simulation")
+    simulation_window.setWidget(QWidget())
+    area.addSubWindow(simulation_window)
+    host._sim_subwindow = simulation_window
+    host._workspace_windows["Simulation"] = simulation_window
+
+    plot_window = main_window._PlotSubWindow(area)
+    plot_window.setWindowTitle("S11")
+    plot_window.setWidget(QWidget())
+    area.addSubWindow(plot_window)
+    host._plot_subwindows = {"Sweep::S11": plot_window}
+    host._show_workspace_window = Mock()
+
+    for window in (host._model_window, simulation_window, plot_window):
+        window.setGeometry(150, 140, 360, 280)
+
+    main_window.MainWindow._restore_workspace_defaults(host)
+
+    assert host._model_window.geometry().getRect() == (24, 24, 700, 520)
+    assert simulation_window.geometry().getRect() == (72, 72, 680, 520)
+    assert plot_window.geometry().getRect() == (60, 60, 648, 504)
+    host._show_workspace_window.assert_called_once_with("Model")
+    assert app is not None
+    host.close()
 
 
 def test_closing_new_project_disposes_simulation_panel():
@@ -810,6 +848,7 @@ def test_window_menu_exposes_chart_arrangement_commands():
     window._plot_views = {"Sweep::S11": plot_window.widget()}
     window._tile_plot_windows = Mock()
     window._cascade_plot_windows = Mock()
+    window._restore_workspace_defaults = Mock()
     window._show_plot_window = lambda key: main_window.MainWindow._show_plot_window(window, key)
     window._close_all_plot_windows = Mock()
     window.setCentralWidget(area)
