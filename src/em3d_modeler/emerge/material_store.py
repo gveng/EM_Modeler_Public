@@ -19,7 +19,7 @@
 Provides three sources:
 - Builtin library (from emsutil.lib, if available)
 - Project-local custom database (saved in .em3d file)
-- Optional external global database (JSON path persisted in project)
+- Optional external global database (JSON path persisted in application settings)
 """
 from __future__ import annotations
 
@@ -144,19 +144,34 @@ class MaterialStore:
         return [r.to_dict() for r in sorted(self._project.values(), key=lambda x: x.name.lower())]
 
     def set_global_db_path(self, path: Optional[str], create_if_missing: bool = True) -> None:
-        self.global_db_path = path or None
-        self._global = {}
-        if not self.global_db_path:
+        selected_path = path or None
+        if not selected_path:
+            self.global_db_path = None
+            self._global = {}
             return
 
-        db_path = Path(self.global_db_path)
+        db_path = Path(selected_path)
+        previous_path = self.global_db_path
+        previous_records = self._global
+        self.global_db_path = str(db_path)
         if not db_path.exists():
             if create_if_missing:
-                self._write_global_db([])
+                try:
+                    self._write_global_db([])
+                except Exception:
+                    self.global_db_path = previous_path
+                    self._global = previous_records
+                    raise
             else:
+                self._global = {}
                 return
 
-        self._read_global_db()
+        try:
+            self._read_global_db()
+        except Exception:
+            self.global_db_path = previous_path
+            self._global = previous_records
+            raise
 
     def save_global_db(self) -> None:
         if not self.global_db_path:
@@ -190,6 +205,31 @@ class MaterialStore:
         self._project[rec.name] = rec
         return rec
 
+    def add_global_material(
+        self,
+        name: str,
+        family: str = "Common",
+        er: float = 1.0,
+        ur: float = 1.0,
+        tan_d: float = 0.0,
+        sigma: float = 0.0,
+        color: str = DEFAULT_COLOR,
+        opacity: float = 0.85,
+    ) -> MaterialRecord:
+        rec = MaterialRecord(
+            uid=str(uuid.uuid4()),
+            name=name.strip(),
+            family=family.strip() or "Common",
+            er=float(er),
+            ur=float(ur),
+            tan_d=float(tan_d),
+            sigma=float(sigma),
+            color=color or DEFAULT_COLOR,
+            opacity=float(opacity),
+            source="global",
+        )
+        return self.upsert_global_record(rec)
+
     def upsert_project_record(self, record: MaterialRecord) -> MaterialRecord:
         rec = MaterialRecord(
             uid=str(record.uid or uuid.uuid4()),
@@ -204,6 +244,36 @@ class MaterialStore:
             source="project",
         )
         self._project[rec.name] = rec
+        return rec
+
+    def upsert_global_record(self, record: MaterialRecord) -> MaterialRecord:
+        if not self.global_db_path:
+            raise ValueError("No global material database is configured")
+        rec = MaterialRecord(
+            uid=str(record.uid or uuid.uuid4()),
+            name=str(record.name).strip(),
+            family=str(record.family or "Common").strip() or "Common",
+            er=float(record.er),
+            ur=float(record.ur),
+            tan_d=float(record.tan_d),
+            sigma=float(record.sigma),
+            color=str(record.color or DEFAULT_COLOR),
+            opacity=float(record.opacity),
+            source="global",
+            priority=int(record.priority),
+        )
+        previous_records = self._global
+        self._global = {
+            name: existing
+            for name, existing in self._global.items()
+            if existing.uid != rec.uid and name != rec.name
+        }
+        self._global[rec.name] = rec
+        try:
+            self.save_global_db()
+        except Exception:
+            self._global = previous_records
+            raise
         return rec
 
     def delete_project_record(self, name: str) -> bool:
@@ -264,13 +334,14 @@ class MaterialStore:
         path = Path(self.global_db_path)
         raw = json.loads(path.read_text(encoding="utf-8")) if path.exists() else {}
         records = raw.get("materials", []) if isinstance(raw, dict) else []
-        self._global = {}
+        loaded_records: Dict[str, MaterialRecord] = {}
         for item in records:
             if not isinstance(item, dict):
                 continue
             rec = MaterialRecord.from_dict(item, source_fallback="global")
             rec.source = "global"
-            self._global[rec.name] = rec
+            loaded_records[rec.name] = rec
+        self._global = loaded_records
 
     def _write_global_db(self, materials: List[Dict[str, Any]]) -> None:
         assert self.global_db_path

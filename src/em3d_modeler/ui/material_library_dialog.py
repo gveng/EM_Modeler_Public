@@ -235,7 +235,7 @@ class MaterialLibraryDialog(QDialog):
         self._new_btn.clicked.connect(self._new_material)
         actions.addWidget(self._new_btn)
 
-        self._edit_btn = QPushButton("Edit Project Material...")
+        self._edit_btn = QPushButton("Edit Material...")
         self._edit_btn.clicked.connect(self._edit_material)
         actions.addWidget(self._edit_btn)
 
@@ -339,9 +339,14 @@ class MaterialLibraryDialog(QDialog):
             self._color_preview.setStyleSheet(f"background:{rec.color};")
             self._color_value.setText(rec.color)
 
+        editable = rec is not None and rec.source in {"project", "global"}
         project_custom = rec is not None and rec.source == "project"
         global_selected = rec is not None and self._source_combo.currentIndex() == 1
-        self._edit_btn.setEnabled(project_custom)
+        self._edit_btn.setText(
+            "Edit Global Material..." if rec is not None and rec.source == "global"
+            else "Edit Project Material..."
+        )
+        self._edit_btn.setEnabled(editable)
         self._delete_btn.setEnabled(project_custom)
         self._append_btn.setEnabled(global_selected)
 
@@ -351,20 +356,39 @@ class MaterialLibraryDialog(QDialog):
         self._refresh_list()
 
     def _new_material(self) -> None:
+        if not self._store.global_db_path:
+            QMessageBox.warning(
+                self,
+                "Global Material Database",
+                "Select a Global DB before creating a material.",
+            )
+            return
         dlg = _MaterialEditorDialog(self)
         if dlg.exec_() != QDialog.Accepted or dlg.result_record is None:
             return
-        self._store.upsert_project_record(dlg.result_record)
+        try:
+            self._store.upsert_global_record(dlg.result_record)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Global Material Database", f"Unable to save material: {exc}")
+            return
+        self._source_combo.setCurrentIndex(1)
         self._mark_changed()
 
     def _edit_material(self) -> None:
         rec = self._current_record()
-        if rec is None or rec.source != "project":
+        if rec is None or rec.source not in {"project", "global"}:
             return
         dlg = _MaterialEditorDialog(self, rec)
         if dlg.exec_() != QDialog.Accepted or dlg.result_record is None:
             return
-        self._store.upsert_project_record(dlg.result_record)
+        try:
+            if rec.source == "global":
+                self._store.upsert_global_record(dlg.result_record)
+            else:
+                self._store.upsert_project_record(dlg.result_record)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Material Library", f"Unable to save material: {exc}")
+            return
         self._mark_changed()
 
     def _delete_material(self) -> None:
@@ -393,7 +417,7 @@ class MaterialLibraryDialog(QDialog):
 
     def _set_global_db(self) -> None:
         suggested = self._store.global_db_path or str(Path.home() / "em3d_materials_global.json")
-        path, _ = QFileDialog.getSaveFileName(
+        path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Global Material Database",
             suggested,
@@ -401,10 +425,26 @@ class MaterialLibraryDialog(QDialog):
         )
         if not path:
             return
-        self._store.set_global_db_path(path, create_if_missing=True)
-        self._store.save_global_db()
+        try:
+            self._store.set_global_db_path(path, create_if_missing=False)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Global Material Database", f"Unable to load {path}: {exc}")
+            return
         self._mark_changed()
 
     def _reload_global_db(self) -> None:
-        self._store.set_global_db_path(self._store.global_db_path, create_if_missing=False)
+        suggested = self._store.global_db_path or str(Path.home() / "em3d_materials_global.json")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Global Material Database",
+            suggested,
+            "JSON (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            self._store.set_global_db_path(path, create_if_missing=False)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Global Material Database", f"Unable to load {path}: {exc}")
+            return
         self._mark_changed()

@@ -359,7 +359,8 @@ def _boolean_step_export_issues(bundle: dict) -> list[str]:
     return issues
 
 def _add_toolbar_group(
-    toolbar, title: str, actions: list, columns: int = 3, *, compact: bool = False
+    toolbar, title: str, actions: list, columns: int = 3, *, compact: bool = False,
+    dense: bool = False,
 ) -> None:
     group = QWidget(toolbar)
     group.setProperty("toolbarGroupTitle", title)
@@ -371,7 +372,8 @@ def _add_toolbar_group(
         grid.setVerticalSpacing(2)
     else:
         layout = QVBoxLayout(group)
-        layout.setContentsMargins(10, 0, 10, 0)
+        horizontal_margin = 1 if dense else 10
+        layout.setContentsMargins(horizontal_margin, 0, horizontal_margin, 0)
         layout.setSpacing(2)
         caption = QLabel(title, group)
         caption.setAlignment(Qt.AlignHCenter | Qt.AlignTop)
@@ -379,7 +381,7 @@ def _add_toolbar_group(
         layout.addWidget(caption)
         grid = QGridLayout()
         grid.setContentsMargins(0, 0, 0, 0)
-        grid.setHorizontalSpacing(4)
+        grid.setHorizontalSpacing(2 if dense else 4)
         grid.setVerticalSpacing(2)
     columns = max(1, columns)
     for index, action in enumerate(actions):
@@ -392,6 +394,8 @@ def _add_toolbar_group(
                 button.setFixedSize(24, 24)
                 button.setAccessibleName(action.text())
                 button.setToolTip(action.toolTip() or action.text())
+            elif dense:
+                button.setFixedSize(20, 20)
             else:
                 button.setFixedSize(30, 27)
             widget = button
@@ -402,12 +406,24 @@ def _add_toolbar_group(
         group.setFixedSize(group.sizeHint())
     else:
         layout.addLayout(grid)
-        margins = layout.contentsMargins()
-        group.setFixedWidth(max(122, grid.sizeHint().width() + margins.left() + margins.right()))
+        if dense:
+            group.setFixedWidth(
+                max(caption.sizeHint().width(), grid.sizeHint().width())
+                + horizontal_margin * 2
+            )
+        else:
+            margins = layout.contentsMargins()
+            group.setFixedWidth(max(122, grid.sizeHint().width() + margins.left() + margins.right()))
     group_action = toolbar.addWidget(group)
     alignment = Qt.AlignVCenter if compact else Qt.AlignTop
     toolbar.layout().setAlignment(toolbar.widgetForAction(group_action), alignment)
-    toolbar.addSeparator()
+    if dense:
+        separator_action = toolbar.addSeparator()
+        separator_widget = toolbar.widgetForAction(separator_action)
+        if separator_widget is not None:
+            separator_widget.setFixedWidth(toolbar.iconSize().width())
+    else:
+        toolbar.addSeparator()
 
 
 class _PlotMdiArea(QMdiArea):
@@ -601,6 +617,7 @@ class MainWindow(QMainWindow):
         self._sim_status_total_jobs = 0
         self._boolean_decimation_enabled = False
         self._workspace_path = ""
+        self._global_material_db_path = ""
         self._sim_cached_script = ""
         self._sim_cached_script_bundle: dict = {"master": "", "scripts": []}
         self._workspace_windows: dict[str, _PlotSubWindow] = {}
@@ -1152,7 +1169,7 @@ class MainWindow(QMainWindow):
         self._main_toolbar = tb
         tb.setObjectName("main_toolbar")
         tb.setMovable(False)
-        tb.setIconSize(QSize(22, 22))
+        tb.setIconSize(QSize(18, 18))
         tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
 
         def add_group(
@@ -1163,7 +1180,14 @@ class MainWindow(QMainWindow):
             compact: bool = False,
         ) -> None:
             target_toolbar = toolbar or tb
-            _add_toolbar_group(target_toolbar, title, actions, columns, compact=compact)
+            _add_toolbar_group(
+                target_toolbar,
+                title,
+                actions,
+                columns,
+                compact=compact,
+                dense=not compact,
+            )
 
         # ������ Primitive shapes ������������������������������������������������������������������������������������������������������������������������
         _DRAW_ICONS = [
@@ -1219,9 +1243,9 @@ class MainWindow(QMainWindow):
         act_common.setToolTip("Boolean Common (Intersection): keep overlapping volume")
         act_common.triggered.connect(self._bool_common)
         add_group("Boolean", [act_cut, act_fuse, act_common])
-        self._fuse_label = QLabel("Fuse: 0 selected")
+        self._fuse_label = QLabel("Fuse: 0")
         self._fuse_label.setToolTip("Number of objects currently selected for Boolean Fuse")
-        self._fuse_label.setStyleSheet("font-size: 10px; color: #666; padding: 0 6px;")
+        self._fuse_label.setStyleSheet("font-size: 10px; color: #666; padding: 0 2px;")
         tb.addWidget(self._fuse_label)
 
         act_scale = QAction(_icon("image-scaling"), "Scale", self)
@@ -1251,13 +1275,8 @@ class MainWindow(QMainWindow):
             columns=3,
         )
 
-        self.addToolBarBreak(Qt.TopToolBarArea)
-        tb = self.addToolBar("Workspace")
+        tb = self._main_toolbar
         self._workspace_toolbar = tb
-        tb.setObjectName("workspace_toolbar")
-        tb.setMovable(False)
-        tb.setIconSize(QSize(22, 22))
-        tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
 
         act_play = QAction(_icon("media-playback-start"), "Play", self)
         act_play.setToolTip("Open simulation panel (EMERGE Python script + verbose output)")
@@ -1294,12 +1313,13 @@ class MainWindow(QMainWindow):
         add_group(
             "View",
             [act_fit_all, act_fit_selection, act_isometric, act_projection, act_recompute_model],
-            columns=5,
+            columns=3,
         )
 
         # ������ Selection mode ���������������������������������������������������������������������������������������������������������������������������
         self._sel_mode_combo = QComboBox()
         self._sel_mode_combo.addItems(["All", "Surface", "Edge", "Vertex", "Grid"])
+        self._sel_mode_combo.setFixedWidth(92)
         self._sel_mode_combo.setToolTip(
             "Selection mode:\n"
             "  All    - pick whole bodies\n"
@@ -1318,6 +1338,9 @@ class MainWindow(QMainWindow):
         act_parameters.setToolTip("Open the project parameter table")
         act_parameters.triggered.connect(self._open_project_parameters)
         add_group("Tools", [act_measure, act_parameters], columns=2)
+        last_action = tb.actions()[-1] if tb.actions() else None
+        if last_action is not None and last_action.isSeparator():
+            tb.removeAction(last_action)
 
         sketch_tb = self.addToolBar("Sketch")
         self._sketch_context_toolbar = sketch_tb
@@ -3856,7 +3879,7 @@ class MainWindow(QMainWindow):
         self._body_props.set_object(obj)
         self._materials.highlight(obj)
         # Update Fuse counter when single object selected
-        self._fuse_label.setText("Fuse: 1 selected")
+        self._fuse_label.setText("Fuse: 1")
         self._fuse_label.setStyleSheet("font-size: 10px; color: #666;")
         if obj:
             self._info_bar.set_info(f"Selected: {obj.name}  [{type(obj).__name__}]")
@@ -3871,10 +3894,10 @@ class MainWindow(QMainWindow):
         self._materials.highlight(objects)
         # Update Fuse counter in toolbar
         if len(objects) >= 2:
-            self._fuse_label.setText(f"Fuse: {len(objects)} selected")
+            self._fuse_label.setText(f"Fuse: {len(objects)}")
             self._fuse_label.setStyleSheet("font-size: 10px; color: #0a0; font-weight: bold;")
         else:
-            self._fuse_label.setText("Fuse: 0 selected")
+            self._fuse_label.setText("Fuse: 0")
             self._fuse_label.setStyleSheet("font-size: 10px; color: #666;")
         if len(objects) > 1:
             self._info_bar.set_info(f"{len(objects)} objects selected (Ctrl+click to extend)")
@@ -3982,7 +4005,16 @@ class MainWindow(QMainWindow):
         if not name:
             return
         if self._material_store.get_record(name, source="project") is None:
-            self._material_store.add_project_material(name=name)
+            try:
+                if self._material_store.get_record(name, source="global") is None:
+                    self._material_store.add_global_material(name=name)
+                self._material_store.append_global_to_project([name])
+            except (OSError, ValueError, TypeError) as exc:
+                QMessageBox.warning(
+                    self,
+                    "Global Material Database",
+                    f"Unable to save material: {exc}",
+                )
         self._sync_material_choices()
 
     def _open_material_picker(self, current_name: str, selected_objects: list) -> None:
@@ -4010,7 +4042,16 @@ class MainWindow(QMainWindow):
             self._material_store.append_global_to_project([rec.name])
             self._sync_material_choices()
         elif rec.source == "project" and self._material_store.get_record(rec.name, source="project") is None:
-            self._material_store.upsert_project_record(rec)
+            try:
+                self._material_store.upsert_global_record(rec)
+            except (OSError, ValueError, TypeError) as exc:
+                QMessageBox.warning(
+                    self,
+                    "Global Material Database",
+                    f"Unable to save material: {exc}",
+                )
+                return
+            self._material_store.append_global_to_project([rec.name])
             self._sync_material_choices()
 
         name = rec.name
@@ -7119,6 +7160,9 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
         self._workspace_path = str(settings.value("utility/workspace_path", self._workspace_path)).strip()
+        self._global_material_db_path = str(
+            settings.value("utility/global_material_db_path", self._global_material_db_path)
+        ).strip()
 
     def _save_app_settings(self) -> None:
         settings = QSettings()
@@ -7150,6 +7194,7 @@ class MainWindow(QMainWindow):
         settings.setValue("utility/export_full_scene_step", int(self._export_full_scene_step))
         settings.setValue("utility/boolean_decimation_enabled", int(self._boolean_decimation_enabled))
         settings.setValue("utility/workspace_path", self._workspace_path)
+        settings.setValue("utility/global_material_db_path", self._global_material_db_path)
         settings.sync()
 
     def _sync_settings_dialog_values(self) -> None:
@@ -7180,6 +7225,7 @@ class MainWindow(QMainWindow):
             export_full_scene_step=self._export_full_scene_step,
             boolean_decimation_enabled=self._boolean_decimation_enabled,
             workspace_path=self._workspace_path,
+            global_material_db_path=self._global_material_db_path,
         )
 
     def _convert_scene_units(self, old_units: str, new_units: str) -> None:
@@ -7331,6 +7377,11 @@ class MainWindow(QMainWindow):
         self._export_full_scene_step = bool(values.get("export_full_scene_step", self._export_full_scene_step))
         self._boolean_decimation_enabled = bool(values.get("boolean_decimation_enabled", self._boolean_decimation_enabled))
         self._workspace_path = str(values.get("workspace_path", self._workspace_path)).strip()
+        global_material_db_path = str(
+            values.get("global_material_db_path", self._global_material_db_path)
+        ).strip()
+        if global_material_db_path != self._global_material_db_path:
+            self._set_global_material_db_path(global_material_db_path, persist=False)
         if self._export_full_scene_step and not old_export_full_scene_step:
             self._sim_full_scene_step_dirty = True
         self._project_tree.set_runtime_settings({
@@ -8227,6 +8278,14 @@ class MainWindow(QMainWindow):
         self._project_name = "Untitled"
         self._project_path = None
         self._material_store = MaterialStore()
+        if self._global_material_db_path:
+            try:
+                self._material_store.set_global_db_path(
+                    self._global_material_db_path,
+                    create_if_missing=False,
+                )
+            except (OSError, ValueError, TypeError) as exc:
+                self._info_bar.set_info(f"Unable to load global material DB: {exc}")
         self._reset_simulation_cache()
         self.setWindowTitle(f"EM 3D Modeler - {self._project_name}")
         self._project_tree.set_project_name(self._project_name)
@@ -8340,10 +8399,25 @@ class MainWindow(QMainWindow):
                 data.get("active_plane_name"),
             )
             self._material_store.load_project_materials(data.get("project_materials", []))
-            self._material_store.set_global_db_path(
-                data.get("global_material_db_path"),
-                create_if_missing=False,
-            )
+            project_global_db_path = data.get("global_material_db_path")
+            selected_global_db_path = self._global_material_db_path or str(
+                project_global_db_path or ""
+            ).strip()
+            try:
+                self._material_store.set_global_db_path(
+                    selected_global_db_path or None,
+                    create_if_missing=False,
+                )
+            except (OSError, ValueError, TypeError) as exc:
+                QMessageBox.warning(
+                    self,
+                    "Global Material Database",
+                    f"Unable to load {selected_global_db_path}: {exc}",
+                )
+            else:
+                if not self._global_material_db_path and selected_global_db_path:
+                    self._global_material_db_path = selected_global_db_path
+                    self._save_app_settings()
             self._sync_material_choices()
             grid = data.get("grid", {})
             self._units = data.get("units", "mm")
@@ -8522,7 +8596,7 @@ class MainWindow(QMainWindow):
 
     def _set_global_material_db(self) -> None:
         suggested = self._material_store.global_db_path or str(Path.home() / "em3d_materials_global.json")
-        path, _ = QFileDialog.getSaveFileName(
+        path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Global Material Database",
             suggested,
@@ -8530,22 +8604,46 @@ class MainWindow(QMainWindow):
         )
         if not path:
             return
-        self._material_store.set_global_db_path(path, create_if_missing=True)
-        self._material_store.save_global_db()
+        try:
+            self._set_global_material_db_path(path)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Global Material Database", f"Unable to load {path}: {exc}")
+
+    def _set_global_material_db_path(self, path: str, *, persist: bool = True) -> None:
+        normalized_path = str(path or "").strip()
+        self._material_store.set_global_db_path(
+            normalized_path or None,
+            create_if_missing=False,
+        )
+        self._global_material_db_path = normalized_path
+        if persist:
+            self._save_app_settings()
         self._sync_material_choices()
-        self._info_bar.set_info(f"Global material DB: {path}")
+        if normalized_path:
+            self._info_bar.set_info(f"Global material DB: {normalized_path}")
+        else:
+            self._info_bar.set_info("Global material DB cleared")
 
     def _reload_global_material_db(self) -> None:
-        self._material_store.set_global_db_path(self._material_store.global_db_path, create_if_missing=False)
-        self._sync_material_choices()
-        if self._material_store.global_db_path:
-            self._info_bar.set_info(f"Global material DB reloaded: {self._material_store.global_db_path}")
-        else:
-            self._info_bar.set_info("No global material DB configured")
+        suggested = self._material_store.global_db_path or str(Path.home() / "em3d_materials_global.json")
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Global Material Database",
+            suggested,
+            "JSON (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+        try:
+            self._set_global_material_db_path(path)
+        except (OSError, ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Global Material Database", f"Unable to load {path}: {exc}")
 
     def _open_material_library_dialog(self) -> None:
         dlg = MaterialLibraryDialog(self, self._material_store, self._sync_material_choices)
         dlg.exec_()
+        self._global_material_db_path = str(self._material_store.global_db_path or "").strip()
+        self._save_app_settings()
         self._sync_material_choices()
         if dlg.changed:
             self._info_bar.set_info("Material library updated")

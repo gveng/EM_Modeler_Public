@@ -8,7 +8,11 @@ $bundleVersion = $version -replace 'b\d+$', '_Beta'
 $spec = Join-Path $root "EM3D_Modeler_$bundleVersion.spec"
 if (-not (Test-Path $spec)) { throw "Versioned PyInstaller spec not found: $spec. Run scripts/update_pyinstaller_spec.py first." }
 
-pyinstaller --clean --noconfirm $spec
+& pyinstaller --clean --noconfirm $spec
+$pyinstallerExitCode = $LASTEXITCODE
+if ($pyinstallerExitCode -ne 0) {
+    throw "PyInstaller failed with exit code $pyinstallerExitCode. Review the PyInstaller output above."
+}
 
 $bundleName = [IO.Path]::GetFileNameWithoutExtension($spec)
 $bundle = Join-Path $root "dist\$bundleName"

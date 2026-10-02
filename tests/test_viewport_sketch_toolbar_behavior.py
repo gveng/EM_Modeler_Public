@@ -635,7 +635,7 @@ def test_toolbar_groups_use_icon_only_buttons_and_size_for_all_columns():
 def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions():
     application = QApplication.instance() or QApplication([])
     window = QMainWindow()
-    window.resize(640, 700)
+    window.resize(864, 700)
     window._viewport = Mock()
     window._viewport.is_parallel_projection.return_value = False
     for name in (
@@ -652,6 +652,15 @@ def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions(
 
     MainWindow._build_toolbar(window)
     window.show()
+    application.processEvents()
+    assert window._workspace_toolbar is window._main_toolbar
+    assert window._main_toolbar.sizeHint().width() <= window.width()
+    separators = [action for action in window._main_toolbar.actions() if action.isSeparator()]
+    assert len(separators) == 7
+    assert all(
+        window._main_toolbar.widgetForAction(action).width() == 18
+        for action in separators
+    )
     window._main_toolbar.hide()
     window._workspace_toolbar.hide()
     window._sketch_context_toolbar.show()
@@ -669,12 +678,11 @@ def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions(
         return groups
 
     main_groups = groups_by_title(window._main_toolbar)
-    main_groups.update(groups_by_title(window._workspace_toolbar))
     sketch_groups = groups_by_title(window._sketch_context_toolbar)
-    assert max(
-        window._main_toolbar.sizeHint().width(),
-        window._workspace_toolbar.sizeHint().width(),
-    ) < 900
+    for group in main_groups.values():
+        group_layout = group.layout()
+        if group_layout.count() > 1 and group_layout.itemAt(1).layout() is not None:
+            assert group_layout.itemAt(1).layout().rowCount() <= 2
     main_3d_buttons = main_groups["3D"].findChildren(QToolButton)
     assert [button.defaultAction().text() for button in main_3d_buttons] == [
         "Box", "Cylinder", "Cone", "Sphere", "Open Region / PML", "Import STEP",

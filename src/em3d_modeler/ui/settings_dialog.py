@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Dict, Tuple
 
 from PySide6.QtCore import Qt, QLocale
@@ -230,6 +231,16 @@ class SettingsDialog(QDialog):
         workspace_row.addWidget(self._workspace_browse_btn)
         utility_layout.addWidget(QLabel("Workspace folder", self._utility_tab))
         utility_layout.addLayout(workspace_row)
+        material_db_row = QHBoxLayout()
+        self._material_db_path_edit = QLineEdit(self._utility_tab)
+        self._material_db_path_edit.setReadOnly(True)
+        self._material_db_path_edit.setPlaceholderText("Not set")
+        material_db_row.addWidget(self._material_db_path_edit, 1)
+        self._material_db_browse_btn = QPushButton("Browse…", self._utility_tab)
+        self._material_db_browse_btn.clicked.connect(self._browse_material_db)
+        material_db_row.addWidget(self._material_db_browse_btn)
+        utility_layout.addWidget(QLabel("Global material database", self._utility_tab))
+        utility_layout.addLayout(material_db_row)
         self._export_full_scene_step_check = QCheckBox(
             "Export complete scene STEP",
             self._utility_tab,
@@ -256,6 +267,19 @@ class SettingsDialog(QDialog):
         )
         if directory:
             self._workspace_path_edit.setText(directory)
+
+    def _browse_material_db(self) -> None:
+        suggested = self._material_db_path_edit.text().strip() or str(
+            Path.home() / "em3d_materials_global.json"
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Global Material Database",
+            suggested,
+            "JSON (*.json);;All Files (*)",
+        )
+        if path:
+            self._material_db_path_edit.setText(path)
 
     def _choose_custom_color(self) -> None:
         qcolor = QColorDialog.getColor(self._to_qcolor(self._custom_color), self, "Selection color")
@@ -343,6 +367,7 @@ class SettingsDialog(QDialog):
         export_full_scene_step: bool = False,
         boolean_decimation_enabled: bool = False,
         workspace_path: str = "",
+        global_material_db_path: str = "",
     ) -> None:
         self._units_combo.setCurrentText(units)
         self._current_units = units
@@ -385,6 +410,7 @@ class SettingsDialog(QDialog):
         self._export_full_scene_step_check.setChecked(bool(export_full_scene_step))
         self._boolean_decimation_check.setChecked(bool(boolean_decimation_enabled))
         self._workspace_path_edit.setText(str(workspace_path or ""))
+        self._material_db_path_edit.setText(str(global_material_db_path or ""))
 
     def values(self) -> dict:
         color_name = self._selection_color_combo.currentText()
@@ -412,4 +438,5 @@ class SettingsDialog(QDialog):
             "export_full_scene_step": bool(self._export_full_scene_step_check.isChecked()),
             "boolean_decimation_enabled": bool(self._boolean_decimation_check.isChecked()),
             "workspace_path": self._workspace_path_edit.text().strip(),
+            "global_material_db_path": self._material_db_path_edit.text().strip(),
         }

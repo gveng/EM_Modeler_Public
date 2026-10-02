@@ -14,6 +14,7 @@ def test_utility_settings_are_exposed_and_default_off(tmp_path):
     assert "progressive_sparams_enabled" not in values
     assert not hasattr(dialog, "_progressive_sparams_check")
     assert values["workspace_path"] == ""
+    assert values["global_material_db_path"] == ""
     assert [dialog._tabs.tabText(index) for index in range(dialog._tabs.count())] == [
         "Display",
         "Simulation",
@@ -32,6 +33,7 @@ def test_utility_settings_are_exposed_and_default_off(tmp_path):
         export_full_scene_step=True,
         boolean_decimation_enabled=True,
         workspace_path=str(tmp_path),
+        global_material_db_path=str(tmp_path / "materials.json"),
     )
 
     updated = dialog.values()
@@ -39,6 +41,7 @@ def test_utility_settings_are_exposed_and_default_off(tmp_path):
     assert updated["boolean_decimation_enabled"] is True
     assert "progressive_sparams_enabled" not in updated
     assert updated["workspace_path"] == str(tmp_path)
+    assert updated["global_material_db_path"] == str(tmp_path / "materials.json")
 
 
 def test_workspace_folder_picker_updates_the_selected_path(monkeypatch, tmp_path):
@@ -52,3 +55,17 @@ def test_workspace_folder_picker_updates_the_selected_path(monkeypatch, tmp_path
     dialog._browse_workspace()
 
     assert dialog.values()["workspace_path"] == str(tmp_path)
+
+
+def test_material_database_picker_updates_the_selected_path(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    dialog = SettingsDialog()
+    db_path = tmp_path / "materials.json"
+    monkeypatch.setattr(
+        "em3d_modeler.ui.settings_dialog.QFileDialog.getOpenFileName",
+        lambda *_args: (str(db_path), "JSON (*.json)"),
+    )
+
+    dialog._browse_material_db()
+
+    assert dialog.values()["global_material_db_path"] == str(db_path)
