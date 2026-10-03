@@ -46,7 +46,7 @@ from PySide6.QtWidgets import (
     QFormLayout, QDoubleSpinBox, QComboBox, QCheckBox, QDialogButtonBox,
 )
 from PySide6.QtCore    import Signal, Qt
-from PySide6.QtGui     import QIcon, QAction, QKeySequence, QShortcut
+from PySide6.QtGui     import QIcon, QAction, QKeySequence, QShortcut, QImage
 
 try:
     from vtkmodules.qt.QVTKRenderWindowInteractor import QVTKRenderWindowInteractor
@@ -78,6 +78,298 @@ def _icon(name: str) -> QIcon:
         if p.exists():
             return QIcon(str(p))
     return QIcon()
+
+
+def _render_axonometric_actors(
+    actors,
+    *,
+    background,
+    background2,
+    gradient_background: bool,
+    width: int,
+    height: int,
+    focus_point=None,
+    parallel_scale: float | None = None,
+    camera_normal=None,
+    view_up=None,
+    highlight_actor=None,
+) -> QImage:
+    """Render actor copies with an isolated camera and optional framing/orientation."""
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+
+    actors = [actor for actor in actors if actor is not None]
+    if not actors:
+        return QImage()
+    renderer = vtk.vtkRenderer()
+    renderer.SetBackground(background)
+    renderer.SetBackground2(background2)
+    renderer.SetGradientBackground(bool(gradient_background))
+    for actor in actors:
+        actor_copy = _report_actor_copy(
+            actor,
+            selected=actor is highlight_actor,
+        )
+        # Focused report snapshots must remain useful even when the assigned
+        # object is hidden in the interactive scene; this affects only the copy.
+        actor_copy.SetVisibility(1)
+        renderer.AddActor(actor_copy)
+
+    bounds = renderer.ComputeVisiblePropBounds()
+    if len(bounds) != 6 or bounds[0] > bounds[1]:
+        return QImage()
+    bounds_center = (
+        (bounds[0] + bounds[1]) / 2.0,
+        (bounds[2] + bounds[3]) / 2.0,
+        (bounds[4] + bounds[5]) / 2.0,
+    )
+    center = tuple(float(value) for value in focus_point) if focus_point is not None else bounds_center
+    diagonal = max(
+        1.0,
+        ((bounds[1] - bounds[0]) ** 2
+         + (bounds[3] - bounds[2]) ** 2
+         + (bounds[5] - bounds[4]) ** 2) ** 0.5,
+    )
+    camera = renderer.GetActiveCamera()
+    camera.ParallelProjectionOn()
+    camera.SetFocalPoint(*center)
+    direction, view_up = _camera_orientation(camera_normal, view_up)
+    camera.SetPosition(
+        center[0] + direction[0] * diagonal * 2.0,
+        center[1] + direction[1] * diagonal * 2.0,
+        center[2] + direction[2] * diagonal * 2.0,
+    )
+    camera.SetViewUp(*view_up)
+    camera.SetParallelScale(
+        float(parallel_scale)
+        if parallel_scale is not None
+        else diagonal * (0.62 if focus_point is None else 0.08)
+    )
+    renderer.ResetCameraClippingRange(bounds)
+
+    render_window = vtk.vtkRenderWindow()
+    render_window.SetOffScreenRendering(1)
+    render_window.SetMultiSamples(0)
+    render_window.SetSize(max(1, int(width)), max(1, int(height)))
+    render_window.AddRenderer(renderer)
+    try:
+        render_window.Render()
+        capture = vtk.vtkWindowToImageFilter()
+        capture.SetInput(render_window)
+        capture.SetInputBufferTypeToRGB()
+        capture.ReadFrontBufferOff()
+        capture.Update()
+        image_data = capture.GetOutput()
+        image_width, image_height, _ = image_data.GetDimensions()
+        scalars = image_data.GetPointData().GetScalars()
+        if scalars is None or image_width <= 0 or image_height <= 0:
+            return QImage()
+        pixels = vtk_to_numpy(scalars).reshape(image_height, image_width, 3)
+        return QImage(
+            pixels.data,
+            image_width,
+            image_height,
+            int(pixels.strides[0]),
+            QImage.Format.Format_RGB888,
+        ).copy().flipped(Qt.Orientation.Vertical)
+    finally:
+        render_window.Finalize()
+
+
+def _report_actor_copy(actor, *, selected: bool = False):
+    """Copy an actor and optionally apply the viewport's object-selection style."""
+    actor_copy = vtk.vtkActor()
+    actor_copy.ShallowCopy(actor)
+    # ShallowCopy shares the source vtkProperty; give report copies an isolated
+    # property so applying a highlight cannot alter the live viewport.
+    prop = vtk.vtkProperty()
+    prop.DeepCopy(actor.GetProperty())
+    actor_copy.SetProperty(prop)
+    if selected:
+        color = scene_objects.SELECTION_COLOR
+        prop.SetColor(*color)
+        prop.SetLineWidth(2.5)
+        prop.SetEdgeColor(*(max(component * 0.65, 0.0) for component in color))
+    return actor_copy
+
+
+def _camera_orientation(camera_normal=None, view_up=None):
+    """Return orthonormal camera direction/up vectors."""
+    direction = camera_normal if camera_normal is not None else (1.0, -1.0, 1.0)
+    try:
+        direction = tuple(float(value) for value in direction)
+    except (TypeError, ValueError):
+        direction = (1.0, -1.0, 1.0)
+    length = math.sqrt(sum(value * value for value in direction))
+    if len(direction) != 3 or length <= 1e-12:
+        direction = (1.0, -1.0, 1.0)
+        length = math.sqrt(3.0)
+    direction = tuple(value / length for value in direction)
+    if view_up is None:
+        view_up = (0.0, 0.0, 1.0) if abs(direction[2]) < 0.95 else (0.0, 1.0, 0.0)
+    try:
+        up = tuple(float(value) for value in view_up)
+    except (TypeError, ValueError):
+        up = (0.0, 0.0, 1.0)
+    if len(up) != 3:
+        up = (0.0, 0.0, 1.0)
+    projection = sum(up[index] * direction[index] for index in range(3))
+    up = tuple(up[index] - projection * direction[index] for index in range(3))
+    up_length = math.sqrt(sum(value * value for value in up))
+    if up_length <= 1e-12:
+        fallback = (0.0, 1.0, 0.0) if abs(direction[1]) < 0.95 else (1.0, 0.0, 0.0)
+        projection = sum(fallback[index] * direction[index] for index in range(3))
+        up = tuple(fallback[index] - projection * direction[index] for index in range(3))
+        up_length = math.sqrt(sum(value * value for value in up))
+    return direction, tuple(value / up_length for value in up)
+
+
+def _actor_plane_normal(actor):
+    """Estimate the dominant plane normal of a planar actor in world coordinates."""
+    if actor is None or actor.GetMapper() is None:
+        return None
+    from vtkmodules.util.numpy_support import vtk_to_numpy
+    import numpy as np
+
+    mapper = actor.GetMapper()
+    mapper.Update()
+    polydata = mapper.GetInput()
+    if polydata is None or polydata.GetNumberOfPoints() < 3:
+        return None
+    points = vtk_to_numpy(polydata.GetPoints().GetData()).astype(float, copy=False)
+    matrix = actor.GetMatrix()
+    world_points = np.asarray(
+        [matrix.MultiplyPoint((point[0], point[1], point[2], 1.0))[:3] for point in points],
+        dtype=float,
+    )
+    centered = world_points - world_points.mean(axis=0)
+    try:
+        _, singular_values, vectors = np.linalg.svd(centered, full_matrices=False)
+    except np.linalg.LinAlgError:
+        return None
+    if len(singular_values) < 3 or singular_values[0] <= 1e-12:
+        return None
+    # Reject volumetric objects instead of assigning them an arbitrary normal.
+    if singular_values[-1] / singular_values[0] > 0.12:
+        return None
+    normal = vectors[-1]
+    length = float(np.linalg.norm(normal))
+    if length <= 1e-12:
+        return None
+    return tuple(float(value / length) for value in normal)
+
+
+def _align_normal_to_port_excitation(normal, port: dict):
+    """Use a parallel configured lumped direction only to choose normal sign."""
+    if (
+        not isinstance(port, dict)
+        or str(port.get("type", "")).strip().casefold() != "lumpedport"
+    ):
+        return normal
+    params = port.get("params", {}) if isinstance(port, dict) else {}
+    params = params if isinstance(params, dict) else {}
+    try:
+        excitation = tuple(
+            float(params.get(f"Direction_{axis}", 0.0))
+            for axis in ("X", "Y", "Z")
+        )
+    except (TypeError, ValueError):
+        return normal
+    excitation_length = math.sqrt(sum(value * value for value in excitation))
+    if excitation_length <= 1e-12:
+        return normal
+    dot = sum(
+        normal[index] * excitation[index] / excitation_length
+        for index in range(3)
+    )
+    if abs(dot) >= 1.0 - 1e-6 and dot < 0.0:
+        return tuple(-value for value in normal)
+    return normal
+
+
+def _port_plane_orientation(objects, port: dict, plate_geometry: dict | None = None):
+    """Resolve camera normal and in-plane up vector from world-space plate axes."""
+    if isinstance(plate_geometry, dict):
+        try:
+            u = tuple(float(value) for value in plate_geometry.get("u", ()))
+            v = tuple(float(value) for value in plate_geometry.get("v", ()))
+            if len(u) == 3 and len(v) == 3:
+                cross = (
+                    u[1] * v[2] - u[2] * v[1],
+                    u[2] * v[0] - u[0] * v[2],
+                    u[0] * v[1] - u[1] * v[0],
+                )
+                length = math.sqrt(sum(value * value for value in cross))
+                if length > 1e-12:
+                    normal = tuple(value / length for value in cross)
+                    normal = _align_normal_to_port_excitation(normal, port)
+                    return normal, v
+        except (TypeError, ValueError):
+            pass
+
+    model_objects = [
+        obj for obj in objects
+        if obj.actor is not None and bool(getattr(obj, "is_model", True))
+    ]
+    object_name = str(port.get("object", "")).strip() if isinstance(port, dict) else ""
+    target = next((obj for obj in model_objects if obj.name == object_name), None)
+    if target is not None:
+        normal = _actor_plane_normal(target.actor)
+        if normal is not None:
+            return _align_normal_to_port_excitation(normal, port), None
+    return None, None
+
+
+def _port_plane_normal(objects, port: dict):
+    """Compatibility helper returning the assigned plate's geometric normal."""
+    return _port_plane_orientation(objects, port)[0]
+
+
+def _port_snapshot_actors(objects, port: dict):
+    """Return all model actors and the connected port object, if present."""
+    model_objects = [
+        obj for obj in objects
+        if obj.actor is not None and bool(getattr(obj, "is_model", True))
+    ]
+    object_name = str(port.get("object", "")).strip() if isinstance(port, dict) else ""
+    target = next((obj for obj in model_objects if obj.name == object_name), None)
+    return [obj.actor for obj in model_objects], target
+
+
+def _port_actor_parallel_scale(
+    actors,
+    *,
+    camera_normal=None,
+    view_up=None,
+    width: int = 900,
+    height: int = 640,
+) -> float | None:
+    """Fit aggregate actor bounds in a parallel camera with aspect-ratio margin."""
+    bounds = [actor.GetBounds() for actor in actors if actor is not None]
+    if not bounds:
+        return None
+    extents = (
+        (max(item[1] for item in bounds) - min(item[0] for item in bounds)) / 2.0,
+        (max(item[3] for item in bounds) - min(item[2] for item in bounds)) / 2.0,
+        (max(item[5] for item in bounds) - min(item[4] for item in bounds)) / 2.0,
+    )
+    direction, up = _camera_orientation(camera_normal, view_up)
+    right = (
+        direction[1] * up[2] - direction[2] * up[1],
+        direction[2] * up[0] - direction[0] * up[2],
+        direction[0] * up[1] - direction[1] * up[0],
+    )
+    vertical_half_extent = sum(
+        abs(up[index]) * extents[index] for index in range(3)
+    )
+    horizontal_half_extent = sum(
+        abs(right[index]) * extents[index] for index in range(3)
+    )
+    aspect_ratio = max(float(width) / max(float(height), 1.0), 1e-6)
+    required_scale = max(
+        vertical_half_extent,
+        horizontal_half_extent / aspect_ratio,
+    )
+    return max(required_scale * 1.1, 1e-6)
 
 
 # ──────────────────────────────────────────────────────────────────────────────
@@ -363,6 +655,78 @@ class Viewport3DWidget(QWidget):
         self._renderer.ResetCamera(*bounds)
         self._renderer.ResetCameraClippingRange()
         self._render()
+
+    def render_axonometric_image(self, width: int = 1400, height: int = 900) -> QImage:
+        """Render model actors off-screen without changing the live camera."""
+        actors = [
+            obj.actor
+            for obj in self.scene.objects
+            if obj.actor is not None and obj.is_visible()
+            and bool(getattr(obj, "is_model", True))
+        ]
+        return _render_axonometric_actors(
+            actors,
+            background=self._renderer.GetBackground(),
+            background2=self._renderer.GetBackground2(),
+            gradient_background=self._renderer.GetGradientBackground(),
+            width=width,
+            height=height,
+        )
+
+    def render_port_image(
+        self,
+        port: dict,
+        width: int = 900,
+        height: int = 640,
+        *,
+        plate_geometry: dict | None = None,
+    ) -> QImage:
+        """Render the full assembly normal to a port plane, off-screen and in isolation."""
+        objects = self.scene.objects
+        actors, connected_object = _port_snapshot_actors(objects, port)
+        is_plane_wave = (
+            isinstance(port, dict)
+            and str(port.get("type", "")).strip().casefold() == "planewave"
+        )
+        if is_plane_wave:
+            # PlaneWave is a global excitation and has no assigned port plane.
+            camera_normal = view_up = focus_point = parallel_scale = None
+        else:
+            camera_normal, view_up = _port_plane_orientation(
+                objects, port, plate_geometry
+            )
+            if actors:
+                bounds = [actor.GetBounds() for actor in actors]
+                focus_point = (
+                    (min(item[0] for item in bounds) + max(item[1] for item in bounds)) / 2.0,
+                    (min(item[2] for item in bounds) + max(item[3] for item in bounds)) / 2.0,
+                    (min(item[4] for item in bounds) + max(item[5] for item in bounds)) / 2.0,
+                )
+                parallel_scale = _port_actor_parallel_scale(
+                    actors,
+                    camera_normal=camera_normal,
+                    view_up=view_up,
+                    width=width,
+                    height=height,
+                )
+            else:
+                focus_point = None
+                parallel_scale = None
+        return _render_axonometric_actors(
+            actors,
+            background=self._renderer.GetBackground(),
+            background2=self._renderer.GetBackground2(),
+            gradient_background=self._renderer.GetGradientBackground(),
+            width=width,
+            height=height,
+            focus_point=focus_point,
+            parallel_scale=parallel_scale,
+            camera_normal=camera_normal,
+            view_up=view_up,
+            highlight_actor=(
+                connected_object.actor if connected_object is not None else None
+            ),
+        )
 
     def _fit_camera_to_objects(self, objects) -> None:
         bounds = self._visible_objects_bounds(objects)

@@ -211,7 +211,11 @@ class _JobObjectExtendedLimitInformation(ctypes.Structure):
 def _icon(name: str) -> "QIcon":
     """Load SVG/PNG icon by Part_Name from the Icons folder."""
     for ext in ("svg", "png"):
-        for p in (_ICONS_DIR / f"{name}.{ext}", _ICONS_DIR / "Sketcher" / f"{name}.{ext}"):
+        for p in (
+            _ICONS_DIR / f"{name}.{ext}",
+            _ICONS_DIR / "Sketcher" / f"{name}.{ext}",
+            _ICONS_DIR / "Core_Duo" / f"{name}.{ext}",
+        ):
             if p.exists():
                 from PySide6.QtGui import QIcon
                 return QIcon(str(p))
@@ -1004,7 +1008,14 @@ class MainWindow(QMainWindow):
     def _show_chart(self, key: str, plot_data: dict, *, progressive: bool = False) -> None:
         output_name = self._chart_output_name(key)
         append_key = self._append_chart_keys.get(output_name)
-        append_view = self._plot_views.get(append_key) if append_key else None
+        is_farfield_3d = (
+            str(plot_data.get("plot_type", "")).strip().lower() == "plot_ff_3d"
+        )
+        append_view = (
+            self._plot_views.get(append_key)
+            if append_key and not is_farfield_3d
+            else None
+        )
         if append_view is not None and append_view.plot_type != str(
             plot_data.get("plot_type", append_view.plot_type)
         ):
@@ -1100,7 +1111,12 @@ class MainWindow(QMainWindow):
 
         title = str(plot_data.get("title", key)).strip() or key
         window.setWindowTitle(title)
-        if progressive:
+        if is_farfield_3d and "image" in plot_data:
+            view.set_farfield_3d_image(
+                plot_data["image"],
+                title=plot_data["title"],
+            )
+        elif progressive:
             view.set_progressive_data(
                 plot_data["x_values"],
                 plot_data["series"],
@@ -1301,6 +1317,502 @@ class MainWindow(QMainWindow):
         )
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� toolbar
+    def _export_report(self) -> None:
+        """Ask for a destination and export a point-in-time project report."""
+        default_name = f"{self._project_name or 'Untitled'}_report.pdf"
+        workspace = self._workspace_dialog_directory()
+        initial_path = str(Path(workspace) / default_name) if workspace else default_name
+        path, _ = QFileDialog.getSaveFileName(
+            self,
+            "Save Project Report",
+            initial_path,
+            "PDF files (*.pdf)",
+        )
+        if not path:
+            return
+        destination = Path(path).expanduser()
+        if destination.suffix.lower() != ".pdf":
+            destination = destination.with_suffix(".pdf")
+        try:
+            self._write_project_report(destination)
+        except Exception as exc:
+            QMessageBox.critical(self, "Report Export Error", str(exc))
+            return
+        self._info_bar.set_info(f"PDF report saved: {destination}")
+
+    def _render_report_plot_data(self, plot_data: dict):
+        from .chart_view import PlotView
+
+        plot_type = str(plot_data.get("plot_type", "plot_sp"))
+        title = str(plot_data.get("title", "Plot"))
+        view = PlotView(plot_type, settings_key=f"report:{uuid.uuid4().hex}")
+        try:
+            view.resize(1100, 700)
+            view.set_plot_data(
+                plot_data.get("x_values", []),
+                plot_data.get("series", []),
+                title=title,
+                xlabel=str(plot_data.get("xlabel", "")),
+                ylabel=str(plot_data.get("ylabel", "")),
+                persist=False,
+            )
+            QApplication.processEvents()
+            return view.capture_plot_image()
+        finally:
+            view.close()
+            view.deleteLater()
+
+    def _report_output_plot_data(self, output: dict, simulation: dict, touchstones: list[Path]):
+        """Build report plot data without calling UI-facing output handlers."""
+        import numpy as np
+
+        from .chart_data import (
+            make_parametric_sparameter_plot_data,
+            make_sparameter_plot_data,
+        )
+        from .touchstone import read_touchstone_ri
+
+        simulation_name = str(output.get("simulation", "")).strip()
+        output_name = str(output.get("name", "Output")).strip() or "Output"
+        plot_type = str(output.get("plot_type", "plot_sp")).strip().lower()
+        params = output.get("params", {}) if isinstance(output.get("params"), dict) else {}
+        sparameter_types = {"plot_sp", "plot_vswr", "smith", "plot"}
+
+        if plot_type in sparameter_types and touchstones:
+            combined = None
+            series = []
+            for path in touchstones:
+                parsed = read_touchstone_ri(path)
+                file_data = make_sparameter_plot_data(
+                    {
+                        "name": output_name,
+                        "plot_type": plot_type,
+                        "params": params,
+                    },
+                    parsed["frequencies"],
+                    parsed["s_matrices"],
+                    include_all_parameters=True,
+                    file_name=path.name,
+                    file_id=str(path.resolve()),
+                )
+                for trace in file_data["series"]:
+                    trace["source_path"] = str(path.resolve())
+                    trace["source_kind"] = "touchstone"
+                if combined is None:
+                    combined = file_data
+                series.extend(file_data["series"])
+            combined["series"] = series
+            return combined, "Touchstone results", ""
+
+        loaded_sim, grid, simdata_path = self._load_sim_grid_from_results(
+            simulation_name,
+            allow_irregular=(
+                str(simulation.get("type", "")).strip().lower() == "parametric"
+                and plot_type in sparameter_types
+            ),
+        )
+        source_path = str(Path(simdata_path).resolve())
+        if plot_type in sparameter_types:
+            if (
+                str(simulation.get("type", "")).strip().lower() == "parametric"
+                and hasattr(grid, "_data_entries")
+            ):
+                chart_data = make_parametric_sparameter_plot_data(
+                    {"name": output_name, "plot_type": plot_type, "params": params},
+                    grid,
+                    str(simulation.get("ParamName", "")),
+                    [
+                        value.strip()
+                        for value in str(simulation.get("ParamValues", "")).split(",")
+                        if value.strip()
+                    ],
+                    expected_frequency_count=max(
+                        1, int(simulation.get("NumberOfPoints", 0))
+                    ),
+                    simulation_name=simulation_name,
+                )
+            else:
+                frequencies = getattr(grid, "freq", None)
+                if frequencies is None:
+                    raise ValueError("Simulation results have no frequency axis.")
+                ports = self._grid_port_numbers(grid)
+                port_curves = {
+                    (out_port, in_port): np.asarray(grid.S(out_port, in_port)).reshape(-1)
+                    for out_port in ports
+                    for in_port in ports
+                }
+                matrices = [
+                    [
+                        [port_curves[(out_port, in_port)][index] for in_port in ports]
+                        for out_port in ports
+                    ]
+                    for index in range(len(frequencies))
+                ]
+                chart_data = make_sparameter_plot_data(
+                    {"name": output_name, "plot_type": plot_type, "params": params},
+                    frequencies,
+                    matrices,
+                    include_all_parameters=True,
+                    file_name=Path(simdata_path).name,
+                    file_id=f"{simulation_name}::{output_name}",
+                )
+            for trace in chart_data.get("series", []):
+                trace["source_path"] = source_path
+                trace["source_kind"] = "simdata"
+            return chart_data, "Simulation results", source_path
+
+        if plot_type in {"plot_ff", "plot_ff_polar", "plot_ff_3d"}:
+            chart_data = self._report_farfield_data(
+                output, loaded_sim, grid, simdata_path, params
+            )
+            chart_data["source_path"] = source_path
+            return chart_data, "Far-field simulation results", source_path
+        raise ValueError(f"Unsupported report plot type: {plot_type}")
+
+    @staticmethod
+    def _capture_emerge_plot_image(plotter):
+        import numpy as np
+
+        render_window = getattr(plotter, "render_window", None)
+        enable_off_screen = getattr(render_window, "SetOffScreenRendering", None)
+        if not callable(enable_off_screen):
+            raise RuntimeError("The EMERGE far-field renderer cannot render off-screen.")
+        enable_off_screen(1)
+        plotter.off_screen = True
+        return np.asarray(plotter.screenshot(return_img=True))
+
+    def _report_farfield_data(self, output: dict, loaded_sim, grid, simdata_path, params: dict):
+        import numpy as np
+
+        from PySide6.QtGui import QImage
+
+        name = str(output.get("name", "Far-field")).strip() or "Far-field"
+        plot_type = str(output.get("plot_type", "plot_ff")).strip().lower()
+        plane = str(params.get("plane", "XY")).strip().upper() or "XY"
+        theta = getattr(grid, "theta", None)
+        phi = getattr(grid, "phi", None)
+        farfield_data = getattr(grid, "ff", None)
+        if farfield_data is None:
+            farfield_data = getattr(grid, "E", getattr(grid, "farfield", None))
+
+        if farfield_data is None:
+            mw_data = getattr(getattr(loaded_sim, "data", None), "mw", None)
+            field_data = getattr(mw_data, "field", None)
+            frequencies = np.asarray(getattr(grid, "freq", []))
+            if field_data is None or not frequencies.size:
+                raise ValueError("No saved far-field field data is available.")
+            requested_frequency = float(params.get("frequency_GHz", 0.0) or 0.0) * 1e9
+            if requested_frequency <= 0.0:
+                requested_frequency = (float(frequencies[0]) + float(frequencies[-1])) / 2.0
+            selected_frequency = float(
+                frequencies[int(np.argmin(np.abs(frequencies - requested_frequency)))]
+            )
+            field_entry = field_data.find(freq=selected_frequency)
+            boundary_geometries = [
+                geometry for geometry in loaded_sim.all_geos()
+                if callable(getattr(geometry, "boundary", None))
+            ]
+            if not boundary_geometries:
+                raise ValueError("Far-field plotting requires boundary faces in the result model.")
+            faces = boundary_geometries[0].boundary()
+            for geometry in boundary_geometries[1:]:
+                faces = faces + geometry.boundary()
+            if plot_type == "plot_ff_3d":
+                farfield = field_entry.farfield_3d(faces)
+                display = loaded_sim.display
+                display.add_farfield3d(
+                    farfield,
+                    component="normE",
+                    quantity="abs",
+                    dB=True,
+                    dBfloor=-40,
+                    opacity=0.75,
+                )
+                plotter = getattr(display, "_plot", None)
+                if plotter is None:
+                    raise RuntimeError("The far-field renderer is unavailable.")
+                try:
+                    pixels = self._capture_emerge_plot_image(plotter)
+                    if pixels.ndim != 3 or pixels.shape[2] < 3:
+                        raise RuntimeError("The far-field renderer returned no image.")
+                    pixels = np.ascontiguousarray(pixels[:, :, :3], dtype=np.uint8)
+                    image = QImage(
+                        pixels.data,
+                        pixels.shape[1],
+                        pixels.shape[0],
+                        int(pixels.strides[0]),
+                        QImage.Format.Format_RGB888,
+                    ).copy()
+                finally:
+                    try:
+                        plotter.close()
+                    except Exception:
+                        pass
+                    try:
+                        display.clean()
+                    except Exception:
+                        pass
+                return {
+                    "title": name,
+                    "plot_type": plot_type,
+                    "image": image,
+                    "series": [],
+                }
+            plane_axes = {
+                "XY": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+                "XZ": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                "YZ": ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0)),
+            }
+            ref_direction, plane_normal = plane_axes.get(plane, plane_axes["XY"])
+            farfield = field_entry.farfield_2d(ref_direction, plane_normal, faces)
+            theta = farfield.ang
+            farfield_data = farfield.gain.norm
+
+        value = farfield_data
+        if isinstance(value, dict):
+            for key in ("E", "field", "value", "magnitude", "Et", "Etheta", "Ephi"):
+                if key in value:
+                    value = value[key]
+                    break
+            if isinstance(value, dict):
+                theta = next(
+                    (value[key] for key in ("theta", "phi", "ang", "angles") if key in value),
+                    theta,
+                )
+        theta_values = np.asarray(theta) if theta is not None else None
+        values = np.asarray(value)
+        if theta_values is not None and values.ndim > 1 and values.size == theta_values.size:
+            values = values.reshape(theta_values.shape)
+        if theta_values is None and values.ndim >= 1:
+            theta_values = np.linspace(0.0, 2.0 * np.pi, values.size)
+        if theta_values is None or not values.size:
+            raise ValueError("Far-field results do not contain usable angle/magnitude data.")
+        if plot_type == "plot_ff_3d":
+            return self._render_farfield_surface(name, theta_values, phi, values)
+        return {
+            "title": f"{name} - {plane} plane",
+            "plot_type": plot_type,
+            "xlabel": "Theta (rad)",
+            "ylabel": "Magnitude",
+            "x_values": np.asarray(theta_values).reshape(-1),
+            "series": [{"label": name, "values": values.reshape(-1)}],
+        }
+
+    @staticmethod
+    def _render_farfield_surface(name: str, theta, phi, values):
+        import numpy as np
+        from matplotlib import cm
+        from matplotlib.backends.backend_agg import FigureCanvasAgg
+        from matplotlib.figure import Figure
+        from PySide6.QtGui import QImage
+
+        theta_values = np.asarray(theta, dtype=float).reshape(-1)
+        phi_values = np.asarray(phi, dtype=float).reshape(-1) if phi is not None else None
+        magnitude = np.abs(np.asarray(values))
+        if phi_values is None or magnitude.size != theta_values.size * phi_values.size:
+            raise ValueError("3D far-field result requires matching theta, phi, and magnitude grids.")
+        theta_grid, phi_grid = np.meshgrid(theta_values, phi_values)
+        radius = magnitude.reshape(theta_grid.shape)
+        if not np.isfinite(radius).any():
+            raise ValueError("Far-field data contains no finite magnitudes.")
+        radius = np.nan_to_num(radius, nan=0.0, posinf=0.0, neginf=0.0)
+        radius /= max(float(radius.max()), 1e-12)
+        x = radius * np.sin(theta_grid) * np.cos(phi_grid)
+        y = radius * np.sin(theta_grid) * np.sin(phi_grid)
+        z = radius * np.cos(theta_grid)
+        figure = Figure(figsize=(8, 6), dpi=120)
+        canvas = FigureCanvasAgg(figure)
+        axes = figure.add_subplot(111, projection="3d")
+        axes.plot_surface(
+            x, y, z,
+            facecolors=cm.viridis(radius),
+            linewidth=0,
+            antialiased=True,
+        )
+        axes.set_title(name)
+        axes.set_axis_off()
+        canvas.draw()
+        pixels = np.asarray(canvas.buffer_rgba(), dtype=np.uint8)
+        return {
+            "title": name,
+            "plot_type": "plot_ff_3d",
+            "image": QImage(
+                pixels.data, pixels.shape[1], pixels.shape[0],
+                int(pixels.strides[0]), QImage.Format.Format_RGBA8888,
+            ).copy(),
+            "series": [],
+        }
+
+    def _collect_report_plots(self, settings: dict) -> list[dict]:
+        from .report import (
+            enabled_simulation_names,
+            filter_enabled_simulation_plots,
+            touchstone_sources,
+        )
+        from .touchstone import find_touchstones
+
+        enabled_simulations = enabled_simulation_names(settings)
+        simulation_items = settings.get("simulations", [])
+        simulation_by_name = {
+            str(item.get("name", "")).strip(): item
+            for item in simulation_items
+            if isinstance(item, dict)
+            and bool(item.get("enabled", True))
+            and str(item.get("name", "")).strip()
+        } if isinstance(simulation_items, list) else {}
+        outputs = settings.get("outputs", [])
+        outputs = [
+            item for item in outputs
+            if isinstance(item, dict) and bool(item.get("enabled", True))
+            and str(item.get("simulation", "")).strip() in enabled_simulations
+        ] if isinstance(outputs, list) else []
+        plots: list[dict] = []
+        views = getattr(self, "_plot_views", {})
+        for output in outputs:
+            simulation = str(output.get("simulation", "")).strip()
+            name = str(output.get("name", "Output")).strip() or "Output"
+            key = f"{simulation}::{name}"
+            simulation_config = simulation_by_name.get(simulation)
+            if simulation_config is None:
+                continue
+            touchstones = find_touchstones(
+                self._simulation_bundle_dir(), self._project_name, simulation
+            )
+            view = views.get(key)
+            try:
+                if view is not None:
+                    image = view.capture_plot_image()
+                    series = list(getattr(view, "_series_data", []))
+                    title = str(getattr(view, "_title", "") or name)
+                    source = ""
+                else:
+                    data, source, source_path = self._report_output_plot_data(
+                        output, simulation_config, touchstones
+                    )
+                    image = data.get("image")
+                    if image is None:
+                        image = self._render_report_plot_data(data)
+                    series = data.get("series", [])
+                    title = str(data.get("title", name))
+                    if source_path:
+                        source = f"{source}: {source_path}"
+                # Provenance must track exactly the traces captured by the
+                # chart (or selected by the output definition for a new plot).
+                visible_series = [
+                    item for item in series
+                    if isinstance(item, dict) and bool(item.get("visible", True))
+                ]
+                sources = touchstone_sources(visible_series, touchstones)
+                touchstone_names = sorted(
+                    {entry["name"] for entry in sources}, key=str.casefold
+                )
+                if not touchstone_names:
+                    trace_source = next(
+                        (
+                            str(item.get("source_path", "")).strip()
+                            for item in visible_series
+                            if item.get("source_path")
+                            and str(item.get("source_kind", "")).lower() != "touchstone"
+                        ),
+                        "",
+                    )
+                    if not trace_source:
+                        trace_source = next(
+                            (
+                                str(item.get("file_name", "")).strip()
+                                for item in visible_series
+                                if str(item.get("file_name", "")).lower().endswith(".emerge")
+                            ),
+                            "",
+                        )
+                    if not trace_source:
+                        for results_dir in self._candidate_results_dirs_for_sim(simulation):
+                            simdata_file = self._simdata_file_in_dir(results_dir)
+                            if simdata_file is not None:
+                                trace_source = str(simdata_file.resolve())
+                                break
+                    plot_type = str(output.get("plot_type", "")).strip().lower()
+                    if plot_type.startswith("plot_ff"):
+                        source = f"Far-field results: {trace_source}" if trace_source else "Far-field results"
+                    elif trace_source:
+                        source = f"Simulation results (simdata): {trace_source}"
+                    elif not source:
+                        source = "Inserted chart data"
+                plots.append({
+                    "simulation": simulation,
+                    "key": key,
+                    "name": title,
+                    "image": image,
+                    "touchstone_files": touchstone_names,
+                    "touchstone_sources": sources,
+                    "source": "" if touchstone_names else source,
+                })
+            except Exception:
+                # Missing or malformed results should not block other report
+                # sections or outputs.
+                continue
+        return filter_enabled_simulation_plots(settings, plots)
+
+    def _write_project_report(self, destination: Path) -> None:
+        from .report import write_project_report
+
+        settings = self._project_tree.get_settings()
+        materials = {
+            str(getattr(obj, "material", "")).strip()
+            for obj in self._viewport.scene.objects
+            if str(getattr(obj, "material", "")).strip()
+        }
+        materials.update(
+            str(item.get("name", "")).strip()
+            for item in self._material_store.project_materials_to_json()
+            if isinstance(item, dict) and str(item.get("name", "")).strip()
+        )
+        port_snapshots = []
+        ports = settings.get("ports", [])
+        try:
+            plate_geometry_by_name = {
+                str(item.get("plate_name", "")).strip(): item
+                for item in self._collect_plate_lumped_ports()
+                if isinstance(item, dict) and str(item.get("plate_name", "")).strip()
+            }
+        except Exception:
+            # A report should still be exportable for incomplete port
+            # assignments; the viewport can fall back to available geometry.
+            plate_geometry_by_name = {}
+        if isinstance(ports, list):
+            for port in ports:
+                if not isinstance(port, dict):
+                    continue
+                try:
+                    object_name = str(port.get("object", "")).strip()
+                    image = self._viewport.render_port_image(
+                        port,
+                        plate_geometry=plate_geometry_by_name.get(object_name),
+                    )
+                except Exception:
+                    # Preserve the configured port and its settings even if
+                    # its geometry cannot be rendered in this report.
+                    image = None
+                snapshot = {
+                    "project": self._project_name or "Untitled",
+                    "port": port,
+                    "image": image,
+                }
+                if str(port.get("type", "")).strip().casefold() == "planewave":
+                    snapshot["note"] = (
+                        "PlaneWave has no mapped port geometry; the image shows overall model context."
+                    )
+                port_snapshots.append(snapshot)
+        write_project_report(
+            destination,
+            project_name=self._project_name,
+            settings=settings,
+            materials=sorted(materials, key=str.casefold),
+            model_image=self._viewport.render_axonometric_image(),
+            plots=self._collect_report_plots(settings),
+            port_snapshots=port_snapshots,
+        )
+
     def _build_toolbar(self) -> None:
         tb = self.addToolBar("Main")
         self._main_toolbar = tb
@@ -1350,14 +1862,14 @@ class MainWindow(QMainWindow):
         add_group("3D", primitive_actions, columns=3)
 
         # Sketch tool
-        act_sketch = QAction(_icon("Part_Sketch_Face"), "Sketch", self)
+        act_sketch = QAction(_icon("Part_Sketch"), "Sketch", self)
         act_sketch.setToolTip("Open parametric sketch canvas (extrude or revolve)")
         act_sketch.triggered.connect(self._open_sketch)
 
         act_planar = QAction(_icon("Std_Plane"), "Planar", self)
         act_planar.setToolTip("Define planar structure: pick start/end (vertex/edge/face snap) on active plane")
         act_planar.triggered.connect(lambda: self._start_draw("planar"))
-        act_plate_face = QAction(_icon("Std_Plane"), "Plate from Face/Edge", self)
+        act_plate_face = QAction(_icon("Plate_on_Face"), "Plate from Face/Edge", self)
         act_plate_face.setToolTip("Create a thin plate from the last selected face or axis-aligned edge")
         act_plate_face.triggered.connect(self._create_plate_from_face)
         act_circular_plate = QAction(_icon("Sketcher_CreateCircle"), "Circular Plate", self)
@@ -7957,11 +8469,104 @@ class MainWindow(QMainWindow):
         callback()
         self._track_output_plot_windows(existing_figures)
 
-    def _on_output_plot_requested(self, payload: dict, *, results_dir: Path | None = None) -> None:
+    def _show_farfield_3d_display(
+        self,
+        loaded_sim,
+        grid,
+        plot_params: dict,
+    ) -> float:
+        """Open the saved normE/dB far field in EMERGE's separate viewer."""
+        import numpy as np
+
+        mw_data = getattr(getattr(loaded_sim, "data", None), "mw", None)
+        field_data = getattr(mw_data, "field", None)
+        frequencies = np.asarray(getattr(grid, "freq", []), dtype=float).reshape(-1)
+        if field_data is None or not frequencies.size:
+            raise RuntimeError(
+                "3D far-field plotting requires saved E/H fields and a solved frequency."
+            )
+
+        requested_frequency_ghz = float(plot_params.get("frequency_GHz", 0.0) or 0.0)
+        requested_frequency = requested_frequency_ghz * 1e9
+        if requested_frequency <= 0.0:
+            requested_frequency = (float(frequencies[0]) + float(frequencies[-1])) / 2.0
+        selected_frequency = float(
+            frequencies[int(np.argmin(np.abs(frequencies - requested_frequency)))]
+        )
+        field_entry = field_data.find(freq=selected_frequency)
+        geometries = list(loaded_sim.all_geos())
+        boundary_geometries = [
+            geometry
+            for geometry in geometries
+            if callable(getattr(geometry, "boundary", None))
+        ]
+        if not boundary_geometries:
+            raise RuntimeError(
+                "Far-field plotting requires at least one geometry with boundary faces."
+            )
+        faces = boundary_geometries[0].boundary()
+        for geometry in boundary_geometries[1:]:
+            faces = faces + geometry.boundary()
+        farfield = field_entry.farfield_3d(faces)
+        display = getattr(loaded_sim, "display", None)
+        if display is None:
+            raise RuntimeError("The EMERGE far-field renderer is unavailable.")
+        self._farfield_displays.append(display)
+
+        scene_objects = getattr(
+            getattr(getattr(self, "_viewport", None), "scene", None),
+            "objects",
+            [],
+        )
+        model_display_state = {
+            str(getattr(obj, "name", "")).strip(): (
+                bool(obj.is_visible()),
+                max(0.0, min(1.0, float(getattr(obj, "opacity", 0.85)))),
+            )
+            for obj in scene_objects
+            if bool(getattr(obj, "is_model", True))
+        }
+        for geometry in geometries:
+            geometry_name = str(getattr(geometry, "name", "")).strip()
+            source_name = geometry_name.split("_OCC", 1)[0].strip()
+            display_state = model_display_state.get(source_name)
+            if display_state is None:
+                display_state = model_display_state.get(geometry_name)
+            if display_state is not None:
+                visible, source_opacity = display_state
+                display.add_object(
+                    geometry,
+                    opacity=source_opacity if visible else 0.0,
+                )
+
+        mesh_nodes = np.asarray(
+            getattr(getattr(loaded_sim, "mesh", None), "nodes", [])
+        )
+        rmax = None
+        if mesh_nodes.ndim == 2 and mesh_nodes.shape[0] == 3 and mesh_nodes.shape[1]:
+            rmax = max(float(np.ptp(mesh_nodes, axis=1).max()) * 2.0, 1e-6)
+        display.add_farfield3d(
+            farfield,
+            component="normE",
+            quantity="abs",
+            dB=True,
+            dBfloor=-40,
+            rmax=rmax,
+            opacity=0.75,
+        )
+        if getattr(display, "_plot", None) is None:
+            raise RuntimeError("The EMERGE far-field renderer is unavailable.")
+        display.show()
+        return selected_frequency
+
+    def _on_output_plot_requested(
+        self, payload: dict, *, results_dir: Path | None = None
+    ) -> None:
         name = str(payload.get("name", "Output")).strip() or "Output"
         sim_name = str(payload.get("simulation", "")).strip()
         plot_type = str(payload.get("plot_type", "plot_sp")).strip() or "plot_sp"
         plot_params = payload.get("params", {}) if isinstance(payload.get("params", {}), dict) else {}
+
         if not sim_name:
             QMessageBox.warning(self, "Output", "Output has no simulation assigned.")
             return
@@ -8112,8 +8717,24 @@ class MainWindow(QMainWindow):
             return
 
         if plot_type in {"plot_ff", "plot_ff_polar", "plot_ff_3d"}:
+            if plot_type == "plot_ff_3d":
+                selected_frequency = self._show_farfield_3d_display(
+                    loaded_sim,
+                    grid,
+                    plot_params,
+                )
+                selected_frequency_ghz = selected_frequency / 1e9
+                self._info_bar.set_info(
+                    f"Output plotted: {name} ({plot_type}) at "
+                    f"{selected_frequency_ghz:.9g} GHz from {simdata_path}"
+                )
+                self._append_sim_log(
+                    f"[info] Output plotted: {name} ({plot_type}) at "
+                    f"{selected_frequency_ghz:.9g} GHz from {simdata_path}"
+                )
+                return
+
             plane = str(plot_params.get("plane", "XY")).strip().upper() or "XY"
-            polar_3d = bool(plot_params.get("polar_3d", False))
             theta = getattr(grid, "theta", None)
             phi = getattr(grid, "phi", None)
             ff_data = getattr(grid, "ff", None)
@@ -8146,56 +8767,14 @@ class MainWindow(QMainWindow):
                     faces = boundary_geometries[0].boundary()
                     for geometry in boundary_geometries[1:]:
                         faces = faces + geometry.boundary()
-                    if plot_type == "plot_ff_3d":
-                        farfield = field_entry.farfield_3d(faces)
-                        display = loaded_sim.display
-                        self._farfield_displays.append(display)
-                        model_display_state = {
-                            str(getattr(obj, "name", "")).strip(): (
-                                bool(obj.is_visible()),
-                                max(0.0, min(1.0, float(getattr(obj, "opacity", 0.85)))),
-                            )
-                            for obj in self._viewport.scene.objects
-                            if bool(getattr(obj, "is_model", True))
-                        }
-                        for geometry in loaded_sim.all_geos():
-                            geometry_name = str(getattr(geometry, "name", "")).strip()
-                            source_name = geometry_name.split("_OCC", 1)[0].strip()
-                            display_state = model_display_state.get(source_name)
-                            if display_state is None:
-                                display_state = model_display_state.get(geometry_name)
-                            if display_state is not None:
-                                _visible, source_opacity = display_state
-                                display.add_object(
-                                    geometry,
-                                    opacity=source_opacity if _visible else 0.0,
-                                )
-                        mesh_nodes = np.asarray(getattr(loaded_sim.mesh, "nodes", []))
-                        rmax = None
-                        if mesh_nodes.ndim == 2 and mesh_nodes.shape[0] == 3 and mesh_nodes.shape[1]:
-                            rmax = max(float(np.ptp(mesh_nodes, axis=1).max()) * 2.0, 1e-6)
-                        display.add_farfield3d(
-                            farfield,
-                            component="normE",
-                            quantity="abs",
-                            dB=True,
-                            dBfloor=-40,
-                            rmax=rmax,
-                            opacity=0.75,
-                        )
-                        display.show()
-                        self._info_bar.set_info(f"Output plotted: {name} ({plot_type}) from {simdata_path}")
-                        self._append_sim_log(f"[info] Output plotted: {name} ({plot_type}) from {simdata_path}")
-                        return
-                    else:
-                        plane_axes = {
-                            "XY": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
-                            "XZ": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
-                            "YZ": ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0)),
-                        }
-                        ref_direction, plane_normal = plane_axes.get(plane, plane_axes["XY"])
-                        farfield = field_entry.farfield_2d(ref_direction, plane_normal, faces)
-                        theta = farfield.ang
+                    plane_axes = {
+                        "XY": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
+                        "XZ": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
+                        "YZ": ((0.0, 1.0, 0.0), (1.0, 0.0, 0.0)),
+                    }
+                    ref_direction, plane_normal = plane_axes.get(plane, plane_axes["XY"])
+                    farfield = field_entry.farfield_2d(ref_direction, plane_normal, faces)
+                    theta = farfield.ang
                     ff_data = farfield.gain.norm
             if ff_data is None:
                 raise RuntimeError(
@@ -8210,10 +8789,12 @@ class MainWindow(QMainWindow):
                         value = ff_data[key]
                         break
                 if isinstance(value, dict):
-                    for key in ("theta", "phi", "ang", "angles"):
+                    for key in ("theta", "ang", "angles"):
                         if key in value:
                             theta = value[key]
                             break
+                    if "phi" in value:
+                        phi = value["phi"]
 
             theta_arr = np.asarray(theta) if theta is not None else None
             phi_arr = np.asarray(phi) if phi is not None else None

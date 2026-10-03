@@ -1303,13 +1303,32 @@ def export_emerge_python_script(
 
     if domain_boundaries:
         lines += [
-            "# Assign global boundary settings to the six outer faces of the open-region domain.",
+            "# Assign global boundary settings to the configured outer faces of the open-region domain.",
             f"_open_region_objects = list(geometry_groups[{_q(air_volume_name)}].objects)",
             "if len(_open_region_objects) != 1:",
             f"    raise RuntimeError('Open-region domain {_q(air_volume_name)} must contain exactly one geometry object')",
             "_open_region_object = _open_region_objects[0]",
+            "_open_region_face_boundary_types = {}",
+            "def _resolve_open_region_boundary_face(face_selector, boundary_type):",
+            "    try:",
+            "        face_selection = _open_region_object.face(face_selector)",
+            "    except ValueError as error:",
+            "        available_faces = _open_region_object.all_faces()",
+            "        if len(available_faces) != 1:",
+            f"            raise RuntimeError('Open-region domain {_q(air_volume_name)} does not expose face ' + repr(face_selector) + '; cannot safely map the boundary') from error",
+            "        face_selection = available_faces[0]",
+            "        print('[warn] Open-region boundary ' + repr(face_selector) + ' mapped to the geometry object\\'s only face')",
+            "    face_key = tuple(sorted(face_selection.tags))",
+            "    existing_boundary_type = _open_region_face_boundary_types.get(face_key)",
+            "    if existing_boundary_type is not None:",
+            "        if existing_boundary_type != boundary_type:",
+            "            raise RuntimeError('Open-region face has conflicting global boundaries: ' + existing_boundary_type + ' and ' + boundary_type)",
+            "        return None",
+            "    _open_region_face_boundary_types[face_key] = boundary_type",
+            "    return face_selection",
+            "_open_region_boundary_groups = {}",
         ]
-        boundary_groups: Dict[str, List[str]] = {}
+        boundary_groups: List[str] = []
         for boundary_key, face_selector, boundary_type in domain_boundaries:
             if face_selector in waveguide_face_selectors:
                 lines.append(
@@ -1318,9 +1337,16 @@ def export_emerge_python_script(
                 continue
             if boundary_type in {"Open", "Radiation", "Pec", "Pmc"}:
                 var_name = f"_open_face_{boundary_key.lower()}"
-                lines.append(f"{var_name} = _open_region_object.face({_q(face_selector)})")
                 group_type = "Absorbing" if boundary_type in {"Open", "Radiation"} else boundary_type
-                boundary_groups.setdefault(group_type, []).append(var_name)
+                lines.append(
+                    f"{var_name} = _resolve_open_region_boundary_face({_q(face_selector)}, {_q(group_type)})"
+                )
+                lines.append(f"if {var_name} is not None:")
+                lines.append(
+                    f"    _open_region_boundary_groups.setdefault({_q(group_type)}, []).append({var_name})"
+                )
+                if group_type not in boundary_groups:
+                    boundary_groups.append(group_type)
             elif boundary_type == "Pml" and pml_setup is not None:
                 continue
             elif boundary_type == "Pml":
@@ -1331,14 +1357,20 @@ def export_emerge_python_script(
                 lines.append(
                     f"print({_q(f'[warn] Global boundary {boundary_key}={boundary_type} is not a surface AbsorbingBoundary and was not exported')})"
                 )
-        for boundary_type, face_vars in boundary_groups.items():
-            selection_expression = " + ".join(face_vars)
+        for boundary_type in boundary_groups:
+            group_expression = f"_open_region_boundary_groups[{_q(boundary_type)}]"
+            lines += [
+                f"if {group_expression}:",
+                f"    _combined_open_region_faces = {group_expression}[0]",
+                f"    for _additional_open_region_face in {group_expression}[1:]:",
+                "        _combined_open_region_faces = _combined_open_region_faces + _additional_open_region_face",
+            ]
             if boundary_type == "Absorbing":
-                lines.append(f"simulationObj.mw.bc.AbsorbingBoundary({selection_expression})")
+                lines.append("    simulationObj.mw.bc.AbsorbingBoundary(_combined_open_region_faces)")
             elif boundary_type == "Pec":
-                lines.append(f"simulationObj.mw.bc.PEC({selection_expression})")
+                lines.append("    simulationObj.mw.bc.PEC(_combined_open_region_faces)")
             elif boundary_type == "Pmc":
-                lines.append(f"simulationObj.mw.bc.PMC({selection_expression})")
+                lines.append("    simulationObj.mw.bc.PMC(_combined_open_region_faces)")
         lines.append("")
 
     lines += [

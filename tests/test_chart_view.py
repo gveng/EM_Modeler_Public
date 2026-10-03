@@ -1472,6 +1472,26 @@ def test_matplotlib_chart_x_scale_persists_across_recreation(memory_qsettings):
     assert app is not None
 
 
+def test_plot_ff_3d_renders_the_emerge_image_inside_the_chart_workspace():
+    app = QApplication.instance() or QApplication([])
+    view = PlotView("plot_ff_3d")
+    image = np.asarray(
+        [[[15, 30, 45], [60, 75, 90]], [[105, 120, 135], [150, 165, 180]]],
+        dtype=np.uint8,
+    )
+
+    view.set_farfield_3d_image(image, title="Radiation pattern - 1 GHz")
+
+    assert view.axes.name == "rectilinear"
+    assert len(view.axes.images) == 1
+    np.testing.assert_array_equal(view.axes.images[0].get_array(), image)
+    assert view._canvas_scroll.widget() is view.canvas
+    assert view.append_button.isEnabled() is False
+    assert not view.x_scale_combo.isEnabled()
+    assert not view.display_mode_combo.isEnabled()
+    assert app is not None
+
+
 def test_empty_plot_view_accepts_its_first_progressive_data_chunk():
     app = QApplication.instance() or QApplication([])
     view = PlotView("plot_sp")

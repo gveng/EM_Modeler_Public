@@ -11,7 +11,7 @@ import vtk
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMainWindow, QToolButton
+from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMainWindow, QMenu, QToolButton
 
 import em3d_modeler.ui.main_window as main_window_module
 from em3d_modeler.ui.main_window import MainWindow, _BooleanCutSetupDialog
@@ -988,6 +988,69 @@ def test_generate_plot_uses_saved_touchstone_without_loading_emerge(tmp_path):
     window._append_sim_log.assert_called_once()
 
 
+def test_generate_plot_ff_3d_opens_emerge_window_at_nearest_solved_frequency():
+    farfield = object()
+    field_entry = SimpleNamespace(farfield_3d=Mock(return_value=farfield))
+    field_data = SimpleNamespace(find=Mock(return_value=field_entry))
+    geometry = SimpleNamespace(boundary=Mock(return_value=["face"]))
+    plotter = SimpleNamespace()
+    display = SimpleNamespace(
+        add_object=Mock(),
+        add_farfield3d=Mock(),
+        show=Mock(),
+        _plot=plotter,
+        clean=Mock(),
+    )
+    loaded_sim = SimpleNamespace(
+        data=SimpleNamespace(mw=SimpleNamespace(field=field_data)),
+        all_geos=lambda: [geometry],
+        display=display,
+    )
+    grid = SimpleNamespace(freq=[0.9e9, 1.0e9, 1.1e9])
+    show_chart = Mock()
+    window = SimpleNamespace(
+        _project_name="Model",
+        _load_sim_grid_from_results=Mock(return_value=(loaded_sim, grid, "simdata.emerge")),
+        _show_chart=show_chart,
+        _info_bar=SimpleNamespace(set_info=Mock()),
+        _append_sim_log=Mock(),
+        _farfield_displays=[],
+    )
+    window._show_farfield_3d_display = MethodType(
+        MainWindow._show_farfield_3d_display,
+        window,
+    )
+
+    MainWindow._on_output_plot_requested(
+        window,
+        {
+            "name": "Radiation pattern",
+            "simulation": "Sweep",
+            "plot_type": "plot_ff_3d",
+            "params": {"frequency_GHz": 1.04},
+        },
+    )
+
+    show_chart.assert_not_called()
+    field_data.find.assert_called_once_with(freq=1.0e9)
+    field_entry.farfield_3d.assert_called_once_with(["face"])
+    display.add_farfield3d.assert_called_once_with(
+        farfield,
+        component="normE",
+        quantity="abs",
+        dB=True,
+        dBfloor=-40,
+        rmax=None,
+        opacity=0.75,
+    )
+    display.show.assert_called_once_with()
+    assert window._farfield_displays == [display]
+    display.clean.assert_not_called()
+    assert "at 1 GHz" in window._info_bar.set_info.call_args.args[0]
+    assert "at 1 GHz" in window._info_bar.set_info.call_args.args[0]
+    assert "at 1 GHz" in window._append_sim_log.call_args.args[0]
+
+
 def test_generate_plot_opens_empty_chart_when_simulation_has_no_results(tmp_path):
     show_chart = Mock()
     window = SimpleNamespace(
@@ -1780,12 +1843,51 @@ def test_sketch_toolbar_shows_select_delete_and_exit_actions():
     actions = [button.defaultAction() for button in edit_group.findChildren(QToolButton)]
     assert [action.text() for action in actions] == ["Select", "Delete", "Exit Sketch"]
     assert all(not action.icon().isNull() for action in actions)
+    tools_group = next(
+        widget for action in window._main_toolbar.actions()
+        if (widget := window._main_toolbar.widgetForAction(action)) is not None
+        and widget.property("toolbarGroupTitle") == "Tools"
+    )
+    tools_actions = [button.defaultAction() for button in tools_group.findChildren(QToolButton)]
+    assert [action.text() for action in tools_actions] == ["Measure", "Parameters"]
     actions[0].trigger()
     actions[1].trigger()
     actions[2].trigger()
     window._viewport._sketch_set_selection_mode.assert_called_once()
     window._viewport._sketch_delete_selected.assert_called_once()
     window._viewport.exit_sketch.assert_called_once_with(commit=False)
+    assert application is not None
+
+
+def test_tools_menu_does_not_offer_report():
+    application = QApplication.instance() or QApplication([])
+    window = QMainWindow()
+    window._viewport = SimpleNamespace(
+        cancel_draw=Mock(),
+        measurement_mode_changed=Mock(),
+        reset_camera=Mock(),
+        reset_reference_plane=Mock(),
+    )
+    for name in (
+        "_new_project", "_close_project", "_open_project", "_save_project",
+        "_save_project_as", "_import_step", "_export_emerge",
+        "_set_global_material_db", "_reload_global_material_db",
+        "_delete_selected", "_set_cancel_drawing_enabled", "_undo", "_redo",
+        "_update_history_actions", "_set_view", "_open_reference_plane_dialog",
+        "_toggle_grid", "_rebuild_window_menu", "_refresh_recent_projects",
+        "_open_settings_dialog", "_open_material_library_dialog",
+        "_open_project_parameters", "_export_model_step", "_open_help",
+        "_show_about",
+    ):
+        setattr(window, name, Mock())
+
+    MainWindow._build_menus(window)
+
+    tools_menu = next(
+        menu for menu in window.findChildren(QMenu)
+        if menu.title().replace("&", "") == "Tools"
+    )
+    assert all("Report" not in action.text() for action in tools_menu.actions())
     assert application is not None
 
 

@@ -859,7 +859,9 @@ class PlotView(QWidget):
         self._is_vswr = self.plot_type == "plot_vswr"
         self._is_farfield = self.plot_type in {"plot_ff", "plot_ff_polar", "plot_ff_3d"}
         self._is_polar = self.plot_type == "plot_ff_polar"
+        self._is_farfield_3d = self.plot_type == "plot_ff_3d"
         self._use_pyqtgraph = not self._is_farfield
+        self._farfield_3d_image: np.ndarray | None = None
         self._x_values = np.asarray([], dtype=float)
         self._series_data: list[dict[str, Any]] = []
         self._equations: list[dict[str, Any]] = []
@@ -908,7 +910,7 @@ class PlotView(QWidget):
         self.x_scale_combo.setObjectName("xScaleCombo")
         self.x_scale_combo.addItems(["Linear", "Log"])
         self._last_x_log = self.x_scale_combo.currentText() == "Log"
-        if self._is_smith or self._is_polar:
+        if self._is_smith or self._is_polar or self._is_farfield_3d:
             self.x_scale_combo.setEnabled(False)
 
         self.y_scale_combo = QComboBox(self)
@@ -960,6 +962,7 @@ class PlotView(QWidget):
         self.append_button.setCheckable(True)
         self.append_button.setToolTip("Append subsequent simulations to this chart")
         self.append_button.setAccessibleName("Append to Chart")
+        self.append_button.setEnabled(not self._is_farfield_3d)
         self.append_button.toggled.connect(self.append_mode_changed.emit)
         self.clear_markers_button = self.remove_markers_button
         marker_actions_enabled = self._use_pyqtgraph and not self._is_smith
@@ -1012,7 +1015,12 @@ class PlotView(QWidget):
             from matplotlib.figure import Figure
 
             self.figure = Figure(figsize=(7, 4))
-            self.axes = self.figure.add_subplot(111, projection="polar" if self._is_polar else None)
+            projection = (
+                "3d" if self._is_farfield_3d
+                else "polar" if self._is_polar
+                else None
+            )
+            self.axes = self.figure.add_subplot(111, projection=projection)
             self.canvas = FigureCanvasQTAgg(self.figure)
             self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             self._canvas_scroll.setWidget(self.canvas)
@@ -1875,13 +1883,15 @@ class PlotView(QWidget):
         title: str,
         xlabel: str,
         ylabel: str,
+        persist: bool = True,
     ) -> None:
         self._progressive_x_range = None
+        self._farfield_3d_image = None
         self._base_file_ids = {
             str(item.get("file_id", item.get("file_name", "default")))
             for item in series
         }
-        appended_series = self._load_appended_series()
+        appended_series = self._load_appended_series() if persist else []
         self._appended_file_ids = {
             str(item["file_id"]) for item in appended_series
         }
@@ -1893,8 +1903,42 @@ class PlotView(QWidget):
         self._xlabel = str(xlabel)
         self._ylabel = str(ylabel)
         self._redraw()
-        self._save_appended_series()
-        self._save_chart_settings()
+        if persist:
+            self._save_appended_series()
+            self._save_chart_settings()
+
+    def set_farfield_3d_image(
+        self,
+        image: np.ndarray,
+        *,
+        title: str,
+        persist: bool = True,
+    ) -> None:
+        """Display an EMERGE-rendered far-field image in the chart workspace."""
+        if not self._is_farfield_3d:
+            raise ValueError("3D far-field images can only be set on a plot_ff_3d view.")
+
+        image_array = np.asarray(image)
+        if image_array.ndim != 3 or image_array.shape[2] < 3:
+            raise ValueError("The 3D far-field renderer returned an invalid image.")
+        self._farfield_3d_image = np.ascontiguousarray(
+            image_array[:, :, :3],
+            dtype=np.uint8,
+        )
+        self._title = str(title)
+        self._xlabel = ""
+        self._ylabel = ""
+        self._series_data = []
+        self._x_values = np.asarray([], dtype=float)
+        self._redraw()
+        if persist:
+            self._save_chart_settings()
+
+    def capture_plot_image(self):
+        """Capture only the plotted canvas, excluding chart controls and panels."""
+        self._root_layout.activate()
+        self.canvas.ensurePolished()
+        return self.canvas.grab().toImage()
 
     def append_plot_data(
         self,
@@ -2917,7 +2961,9 @@ class PlotView(QWidget):
         from matplotlib.figure import Figure
         import matplotlib.pyplot as plt
 
-        emerge_plot = importlib.import_module("emerge.plot")
+        emerge_plot = (
+            None if self._is_farfield_3d else importlib.import_module("emerge.plot")
+        )
         visible_series = [item for item in self._series_data if item["visible"]]
         labels = [item["legend_label"] for item in visible_series]
         values = [np.asarray(item["values"]) for item in visible_series]
@@ -2935,9 +2981,20 @@ class PlotView(QWidget):
         old_show = plt.show
         plt.show = lambda *_args, **_kwargs: None
         try:
-            if not visible_series:
+            if self._is_farfield_3d and self._farfield_3d_image is not None:
                 figure = Figure()
-                axes = figure.add_subplot(111, projection="polar" if self._is_polar else None)
+                axes = figure.add_subplot(111)
+                axes.imshow(self._farfield_3d_image)
+                axes.set_axis_off()
+                figure.subplots_adjust(left=0, right=1, bottom=0, top=1)
+            elif not visible_series:
+                figure = Figure()
+                projection = (
+                    "3d" if self._is_farfield_3d
+                    else "polar" if self._is_polar
+                    else None
+                )
+                axes = figure.add_subplot(111, projection=projection)
                 axes.set_title(self._title)
                 if self._is_smith:
                     axes.set_xlim(-1.1, 1.1)

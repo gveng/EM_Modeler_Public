@@ -49,6 +49,133 @@ class _FailingFitGrid(_FakeGrid):
         raise RuntimeError("SVD did not converge")
 
 
+class _FakeFaceSelection:
+    def __init__(self, tags):
+        self.tags = list(tags)
+
+    def __add__(self, other):
+        return _FakeFaceSelection(self.tags + other.tags)
+
+
+class _SingleFaceGeometry:
+    def __init__(self):
+        self.only_face = _FakeFaceSelection([42])
+
+    def face(self, name):
+        if name == "+x":
+            return self.only_face
+        raise ValueError(f"The face {name} does not exist; only ['+x']")
+
+    def all_faces(self):
+        return [self.only_face]
+
+
+class _SixFaceGeometry:
+    def __init__(self):
+        self.faces = {
+            name: _FakeFaceSelection([index])
+            for index, name in enumerate(("-x", "+x", "-y", "+y", "-z", "+z"), start=1)
+        }
+
+    def face(self, name):
+        return self.faces[name]
+
+    def all_faces(self):
+        return list(self.faces.values())
+
+
+def _open_region_boundary_export(boundaries):
+    return python_script_exporter.export_emerge_python_script(
+        project_name="OpenRegionBoundaryTest",
+        settings={
+            "open_region": {"enabled": True, "object": "Air"},
+            "boundaries": boundaries,
+        },
+        step_entries=[{"object_name": "Air", "material": "AIR"}],
+        run_sweep=False,
+    )
+
+
+def _open_region_boundary_code(boundaries):
+    script = _open_region_boundary_export(boundaries)
+    ast.parse(script)
+    start = script.index("# Assign global boundary settings to the configured outer faces")
+    end = script.index("# [8] MESH GENERATION", start)
+    return script[start:end]
+
+
+def _execute_open_region_boundary_code(code, geometry):
+    calls = []
+    boundary_conditions = SimpleNamespace(
+        AbsorbingBoundary=lambda selection: calls.append(("Absorbing", selection)),
+        PEC=lambda selection: calls.append(("Pec", selection)),
+        PMC=lambda selection: calls.append(("Pmc", selection)),
+    )
+    namespace = {
+        "geometry_groups": {"Air": SimpleNamespace(objects=[geometry])},
+        "simulationObj": SimpleNamespace(mw=SimpleNamespace(bc=boundary_conditions)),
+    }
+    exec(code, namespace)
+    return calls
+
+
+def test_open_region_single_face_maps_missing_axis_boundaries_and_deduplicates():
+    code = _open_region_boundary_code({
+        "Xmin": "Open",
+        "Xmax": "Open",
+        "Ymin": "Open",
+        "Ymax": "Open",
+        "Zmin": "Open",
+        "Zmax": "Open",
+    })
+    output = io.StringIO()
+
+    with contextlib.redirect_stdout(output):
+        calls = _execute_open_region_boundary_code(code, _SingleFaceGeometry())
+
+    assert len(calls) == 1
+    assert calls[0][0] == "Absorbing"
+    assert calls[0][1].tags == [42]
+    assert "mapped to the geometry object's only face" in output.getvalue()
+
+
+def test_open_region_single_face_rejects_conflicting_boundary_types():
+    code = _open_region_boundary_code({"Xmin": "Open", "Xmax": "PEC"})
+
+    with pytest.raises(RuntimeError, match="conflicting global boundaries"):
+        _execute_open_region_boundary_code(code, _SingleFaceGeometry())
+
+
+def test_open_region_axis_faces_are_combined_for_box_geometry():
+    code = _open_region_boundary_code({
+        "Xmin": "Open",
+        "Xmax": "Open",
+        "Ymin": "Open",
+        "Ymax": "Open",
+        "Zmin": "Open",
+        "Zmax": "Open",
+    })
+    output = io.StringIO()
+
+    with contextlib.redirect_stdout(output):
+        calls = _execute_open_region_boundary_code(code, _SixFaceGeometry())
+
+    assert len(calls) == 1
+    assert calls[0][0] == "Absorbing"
+    assert calls[0][1].tags == [1, 2, 3, 4, 5, 6]
+    assert "mapped to the geometry object's only face" not in output.getvalue()
+
+
+def test_clean_worker_keeps_open_region_single_face_fallback():
+    script = _open_region_boundary_export({"Xmin": "Open"})
+
+    clean_script = build_clean_emerge_python_script(script, "sweep")
+
+    ast.parse(clean_script)
+    assert "def _resolve_open_region_boundary_face" in clean_script
+    assert "_open_region_object.all_faces()" in clean_script
+
+
 def test_object_conductor_boundaries_export_with_material_and_si_thickness(monkeypatch):
     monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "unknown")
     script = python_script_exporter.export_emerge_python_script(
