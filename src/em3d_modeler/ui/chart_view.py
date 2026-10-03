@@ -1,17 +1,24 @@
 from __future__ import annotations
 
+import ast
 from collections.abc import Sequence
 import hashlib
 import importlib
 import json
+import logging
 import math
+import os
 from pathlib import Path
+import operator
+import re
 import sys
+import tempfile
 from typing import Any
+import zlib
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import QEvent, QPoint, Qt, Signal, QSettings
+from PySide6.QtCore import QEvent, QPoint, QStandardPaths, Qt, Signal, QSettings
 from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -70,6 +77,130 @@ _TRACE_PALETTE = (
 _SMITH_RESISTANCE_VALUES = (0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0)
 _SMITH_REACTANCE_VALUES = _SMITH_RESISTANCE_VALUES
 _SMITH_LABEL_VALUES = (0.2, 0.5, 1.0, 2.0, 5.0)
+_LOGGER = logging.getLogger(__name__)
+_EQUATION_FILE_ID = "__chart_equations__"
+_EQUATION_FUNCTIONS = {
+    "abs": np.abs,
+    "angle": np.angle,
+    "arccos": np.arccos,
+    "arcsin": np.arcsin,
+    "arctan": np.arctan,
+    "conj": np.conjugate,
+    "cos": np.cos,
+    "exp": np.exp,
+    "imag": np.imag,
+    "log": np.log,
+    "log10": np.log10,
+    "maximum": np.maximum,
+    "minimum": np.minimum,
+    "real": np.real,
+    "sin": np.sin,
+    "sqrt": np.sqrt,
+    "tan": np.tan,
+}
+_EQUATION_BINARY_OPERATORS = {
+    ast.Add: operator.add,
+    ast.Sub: operator.sub,
+    ast.Mult: operator.mul,
+    ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv,
+    ast.Mod: operator.mod,
+    ast.Pow: operator.pow,
+}
+_EQUATION_UNARY_OPERATORS = {ast.UAdd: operator.pos, ast.USub: operator.neg}
+_IDENTIFIER = re.compile(r"^[A-Za-z_]\w*$")
+
+
+def _parse_equation_expression(expression: str, allowed_names: set[str]) -> ast.Expression:
+    """Parse and restrict an equation to numeric operators and approved functions."""
+    if len(expression) > 512:
+        raise ValueError("Formula is too long (maximum 512 characters).")
+    try:
+        tree = ast.parse(expression, mode="eval")
+    except SyntaxError as exc:
+        raise ValueError(f"Invalid formula syntax: {exc.msg}.") from exc
+    nodes = list(ast.walk(tree))
+    if len(nodes) > 100:
+        raise ValueError("Formula is too complex (maximum 100 syntax elements).")
+    permitted_names = allowed_names | set(_EQUATION_FUNCTIONS) | {"pi", "e"}
+    for node in nodes:
+        if isinstance(node, ast.Name):
+            if node.id not in permitted_names:
+                raise ValueError(f"Unknown formula variable or function '{node.id}'.")
+        elif isinstance(node, ast.Call):
+            if not isinstance(node.func, ast.Name) or node.func.id not in _EQUATION_FUNCTIONS:
+                raise ValueError("Only the listed numeric functions may be called.")
+            if node.keywords:
+                raise ValueError("Formula functions do not accept keyword arguments.")
+        elif isinstance(node, ast.Constant):
+            if isinstance(node.value, bool) or not isinstance(node.value, (int, float)):
+                raise ValueError("Only numeric constants are allowed in formulas.")
+        elif isinstance(node, ast.BinOp):
+            if type(node.op) not in _EQUATION_BINARY_OPERATORS:
+                raise ValueError("This arithmetic operator is not supported.")
+        elif isinstance(node, ast.UnaryOp):
+            if type(node.op) not in _EQUATION_UNARY_OPERATORS:
+                raise ValueError("This unary operator is not supported.")
+        elif isinstance(
+            node,
+            (
+                ast.Expression, ast.Load, ast.Add, ast.Sub, ast.Mult, ast.Div,
+                ast.FloorDiv, ast.Mod, ast.Pow, ast.UAdd, ast.USub,
+            ),
+        ):
+            continue
+        else:
+            raise ValueError(f"Formula element '{type(node).__name__}' is not allowed.")
+    return tree
+
+
+def _evaluate_equation_expression(
+    expression: str,
+    variables: dict[str, Any],
+) -> np.ndarray:
+    """Evaluate a validated element-wise numeric formula without using eval()."""
+    tree = _parse_equation_expression(expression, set(variables))
+
+    def calculate(node: ast.AST) -> Any:
+        if isinstance(node, ast.Expression):
+            return calculate(node.body)
+        if isinstance(node, ast.Constant):
+            return node.value
+        if isinstance(node, ast.Name):
+            if node.id == "pi":
+                return math.pi
+            if node.id == "e":
+                return math.e
+            if node.id in variables:
+                return variables[node.id]
+            return _EQUATION_FUNCTIONS[node.id]
+        if isinstance(node, ast.BinOp):
+            left, right = calculate(node.left), calculate(node.right)
+            if isinstance(node.op, ast.Pow) and np.isscalar(right):
+                if abs(right) > 1000:
+                    raise ValueError("Formula exponents must be between -1000 and 1000.")
+            return _EQUATION_BINARY_OPERATORS[type(node.op)](left, right)
+        if isinstance(node, ast.UnaryOp):
+            return _EQUATION_UNARY_OPERATORS[type(node.op)](calculate(node.operand))
+        if isinstance(node, ast.Call):
+            function = _EQUATION_FUNCTIONS[node.func.id]
+            return function(*(calculate(argument) for argument in node.args))
+        raise ValueError(f"Formula element '{type(node).__name__}' is not allowed.")
+
+    with np.errstate(all="ignore"):
+        result = np.asarray(calculate(tree))
+    if result.ndim == 0:
+        result = result.reshape(1)
+    return result.reshape(-1)
+
+
+def _chart_data_cache_root() -> Path:
+    app_data = QStandardPaths.writableLocation(
+        QStandardPaths.StandardLocation.AppLocalDataLocation
+    )
+    if app_data:
+        return Path(app_data) / "chart-data"
+    return Path.home() / ".em3d_modeler" / "chart-data"
 
 
 def _chart_logo_path() -> Path | None:
@@ -316,6 +447,17 @@ class _MarkerReadout(pg.TextItem):
         return super().itemChange(change, value)
 
 
+class _PersistentLegendItem(pg.LegendItem):
+    def __init__(self, position_changed, **options) -> None:
+        self._position_changed = position_changed
+        super().__init__(**options)
+
+    def mouseDragEvent(self, event) -> None:
+        super().mouseDragEvent(event)
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._position_changed(self)
+
+
 class _DraggableLegendPanel(QFrame):
     position_changed = Signal()
 
@@ -406,6 +548,13 @@ class _PlotSettingsDialog(QDialog):
         self.dataset_combo.setObjectName("traceDatasetCombo")
         self.dataset_combo.setToolTip("Choose the dataset whose available parameters are shown")
         available_layout.addWidget(self.dataset_combo)
+        self.remove_dataset_button = QPushButton("Remove dataset", available_panel)
+        self.remove_dataset_button.setObjectName("removeDatasetButton")
+        self.remove_dataset_button.setToolTip(
+            "Unload the selected loaded/appended dataset and all of its parameters"
+        )
+        self.remove_dataset_button.setEnabled(False)
+        available_layout.addWidget(self.remove_dataset_button)
         self.trace_search = QLineEdit(available_panel)
         self.trace_search.setPlaceholderText("Filter parameters")
         self.trace_search.setClearButtonEnabled(True)
@@ -515,6 +664,127 @@ class _PlotSettingsDialog(QDialog):
         plot_layout.addWidget(self.remove_logo_checkbox, alignment=Qt.AlignmentFlag.AlignLeft)
         self.tabs.addTab(option_page, "Option")
 
+        equation_page = QWidget(self.tabs)
+        equation_layout = QVBoxLayout(equation_page)
+        equation_layout.addWidget(QLabel(
+            "Create calculated traces from parameters plotted on this chart.",
+            equation_page,
+        ))
+        equation_split = QHBoxLayout()
+        self.equations_list = QListWidget(equation_page)
+        self.equations_list.setObjectName("equationsList")
+        self.equations_list.setMinimumWidth(190)
+        equation_split.addWidget(self.equations_list, 1)
+        equation_editor = QWidget(equation_page)
+        editor_layout = QVBoxLayout(equation_editor)
+        editor_layout.setContentsMargins(0, 0, 0, 0)
+        equation_form = QFormLayout()
+        self.equation_name_edit = QLineEdit(equation_editor)
+        self.equation_name_edit.setObjectName("equationNameEdit")
+        self.equation_name_edit.setPlaceholderText("e.g. S11_power")
+        equation_form.addRow("Result name", self.equation_name_edit)
+        self.equation_formula_edit = QLineEdit(equation_editor)
+        self.equation_formula_edit.setObjectName("equationFormulaEdit")
+        self.equation_formula_edit.setPlaceholderText("e.g. abs(s11) ** 2")
+        self.equation_formula_edit.setToolTip(
+            "Use +, -, *, /, **, %, parentheses and numeric functions such as abs, real, imag, sqrt, log10, sin, and cos."
+        )
+        equation_form.addRow("Formula", self.equation_formula_edit)
+        editor_layout.addLayout(equation_form)
+
+        variable_row = QHBoxLayout()
+        self.equation_parameter_combo = QComboBox(equation_editor)
+        self.equation_parameter_combo.setObjectName("equationParameterCombo")
+        self.equation_parameter_combo.setToolTip(
+            "Select a trace from any dataset currently loaded on this chart."
+        )
+        variable_row.addWidget(self.equation_parameter_combo, 1)
+        self.equation_variable_name_edit = QLineEdit(equation_editor)
+        self.equation_variable_name_edit.setObjectName("equationVariableNameEdit")
+        self.equation_variable_name_edit.setPlaceholderText("Variable")
+        self.equation_variable_name_edit.setMaximumWidth(100)
+        variable_row.addWidget(self.equation_variable_name_edit)
+        self.add_equation_variable_button = QPushButton("Add variable", equation_editor)
+        self.add_equation_variable_button.setObjectName("addEquationVariableButton")
+        variable_row.addWidget(self.add_equation_variable_button)
+        editor_layout.addLayout(variable_row)
+        self.equation_variables_list = QListWidget(equation_editor)
+        self.equation_variables_list.setObjectName("equationVariablesList")
+        self.equation_variables_list.setMaximumHeight(92)
+        self.equation_variables_list.setToolTip(
+            "Select a variable and use Remove selected variable to remove it."
+        )
+        editor_layout.addWidget(self.equation_variables_list)
+        self.remove_equation_variable_button = QPushButton("Remove selected variable", equation_editor)
+        self.remove_equation_variable_button.setObjectName("removeEquationVariableButton")
+        editor_layout.addWidget(
+            self.remove_equation_variable_button,
+            alignment=Qt.AlignmentFlag.AlignLeft,
+        )
+
+        constant_row = QHBoxLayout()
+        self.equation_constant_name_edit = QLineEdit(equation_editor)
+        self.equation_constant_name_edit.setObjectName("equationConstantNameEdit")
+        self.equation_constant_name_edit.setPlaceholderText("Constant")
+        self.equation_constant_name_edit.setMaximumWidth(100)
+        constant_row.addWidget(self.equation_constant_name_edit)
+        self.equation_constant_value_edit = QLineEdit(equation_editor)
+        self.equation_constant_value_edit.setObjectName("equationConstantValueEdit")
+        self.equation_constant_value_edit.setPlaceholderText("Numeric value")
+        self.equation_constant_value_edit.setMaximumWidth(120)
+        constant_row.addWidget(self.equation_constant_value_edit)
+        self.add_equation_constant_button = QPushButton("Add constant", equation_editor)
+        self.add_equation_constant_button.setObjectName("addEquationConstantButton")
+        constant_row.addWidget(self.add_equation_constant_button)
+        editor_layout.addLayout(constant_row)
+        self.equation_constants_list = QListWidget(equation_editor)
+        self.equation_constants_list.setObjectName("equationConstantsList")
+        self.equation_constants_list.setMaximumHeight(72)
+        self.equation_constants_list.setToolTip(
+            "Select a constant and use Remove selected constant to remove it."
+        )
+        editor_layout.addWidget(self.equation_constants_list)
+        self.remove_equation_constant_button = QPushButton("Remove selected constant", equation_editor)
+        self.remove_equation_constant_button.setObjectName("removeEquationConstantButton")
+        editor_layout.addWidget(
+            self.remove_equation_constant_button,
+            alignment=Qt.AlignmentFlag.AlignLeft,
+        )
+        equation_buttons = QHBoxLayout()
+        self.new_equation_button = QPushButton("New", equation_editor)
+        self.new_equation_button.setObjectName("newEquationButton")
+        self.save_equation_button = QPushButton("Add / Update equation", equation_editor)
+        self.save_equation_button.setObjectName("saveEquationButton")
+        self.remove_equation_button = QPushButton("Remove equation", equation_editor)
+        self.remove_equation_button.setObjectName("removeEquationButton")
+        equation_buttons.addWidget(self.new_equation_button)
+        equation_buttons.addWidget(self.save_equation_button)
+        equation_buttons.addWidget(self.remove_equation_button)
+        editor_layout.addLayout(equation_buttons)
+        self.equation_error_label = QLabel(equation_editor)
+        self.equation_error_label.setObjectName("equationErrorLabel")
+        self.equation_error_label.setWordWrap(True)
+        self.equation_error_label.setStyleSheet("color: #b42318;")
+        self.equation_error_label.hide()
+        editor_layout.addWidget(self.equation_error_label)
+        equation_split.addWidget(equation_editor, 2)
+        equation_layout.addLayout(equation_split, 1)
+        self.tabs.addTab(equation_page, "Equation")
+        self._equation_editor_variables: list[dict[str, str]] = []
+        self._equation_editor_constants: dict[str, float] = {}
+        self.add_equation_variable_button.clicked.connect(view._add_equation_variable)
+        self.add_equation_constant_button.clicked.connect(view._add_equation_constant)
+        self.new_equation_button.clicked.connect(view._new_equation_editor)
+        self.equations_list.currentRowChanged.connect(view._load_equation_editor)
+        self.save_equation_button.clicked.connect(view._save_equation_from_editor)
+        self.remove_equation_button.clicked.connect(view._remove_equation_from_editor)
+        self.remove_equation_variable_button.clicked.connect(
+            lambda: view._remove_selected_equation_item(self.equation_variables_list)
+        )
+        self.remove_equation_constant_button.clicked.connect(
+            lambda: view._remove_selected_equation_item(self.equation_constants_list)
+        )
+
         self.add_trace_button.clicked.connect(lambda: view._move_trace_items(self.available_list, True))
         self.remove_trace_button.clicked.connect(lambda: view._move_trace_items(self.selected_list, False))
         self.available_list.itemDoubleClicked.connect(
@@ -529,6 +799,8 @@ class _PlotSettingsDialog(QDialog):
         self.configure_trace_button.clicked.connect(view._configure_selected_trace)
         self.trace_search.textChanged.connect(view._filter_trace_lists)
         self.dataset_combo.currentIndexChanged.connect(view._populate_available_traces)
+        self.dataset_combo.currentIndexChanged.connect(view._update_remove_dataset_button)
+        self.remove_dataset_button.clicked.connect(view._remove_selected_dataset)
         self.available_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.selected_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.available_list.customContextMenuRequested.connect(
@@ -590,7 +862,11 @@ class PlotView(QWidget):
         self._use_pyqtgraph = not self._is_farfield
         self._x_values = np.asarray([], dtype=float)
         self._series_data: list[dict[str, Any]] = []
+        self._equations: list[dict[str, Any]] = []
+        self._equation_errors: list[str] = []
         self._overlay_file_ids: set[str] = set()
+        self._appended_file_ids: set[str] = set()
+        self._base_file_ids: set[str] = set()
         self._trace_items: dict[tuple[str, str], QListWidgetItem] = {}
         self._append_sequence = 0
         self._curve_items = []
@@ -599,6 +875,8 @@ class PlotView(QWidget):
         self._plot_logo_item: QGraphicsPixmapItem | None = None
         self._plot_logo_source: QPixmap | None = None
         self._legend_item: pg.LegendItem | None = None
+        self._legend_position: tuple[float, float] | None = None
+        self._legend_moved = False
         self._legend_scale_percent = 100
         self._marker_scale_percent = 100
         self._remove_logo = False
@@ -650,6 +928,7 @@ class PlotView(QWidget):
         self._available_trace_list = self._settings_dialog.available_list
         self._selected_trace_list = self._settings_dialog.selected_list
         self.load_touchstone_button = self._settings_dialog.load_touchstone_button
+        self._refresh_equation_list()
         logo_checkbox = self._settings_dialog.remove_logo_checkbox
         logo_checkbox.blockSignals(True)
         logo_checkbox.setChecked(self._remove_logo)
@@ -872,6 +1151,10 @@ class PlotView(QWidget):
         except (TypeError, ValueError, OverflowError):
             legend_scale = 100
         self._legend_scale_percent = legend_scale if 50 <= legend_scale <= 100 else 100
+        self._legend_position = self._setting_legend_position(
+            settings.value(f"{prefix}/legend_position", None)
+        )
+        self._legend_moved = self._legend_position is not None
         raw_marker_scale = settings.value(f"{prefix}/marker_scale_percent", 100)
         try:
             marker_scale = int(raw_marker_scale)
@@ -886,6 +1169,21 @@ class PlotView(QWidget):
         self._pending_marker_positions = self._setting_marker_positions(
             settings.value(f"{prefix}/marker_positions", "")
         )
+        self._equations = self._setting_equations(
+            settings.value(f"{prefix}/equations", "")
+        )
+
+    @staticmethod
+    def _setting_legend_position(value: Any) -> tuple[float, float] | None:
+        if not isinstance(value, (list, tuple)) or len(value) != 2:
+            return None
+        try:
+            x, y = float(value[0]), float(value[1])
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(x) or not math.isfinite(y):
+            return None
+        return x, y
 
     @staticmethod
     def _setting_marker_positions(value: Any) -> list[dict[str, Any]]:
@@ -928,6 +1226,70 @@ class PlotView(QWidget):
             })
         return entries
 
+    @staticmethod
+    def _setting_equations(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, str) or not value.strip():
+            return []
+        try:
+            definitions = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(definitions, list):
+            return []
+        equations: list[dict[str, Any]] = []
+        for definition in definitions:
+            if not isinstance(definition, dict):
+                continue
+            name = definition.get("name")
+            expression = definition.get("expression")
+            raw_variables = definition.get("variables")
+            raw_constants = definition.get("constants")
+            if (
+                not isinstance(name, str) or not name.strip()
+                or not isinstance(expression, str) or not expression.strip()
+                or not isinstance(raw_variables, list)
+                or not isinstance(raw_constants, dict)
+            ):
+                continue
+            variables = []
+            for variable in raw_variables:
+                if not isinstance(variable, dict):
+                    continue
+                variable_name = variable.get("name")
+                file_id = variable.get("file_id")
+                label = variable.get("label")
+                if (
+                    isinstance(variable_name, str) and _IDENTIFIER.fullmatch(variable_name)
+                    and isinstance(file_id, str) and file_id
+                    and isinstance(label, str) and label
+                ):
+                    variables.append({
+                        "name": variable_name,
+                        "file_id": file_id,
+                        "label": label,
+                    })
+            constants: dict[str, float] = {}
+            for constant_name, raw_value in raw_constants.items():
+                if not isinstance(constant_name, str) or not _IDENTIFIER.fullmatch(constant_name):
+                    continue
+                try:
+                    constant_value = float(raw_value)
+                except (TypeError, ValueError, OverflowError):
+                    continue
+                if (
+                    math.isfinite(constant_value)
+                    and constant_name not in _EQUATION_FUNCTIONS
+                    and constant_name not in {"pi", "e"}
+                ):
+                    constants[constant_name] = constant_value
+            equations.append({
+                "name": name.strip(),
+                "expression": expression.strip(),
+                "variables": variables,
+                "constants": constants,
+            })
+        return equations
+
     def _save_chart_settings(self) -> None:
         prefix = self._chart_settings_prefix
         settings = self._trace_color_settings
@@ -941,7 +1303,295 @@ class PlotView(QWidget):
         settings.setValue(f"{prefix}/legend_scale_percent", self._legend_scale_percent)
         settings.setValue(f"{prefix}/marker_scale_percent", self._marker_scale_percent)
         settings.setValue(f"{prefix}/remove_logo", self._remove_logo)
+        settings.setValue(f"{prefix}/equations", json.dumps(self._equations))
+        if self._legend_position is not None:
+            settings.setValue(f"{prefix}/legend_position", list(self._legend_position))
         settings.sync()
+
+    @staticmethod
+    def _equation_reserved_names() -> set[str]:
+        return set(_EQUATION_FUNCTIONS) | {"pi", "e"}
+
+    def _set_equation_error(self, message: str) -> None:
+        label = self._settings_dialog.equation_error_label
+        label.setText(message)
+        label.setVisible(bool(message))
+        label.setToolTip(message)
+
+    def _refresh_equation_list(self, selected_row: int | None = None) -> None:
+        if not hasattr(self, "_settings_dialog"):
+            return
+        widget = self._settings_dialog.equations_list
+        widget.blockSignals(True)
+        widget.clear()
+        for equation in self._equations:
+            item = QListWidgetItem(equation["name"])
+            item.setToolTip(equation["expression"])
+            widget.addItem(item)
+        if selected_row is not None and 0 <= selected_row < widget.count():
+            widget.setCurrentRow(selected_row)
+        widget.blockSignals(False)
+        self._sync_equation_source_combo()
+        self._load_equation_editor(widget.currentRow())
+
+    def _sync_equation_source_combo(self) -> None:
+        if not hasattr(self, "_settings_dialog"):
+            return
+        combo = self._settings_dialog.equation_parameter_combo
+        current_source = combo.currentData()
+        sources = [
+            entry for entry in self._series_data
+            if entry["file_id"] != _EQUATION_FILE_ID
+        ]
+        combo.blockSignals(True)
+        combo.clear()
+        for entry in sources:
+            combo.addItem(
+                f"{entry['file_name']} — {entry['label']}",
+                (entry["file_id"], entry["label"]),
+            )
+        restored_index = combo.findData(current_source)
+        if restored_index >= 0:
+            combo.setCurrentIndex(restored_index)
+        combo.blockSignals(False)
+
+    def _render_equation_editor_mappings(self) -> None:
+        dialog = self._settings_dialog
+        dialog.equation_variables_list.clear()
+        for variable in dialog._equation_editor_variables:
+            source = next(
+                (
+                    entry for entry in self._series_data
+                    if entry["file_id"] == variable["file_id"]
+                    and entry["label"] == variable["label"]
+                ),
+                None,
+            )
+            source_name = source["file_name"] if source is not None else variable["file_id"]
+            item = QListWidgetItem(
+                f"{variable['name']} ← {source_name} — {variable['label']}"
+            )
+            item.setData(Qt.ItemDataRole.UserRole, variable)
+            dialog.equation_variables_list.addItem(item)
+        dialog.equation_constants_list.clear()
+        for name, value in dialog._equation_editor_constants.items():
+            item = QListWidgetItem(f"{name} = {value:g}")
+            item.setData(Qt.ItemDataRole.UserRole, (name, value))
+            dialog.equation_constants_list.addItem(item)
+
+    def _add_equation_variable(self) -> None:
+        dialog = self._settings_dialog
+        name = dialog.equation_variable_name_edit.text().strip()
+        source = dialog.equation_parameter_combo.currentData()
+        if not _IDENTIFIER.fullmatch(name):
+            self._set_equation_error("Enter a valid variable name (letters, digits, and underscores; not starting with a digit).")
+            return
+        if name in self._equation_reserved_names():
+            self._set_equation_error(f"'{name}' is reserved for a formula function or constant.")
+            return
+        if name in dialog._equation_editor_constants:
+            self._set_equation_error(f"'{name}' is already defined as a constant.")
+            return
+        if any(variable["name"] == name for variable in dialog._equation_editor_variables):
+            self._set_equation_error(f"Variable '{name}' is already defined.")
+            return
+        if not isinstance(source, (tuple, list)) or len(source) != 2:
+            self._set_equation_error("Load or plot a parameter before adding a variable.")
+            return
+        file_id, label = str(source[0]), str(source[1])
+        dialog._equation_editor_variables.append({
+            "name": name,
+            "file_id": file_id,
+            "label": label,
+        })
+        dialog.equation_variable_name_edit.clear()
+        self._render_equation_editor_mappings()
+        self._set_equation_error("")
+
+    def _add_equation_constant(self) -> None:
+        dialog = self._settings_dialog
+        name = dialog.equation_constant_name_edit.text().strip()
+        if not _IDENTIFIER.fullmatch(name):
+            self._set_equation_error("Enter a valid constant name (letters, digits, and underscores; not starting with a digit).")
+            return
+        if name in self._equation_reserved_names():
+            self._set_equation_error(f"'{name}' is reserved for a formula function or constant.")
+            return
+        if any(variable["name"] == name for variable in dialog._equation_editor_variables):
+            self._set_equation_error(f"'{name}' is already defined as a parameter variable.")
+            return
+        try:
+            value = float(dialog.equation_constant_value_edit.text())
+        except (TypeError, ValueError, OverflowError):
+            self._set_equation_error("Enter a numeric constant value.")
+            return
+        if not math.isfinite(value):
+            self._set_equation_error("Constant values must be finite.")
+            return
+        dialog._equation_editor_constants[name] = value
+        dialog.equation_constant_name_edit.clear()
+        dialog.equation_constant_value_edit.clear()
+        self._render_equation_editor_mappings()
+        self._set_equation_error("")
+
+    def _load_equation_editor(self, row: int) -> None:
+        dialog = self._settings_dialog
+        if row < 0 or row >= len(self._equations):
+            dialog.equation_name_edit.clear()
+            dialog.equation_formula_edit.clear()
+            dialog._equation_editor_variables = []
+            dialog._equation_editor_constants = {}
+            dialog.remove_equation_button.setEnabled(False)
+        else:
+            equation = self._equations[row]
+            dialog.equation_name_edit.setText(equation["name"])
+            dialog.equation_formula_edit.setText(equation["expression"])
+            dialog._equation_editor_variables = [
+                dict(variable) for variable in equation["variables"]
+            ]
+            dialog._equation_editor_constants = dict(equation["constants"])
+            dialog.remove_equation_button.setEnabled(True)
+        self._render_equation_editor_mappings()
+        self._set_equation_error("")
+
+    def _new_equation_editor(self) -> None:
+        self._settings_dialog.equations_list.clearSelection()
+        self._settings_dialog.equations_list.setCurrentRow(-1)
+        self._load_equation_editor(-1)
+
+    def _remove_selected_equation_item(self, widget: QListWidget) -> None:
+        if not widget.selectedItems():
+            return
+        selected = widget.currentItem()
+        if selected is None:
+            return
+        dialog = self._settings_dialog
+        if widget is dialog.equation_variables_list:
+            variable = selected.data(Qt.ItemDataRole.UserRole)
+            dialog._equation_editor_variables = [
+                item for item in dialog._equation_editor_variables if item != variable
+            ]
+        else:
+            name, _value = selected.data(Qt.ItemDataRole.UserRole)
+            dialog._equation_editor_constants.pop(name, None)
+        self._render_equation_editor_mappings()
+
+    def _save_equation_from_editor(self) -> None:
+        dialog = self._settings_dialog
+        name = dialog.equation_name_edit.text().strip()
+        expression = dialog.equation_formula_edit.text().strip()
+        if not name:
+            self._set_equation_error("Enter a name for the calculated trace.")
+            return
+        if not expression:
+            self._set_equation_error("Enter a formula for the calculated trace.")
+            return
+        variable_names = [item["name"] for item in dialog._equation_editor_variables]
+        if len(variable_names) != len(set(variable_names)):
+            self._set_equation_error("Each parameter variable must have a unique name.")
+            return
+        constants = dialog._equation_editor_constants
+        if set(variable_names) & set(constants):
+            self._set_equation_error("Parameter variables and constants must have unique names.")
+            return
+        selected_row = dialog.equations_list.currentRow()
+        if any(
+            index != selected_row and equation["name"].casefold() == name.casefold()
+            for index, equation in enumerate(self._equations)
+        ):
+            self._set_equation_error(f"An equation named '{name}' already exists.")
+            return
+        try:
+            _parse_equation_expression(
+                expression,
+                set(variable_names) | set(constants),
+            )
+        except ValueError as exc:
+            self._set_equation_error(str(exc))
+            return
+        definition = {
+            "name": name,
+            "expression": expression,
+            "variables": [dict(item) for item in dialog._equation_editor_variables],
+            "constants": dict(constants),
+        }
+        if selected_row < 0:
+            self._equations.append(definition)
+            selected_row = len(self._equations) - 1
+        else:
+            self._equations[selected_row] = definition
+        self._equations_changed(selected_row)
+
+    def _remove_equation_from_editor(self) -> None:
+        row = self._settings_dialog.equations_list.currentRow()
+        if row < 0 or row >= len(self._equations):
+            return
+        del self._equations[row]
+        next_row = min(row, len(self._equations) - 1) if self._equations else None
+        self._equations_changed(next_row)
+
+    def _equations_changed(self, selected_row: int | None = None) -> None:
+        self._refresh_equation_list(selected_row)
+        self._update_data(self._x_values, self._series_data)
+        self._redraw(reset_range=True)
+        self._save_chart_settings()
+
+    def _calculate_equation_series(
+        self,
+        source_series: list[dict[str, Any]],
+    ) -> list[dict[str, Any]]:
+        sources = {
+            (entry["file_id"], entry["label"]): entry
+            for entry in source_series
+            if entry["file_id"] != _EQUATION_FILE_ID
+        }
+        calculated: list[dict[str, Any]] = []
+        errors = []
+        for equation in self._equations:
+            try:
+                variables: dict[str, Any] = {}
+                x_values = None
+                for variable in equation["variables"]:
+                    key = (variable["file_id"], variable["label"])
+                    source = sources.get(key)
+                    if source is None:
+                        raise ValueError(
+                            f"parameter '{variable['label']}' from its selected dataset is not loaded"
+                        )
+                    source_x = np.asarray(source["x_values"], dtype=float).reshape(-1)
+                    if x_values is None:
+                        x_values = source_x
+                    elif source_x.shape != x_values.shape or not np.array_equal(source_x, x_values):
+                        raise ValueError("all parameter variables must have the same X values")
+                    variables[variable["name"]] = source["values"]
+                variables.update(equation["constants"])
+                if x_values is None:
+                    x_values = np.asarray(self._x_values, dtype=float).reshape(-1)
+                    if not len(x_values):
+                        raise ValueError("add a parameter variable to provide the chart X axis")
+                values = _evaluate_equation_expression(equation["expression"], variables)
+                if values.size == 1 and x_values.size != 1:
+                    values = np.full(x_values.size, values.item())
+                elif values.size != x_values.size:
+                    raise ValueError(
+                        f"formula produced {values.size} values for {x_values.size} X values"
+                    )
+                if not np.all(np.isfinite(values)):
+                    raise ValueError("formula produced non-finite values")
+                calculated.append({
+                    "label": equation["name"],
+                    "file_name": "Equations",
+                    "file_id": _EQUATION_FILE_ID,
+                    "x_values": x_values,
+                    "values": values,
+                    "visible": True,
+                    "configured": True,
+                })
+            except (ArithmeticError, TypeError, ValueError, IndexError, OverflowError) as exc:
+                errors.append(f"Equation '{equation['name']}': {exc}")
+        self._equation_errors = errors
+        self._set_equation_error("\n".join(errors))
+        return calculated
 
     def _save_marker_positions(self) -> None:
         prefix = self._chart_settings_prefix
@@ -956,6 +1606,126 @@ class PlotView(QWidget):
             entries.append(entry)
         settings.setValue(f"{prefix}/marker_positions", json.dumps(entries))
         settings.sync()
+
+    def _appended_series_path(self) -> Path:
+        chart_digest = self._chart_settings_prefix.rsplit("/", 1)[-1]
+        return _chart_data_cache_root() / f"{chart_digest}.json.zlib"
+
+    def _save_appended_series(self) -> None:
+        path = self._appended_series_path()
+        appended = [
+            entry for entry in self._series_data
+            if entry["file_id"] in self._appended_file_ids
+        ]
+        if not appended:
+            if path.exists():
+                path.unlink()
+            return
+
+        serialized = []
+        for entry in appended:
+            values = np.asarray(entry["values"]).reshape(-1)
+            if np.iscomplexobj(values):
+                encoded_values = [
+                    [float(value.real), float(value.imag)] for value in values
+                ]
+            else:
+                encoded_values = np.asarray(values, dtype=float).tolist()
+            serialized.append({
+                "file_id": entry["file_id"],
+                "label": entry["label"],
+                "file_name": entry["file_name"],
+                "configured": bool(entry["configured"]),
+                "x_values": np.asarray(entry["x_values"], dtype=float).tolist(),
+                "complex": bool(np.iscomplexobj(values)),
+                "values": encoded_values,
+            })
+
+        payload = json.dumps(
+            {"version": 1, "series": serialized},
+            separators=(",", ":"),
+        ).encode("utf-8")
+        compressed = zlib.compress(payload, level=9)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        temporary_path: Path | None = None
+        try:
+            with tempfile.NamedTemporaryFile(
+                dir=path.parent,
+                prefix=f"{path.name}.",
+                suffix=".tmp",
+                delete=False,
+            ) as temporary:
+                temporary_path = Path(temporary.name)
+                temporary.write(compressed)
+            os.replace(temporary_path, path)
+        finally:
+            if temporary_path is not None and temporary_path.exists():
+                temporary_path.unlink()
+
+    def _load_appended_series(self) -> list[dict[str, Any]]:
+        path = self._appended_series_path()
+        if not path.is_file():
+            return []
+        try:
+            payload = json.loads(zlib.decompress(path.read_bytes()).decode("utf-8"))
+            if not isinstance(payload, dict) or payload.get("version") != 1:
+                raise ValueError("unsupported appended-series cache version")
+            raw_series = payload.get("series")
+            if not isinstance(raw_series, list):
+                raise ValueError("appended-series cache is not a list")
+
+            restored: list[dict[str, Any]] = []
+            for item in raw_series:
+                if not isinstance(item, dict):
+                    raise ValueError("appended-series entry is not an object")
+                file_id = item.get("file_id")
+                label = item.get("label")
+                if not isinstance(file_id, str) or not file_id:
+                    raise ValueError("appended-series entry has no file ID")
+                if not isinstance(label, str) or not label:
+                    raise ValueError("appended-series entry has no label")
+
+                x_values = np.asarray(item.get("x_values"), dtype=float).reshape(-1)
+                encoded_values = item.get("values")
+                if item.get("complex") is True:
+                    if not isinstance(encoded_values, list) or any(
+                        not isinstance(value, list) or len(value) != 2
+                        for value in encoded_values
+                    ):
+                        raise ValueError("complex series values are malformed")
+                    values = np.asarray(
+                        [
+                            complex(float(value[0]), float(value[1]))
+                            for value in encoded_values
+                        ],
+                        dtype=complex,
+                    )
+                else:
+                    values = np.asarray(encoded_values, dtype=float).reshape(-1)
+                if len(values) != len(x_values):
+                    raise ValueError("series value and x-value counts do not match")
+
+                file_name = item.get("file_name", "")
+                restored.append({
+                    "file_id": file_id,
+                    "label": label,
+                    "file_name": file_name if isinstance(file_name, str) else "",
+                    "configured": bool(item.get("configured", False)),
+                    "x_values": x_values,
+                    "values": values,
+                })
+            return restored
+        except (
+            OSError,
+            UnicodeDecodeError,
+            json.JSONDecodeError,
+            zlib.error,
+            TypeError,
+            ValueError,
+            OverflowError,
+        ) as exc:
+            _LOGGER.warning("Could not restore appended chart data from %s: %s", path, exc)
+            return []
 
     def _trace_setting_key(self, file_id: str, label: str, setting: str) -> str:
         identity = "\x1f".join((self._settings_key, file_id, label))
@@ -995,8 +1765,32 @@ class PlotView(QWidget):
             plot_bounds.bottom() - pixmap.height() - 8,
         )
 
-    def _remember_legend_position(self) -> None:
+    def _remember_legend_position(self, legend=None) -> None:
+        if legend is not None and legend.parentItem() is not None:
+            bounds = legend.parentItem().boundingRect()
+            if bounds.width() > 0 and bounds.height() > 0:
+                self._legend_position = (
+                    legend.pos().x() / bounds.width(),
+                    legend.pos().y() / bounds.height(),
+                )
+        elif self._legend_panel is not None:
+            host = self._overlay_host
+            if host.width() > 0 and host.height() > 0:
+                self._legend_position = (
+                    self._legend_panel.x() / host.width(),
+                    self._legend_panel.y() / host.height(),
+                )
         self._legend_moved = True
+        if self._legend_position is not None:
+            self._save_chart_settings()
+
+    def _apply_legend_position(self, legend) -> None:
+        if self._legend_position is None or legend.parentItem() is None:
+            return
+        bounds = legend.parentItem().boundingRect()
+        if bounds.width() <= 0 or bounds.height() <= 0:
+            return
+        legend.anchor((0, 0), self._legend_position)
 
     def _position_overlay_widgets(self) -> None:
         host = self._overlay_host
@@ -1029,7 +1823,12 @@ class PlotView(QWidget):
             )
             self._legend_panel.layout().setSpacing(max(1, round(3 * scale)))
             self._external_legend.setMaximumHeight(round(180 * scale))
-            if not getattr(self, "_legend_moved", False):
+            if self._legend_position is not None:
+                position = QPoint(
+                    round(self._legend_position[0] * host.width()),
+                    round(self._legend_position[1] * host.height()),
+                )
+            elif not getattr(self, "_legend_moved", False):
                 position = QPoint(host.width() - width - 12, 12)
             else:
                 position = QPoint(self._legend_panel.pos())
@@ -1040,6 +1839,8 @@ class PlotView(QWidget):
                 _bounded_overlay_position(host, self._legend_panel, position)
             )
             self._legend_panel.raise_()
+        if self._use_pyqtgraph and self._legend_item is not None:
+            self._apply_legend_position(self._legend_item)
         marker_font = _scaled_overlay_font(host.font(), scale * (self._marker_scale_percent / 100.0))
         for marker_line, readout in self._marker_items:
             marker_line.setPen(
@@ -1076,11 +1877,24 @@ class PlotView(QWidget):
         ylabel: str,
     ) -> None:
         self._progressive_x_range = None
-        self._update_data(x_values, series)
+        self._base_file_ids = {
+            str(item.get("file_id", item.get("file_name", "default")))
+            for item in series
+        }
+        appended_series = self._load_appended_series()
+        self._appended_file_ids = {
+            str(item["file_id"]) for item in appended_series
+        }
+        self._overlay_file_ids.update(
+            str(item["file_id"]) for item in appended_series
+        )
+        self._update_data(x_values, [*series, *appended_series])
         self._title = str(title)
         self._xlabel = str(xlabel)
         self._ylabel = str(ylabel)
         self._redraw()
+        self._save_appended_series()
+        self._save_chart_settings()
 
     def append_plot_data(
         self,
@@ -1092,7 +1906,15 @@ class PlotView(QWidget):
         ylabel: str,
     ) -> None:
         self._progressive_x_range = None
-        self._append_sequence += 1
+        existing_ids = {entry["file_id"] for entry in self._series_data}
+        source_ids = {
+            str(item.get("file_id", item.get("file_name", "default")))
+            for item in series
+        }
+        next_sequence = self._append_sequence + 1
+        while any(f"{source_id}::append-{next_sequence}" in existing_ids for source_id in source_ids):
+            next_sequence += 1
+        self._append_sequence = next_sequence
         incoming = []
         for item in series:
             copied = dict(item)
@@ -1104,6 +1926,7 @@ class PlotView(QWidget):
             copied["x_values"] = copied.get("x_values", x_values)
             incoming.append(copied)
         self._overlay_file_ids.update(str(item["file_id"]) for item in incoming)
+        self._appended_file_ids.update(str(item["file_id"]) for item in incoming)
         self._update_data(self._x_values, [*self._series_data, *incoming])
         if incoming:
             dataset_combo = self._settings_dialog.dataset_combo
@@ -1114,6 +1937,8 @@ class PlotView(QWidget):
         self._xlabel = str(xlabel)
         self._ylabel = str(ylabel)
         self._redraw(reset_range=True)
+        self._save_appended_series()
+        self._save_chart_settings()
 
     def add_file_data(
         self,
@@ -1128,6 +1953,7 @@ class PlotView(QWidget):
         ]
         incoming = [dict(item, x_values=item.get("x_values", x_values)) for item in series]
         self._overlay_file_ids.update(incoming_ids)
+        self._appended_file_ids.update(incoming_ids)
         self._update_data(self._x_values, [*existing, *incoming])
         if series:
             preferred_id = str(series[-1].get("file_id", series[-1].get("file_name", "default")))
@@ -1136,6 +1962,8 @@ class PlotView(QWidget):
             if dataset_index >= 0:
                 dataset_combo.setCurrentIndex(dataset_index)
         self._redraw(reset_range=True)
+        self._save_appended_series()
+        self._save_chart_settings()
 
     def selected_parameters(self) -> list[str]:
         return list(dict.fromkeys(
@@ -1164,30 +1992,44 @@ class PlotView(QWidget):
             if not math.isfinite(low) or not math.isfinite(high) or low >= high:
                 raise ValueError("progressive x range must be finite and increasing")
             self._progressive_x_range = (low, high)
-        incoming_ids = {
-            str(item.get("file_id", str(item.get("file_name", "")) or "default"))
+        incoming_keys = {
+            (
+                str(item.get("file_id", str(item.get("file_name", "")) or "default")),
+                str(item["label"]),
+            )
             for item in series
         }
+        self._appended_file_ids.update(
+            file_id
+            for file_id, _label in incoming_keys
+            if file_id in self._overlay_file_ids and file_id not in self._base_file_ids
+        )
         overlays = [
             item for item in self._series_data
             if item["file_id"] in self._overlay_file_ids
-            and item["file_id"] not in incoming_ids
+            and (item["file_id"], item["label"]) not in incoming_keys
         ]
         self._update_data(x_values, [*overlays, *series])
         self._title = str(title)
         self._xlabel = str(xlabel)
         self._ylabel = str(ylabel)
         self._redraw()
+        self._save_appended_series()
+        self._save_chart_settings()
 
     def clear_data(self) -> None:
         self._progressive_x_range = None
         self._x_values = np.asarray([], dtype=float)
         self._series_data = []
         self._overlay_file_ids.clear()
+        self._appended_file_ids.clear()
+        self._base_file_ids.clear()
+        self._calculate_equation_series([])
         if self._use_pyqtgraph:
             self._clear_markers()
         self._sync_series_controls()
         self._redraw(reset_range=True)
+        self._save_appended_series()
 
     @staticmethod
     def _normalize_color(value: Any, fallback: str = "#1f77b4") -> str:
@@ -1201,6 +2043,8 @@ class PlotView(QWidget):
         }
         updated: list[dict[str, Any]] = []
         for index, item in enumerate(series):
+            if str(item.get("file_id", "")) == _EQUATION_FILE_ID:
+                continue
             label = str(item["label"])
             values = np.asarray(item["values"]).reshape(-1)
             file_name = str(item.get("file_name", ""))
@@ -1243,6 +2087,43 @@ class PlotView(QWidget):
                 "visible": old_style["visible"] if old_style is not None else saved_visible,
                 "configured": bool(item.get("configured", False)),
                 "color": current_color,
+                "marker": old_style["marker"] if old_style is not None else saved_marker,
+            })
+        equation_start_index = len(updated)
+        for equation_index, item in enumerate(self._calculate_equation_series(updated)):
+            label = item["label"]
+            file_id = item["file_id"]
+            key = (file_id, label)
+            old_style = previous.get(key)
+            saved_color = str(
+                self._trace_color_settings.value(
+                    self._trace_color_setting_key(file_id, label), ""
+                )
+            )
+            if not QColor(saved_color).isValid():
+                saved_color = ""
+            saved_visible = self._setting_bool(
+                self._trace_color_settings.value(
+                    self._trace_setting_key(file_id, label, "visibility"), True
+                ),
+                True,
+            )
+            saved_marker = self._trace_color_settings.value(
+                self._trace_setting_key(file_id, label, "marker"), ""
+            )
+            if saved_marker not in _MARKERS.values():
+                saved_marker = ""
+            palette_color = self._normalize_color(
+                _TRACE_PALETTE[
+                    (equation_start_index + equation_index) % len(_TRACE_PALETTE)
+                ]
+            )
+            color = old_style["color"] if old_style is not None else saved_color or palette_color
+            updated.append({
+                **item,
+                "legend_label": f"{label} - Equations",
+                "visible": old_style["visible"] if old_style is not None else saved_visible,
+                "color": self._normalize_color(color, palette_color),
                 "marker": old_style["marker"] if old_style is not None else saved_marker,
             })
         self._x_values = x_array if x_array.size else (
@@ -1320,9 +2201,11 @@ class PlotView(QWidget):
         self._populate_available_traces()
         self._filter_trace_lists(self._settings_dialog.trace_search.text())
         self._on_selected_trace_changed(self._selected_trace_list.currentItem(), None)
+        self._sync_equation_source_combo()
 
     def _populate_available_traces(self, _index: int = -1) -> None:
         dataset_id = self._settings_dialog.dataset_combo.currentData()
+        self._update_remove_dataset_button()
         self._available_trace_list.clear()
         for entry in self._series_data:
             if entry["file_id"] != dataset_id or entry["visible"]:
@@ -1335,6 +2218,38 @@ class PlotView(QWidget):
             self._available_trace_list.addItem(item)
             self._trace_items[key] = item
         self._filter_trace_lists(self._settings_dialog.trace_search.text())
+
+    def _dataset_is_removable(self, file_id: Any) -> bool:
+        if file_id is None:
+            return False
+        dataset_id = str(file_id)
+        return (
+            dataset_id != _EQUATION_FILE_ID
+            and dataset_id in self._overlay_file_ids
+            and dataset_id not in self._base_file_ids
+        )
+
+    def _update_remove_dataset_button(self, _index: int = -1) -> None:
+        self._settings_dialog.remove_dataset_button.setEnabled(
+            self._dataset_is_removable(self._settings_dialog.dataset_combo.currentData())
+        )
+
+    def _remove_selected_dataset(self) -> None:
+        dataset_id = self._settings_dialog.dataset_combo.currentData()
+        if not self._dataset_is_removable(dataset_id):
+            return
+
+        dataset_id = str(dataset_id)
+        remaining_series = [
+            entry for entry in self._series_data
+            if entry["file_id"] != dataset_id
+        ]
+        self._overlay_file_ids.discard(dataset_id)
+        self._appended_file_ids.discard(dataset_id)
+        self._update_data(self._x_values, remaining_series)
+        self._redraw(reset_range=True)
+        self._save_appended_series()
+        self._save_chart_settings()
 
     def _filter_trace_lists(self, text: str) -> None:
         query = text.casefold().strip()
@@ -1751,7 +2666,8 @@ class PlotView(QWidget):
             if not series:
                 self._legend_item = None
                 return
-            legend = pg.LegendItem(
+            legend = _PersistentLegendItem(
+                self._remember_legend_position,
                 brush=pg.mkBrush(255, 255, 255, 235),
                 pen=pg.mkPen("#d0d5dd"),
                 labelTextColor="#344054",
@@ -1774,6 +2690,7 @@ class PlotView(QWidget):
                 )
                 legend.addItem(sample, legend_label)
             self._legend_item = legend if series else None
+            self._apply_legend_position(legend)
             return
 
         self._external_legend.clear()

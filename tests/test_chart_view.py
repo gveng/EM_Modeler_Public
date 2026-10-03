@@ -200,6 +200,201 @@ def test_plot_logo_is_shown_by_default_and_checkbox_removes_and_restores_it():
     assert app is not None
 
 
+def test_equation_tab_creates_persistent_dynamic_equation_dataset(memory_qsettings):
+    app = QApplication.instance() or QApplication([])
+    view = PlotView("plot_sp", settings_key="equation-chart")
+    source = {
+        "file_id": "run-1",
+        "file_name": "Run 1",
+        "label": "S11",
+        "values": np.asarray([0.1 + 0j, 0.2 + 0j, 0.3 + 0j]),
+    }
+    view.set_plot_data(
+        [1.0, 2.0, 3.0],
+        [source],
+        title="S parameters",
+        xlabel="Frequency (GHz)",
+        ylabel="Magnitude",
+    )
+
+    dialog = view._settings_dialog
+    assert dialog.tabs.tabText(dialog.tabs.count() - 1) == "Equation"
+    assert dialog.equation_parameter_combo.count() == 1
+    dialog.equation_parameter_combo.setCurrentIndex(0)
+    dialog.equation_variable_name_edit.setText("s11")
+    view._add_equation_variable()
+    dialog.equation_constant_name_edit.setText("gain")
+    dialog.equation_constant_value_edit.setText("2")
+    view._add_equation_constant()
+    dialog.equation_name_edit.setText("Power")
+    dialog.equation_formula_edit.setText("abs(s11) ** 2 * gain")
+    view._save_equation_from_editor()
+
+    equations = [
+        entry for entry in view._series_data
+        if entry["file_id"] == chart_view._EQUATION_FILE_ID
+    ]
+    assert len(equations) == 1
+    assert equations[0]["file_name"] == "Equations"
+    assert equations[0]["label"] == "Power"
+    assert equations[0]["x_values"] == pytest.approx([1.0, 2.0, 3.0])
+    assert equations[0]["values"] == pytest.approx([0.02, 0.08, 0.18])
+
+    dialog.new_equation_button.click()
+    dialog.equation_variable_name_edit.setText("s11")
+    view._add_equation_variable()
+    dialog.equation_name_edit.setText("Magnitude")
+    dialog.equation_formula_edit.setText("abs(s11)")
+    view._save_equation_from_editor()
+    assert len([
+        entry for entry in view._series_data
+        if entry["file_id"] == chart_view._EQUATION_FILE_ID
+    ]) == 2
+    persisted = memory_qsettings[f"{view._chart_settings_prefix}/equations"]
+    assert '"expression": "abs(s11) ** 2 * gain"' in persisted
+    assert '"name": "Magnitude"' in persisted
+
+    view.set_plot_data(
+        [1.0, 2.0, 3.0],
+        [dict(source, values=np.asarray([0.5 + 0j, 0.4 + 0j, 0.3 + 0j]))],
+        title="Updated S parameters",
+        xlabel="Frequency (GHz)",
+        ylabel="Magnitude",
+    )
+    recalculated = next(
+        entry for entry in view._series_data
+        if entry["file_id"] == chart_view._EQUATION_FILE_ID
+        and entry["label"] == "Power"
+    )
+    assert recalculated["values"] == pytest.approx([0.5, 0.32, 0.18])
+
+    restored = PlotView("plot_sp", settings_key="equation-chart")
+    restored.set_plot_data(
+        [1.0, 2.0, 3.0],
+        [source],
+        title="Restored S parameters",
+        xlabel="Frequency (GHz)",
+        ylabel="Magnitude",
+    )
+    restored_equation = next(
+        entry for entry in restored._series_data
+        if entry["file_id"] == chart_view._EQUATION_FILE_ID
+        and entry["label"] == "Power"
+    )
+    assert restored_equation["values"] == pytest.approx([0.02, 0.08, 0.18])
+    view.close()
+    restored.close()
+    assert app is not None
+
+
+def test_equation_evaluator_is_safe_and_supports_elementwise_complex_functions():
+    result = chart_view._evaluate_equation_expression(
+        "abs(z) ** 2 + real(z)",
+        {"z": np.asarray([1 + 2j, 3 + 4j])},
+    )
+
+    assert result == pytest.approx([6.0, 28.0])
+    with pytest.raises(ValueError, match="not allowed|Only the listed"):
+        chart_view._evaluate_equation_expression(
+            "__import__('os').system('echo unsafe')",
+            {},
+        )
+    with pytest.raises(ValueError, match="Unknown formula"):
+        chart_view._evaluate_equation_expression("missing + 1", {})
+
+
+def test_equation_x_mismatch_is_reported_in_chart_settings():
+    app = QApplication.instance() or QApplication([])
+    view = PlotView("plot_sp")
+    view.set_plot_data(
+        [1.0, 2.0],
+        [
+            {
+                "file_id": "run-a",
+                "file_name": "Run A",
+                "label": "A",
+                "values": [1.0, 2.0],
+                "x_values": [1.0, 2.0],
+            },
+            {
+                "file_id": "run-b",
+                "file_name": "Run B",
+                "label": "B",
+                "values": [3.0, 4.0],
+                "x_values": [1.5, 2.5],
+            },
+        ],
+        title="S parameters",
+        xlabel="Frequency (GHz)",
+        ylabel="Magnitude",
+    )
+    dialog = view._settings_dialog
+    dialog.equation_parameter_combo.setCurrentIndex(0)
+    dialog.equation_variable_name_edit.setText("a")
+    view._add_equation_variable()
+    dialog.equation_parameter_combo.setCurrentIndex(1)
+    dialog.equation_variable_name_edit.setText("b")
+    view._add_equation_variable()
+    dialog.equation_name_edit.setText("Difference")
+    dialog.equation_formula_edit.setText("a - b")
+    view._save_equation_from_editor()
+
+    assert not any(
+        entry["file_id"] == chart_view._EQUATION_FILE_ID
+        for entry in view._series_data
+    )
+    assert "same X values" in dialog.equation_error_label.text()
+    view.close()
+    assert app is not None
+
+
+def test_equation_uses_file_id_and_label_for_duplicate_trace_names_and_own_x_values():
+    app = QApplication.instance() or QApplication([])
+    view = PlotView("plot_sp")
+    view.set_plot_data(
+        [1.0, 2.0],
+        [
+            {
+                "file_id": "overlay-a",
+                "file_name": "Overlay A",
+                "label": "S21",
+                "values": [0.1 + 0j, 0.2 + 0j],
+                "x_values": [1.0, 2.0],
+            },
+            {
+                "file_id": "overlay-b",
+                "file_name": "Overlay B",
+                "label": "S21",
+                "values": [0.0 + 2j, 2.0 + 0j],
+                "x_values": [4.0, 9.0],
+            },
+        ],
+        title="Overlays",
+        xlabel="Frequency (GHz)",
+        ylabel="Magnitude",
+    )
+
+    dialog = view._settings_dialog
+    dialog.equation_parameter_combo.setCurrentIndex(1)
+    dialog.equation_variable_name_edit.setText("selected")
+    view._add_equation_variable()
+    dialog.equation_name_edit.setText("SelectedOverlay")
+    dialog.equation_formula_edit.setText("selected * 2")
+    view._save_equation_from_editor()
+
+    equation = next(
+        entry for entry in view._series_data
+        if entry["file_id"] == chart_view._EQUATION_FILE_ID
+    )
+    assert equation["x_values"] == pytest.approx([4.0, 9.0])
+    assert equation["values"] == pytest.approx([4j, 4 + 0j])
+    rendered_x, rendered_y = view._curve_items[-1].getData()
+    assert rendered_x == pytest.approx([4.0, 9.0])
+    assert rendered_y == pytest.approx([20 * np.log10(4), 20 * np.log10(4)])
+    view.close()
+    assert app is not None
+
+
 def test_plot_logo_is_scene_native_in_lower_right_of_plot_area():
     app = QApplication.instance() or QApplication([])
     view = PlotView("plot_sp")
@@ -861,6 +1056,8 @@ def test_markers_legend_and_appended_series_restore_without_refresh_duplicates(m
         title="Overlay", xlabel="Frequency (GHz)", ylabel="Magnitude",
     )
     source.display_mode_combo.setCurrentText("Magnitude (linear)")
+    source._set_legend_scale(73)
+    source._set_marker_scale(145)
     source.append_plot_data(
         [10.0, 20.0],
         [
@@ -936,6 +1133,9 @@ def test_markers_legend_and_appended_series_restore_without_refresh_duplicates(m
     )
     app.processEvents()
 
+    assert restored.display_mode_combo.currentText() == "Magnitude (linear)"
+    assert restored._legend_scale_percent == 73
+    assert restored._marker_scale_percent == 145
     restored_overlays = [
         entry for entry in restored._series_data
         if entry["file_id"] in restored._overlay_file_ids
@@ -1041,6 +1241,96 @@ def test_appended_curve_data_is_compressed_in_sidecar_not_qsettings(memory_qsett
     assert len(set(restored_ids)) == 2
     source.close()
     restored.close()
+    assert app is not None
+
+
+def test_loaded_dataset_and_chart_settings_restore_together(memory_qsettings):
+    app = QApplication.instance() or QApplication([])
+    key = "loaded-overlay-settings"
+    base_series = [{
+        "label": "S11",
+        "file_id": "simulation-run",
+        "file_name": "simulation-run",
+        "values": [0.1 + 0.2j, 0.3 + 0.4j],
+    }]
+    source = PlotView("plot_sp", settings_key=key)
+    source.set_plot_data(
+        [1.0, 2.0], base_series,
+        title="Loaded overlay", xlabel="Frequency (GHz)", ylabel="Magnitude",
+    )
+    source.add_file_data(
+        [1.0, 2.0],
+        [{
+            "label": "S21",
+            "file_id": "touchstone-file",
+            "file_name": "loaded.s2p",
+            "values": [0.5 + 0.25j, 0.75 + 0.5j],
+        }],
+    )
+    source.display_mode_combo.setCurrentText("Magnitude (linear)")
+    source._set_legend_scale(82)
+    source._set_marker_scale(130)
+    source._set_marker(("touchstone-file", "S21"), "^")
+    source._set_visible(("touchstone-file", "S21"), False)
+    source.close()
+
+    restored = PlotView("plot_sp", settings_key=key)
+    restored.set_plot_data(
+        [1.0, 2.0], base_series,
+        title="Loaded overlay", xlabel="Frequency (GHz)", ylabel="Magnitude",
+    )
+
+    overlay = next(
+        entry for entry in restored._series_data
+        if entry["file_id"] == "touchstone-file"
+    )
+    assert overlay["values"].tolist() == [0.5 + 0.25j, 0.75 + 0.5j]
+    assert overlay["visible"] is False
+    assert overlay["marker"] == "^"
+    assert restored.display_mode_combo.currentText() == "Magnitude (linear)"
+    assert restored._legend_scale_percent == 82
+    assert restored._marker_scale_percent == 130
+    assert "touchstone-file" in restored._overlay_file_ids
+    assert app is not None
+
+
+def test_append_mode_does_not_cache_the_original_chart_series(memory_qsettings):
+    app = QApplication.instance() or QApplication([])
+    base_series = [{
+        "label": "S11",
+        "file_id": "base-run",
+        "file_name": "base-run",
+        "values": [0.1 + 0.2j, 0.3 + 0.4j],
+    }]
+    view = PlotView("plot_sp", settings_key="append-cache-excludes-base")
+    view.set_plot_data(
+        [1.0, 2.0], base_series,
+        title="Append", xlabel="Frequency", ylabel="Magnitude",
+    )
+    view._overlay_file_ids.add("base-run")
+    view.append_plot_data(
+        [3.0, 4.0],
+        [{
+            "label": "S21",
+            "file_id": "next-run",
+            "file_name": "next-run.s2p",
+            "values": [0.5 + 0.25j, 0.75 + 0.5j],
+        }],
+        title="Append", xlabel="Frequency", ylabel="Magnitude",
+    )
+
+    view.set_plot_data(
+        [1.0, 2.0],
+        [dict(base_series[0], values=[0.2 + 0.1j, 0.4 + 0.3j])],
+        title="Append", xlabel="Frequency", ylabel="Magnitude",
+    )
+
+    assert [(item["file_id"], item["label"]) for item in view._load_appended_series()] == [
+        ("next-run::append-1", "S21")
+    ]
+    base = next(item for item in view._series_data if item["file_id"] == "base-run")
+    assert base["values"].tolist() == [0.2 + 0.1j, 0.4 + 0.3j]
+    assert len(view._series_data) == 2
     assert app is not None
 
 
@@ -1685,3 +1975,121 @@ def test_smith_overlay_accepts_independent_frequency_grids():
         trace_labels = [item.name() for item in view._curve_items]
         assert trace_labels == ["S11 - first.s2p", "S11 - second.s2p"]
         assert app is not None
+
+
+def test_remove_loaded_dataset_removes_all_traces_and_preserves_equation_definition(
+    memory_qsettings,
+):
+    app = QApplication.instance() or QApplication([])
+    settings_key = "remove-loaded-dataset-equation"
+    base = {
+        "file_id": "base-run",
+        "file_name": "Base run",
+        "label": "S11",
+        "values": [0.1 + 0j, 0.2 + 0j],
+    }
+    view = PlotView("plot_sp", settings_key=settings_key)
+    view.set_plot_data(
+        [1.0, 2.0], [base], title="Dataset removal", xlabel="Frequency", ylabel="Magnitude"
+    )
+    view.add_file_data(
+        [1.0, 2.0],
+        [
+            {"file_id": "loaded-run", "file_name": "Loaded run", "label": "S21",
+             "values": [0.3 + 0j, 0.4 + 0j]},
+            {"file_id": "loaded-run", "file_name": "Loaded run", "label": "S22",
+             "values": [0.5 + 0j, 0.6 + 0j], "visible": False},
+        ],
+    )
+
+    dialog = view._settings_dialog
+    dialog.equation_parameter_combo.setCurrentIndex(1)
+    dialog.equation_variable_name_edit.setText("s21")
+    view._add_equation_variable()
+    dialog.equation_name_edit.setText("Twice S21")
+    dialog.equation_formula_edit.setText("s21 * 2")
+    view._save_equation_from_editor()
+    saved_equation = [dict(view._equations[0], variables=[dict(item) for item in view._equations[0]["variables"]])]
+    assert any(entry["label"] == "Twice S21" for entry in view._series_data)
+
+    dataset_combo = dialog.dataset_combo
+    remove_button = dialog.remove_dataset_button
+    base_index = dataset_combo.findData("base-run")
+    dataset_combo.setCurrentIndex(base_index)
+    assert not remove_button.isEnabled()
+    loaded_index = dataset_combo.findData("loaded-run")
+    dataset_combo.setCurrentIndex(loaded_index)
+    assert remove_button.isEnabled()
+    remove_button.click()
+
+    assert [(entry["file_id"], entry["label"]) for entry in view._series_data] == [
+        ("base-run", "S11")
+    ]
+    assert "loaded-run" not in view._overlay_file_ids
+    assert "loaded-run" not in view._appended_file_ids
+    assert not remove_button.isEnabled()
+    assert view._equations == saved_equation
+    assert view._equation_errors and "not loaded" in view._equation_errors[0]
+    assert "Twice S21" in dialog.equation_error_label.text()
+
+    restored = PlotView("plot_sp", settings_key=settings_key)
+    restored.set_plot_data(
+        [1.0, 2.0], [base], title="Dataset removal", xlabel="Frequency", ylabel="Magnitude"
+    )
+    assert restored._equations == saved_equation
+    assert restored._equation_errors and "not loaded" in restored._equation_errors[0]
+    view.close()
+    restored.close()
+    assert app is not None
+
+
+def test_remove_appended_dataset_clears_cache_and_all_trace_list_entries(memory_qsettings):
+    app = QApplication.instance() or QApplication([])
+    view = PlotView("plot_sp", settings_key="remove-appended-dataset")
+    view.set_plot_data(
+        [1.0, 2.0],
+        [{"file_id": "base-run", "file_name": "Base run", "label": "S11",
+          "values": [0.1, 0.2]}],
+        title="Append removal",
+        xlabel="Frequency",
+        ylabel="Magnitude",
+    )
+    view.append_plot_data(
+        [1.0, 2.0],
+        [
+            {"file_id": "appended-run", "file_name": "Appended run", "label": "S21",
+             "values": [0.3, 0.4]},
+            {"file_id": "appended-run", "file_name": "Appended run", "label": "S22",
+             "values": [0.5, 0.6], "visible": False},
+        ],
+        title="Append removal",
+        xlabel="Frequency",
+        ylabel="Magnitude",
+    )
+    appended_id = next(
+        entry["file_id"] for entry in view._series_data if entry["label"] == "S21"
+    )
+    assert view._appended_series_path().is_file()
+    assert any(
+        view._available_trace_list.item(index).text() == "S22"
+        for index in range(view._available_trace_list.count())
+    )
+    assert any(
+        view._selected_trace_list.item(index).text().startswith("S21")
+        for index in range(view._selected_trace_list.count())
+    )
+
+    view._settings_dialog.remove_dataset_button.click()
+
+    assert [(entry["file_id"], entry["label"]) for entry in view._series_data] == [
+        ("base-run", "S11")
+    ]
+    assert view._load_appended_series() == []
+    assert not view._appended_series_path().exists()
+    assert appended_id not in view._overlay_file_ids
+    assert appended_id not in view._appended_file_ids
+    assert view._available_trace_list.count() == 0
+    assert [view._selected_trace_list.item(index).text()
+            for index in range(view._selected_trace_list.count())] == ["S11 - Base run"]
+    assert not view._settings_dialog.remove_dataset_button.isEnabled()
+    assert app is not None

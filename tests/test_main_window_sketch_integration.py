@@ -794,16 +794,31 @@ def test_loading_legacy_touchstone_appends_to_source_chart(
     )
     window = SimpleNamespace(
         _simulation_bundle_dir=Mock(return_value=tmp_path),
+        _project_name="Model",
+        _project_tree=SimpleNamespace(get_settings=lambda: {
+            "simulations": [{"name": "Sweep"}],
+            "outputs": [{
+                "name": "Configured output",
+                "simulation": "Sweep",
+            }],
+        }),
         _plot_views={"Sweep::Configured output": chart_view},
     )
+    window._touchstone_directory_for_chart = (
+        MainWindow._touchstone_directory_for_chart.__get__(window, MainWindow)
+    )
+    file_dialog = Mock(return_value=(
+        str(tmp_path / "Touchstone" / legacy_path.name), ""
+    ))
     monkeypatch.setattr(
         main_window_module.QFileDialog,
         "getOpenFileName",
-        Mock(return_value=(str(tmp_path / "Touchstone" / legacy_path.name), "")),
+        file_dialog,
     )
 
     MainWindow._load_touchstone_for_chart(window, "Sweep::Configured output")
 
+    assert file_dialog.call_args.args[2] == str(tmp_path / "Touchstone")
     chart_view.add_file_data.assert_called_once()
     x_values, series = chart_view.add_file_data.call_args.args
     assert [item["label"] for item in series] == [
@@ -813,6 +828,56 @@ def test_loading_legacy_touchstone_appends_to_source_chart(
     assert [item["visible"] for item in series] == expected_visibility
     assert {item["file_name"] for item in series} == {legacy_path.name}
     assert (tmp_path / "Touchstone" / legacy_path.name).is_file()
+
+
+def test_loading_touchstone_starts_in_the_source_simulation_folder(
+    tmp_path, monkeypatch
+):
+    bundle_dir = tmp_path / "bundle"
+    source_simulation_dir = bundle_dir / "Model_Sweep_B"
+    other_simulation_dir = bundle_dir / "Model_Sweep_A"
+    source_simulation_dir.mkdir(parents=True)
+    other_simulation_dir.mkdir(parents=True)
+    legacy_bundle_file = bundle_dir / "legacy.s1p"
+    legacy_bundle_file.parent.mkdir(parents=True, exist_ok=True)
+    legacy_bundle_file.write_text("# legacy input\n", encoding="ascii")
+    chart_view = SimpleNamespace(
+        selected_parameters=Mock(return_value=[]),
+        configured_parameters=Mock(return_value=[]),
+        add_file_data=Mock(),
+    )
+    window = SimpleNamespace(
+        _simulation_bundle_dir=Mock(return_value=bundle_dir),
+        _project_name="Model",
+        _project_tree=SimpleNamespace(get_settings=lambda: {
+            "simulations": [
+                {"name": "Sweep A"},
+                {"name": "Sweep B"},
+            ],
+            "outputs": [
+                {"name": "Configured output", "simulation": "Sweep A"},
+                {"name": "Configured output", "simulation": "Sweep B"},
+            ],
+        }),
+        _plot_views={"Sweep B::Configured output": chart_view},
+    )
+    window._touchstone_directory_for_chart = (
+        MainWindow._touchstone_directory_for_chart.__get__(window, MainWindow)
+    )
+    file_dialog = Mock(return_value=("", ""))
+    monkeypatch.setattr(
+        main_window_module.QFileDialog, "getOpenFileName", file_dialog
+    )
+
+    MainWindow._load_touchstone_for_chart(window, "Sweep B::Configured output")
+
+    assert file_dialog.call_args.args[2] == str(
+        source_simulation_dir / "Touchstone"
+    )
+    assert (source_simulation_dir / "Touchstone").is_dir()
+    assert (bundle_dir / "Touchstone" / legacy_bundle_file.name).is_file()
+    assert not legacy_bundle_file.exists()
+    assert not (other_simulation_dir / "Touchstone").exists()
 
 
 def test_append_mode_routes_later_simulation_output_to_active_chart():

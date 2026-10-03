@@ -10,9 +10,9 @@ if (-not (Test-Path -LiteralPath $portableBuilder)) {
     throw "Portable build script not found: $portableBuilder"
 }
 
-$arguments = @('-PythonExe', $PythonExe)
 if ($ReplaceExisting) {
-    $arguments += '-ReplaceExisting'
+    & $portableBuilder -PythonExe $PythonExe -ReplaceExisting
 }
-
-& $portableBuilder @arguments
+else {
+    & $portableBuilder -PythonExe $PythonExe
+}

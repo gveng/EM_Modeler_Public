@@ -1123,12 +1123,55 @@ class MainWindow(QMainWindow):
             self._plot_mdi_area.setActiveSubWindow(window)
         self._rebuild_window_menu()
 
+    def _touchstone_directory_for_chart(self, source_chart_key: str) -> Path:
+        """Resolve the Touchstone folder belonging to a configured chart's simulation."""
+        from .touchstone import prepare_touchstone_directory
+
+        bundle_dir = self._simulation_bundle_dir()
+        # Organize legacy files that were placed directly in the bundle root,
+        # even when this chart has a per-simulation folder.
+        bundle_touchstone_dir = prepare_touchstone_directory(bundle_dir)
+        settings_tree = getattr(self, "_project_tree", None)
+        settings = settings_tree.get_settings() if settings_tree is not None else {}
+        simulation_name = None
+        if isinstance(settings, dict):
+            outputs = settings.get("outputs", [])
+            simulations = settings.get("simulations", [])
+            simulation_names = {
+                str(simulation.get("name", "")).strip()
+                for simulation in simulations
+                if isinstance(simulation, dict)
+            } if isinstance(simulations, list) else set()
+            if isinstance(outputs, list):
+                for output in outputs:
+                    if not isinstance(output, dict):
+                        continue
+                    output_simulation = str(output.get("simulation", "")).strip()
+                    output_name = str(output.get("name", "Output"))
+                    if (
+                        output_simulation in simulation_names
+                        and source_chart_key == f"{output_simulation}::{output_name}"
+                    ):
+                        simulation_name = output_simulation
+                        break
+
+        if simulation_name:
+            safe_project = MainWindow._safe_script_token(self, self._project_name)
+            safe_simulation = MainWindow._safe_script_token(self, simulation_name)
+            simulation_dir = bundle_dir / f"{safe_project}_{safe_simulation}"
+            if simulation_dir.is_dir():
+                return prepare_touchstone_directory(simulation_dir)
+
+        # Keep the legacy project-level folder as a fallback for stale charts,
+        # missing simulation folders, and Touchstone files from older runs.
+        return bundle_touchstone_dir
+
     def _load_touchstone_for_chart(self, source_chart_key: str) -> None:
         from .chart_data import make_sparameter_plot_data
-        from .touchstone import prepare_touchstone_directory, read_touchstone_ri
+        from .touchstone import read_touchstone_ri
 
         try:
-            touchstone_dir = prepare_touchstone_directory(self._simulation_bundle_dir())
+            touchstone_dir = self._touchstone_directory_for_chart(source_chart_key)
         except OSError as exc:
             QMessageBox.warning(self, "Touchstone", f"Unable to prepare Touchstone folder: {exc}")
             return
