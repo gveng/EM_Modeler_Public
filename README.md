@@ -5,7 +5,7 @@ geometries and exporting them to the EMERGE simulation workflow. It combines a
 VTK viewport, parametric primitives, CAD import, material assignment, boolean
 modeling, and EMERGE-oriented project export in one application.
 
-Current version: `1.4.5`
+Current version: `1.4.6`
 
 ## What You Can Do
 
@@ -126,7 +126,9 @@ The script publishes only the committed `HEAD` tree, requires tracked changes to
 be committed first, and uses a temporary clone. The public repository keeps its
 own history; this repository's remotes and Git configuration are not changed.
 Only files tracked by Git are included, so review the tracked files before the
-first public release. Git's configured credential helper is used for access.
+first public release. Before publishing, the script verifies that the version in
+`pyproject.toml`, the package metadata, and this README agree. Git's configured
+credential helper is used for access.
 
 ## Project Layout
 

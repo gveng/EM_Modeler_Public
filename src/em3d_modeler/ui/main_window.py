@@ -39,6 +39,7 @@ import subprocess
 import traceback
 import sys
 import ctypes
+import uuid
 import vtk
 
 # Resolve resources from source, PyInstaller's internal directory, or the EXE folder.
@@ -384,6 +385,8 @@ def _add_toolbar_group(
         grid.setHorizontalSpacing(2 if dense else 4)
         grid.setVerticalSpacing(2)
     columns = max(1, columns)
+    if dense:
+        columns = max(columns, len(actions))
     for index, action in enumerate(actions):
         if isinstance(action, QAction):
             button = QToolButton(group)
@@ -395,7 +398,7 @@ def _add_toolbar_group(
                 button.setAccessibleName(action.text())
                 button.setToolTip(action.toolTip() or action.text())
             elif dense:
-                button.setFixedSize(20, 20)
+                button.setFixedSize(28, 28)
             else:
                 button.setFixedSize(30, 27)
             widget = button
@@ -625,6 +628,10 @@ class MainWindow(QMainWindow):
         self._sim_subwindow: _PlotSubWindow | None = None
         self._plot_views: dict[str, QWidget] = {}
         self._plot_subwindows: dict[str, _PlotSubWindow] = {}
+        self._farfield_displays: list = []
+        self._append_chart_keys: dict[str, str] = {}
+        self._append_progressive_run_ids: dict[str, str] = {}
+        self._append_run_sequence = 0
         self._sim_log_verbosity = "INFO"
         self._ui_locale = QLocale.c()
 
@@ -970,7 +977,90 @@ class MainWindow(QMainWindow):
         if model_window is not None:
             self._show_workspace_window("Model")
 
+    @staticmethod
+    def _chart_output_name(key: str) -> str:
+        return str(key).rsplit("::", 1)[-1]
+
+    def _on_chart_append_mode_changed(self, chart_key: str, enabled: bool) -> None:
+        output_name = self._chart_output_name(chart_key)
+        if enabled:
+            previous_key = self._append_chart_keys.get(output_name)
+            if previous_key and previous_key != chart_key:
+                previous_view = self._plot_views.get(previous_key)
+                previous_button = getattr(previous_view, "append_button", None)
+                if previous_button is not None:
+                    previous_button.blockSignals(True)
+                    previous_button.setChecked(False)
+                    previous_button.blockSignals(False)
+            self._append_chart_keys[output_name] = chart_key
+            view = self._plot_views.get(chart_key)
+            if view is not None:
+                view._overlay_file_ids.update(
+                    item["file_id"] for item in view._series_data
+                )
+        elif self._append_chart_keys.get(output_name) == chart_key:
+            self._append_chart_keys.pop(output_name, None)
+
     def _show_chart(self, key: str, plot_data: dict, *, progressive: bool = False) -> None:
+        output_name = self._chart_output_name(key)
+        append_key = self._append_chart_keys.get(output_name)
+        append_view = self._plot_views.get(append_key) if append_key else None
+        if append_view is not None and append_view.plot_type != str(
+            plot_data.get("plot_type", append_view.plot_type)
+        ):
+            append_view = None
+        if append_view is None and append_key:
+            self._append_chart_keys.pop(output_name, None)
+
+        if append_view is not None:
+            run_id = self._append_progressive_run_ids.get(key)
+            if progressive or run_id is not None:
+                if run_id is None:
+                    self._append_run_sequence += 1
+                    run_id = (
+                        f"{key}::append-run-{self._append_run_sequence}-"
+                        f"{uuid.uuid4().hex}"
+                    )
+                    self._append_progressive_run_ids[key] = run_id
+                source_name = key.split("::", 1)[0]
+                appended_series = []
+                for item in plot_data["series"]:
+                    copied = dict(item)
+                    source_id = str(copied.get("file_id", copied.get("file_name", "default")))
+                    copied["file_id"] = f"{run_id}::{source_id}"
+                    file_name = str(copied.get("file_name", "")).strip()
+                    copied["file_name"] = f"{source_name} - {file_name}" if file_name else source_name
+                    copied["legend_label"] = f"{source_name} - {copied['label']}"
+                    appended_series.append(copied)
+                if not progressive:
+                    append_view._overlay_file_ids = {
+                        file_id
+                        for file_id in append_view._overlay_file_ids
+                        if not file_id.startswith(f"{run_id}::")
+                    }
+                append_view._overlay_file_ids.update(
+                    item["file_id"] for item in appended_series
+                )
+                append_view.set_progressive_data(
+                    plot_data["x_values"],
+                    appended_series,
+                    title=plot_data["title"],
+                    xlabel=plot_data.get("xlabel", ""),
+                    ylabel=plot_data.get("ylabel", ""),
+                    x_range=plot_data.get("x_range"),
+                )
+                if not progressive:
+                    self._append_progressive_run_ids.pop(key, None)
+                return
+            append_view.append_plot_data(
+                plot_data["x_values"],
+                plot_data["series"],
+                title=plot_data["title"],
+                xlabel=plot_data.get("xlabel", ""),
+                ylabel=plot_data.get("ylabel", ""),
+            )
+            return
+
         view = self._plot_views.get(key)
         window = self._plot_subwindows.get(key)
         is_new = view is None or window is None
@@ -984,6 +1074,10 @@ class MainWindow(QMainWindow):
             )
             view.touchstone_load_requested.connect(
                 lambda plot_key=key: self._load_touchstone_for_chart(plot_key)
+            )
+            view.append_mode_changed.connect(
+                lambda enabled, plot_key=key:
+                self._on_chart_append_mode_changed(plot_key, enabled)
             )
             self._plot_views[key] = view
             window = _PlotSubWindow(self._plot_mdi_area)
@@ -1076,7 +1170,7 @@ class MainWindow(QMainWindow):
         if view is None or not hasattr(view, "add_file_data"):
             QMessageBox.warning(self, "Touchstone", "The source chart is no longer available.")
             return
-        selected = view.selected_parameters() or view.configured_parameters()
+        selected = view.selected_parameters()
         for series in plot_data["series"]:
             series["visible"] = series["label"] in selected
             series["configured"] = series["visible"]
@@ -1169,7 +1263,7 @@ class MainWindow(QMainWindow):
         self._main_toolbar = tb
         tb.setObjectName("main_toolbar")
         tb.setMovable(False)
-        tb.setIconSize(QSize(18, 18))
+        tb.setIconSize(QSize(24, 24))
         tb.setToolButtonStyle(Qt.ToolButtonIconOnly)
 
         def add_group(
@@ -1213,7 +1307,7 @@ class MainWindow(QMainWindow):
         add_group("3D", primitive_actions, columns=3)
 
         # Sketch tool
-        act_sketch = QAction(_icon("Part_Sketch"), "Sketch", self)
+        act_sketch = QAction(_icon("Part_Sketch_Face"), "Sketch", self)
         act_sketch.setToolTip("Open parametric sketch canvas (extrude or revolve)")
         act_sketch.triggered.connect(self._open_sketch)
 
@@ -6110,10 +6204,13 @@ class MainWindow(QMainWindow):
     def _reset_progressive_sparams_plot(self) -> None:
         self._sim_progressive_plot_data = None
         self._sim_stdout_buffer = ""
+        self._append_progressive_run_ids = {}
         settings = self._project_tree.get_settings()
         simulations = settings.get("simulations", [])
         outputs = settings.get("outputs", [])
         from .chart_data import supports_live_plot
+        append_chart_keys = getattr(self, "_append_chart_keys", {})
+        self._append_run_sequence = getattr(self, "_append_run_sequence", 0)
 
         progressive_simulations = {
             str(simulation.get("name", "")).strip(): simulation
@@ -6133,6 +6230,20 @@ class MainWindow(QMainWindow):
                 continue
             key = f"{simulation_name}::{output.get('name', 'Output')}"
             view = self._plot_views.get(key)
+            append_key = append_chart_keys.get(str(output.get("name", "Output")))
+            append_view = self._plot_views.get(append_key) if append_key else None
+            if append_view is not None:
+                self._append_run_sequence += 1
+                self._append_progressive_run_ids[key] = (
+                    f"{key}::append-run-{self._append_run_sequence}-"
+                    f"{uuid.uuid4().hex}"
+                )
+                append_view._overlay_file_ids.update(
+                    item["file_id"] for item in append_view._series_data
+                )
+                if view is not None and view is not append_view:
+                    view.clear_data()
+                continue
             if view is not None:
                 view.clear_data()
 
@@ -7995,6 +8106,7 @@ class MainWindow(QMainWindow):
                     if plot_type == "plot_ff_3d":
                         farfield = field_entry.farfield_3d(faces)
                         display = loaded_sim.display
+                        self._farfield_displays.append(display)
                         model_display_state = {
                             str(getattr(obj, "name", "")).strip(): (
                                 bool(obj.is_visible()),
@@ -8275,6 +8387,9 @@ class MainWindow(QMainWindow):
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� project file
     def _new_project(self) -> None:
         self._close_simulation_panel()
+        self._close_all_plot_windows()
+        self._close_floating_dialogs()
+        self._close_farfield_displays()
         self._project_name = "Untitled"
         self._project_path = None
         self._material_store = MaterialStore()
@@ -8324,6 +8439,36 @@ class MainWindow(QMainWindow):
         self._sim_subwindow = None
         self._sim_dlg = None
         self._rebuild_window_menu()
+
+    def _close_floating_dialogs(self) -> None:
+        """Close any non-modal dialogs left floating (Move/Rotate, extrusion
+        height, reference plane, settings, etc.) so nothing stays hanging
+        around after the project is closed."""
+        for dialog in list(self.findChildren(QDialog)):
+            try:
+                if dialog.isVisible():
+                    dialog.close()
+            except RuntimeError:
+                # The underlying C++ object may already have been deleted.
+                continue
+        for attr in ("_extrusion_depth_dialog", "_ref_plane_dlg", "_settings_dlg", "_sim_dlg"):
+            setattr(self, attr, None)
+
+    def _close_farfield_displays(self) -> None:
+        """Close any external (pyvista) far-field viewer windows that were
+        opened from the far-field 3D plot action."""
+        for display in list(getattr(self, "_farfield_displays", [])):
+            try:
+                plotter = getattr(display, "_plot", None)
+                if plotter is not None:
+                    plotter.close()
+            except Exception:
+                pass
+            try:
+                display.clean()
+            except Exception:
+                pass
+        self._farfield_displays = []
 
     def _close_project(self) -> None:
         has_project = self._project_path is not None or bool(self._viewport.scene.objects)

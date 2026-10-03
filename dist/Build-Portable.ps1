@@ -106,7 +106,9 @@ try {
         'docs\HELP.html',
         'Icons\SplashScreen\EM_Logo.ico',
         'Icons\SplashScreen\EM_Logo.png',
-        'Icons\SplashScreen\EM_3d_MODELER_Splash_Screen.png'
+        'Icons\SplashScreen\EM_3d_MODELER_Splash_Screen.png',
+        'Icons\Emerge_Logo\emerge_Logo.png',
+        'Icons\Part_Sketch_Face.svg'
     )) {
         if (-not (Test-Path (Join-Path $bundle $relativePath))) {
             throw "Required portable resource is missing: $relativePath"

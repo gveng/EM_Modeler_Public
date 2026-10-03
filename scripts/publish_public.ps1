@@ -46,10 +46,32 @@ if ([string]::IsNullOrWhiteSpace($Branch)) {
     throw 'Branch cannot be empty.'
 }
 
+$projectVersionMatch = [regex]::Match(
+    (Get-Content -Raw (Join-Path $sourceRoot 'pyproject.toml')),
+    '(?m)^version\s*=\s*"([^"]+)"'
+)
+$packageVersionMatch = [regex]::Match(
+    (Get-Content -Raw (Join-Path $sourceRoot 'src\em3d_modeler\__init__.py')),
+    '(?m)^__version__\s*=\s*"([^"]+)"'
+)
+$readmeVersionMatch = [regex]::Match(
+    (Get-Content -Raw (Join-Path $sourceRoot 'README.md')),
+    '(?m)^Current version:\s*`([^`]+)`\s*$'
+)
+if (-not $projectVersionMatch.Success) {
+    throw 'Could not read project version from pyproject.toml.'
+}
+if (
+    -not $packageVersionMatch.Success -or
+    -not $readmeVersionMatch.Success -or
+    $packageVersionMatch.Groups[1].Value -ne $projectVersionMatch.Groups[1].Value -or
+    $readmeVersionMatch.Groups[1].Value -ne $projectVersionMatch.Groups[1].Value
+) {
+    throw 'Version metadata in pyproject.toml, src/em3d_modeler/__init__.py, and README.md must match before publishing.'
+}
+$version = $projectVersionMatch.Groups[1].Value
 if ([string]::IsNullOrWhiteSpace($CommitMessage)) {
-    $versionLine = Select-String -Path (Join-Path $sourceRoot 'pyproject.toml') -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
-    if ($null -eq $versionLine) { throw 'Could not read project version from pyproject.toml.' }
-    $CommitMessage = "Publish version $($versionLine.Matches[0].Groups[1].Value)"
+    $CommitMessage = "Publish version $version"
 }
 
 $tempRoot = Join-Path ([IO.Path]::GetTempPath()) ('em3d-public-' + [guid]::NewGuid().ToString('N'))

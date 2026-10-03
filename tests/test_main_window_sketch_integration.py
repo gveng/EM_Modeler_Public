@@ -772,14 +772,23 @@ def test_completed_parametric_job_reloads_incomplete_live_chart():
     assert plot_output.call_args.kwargs == {"results_dir": result_dir}
 
 
-def test_loading_legacy_touchstone_appends_to_source_chart(tmp_path, monkeypatch):
+@pytest.mark.parametrize(
+    ("selected_parameters", "expected_visibility"),
+    [
+        (["S21", "S11"], [True, False, True, False]),
+        ([], [False, False, False, False]),
+    ],
+)
+def test_loading_legacy_touchstone_appends_to_source_chart(
+    tmp_path, monkeypatch, selected_parameters, expected_visibility
+):
     legacy_path = tmp_path / "previous_run.s2p"
     legacy_path.write_text(
         "# GHZ S RI R 50\n1 0.1 0 0.2 0 0.3 0 0.4 0\n",
         encoding="ascii",
     )
     chart_view = SimpleNamespace(
-        selected_parameters=Mock(return_value=["S21", "S11"]),
+        selected_parameters=Mock(return_value=selected_parameters),
         configured_parameters=Mock(return_value=["S11"]),
         add_file_data=Mock(),
     )
@@ -801,9 +810,79 @@ def test_loading_legacy_touchstone_appends_to_source_chart(tmp_path, monkeypatch
         "S11", "S12", "S21", "S22",
     ]
     assert x_values == [1.0]
-    assert [item["visible"] for item in series] == [True, False, True, False]
+    assert [item["visible"] for item in series] == expected_visibility
     assert {item["file_name"] for item in series} == {legacy_path.name}
     assert (tmp_path / "Touchstone" / legacy_path.name).is_file()
+
+
+def test_append_mode_routes_later_simulation_output_to_active_chart():
+    active_chart = SimpleNamespace(
+        plot_type="plot_sp",
+        append_plot_data=Mock(),
+    )
+    window = SimpleNamespace(
+        _chart_output_name=MainWindow._chart_output_name,
+        _append_chart_keys={"Transmission": "Sweep A::Transmission"},
+        _append_progressive_run_ids={},
+        _append_run_sequence=0,
+        _plot_views={"Sweep A::Transmission": active_chart},
+    )
+
+    MainWindow._show_chart(
+        window,
+        "Sweep B::Transmission",
+        {
+            "title": "Transmission",
+            "plot_type": "plot_sp",
+            "x_values": [1.0],
+            "series": [{"label": "S21", "values": [0.5]}],
+        },
+    )
+
+    active_chart.append_plot_data.assert_called_once_with(
+        [1.0],
+        [{"label": "S21", "values": [0.5]}],
+        title="Transmission",
+        xlabel="",
+        ylabel="",
+    )
+
+
+def test_append_mode_replaces_progressive_run_with_final_data():
+    saved_overlay_ids = []
+    active_chart = SimpleNamespace(
+        plot_type="plot_sp",
+        _overlay_file_ids={"old", "Sweep B::Transmission::append-run-1::live"},
+    )
+
+    def capture_overlay_ids(*_args, **_kwargs):
+        saved_overlay_ids.append(set(active_chart._overlay_file_ids))
+
+    active_chart.set_progressive_data = Mock(side_effect=capture_overlay_ids)
+    window = SimpleNamespace(
+        _chart_output_name=MainWindow._chart_output_name,
+        _append_chart_keys={"Transmission": "Sweep A::Transmission"},
+        _append_progressive_run_ids={
+            "Sweep B::Transmission": "Sweep B::Transmission::append-run-1"
+        },
+        _append_run_sequence=1,
+        _plot_views={"Sweep A::Transmission": active_chart},
+    )
+    final_data = {
+        "title": "Transmission",
+        "plot_type": "plot_sp",
+        "x_values": [1.0],
+        "series": [{"label": "S21", "values": [0.5], "file_id": "touchstone"}],
+    }
+
+    MainWindow._show_chart(window, "Sweep B::Transmission", final_data)
+
+    active_chart.set_progressive_data.assert_called_once()
+    final_series = active_chart.set_progressive_data.call_args.args[1]
+    assert final_series[0]["file_id"].endswith("::touchstone")
+    assert active_chart._overlay_file_ids == {"old", final_series[0]["file_id"]}
+    assert saved_overlay_ids == [{"old", final_series[0]["file_id"]}]
+    assert window._append_progressive_run_ids == {}
 
 
 def test_generate_plot_uses_saved_touchstone_without_loading_emerge(tmp_path):

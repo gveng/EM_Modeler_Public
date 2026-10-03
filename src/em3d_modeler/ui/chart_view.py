@@ -3,28 +3,42 @@ from __future__ import annotations
 from collections.abc import Sequence
 import hashlib
 import importlib
+import json
 import math
+from pathlib import Path
+import sys
 from typing import Any
 
 import numpy as np
 import pyqtgraph as pg
-from PySide6.QtCore import Qt, Signal, QSettings, QEvent
-from PySide6.QtGui import QColor
+from PySide6.QtCore import QEvent, QPoint, Qt, Signal, QSettings
+from PySide6.QtGui import QBrush, QColor, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
+    QAbstractItemView,
     QCheckBox,
     QColorDialog,
     QComboBox,
     QDialog,
     QDialogButtonBox,
     QFormLayout,
+    QFrame,
+    QGraphicsItem,
+    QGraphicsPixmapItem,
     QHBoxLayout,
     QLabel,
     QLineEdit,
+    QListWidget,
+    QListWidgetItem,
     QMessageBox,
     QMenu,
+    QMdiArea,
+    QMdiSubWindow,
+    QPushButton,
     QScrollArea,
     QSizePolicy,
-    QSpinBox,
+    QSlider,
+    QStyle,
+    QTabWidget,
     QToolButton,
     QVBoxLayout,
     QWidget,
@@ -47,6 +61,7 @@ _MARKERS = {
     "Diamond": "D",
 }
 _DB_FLOOR = 1e-12
+_CHART_SURFACE_COLOR = "#ffffff"
 _PG_SYMBOLS = {"": None, "o": "o", "s": "s", "^": "t", "x": "x", "D": "d"}
 _TRACE_PALETTE = (
     "#1f77b4", "#ff7f0e", "#2ca02c", "#d62728", "#9467bd",
@@ -55,6 +70,20 @@ _TRACE_PALETTE = (
 _SMITH_RESISTANCE_VALUES = (0.1, 0.2, 0.3, 0.5, 0.7, 1.0, 1.5, 2.0, 3.0, 5.0, 10.0, 20.0, 50.0)
 _SMITH_REACTANCE_VALUES = _SMITH_RESISTANCE_VALUES
 _SMITH_LABEL_VALUES = (0.2, 0.5, 1.0, 2.0, 5.0)
+
+
+def _chart_logo_path() -> Path | None:
+    source_root = Path(__file__).resolve().parents[2]
+    roots = (
+        Path(getattr(sys, "_MEIPASS", source_root.parent)),
+        Path(sys.executable).resolve().parent,
+        source_root.parent,
+    )
+    for root in roots:
+        candidate = root / "Icons" / "Emerge_Logo" / "emerge_Logo.png"
+        if candidate.is_file():
+            return candidate
+    return None
 
 
 class _AxisRangeDialog(QDialog):
@@ -132,6 +161,388 @@ class _AxisRangeDialog(QDialog):
         self.accept()
 
 
+def _bounded_overlay_position(parent: QWidget, child: QWidget, position: QPoint) -> QPoint:
+    bounds = parent.rect()
+    return QPoint(
+        max(0, min(position.x(), bounds.width() - child.width())),
+        max(0, min(position.y(), bounds.height() - child.height())),
+    )
+
+
+def _overlay_scale(host: QWidget) -> float:
+    return max(0.7, min(1.2, min(host.width() / 800, host.height() / 600)))
+
+
+def _scaled_overlay_font(font, scale: float):
+    point_size = font.pointSizeF()
+    if point_size > 0:
+        font.setPointSizeF(max(6.0, point_size * scale))
+    elif font.pixelSize() > 0:
+        font.setPixelSize(max(7, round(font.pixelSize() * scale)))
+    return font
+
+
+class _TraceSettingsDialog(QDialog):
+    def __init__(self, color: str, marker: str, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("Trace Settings")
+        self.resize(340, 150)
+        self.color = color
+        self.marker = marker
+
+        layout = QVBoxLayout(self)
+        form = QFormLayout()
+        self.color_button = QPushButton("Choose color...", self)
+        self._update_color_button()
+        self.color_button.clicked.connect(self._choose_color)
+        form.addRow("Color", self.color_button)
+        self.marker_combo = QComboBox(self)
+        self.marker_combo.addItems(list(_MARKERS))
+        self.marker_combo.setCurrentText(
+            next(name for name, value in _MARKERS.items() if value == marker)
+        )
+        form.addRow("Marker", self.marker_combo)
+        layout.addLayout(form)
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel, self)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _update_color_button(self) -> None:
+        self.color_button.setText(self.color)
+        self.color_button.setStyleSheet(f"background-color: {self.color};")
+
+    def _choose_color(self) -> None:
+        color = QColorDialog.getColor(QColor(self.color), self, "Trace color")
+        if color.isValid():
+            self.color = color.name()
+            self._update_color_button()
+
+    def _accept(self) -> None:
+        self.marker = _MARKERS[self.marker_combo.currentText()]
+        self.accept()
+
+
+class _DragHandle(QLabel):
+    def __init__(self, text: str = "Legend", parent=None) -> None:
+        super().__init__(text, parent)
+        self._drag_offset: QPoint | None = None
+
+    def mousePressEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            panel = self.parentWidget()
+            parent = panel.parentWidget() if panel is not None else None
+            if panel is None or parent is None:
+                super().mousePressEvent(event)
+                return
+            self._drag_offset = (
+                event.globalPosition().toPoint()
+                - panel.mapToGlobal(QPoint(0, 0))
+            )
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event) -> None:
+        if self._drag_offset is not None:
+            panel = self.parentWidget()
+            parent = panel.parentWidget() if panel is not None else None
+            if panel is not None and parent is not None:
+                target = parent.mapFromGlobal(
+                    event.globalPosition().toPoint() - self._drag_offset
+                )
+                panel.move(_bounded_overlay_position(parent, panel, target))
+                panel.position_changed.emit()
+            event.accept()
+            return
+        super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event) -> None:
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._drag_offset = None
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class _ChartSurface(QFrame):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("chartSurface")
+        self.setStyleSheet(
+            f"QFrame#chartSurface {{ background-color: {_CHART_SURFACE_COLOR}; border: none; }}"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(0)
+
+
+class _MarkerReadout(pg.TextItem):
+    moved = Signal()
+
+    def __init__(self, **options) -> None:
+        super().__init__("", **options)
+        self._manual_position = False
+        self._setting_follow_position = False
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIsMovable, True)
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemSendsGeometryChanges, True)
+        self.setAcceptedMouseButtons(Qt.MouseButton.LeftButton)
+
+    @property
+    def movable(self) -> bool:
+        return bool(self.flags() & QGraphicsItem.GraphicsItemFlag.ItemIsMovable)
+
+    @property
+    def manually_positioned(self) -> bool:
+        return self._manual_position
+
+    def set_follow_position(self, x: float, y: float) -> None:
+        if self._manual_position:
+            return
+        self._setting_follow_position = True
+        try:
+            self.setPos(x, y)
+        finally:
+            self._setting_follow_position = False
+
+    def itemChange(self, change, value):
+        if (
+            change == QGraphicsItem.GraphicsItemChange.ItemPositionHasChanged
+            and not self._setting_follow_position
+        ):
+            self._manual_position = True
+            self.moved.emit()
+        return super().itemChange(change, value)
+
+
+class _DraggableLegendPanel(QFrame):
+    position_changed = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("floatingChartLegend")
+        self.setFrameShape(QFrame.Shape.NoFrame)
+        self.setStyleSheet(
+            f"QFrame#floatingChartLegend {{ background-color: {_CHART_SURFACE_COLOR}; }}"
+        )
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(5, 4, 5, 5)
+        layout.setSpacing(3)
+        self.handle = _DragHandle()
+        self.handle.setObjectName("floatingChartLegendHandle")
+        self.handle.setCursor(Qt.CursorShape.SizeAllCursor)
+        layout.addWidget(self.handle)
+        self.list = QListWidget(self)
+        self.list.setObjectName("externalChartLegend")
+        self.list.setStyleSheet(
+            f"QListWidget#externalChartLegend {{ background-color: {_CHART_SURFACE_COLOR}; }}"
+        )
+        self.list.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        self.list.setMaximumHeight(180)
+        layout.addWidget(self.list)
+
+
+class _ChartMdiArea(QMdiArea):
+    resized = Signal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self._chart_window_initialized = False
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        chart_window = getattr(self, "chart_subwindow", None)
+        if chart_window is None:
+            return
+        bounds = self.viewport().rect()
+        margin = min(12, max(0, (bounds.width() - 1) // 2), max(0, (bounds.height() - 1) // 2))
+        chart_window.setGeometry(
+            margin,
+            margin,
+            max(1, bounds.width() - 2 * margin),
+            max(1, bounds.height() - 2 * margin),
+        )
+        self._chart_window_initialized = True
+        self.resized.emit()
+
+
+class _ChartSubWindow(QMdiSubWindow):
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setMinimumSize(360, 280)
+        self.setWindowFlags(
+            Qt.WindowType.SubWindow | Qt.WindowType.FramelessWindowHint
+        )
+
+
+class _PlotSettingsDialog(QDialog):
+    def __init__(self, view: PlotView) -> None:
+        super().__init__(view)
+        self.setObjectName("plotSettingsDialog")
+        self.setWindowTitle("Chart Settings")
+        self.resize(760, 500)
+        layout = QVBoxLayout(self)
+        self.tabs = QTabWidget(self)
+        self.tabs.setObjectName("plotSettingsTabs")
+        layout.addWidget(self.tabs, 1)
+
+        setup_page = QWidget(self.tabs)
+        setup_layout = QVBoxLayout(setup_page)
+        lists_layout = QHBoxLayout()
+        setup_layout.addLayout(lists_layout, 1)
+
+        available_panel = QWidget(setup_page)
+        available_layout = QVBoxLayout(available_panel)
+        available_layout.setContentsMargins(0, 0, 0, 0)
+        available_layout.addWidget(QLabel("Available parameters", available_panel))
+        self.load_touchstone_button = None
+        if not view._is_farfield:
+            self.load_touchstone_button = QPushButton("Load Touchstone file...", available_panel)
+            self.load_touchstone_button.setObjectName("loadTouchstoneButton")
+            self.load_touchstone_button.clicked.connect(view.touchstone_load_requested.emit)
+            available_layout.addWidget(self.load_touchstone_button)
+        self.dataset_combo = QComboBox(available_panel)
+        self.dataset_combo.setObjectName("traceDatasetCombo")
+        self.dataset_combo.setToolTip("Choose the dataset whose available parameters are shown")
+        available_layout.addWidget(self.dataset_combo)
+        self.trace_search = QLineEdit(available_panel)
+        self.trace_search.setPlaceholderText("Filter parameters")
+        self.trace_search.setClearButtonEnabled(True)
+        available_layout.addWidget(self.trace_search)
+        self.available_list = QListWidget(available_panel)
+        self.available_list.setObjectName("availableTraceList")
+        self.available_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        available_layout.addWidget(self.available_list, 1)
+        lists_layout.addWidget(available_panel, 1)
+
+        transfer_layout = QVBoxLayout()
+        transfer_layout.addStretch(1)
+        self.add_trace_button = QPushButton("Add >", setup_page)
+        self.add_trace_button.setObjectName("addTraceButton")
+        self.remove_trace_button = QPushButton("< Remove", setup_page)
+        self.remove_trace_button.setObjectName("removeTraceButton")
+        transfer_layout.addWidget(self.add_trace_button)
+        transfer_layout.addWidget(self.remove_trace_button)
+        transfer_layout.addStretch(1)
+        lists_layout.addLayout(transfer_layout)
+
+        selected_panel = QWidget(setup_page)
+        selected_layout = QVBoxLayout(selected_panel)
+        selected_layout.setContentsMargins(0, 0, 0, 0)
+        selected_layout.addWidget(QLabel("Selected parameters", selected_panel))
+        self.configure_trace_button = QPushButton("Configure selected trace...", selected_panel)
+        self.configure_trace_button.setObjectName("configureTraceButton")
+        self.configure_trace_button.setEnabled(False)
+        selected_layout.addWidget(self.configure_trace_button)
+        self.selected_list = QListWidget(selected_panel)
+        self.selected_list.setObjectName("selectedTraceList")
+        self.selected_list.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        selected_layout.addWidget(self.selected_list, 1)
+        order_layout = QHBoxLayout()
+        order_layout.addStretch(1)
+        self.move_trace_up_button = QToolButton(selected_panel)
+        self.move_trace_up_button.setObjectName("moveTraceUpButton")
+        self.move_trace_up_button.setIcon(
+            selected_panel.style().standardIcon(QStyle.StandardPixmap.SP_ArrowUp)
+        )
+        self.move_trace_up_button.setToolTip("Move selected trace up")
+        self.move_trace_up_button.setAccessibleName("Move selected trace up")
+        self.move_trace_up_button.setEnabled(False)
+        self.move_trace_down_button = QToolButton(selected_panel)
+        self.move_trace_down_button.setObjectName("moveTraceDownButton")
+        self.move_trace_down_button.setIcon(
+            selected_panel.style().standardIcon(QStyle.StandardPixmap.SP_ArrowDown)
+        )
+        self.move_trace_down_button.setToolTip("Move selected trace down")
+        self.move_trace_down_button.setAccessibleName("Move selected trace down")
+        self.move_trace_down_button.setEnabled(False)
+        order_layout.addWidget(self.move_trace_up_button)
+        order_layout.addWidget(self.move_trace_down_button)
+        selected_layout.addLayout(order_layout)
+        lists_layout.addWidget(selected_panel, 1)
+        self.tabs.addTab(setup_page, "Setup")
+
+        option_page = QWidget(self.tabs)
+        plot_layout = QVBoxLayout(option_page)
+        plot_layout.setContentsMargins(12, 12, 12, 12)
+        plot_layout.setAlignment(Qt.AlignmentFlag.AlignTop)
+        plot_form = QFormLayout()
+        plot_form.addRow("Display", view.display_mode_combo)
+        plot_form.addRow("X scale", view.x_scale_combo)
+        plot_form.addRow("Y scale", view.y_scale_combo)
+        self.legend_scale_slider = QSlider(Qt.Orientation.Horizontal, option_page)
+        self.legend_scale_slider.setObjectName("legendScaleSlider")
+        self.legend_scale_slider.setRange(50, 100)
+        self.legend_scale_slider.setValue(view._legend_scale_percent)
+        self.legend_scale_slider.setEnabled(view._use_pyqtgraph)
+        self.legend_scale_slider.setToolTip("Scale the chart legend from 50% to 100%")
+        self.legend_scale_slider.setAccessibleName("Legend size")
+        self.legend_scale_label = QLabel(f"{view._legend_scale_percent}%", option_page)
+        self.legend_scale_slider.valueChanged.connect(view._set_legend_scale)
+        self.legend_scale_slider.valueChanged.connect(
+            lambda value: self.legend_scale_label.setText(f"{value}%")
+        )
+        legend_scale_layout = QHBoxLayout()
+        legend_scale_layout.addWidget(self.legend_scale_slider, 1)
+        legend_scale_layout.addWidget(self.legend_scale_label)
+        plot_form.addRow("Legend size", legend_scale_layout)
+        self.marker_scale_slider = QSlider(Qt.Orientation.Horizontal, option_page)
+        self.marker_scale_slider.setObjectName("markerScaleSlider")
+        self.marker_scale_slider.setRange(50, 200)
+        self.marker_scale_slider.setValue(view._marker_scale_percent)
+        self.marker_scale_slider.setEnabled(view._use_pyqtgraph and not view._is_smith)
+        self.marker_scale_slider.setToolTip("Scale the marker readout labels from 50% to 200%")
+        self.marker_scale_slider.setAccessibleName("Marker size")
+        self.marker_scale_label = QLabel(f"{view._marker_scale_percent}%", option_page)
+        self.marker_scale_slider.valueChanged.connect(view._set_marker_scale)
+        self.marker_scale_slider.valueChanged.connect(
+            lambda value: self.marker_scale_label.setText(f"{value}%")
+        )
+        marker_scale_layout = QHBoxLayout()
+        marker_scale_layout.addWidget(self.marker_scale_slider, 1)
+        marker_scale_layout.addWidget(self.marker_scale_label)
+        plot_form.addRow("Marker size", marker_scale_layout)
+        plot_layout.addLayout(plot_form)
+        self.axis_ranges_button = QPushButton("Axis ranges...", option_page)
+        self.axis_ranges_button.setObjectName("axisRangesButton")
+        self.axis_ranges_button.setEnabled(view._use_pyqtgraph and not view._is_smith)
+        self.axis_ranges_button.clicked.connect(view._open_axis_settings)
+        plot_layout.addWidget(self.axis_ranges_button, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.remove_logo_checkbox = QCheckBox("Remove EMERGE Logo", option_page)
+        self.remove_logo_checkbox.setObjectName("removeEmergeLogoCheckBox")
+        self.remove_logo_checkbox.toggled.connect(view._set_plot_logo_removed)
+        plot_layout.addWidget(self.remove_logo_checkbox, alignment=Qt.AlignmentFlag.AlignLeft)
+        self.tabs.addTab(option_page, "Option")
+
+        self.add_trace_button.clicked.connect(lambda: view._move_trace_items(self.available_list, True))
+        self.remove_trace_button.clicked.connect(lambda: view._move_trace_items(self.selected_list, False))
+        self.available_list.itemDoubleClicked.connect(
+            lambda _item: view._move_trace_items(self.available_list, True)
+        )
+        self.selected_list.itemDoubleClicked.connect(
+            lambda _item: view._move_trace_items(self.selected_list, False)
+        )
+        self.selected_list.currentItemChanged.connect(view._on_selected_trace_changed)
+        self.move_trace_up_button.clicked.connect(lambda: view._move_selected_trace(-1))
+        self.move_trace_down_button.clicked.connect(lambda: view._move_selected_trace(1))
+        self.configure_trace_button.clicked.connect(view._configure_selected_trace)
+        self.trace_search.textChanged.connect(view._filter_trace_lists)
+        self.dataset_combo.currentIndexChanged.connect(view._populate_available_traces)
+        self.available_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.selected_list.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.available_list.customContextMenuRequested.connect(
+            lambda position: view._show_trace_list_context_menu(self.available_list, position)
+        )
+        self.selected_list.customContextMenuRequested.connect(
+            lambda position: view._show_trace_list_context_menu(self.selected_list, position)
+        )
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Close, self)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+
 def _transform_values(values: Sequence[float | complex], mode: str) -> np.ndarray:
     """Convert a complex-valued series to the selected display quantity."""
     values_array = np.asarray(values, dtype=complex)
@@ -155,6 +566,7 @@ class PlotView(QWidget):
     """Reusable embedded chart view for simulation output and live plot data."""
 
     touchstone_load_requested = Signal()
+    append_mode_changed = Signal(bool)
 
     def __init__(
         self,
@@ -168,6 +580,9 @@ class PlotView(QWidget):
         self.plot_type = str(plot_type).strip().lower()
         self._settings_key = str(settings_key or self.plot_type)
         self._trace_color_settings = QSettings()
+        settings_identity = "\x1f".join((self.plot_type, self._settings_key))
+        settings_digest = hashlib.sha256(settings_identity.encode("utf-8")).hexdigest()
+        self._chart_settings_prefix = f"plots/chart_options/{settings_digest}"
         self._is_smith = self.plot_type == "smith"
         self._is_vswr = self.plot_type == "plot_vswr"
         self._is_farfield = self.plot_type in {"plot_ff", "plot_ff_polar", "plot_ff_3d"}
@@ -175,10 +590,19 @@ class PlotView(QWidget):
         self._use_pyqtgraph = not self._is_farfield
         self._x_values = np.asarray([], dtype=float)
         self._series_data: list[dict[str, Any]] = []
-        self._trace_checkboxes: dict[tuple[str, str], QCheckBox] = {}
+        self._overlay_file_ids: set[str] = set()
+        self._trace_items: dict[tuple[str, str], QListWidgetItem] = {}
+        self._append_sequence = 0
         self._curve_items = []
         self._smith_grid_items = []
         self._marker_items = []
+        self._plot_logo_item: QGraphicsPixmapItem | None = None
+        self._plot_logo_source: QPixmap | None = None
+        self._legend_item: pg.LegendItem | None = None
+        self._legend_scale_percent = 100
+        self._marker_scale_percent = 100
+        self._remove_logo = False
+        self._marker_sequence = 0
         self._x_auto_range = True
         self._y_auto_range = True
         self._x_range = None
@@ -191,9 +615,6 @@ class PlotView(QWidget):
 
         root_layout = QVBoxLayout(self)
         self._root_layout = root_layout
-        control_layout = QHBoxLayout()
-        display_mode_label = QLabel("Display")
-        control_layout.addWidget(display_mode_label)
         self.display_mode_combo = QComboBox(self)
         self.display_mode_combo.setObjectName("displayModeCombo")
         self.display_mode_combo.addItems(_DISPLAY_MODES + (("VSWR",) if self._is_vswr else ()))
@@ -204,16 +625,13 @@ class PlotView(QWidget):
         elif self._is_smith or self._is_farfield:
             self.display_mode_combo.setCurrentText("Real")
             self.display_mode_combo.setEnabled(False)
-        control_layout.addWidget(self.display_mode_combo)
 
-        x_scale_label = QLabel("X scale")
-        control_layout.addWidget(x_scale_label)
         self.x_scale_combo = QComboBox(self)
         self.x_scale_combo.setObjectName("xScaleCombo")
         self.x_scale_combo.addItems(["Linear", "Log"])
+        self._last_x_log = self.x_scale_combo.currentText() == "Log"
         if self._is_smith or self._is_polar:
             self.x_scale_combo.setEnabled(False)
-        control_layout.addWidget(self.x_scale_combo)
 
         self.y_scale_combo = QComboBox(self)
         self.y_scale_combo.setObjectName("yScaleCombo")
@@ -226,116 +644,79 @@ class PlotView(QWidget):
             and not self._is_smith
             and self.display_mode_combo.currentText() != "Magnitude (dB)"
         )
-        y_scale_label = QLabel("Y scale")
-        control_layout.addWidget(y_scale_label)
-        control_layout.addWidget(self.y_scale_combo)
-        if self._is_smith:
-            for widget in (
-                display_mode_label,
-                self.display_mode_combo,
-                x_scale_label,
-                self.x_scale_combo,
-                y_scale_label,
-                self.y_scale_combo,
-            ):
-                widget.hide()
+        self._restore_chart_settings()
 
-        self.axis_settings_button = None
-        self.add_marker_button = None
-        self.clear_markers_button = None
-        self.fit_view_button = None
-        if self._use_pyqtgraph and not self._is_smith:
-            self.axis_settings_button = QToolButton(self)
-            self.axis_settings_button.setText("Axes")
-            self.axis_settings_button.setToolTip("Set automatic or manual axis ranges")
-            self.axis_settings_button.clicked.connect(self._open_axis_settings)
-            control_layout.addWidget(self.axis_settings_button)
+        self._settings_dialog = _PlotSettingsDialog(self)
+        self._available_trace_list = self._settings_dialog.available_list
+        self._selected_trace_list = self._settings_dialog.selected_list
+        self.load_touchstone_button = self._settings_dialog.load_touchstone_button
+        logo_checkbox = self._settings_dialog.remove_logo_checkbox
+        logo_checkbox.blockSignals(True)
+        logo_checkbox.setChecked(self._remove_logo)
+        logo_checkbox.blockSignals(False)
 
-            self.add_marker_button = QToolButton(self)
-            self.add_marker_button.setText("Add Marker")
-            self.add_marker_button.setToolTip("Add a movable frequency marker")
-            self.add_marker_button.clicked.connect(self._add_marker_at_center)
-            control_layout.addWidget(self.add_marker_button)
-
-            self.clear_markers_button = QToolButton(self)
-            self.clear_markers_button.setText("Clear Markers")
-            self.clear_markers_button.clicked.connect(self._clear_markers)
-            control_layout.addWidget(self.clear_markers_button)
-
-            self.fit_view_button = QToolButton(self)
-            self.fit_view_button.setText("Fit")
-            self.fit_view_button.setToolTip("Fit all visible data in the plot")
-            self.fit_view_button.clicked.connect(self._fit_view)
-            control_layout.addWidget(self.fit_view_button)
-
-        self.load_touchstone_button = None
-        if not self._is_farfield:
-            self.load_touchstone_button = QToolButton(self)
-            self.load_touchstone_button.setText("Load Touchstone")
-            self.load_touchstone_button.setToolTip(
-                "Add Touchstone curves to this chart"
-            )
-            self.load_touchstone_button.clicked.connect(self.touchstone_load_requested.emit)
-            control_layout.addWidget(self.load_touchstone_button)
-
-        size_digest = hashlib.sha256(self._settings_key.encode("utf-8")).hexdigest()
-        self._plot_size_setting_key = f"plots/sizes/{size_digest}"
-        default_plot_width, default_plot_height = (700, 700) if self._is_smith else (1000, 600)
-        try:
-            initial_width = int(
-                self._trace_color_settings.value(
-                    f"{self._plot_size_setting_key}/width", default_plot_width
-                )
-            )
-        except (TypeError, ValueError):
-            initial_width = default_plot_width
-        try:
-            initial_height = int(
-                self._trace_color_settings.value(
-                    f"{self._plot_size_setting_key}/height", default_plot_height
-                )
-            )
-        except (TypeError, ValueError):
-            initial_height = default_plot_height
-
-        control_layout.addWidget(QLabel("Plot size"))
-        self.plot_width_spin = QSpinBox(self)
-        self.plot_width_spin.setObjectName("plotWidthSpinBox")
-        self.plot_width_spin.setRange(360, 2400)
-        self.plot_width_spin.setSingleStep(50)
-        self.plot_width_spin.setSuffix(" px")
-        self.plot_width_spin.setToolTip("Set the plot canvas width in pixels")
-        self.plot_width_spin.setValue(initial_width)
-        control_layout.addWidget(QLabel("W"))
-        control_layout.addWidget(self.plot_width_spin)
-
-        self.plot_height_spin = QSpinBox(self)
-        self.plot_height_spin.setObjectName("plotHeightSpinBox")
-        self.plot_height_spin.setRange(240, 1600)
-        self.plot_height_spin.setSingleStep(50)
-        self.plot_height_spin.setSuffix(" px")
-        self.plot_height_spin.setToolTip("Set the plot canvas height in pixels")
-        self.plot_height_spin.setValue(initial_height)
-        control_layout.addWidget(QLabel("H"))
-        control_layout.addWidget(self.plot_height_spin)
+        control_layout = QHBoxLayout()
+        control_layout.setSpacing(4)
+        self.settings_button = self._make_action_button(
+            "settings",
+            "Settings", "settingsButton", self._open_settings,
+        )
+        self.fit_view_button = self._make_action_button(
+            "fit",
+            "Fit", "fitViewButton", self._fit_view,
+        )
+        self.add_marker_button = self._make_action_button(
+            "marker-add",
+            "Add Marker", "addMarkerButton", self._add_marker_at_center,
+        )
+        self.remove_markers_button = self._make_action_button(
+            "marker-remove",
+            "Remove Markers", "removeMarkersButton", self._clear_markers,
+        )
+        self.append_button = self._make_action_button(
+            "chart-add",
+            "Append subsequent simulations to this chart",
+            "appendToChartButton", lambda _checked=False: None,
+        )
+        self.append_button.setCheckable(True)
+        self.append_button.setToolTip("Append subsequent simulations to this chart")
+        self.append_button.setAccessibleName("Append to Chart")
+        self.append_button.toggled.connect(self.append_mode_changed.emit)
+        self.clear_markers_button = self.remove_markers_button
+        marker_actions_enabled = self._use_pyqtgraph and not self._is_smith
+        self.add_marker_button.setEnabled(marker_actions_enabled)
+        self.remove_markers_button.setEnabled(marker_actions_enabled)
+        self._action_buttons = (
+            self.settings_button,
+            self.fit_view_button,
+            self.add_marker_button,
+            self.remove_markers_button,
+            self.append_button,
+        )
+        for button in self._action_buttons:
+            control_layout.addWidget(button)
         control_layout.addStretch(1)
         root_layout.addLayout(control_layout)
 
-        self._series_container = QWidget(self)
-        self._series_layout = QVBoxLayout(self._series_container)
-        self._series_layout.setContentsMargins(0, 0, 0, 0)
-        self._series_layout.setSpacing(2)
-        self._series_scroll = QScrollArea(self)
-        self._series_scroll.setWidgetResizable(True)
-        self._series_scroll.setMaximumHeight(150)
-        self._series_scroll.setWidget(self._series_container)
-        root_layout.addWidget(self._series_scroll)
+        self._mdi_area = _ChartMdiArea(self)
+        self._mdi_area.setObjectName("chartMdiArea")
+        self._mdi_area.setFrameShape(QFrame.Shape.NoFrame)
+        self._mdi_area.setMinimumSize(380, 300)
+        self._mdi_area.setViewMode(QMdiArea.ViewMode.SubWindowView)
+        self._mdi_area.setOption(QMdiArea.AreaOption.DontMaximizeSubWindowOnActivation, True)
+        self._chart_background = QColor(_CHART_SURFACE_COLOR)
+        self._mdi_area.setBackground(QBrush(self._chart_background))
+        root_layout.addWidget(self._mdi_area, 1)
 
-        self._canvas_scroll = QScrollArea(self)
-        self._canvas_scroll.setWidgetResizable(False)
-        self._canvas_scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self._chart_subwindow = _ChartSubWindow()
+        self._chart_subwindow.setObjectName("chartSubWindow")
+
+        self._chart_surface = _ChartSurface()
+        self._canvas_scroll = QScrollArea(self._chart_surface)
+        self._canvas_scroll.setFrameShape(QFrame.Shape.NoFrame)
+        self._canvas_scroll.setWidgetResizable(True)
         if self._use_pyqtgraph:
-            self.plot_widget = pg.PlotWidget(self, background="w")
+            self.plot_widget = pg.PlotWidget(self, background=_CHART_SURFACE_COLOR)
             self.plot_widget.setAntialiasing(True)
             self.plot_widget.showGrid(x=True, y=True, alpha=0.22)
             self.plot_widget.setMenuEnabled(True)
@@ -343,9 +724,10 @@ class PlotView(QWidget):
             self.axes = self.plot_widget.getPlotItem()
             self.figure = None
             self.canvas = self.plot_widget
+            self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             self._canvas_scroll.setWidget(self.plot_widget)
-            root_layout.addWidget(self._canvas_scroll, 1)
             self.plot_widget.scene().sigMouseClicked.connect(self._on_plot_scene_clicked)
+            self._initialize_plot_logo()
         else:
             from matplotlib.backends.backend_qtagg import FigureCanvasQTAgg
             from matplotlib.figure import Figure
@@ -353,30 +735,335 @@ class PlotView(QWidget):
             self.figure = Figure(figsize=(7, 4))
             self.axes = self.figure.add_subplot(111, projection="polar" if self._is_polar else None)
             self.canvas = FigureCanvasQTAgg(self.figure)
+            self.canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
             self._canvas_scroll.setWidget(self.canvas)
-            root_layout.addWidget(self._canvas_scroll, 1)
-        self._requested_canvas_size = (
-            self.plot_width_spin.value(),
-            self.plot_height_spin.value(),
-        )
-        self.canvas.setFixedSize(*self._requested_canvas_size)
-        self._canvas_scroll.viewport().installEventFilter(self)
-        self.plot_width_spin.valueChanged.connect(self._apply_plot_size)
-        self.plot_height_spin.valueChanged.connect(self._apply_plot_size)
+
+        self._chart_surface.layout().addWidget(self._canvas_scroll, 1)
+        self._chart_subwindow.setWidget(self._chart_surface)
+        self._mdi_area.addSubWindow(self._chart_subwindow)
+        self._mdi_area.chart_subwindow = self._chart_subwindow
+        self._chart_subwindow.showNormal()
+
+        self._overlay_host = self.plot_widget.viewport() if self._use_pyqtgraph else self.canvas
+        self._legend_panel = None
+        self._external_legend = None
+        if not self._use_pyqtgraph:
+            self._legend_panel = _DraggableLegendPanel(self._overlay_host)
+            self._external_legend = self._legend_panel.list
+            self._external_legend.setFrameShape(QFrame.Shape.NoFrame)
+            self._external_legend.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+            self._legend_panel.position_changed.connect(self._remember_legend_position)
+            self._legend_panel.resize(220, 190)
+            self._legend_panel.hide()
+        self._overlay_host_size = self._overlay_host.size()
+        self._overlay_host.installEventFilter(self)
+        self._mdi_area.resized.connect(self._position_overlay_widgets)
 
         self.display_mode_combo.currentTextChanged.connect(self._on_display_mode_changed)
         if self._use_pyqtgraph and not self._is_smith:
             self.x_scale_combo.currentTextChanged.connect(self._on_axis_scale_changed)
             self.y_scale_combo.currentTextChanged.connect(self._on_axis_scale_changed)
         elif not self._use_pyqtgraph:
-            self.x_scale_combo.currentTextChanged.connect(self._redraw)
+            self.x_scale_combo.currentTextChanged.connect(self._on_matplotlib_x_scale_changed)
 
-    def eventFilter(self, watched, event):
+        self._restore_markers()
+
+    def _restore_markers(self) -> None:
+        entries = getattr(self, "_pending_marker_positions", [])
+        self._pending_marker_positions = []
+        if not entries or not self._use_pyqtgraph or self._is_smith:
+            return
+        for entry in entries:
+            self._add_marker(entry["x"])
+            if entry.get("manual") and entry.get("pos") is not None:
+                self._marker_items[-1][1].setPos(*entry["pos"])
+
+    def _initialize_plot_logo(self) -> None:
+        logo_path = _chart_logo_path()
+        if logo_path is not None:
+            source = QPixmap(str(logo_path))
+            if not source.isNull():
+                self._plot_logo_source = source
+                self._plot_logo_item = QGraphicsPixmapItem(source)
+                self._plot_logo_item.setZValue(1000)
+                self._plot_logo_item.setAcceptedMouseButtons(Qt.MouseButton.NoButton)
+                scene = self.plot_widget.scene()
+                scene.addItem(self._plot_logo_item)
+                self._plot_logo_item.setVisible(not self._remove_logo)
+                view_box = self.plot_widget.getPlotItem().getViewBox()
+                view_box.sigResized.connect(self._position_plot_logo)
+                self._position_plot_logo()
+        self._settings_dialog.remove_logo_checkbox.setEnabled(self._plot_logo_item is not None)
+
+    @staticmethod
+    def _setting_bool(value: Any, fallback: bool) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)) and value in (0, 1):
+            return bool(value)
+        if isinstance(value, str):
+            normalized = value.strip().casefold()
+            if normalized in {"true", "1", "yes", "on"}:
+                return True
+            if normalized in {"false", "0", "no", "off"}:
+                return False
+        return fallback
+
+    @staticmethod
+    def _setting_range(value: Any, logarithmic: bool) -> tuple[float, float] | None:
+        if not isinstance(value, (tuple, list)) or len(value) != 2:
+            return None
+        if any(isinstance(bound, bool) for bound in value):
+            return None
+        try:
+            low, high = float(value[0]), float(value[1])
+        except (TypeError, ValueError):
+            return None
+        if not math.isfinite(low) or not math.isfinite(high) or low >= high:
+            return None
+        if logarithmic and low <= 0:
+            return None
+        return low, high
+
+    def _restore_chart_settings(self) -> None:
+        prefix = self._chart_settings_prefix
+        settings = self._trace_color_settings
+
+        display_mode = str(settings.value(f"{prefix}/display_mode", ""))
+        if self.display_mode_combo.isEnabled() and self.display_mode_combo.findText(display_mode) >= 0:
+            self.display_mode_combo.setCurrentText(display_mode)
+
+        x_scale = str(settings.value(f"{prefix}/x_scale", ""))
+        if self.x_scale_combo.isEnabled() and self.x_scale_combo.findText(x_scale) >= 0:
+            self.x_scale_combo.setCurrentText(x_scale)
+
+        y_scale = str(settings.value(f"{prefix}/y_scale", ""))
         if (
-            watched is self._canvas_scroll.viewport()
-            and event.type() == QEvent.Type.Resize
+            self._use_pyqtgraph
+            and not self._is_smith
+            and self.display_mode_combo.currentText() != "Magnitude (dB)"
+            and self.y_scale_combo.findText(y_scale) >= 0
         ):
-            self._fit_canvas_to_viewport()
+            self.y_scale_combo.setCurrentText(y_scale)
+        elif self.display_mode_combo.currentText() == "Magnitude (dB)":
+            self.y_scale_combo.setCurrentText("Linear")
+        self.y_scale_combo.setEnabled(
+            self._use_pyqtgraph
+            and not self._is_smith
+            and self.display_mode_combo.currentText() != "Magnitude (dB)"
+        )
+
+        x_log = self.x_scale_combo.currentText() == "Log"
+        y_log = self.y_scale_combo.currentText() == "Log"
+        x_range = self._setting_range(settings.value(f"{prefix}/x_range", None), x_log)
+        y_range = self._setting_range(settings.value(f"{prefix}/y_range", None), y_log)
+        x_auto = self._setting_bool(settings.value(f"{prefix}/x_auto_range", True), True)
+        y_auto = self._setting_bool(settings.value(f"{prefix}/y_auto_range", True), True)
+        self._x_auto_range = x_auto or x_range is None
+        self._y_auto_range = y_auto or y_range is None
+        self._x_range = None if self._x_auto_range else x_range
+        self._y_range = None if self._y_auto_range else y_range
+
+        raw_legend_scale = settings.value(f"{prefix}/legend_scale_percent", 100)
+        try:
+            legend_scale = int(raw_legend_scale)
+            if isinstance(raw_legend_scale, float) and not raw_legend_scale.is_integer():
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            legend_scale = 100
+        self._legend_scale_percent = legend_scale if 50 <= legend_scale <= 100 else 100
+        raw_marker_scale = settings.value(f"{prefix}/marker_scale_percent", 100)
+        try:
+            marker_scale = int(raw_marker_scale)
+            if isinstance(raw_marker_scale, float) and not raw_marker_scale.is_integer():
+                raise ValueError
+        except (TypeError, ValueError, OverflowError):
+            marker_scale = 100
+        self._marker_scale_percent = marker_scale if 50 <= marker_scale <= 200 else 100
+        self._remove_logo = self._setting_bool(
+            settings.value(f"{prefix}/remove_logo", False), False
+        )
+        self._pending_marker_positions = self._setting_marker_positions(
+            settings.value(f"{prefix}/marker_positions", "")
+        )
+
+    @staticmethod
+    def _setting_marker_positions(value: Any) -> list[dict[str, Any]]:
+        if not isinstance(value, str) or not value.strip():
+            return []
+        try:
+            raw_entries = json.loads(value)
+        except (TypeError, ValueError):
+            return []
+        if not isinstance(raw_entries, list):
+            return []
+        entries: list[dict[str, Any]] = []
+        for raw_entry in raw_entries:
+            if not isinstance(raw_entry, dict):
+                continue
+            try:
+                x_value = float(raw_entry.get("x"))
+            except (TypeError, ValueError):
+                continue
+            if not math.isfinite(x_value):
+                continue
+            pos = None
+            raw_pos = raw_entry.get("pos")
+            if isinstance(raw_pos, (list, tuple)) and len(raw_pos) == 2:
+                try:
+                    pos_x, pos_y = float(raw_pos[0]), float(raw_pos[1])
+                except (TypeError, ValueError):
+                    pos_x = pos_y = None
+                if (
+                    pos_x is not None
+                    and pos_y is not None
+                    and math.isfinite(pos_x)
+                    and math.isfinite(pos_y)
+                ):
+                    pos = (pos_x, pos_y)
+            entries.append({
+                "x": x_value,
+                "manual": bool(raw_entry.get("manual")) and pos is not None,
+                "pos": pos,
+            })
+        return entries
+
+    def _save_chart_settings(self) -> None:
+        prefix = self._chart_settings_prefix
+        settings = self._trace_color_settings
+        settings.setValue(f"{prefix}/display_mode", self.display_mode_combo.currentText())
+        settings.setValue(f"{prefix}/x_scale", self.x_scale_combo.currentText())
+        settings.setValue(f"{prefix}/y_scale", self.y_scale_combo.currentText())
+        settings.setValue(f"{prefix}/x_auto_range", self._x_auto_range)
+        settings.setValue(f"{prefix}/y_auto_range", self._y_auto_range)
+        settings.setValue(f"{prefix}/x_range", None if self._x_auto_range else list(self._x_range or ()))
+        settings.setValue(f"{prefix}/y_range", None if self._y_auto_range else list(self._y_range or ()))
+        settings.setValue(f"{prefix}/legend_scale_percent", self._legend_scale_percent)
+        settings.setValue(f"{prefix}/marker_scale_percent", self._marker_scale_percent)
+        settings.setValue(f"{prefix}/remove_logo", self._remove_logo)
+        settings.sync()
+
+    def _save_marker_positions(self) -> None:
+        prefix = self._chart_settings_prefix
+        settings = self._trace_color_settings
+        entries = []
+        for line, label in self._marker_items:
+            entry: dict[str, Any] = {"x": float(line.value())}
+            if label.manually_positioned:
+                position = label.pos()
+                entry["manual"] = True
+                entry["pos"] = [float(position.x()), float(position.y())]
+            entries.append(entry)
+        settings.setValue(f"{prefix}/marker_positions", json.dumps(entries))
+        settings.sync()
+
+    def _trace_setting_key(self, file_id: str, label: str, setting: str) -> str:
+        identity = "\x1f".join((self._settings_key, file_id, label))
+        digest = hashlib.sha256(identity.encode("utf-8")).hexdigest()
+        return f"plots/trace_{setting}/{digest}"
+
+    def _save_trace_settings(self, entry: dict[str, Any]) -> None:
+        file_id, label = entry["file_id"], entry["label"]
+        settings = self._trace_color_settings
+        settings.setValue(self._trace_color_setting_key(file_id, label), entry["color"])
+        settings.setValue(self._trace_setting_key(file_id, label, "visibility"), entry["visible"])
+        settings.setValue(self._trace_setting_key(file_id, label, "marker"), entry["marker"])
+        settings.sync()
+
+    def _set_plot_logo_removed(self, removed: bool) -> None:
+        self._remove_logo = bool(removed)
+        if self._plot_logo_item is not None:
+            self._plot_logo_item.setVisible(not removed)
+        self._save_chart_settings()
+
+    def _position_plot_logo(self) -> None:
+        if self._plot_logo_item is None or self._plot_logo_source is None:
+            return
+        plot_bounds = self.plot_widget.getPlotItem().getViewBox().sceneBoundingRect()
+        if plot_bounds.width() <= 0 or plot_bounds.height() <= 0:
+            return
+        logo_size = max(16, min(40, round(plot_bounds.width() * 0.04)))
+        pixmap = self._plot_logo_source.scaled(
+            logo_size,
+            logo_size,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self._plot_logo_item.setPixmap(pixmap)
+        self._plot_logo_item.setPos(
+            plot_bounds.right() - pixmap.width() - 8,
+            plot_bounds.bottom() - pixmap.height() - 8,
+        )
+
+    def _remember_legend_position(self) -> None:
+        self._legend_moved = True
+
+    def _position_overlay_widgets(self) -> None:
+        host = self._overlay_host
+        previous_size = self._overlay_host_size
+        scale = _overlay_scale(host)
+        if self._legend_panel is not None:
+            width = min(
+                max(1, host.width()),
+                max(
+                    round(120 * scale),
+                    min(round(240 * scale), round(host.width() * 0.25)),
+                ),
+            )
+            height = min(
+                max(1, host.height()),
+                min(
+                    round(210 * scale),
+                    max(
+                        round(60 * scale),
+                        round(self._external_legend.count() * 22 * scale + 42 * scale),
+                    ),
+                ),
+            )
+            self._legend_panel.resize(width, height)
+            legend_font = _scaled_overlay_font(host.font(), scale)
+            self._legend_panel.handle.setFont(legend_font)
+            self._external_legend.setFont(legend_font)
+            self._legend_panel.layout().setContentsMargins(
+                round(5 * scale), round(4 * scale), round(5 * scale), round(5 * scale)
+            )
+            self._legend_panel.layout().setSpacing(max(1, round(3 * scale)))
+            self._external_legend.setMaximumHeight(round(180 * scale))
+            if not getattr(self, "_legend_moved", False):
+                position = QPoint(host.width() - width - 12, 12)
+            else:
+                position = QPoint(self._legend_panel.pos())
+                if previous_size.width() > 0 and previous_size.height() > 0:
+                    position.setX(round(position.x() * host.width() / previous_size.width()))
+                    position.setY(round(position.y() * host.height() / previous_size.height()))
+            self._legend_panel.move(
+                _bounded_overlay_position(host, self._legend_panel, position)
+            )
+            self._legend_panel.raise_()
+        marker_font = _scaled_overlay_font(host.font(), scale * (self._marker_scale_percent / 100.0))
+        for marker_line, readout in self._marker_items:
+            marker_line.setPen(
+                pg.mkPen("#d04a28", width=max(1.0, min(2.0, 1.5 * scale)), style=Qt.PenStyle.DashLine)
+            )
+            readout.setFont(marker_font)
+        symbol_size = max(5.0, min(9.0, 7.0 * scale))
+        symbol_width = max(0.8, min(1.4, scale))
+        for curve in self._curve_items:
+            if curve.opts.get("symbol") is not None:
+                curve.setSymbolSize(symbol_size)
+                curve.setSymbolPen(
+                    pg.mkPen(curve.opts["symbolPen"].color(), width=symbol_width)
+                )
+        self._overlay_host_size = host.size()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self._position_overlay_widgets()
+
+    def eventFilter(self, watched, event) -> bool:
+        if watched is getattr(self, "_overlay_host", None):
+            if event.type() == QEvent.Type.Resize:
+                self._position_overlay_widgets()
         return super().eventFilter(watched, event)
 
     def set_plot_data(
@@ -395,6 +1082,39 @@ class PlotView(QWidget):
         self._ylabel = str(ylabel)
         self._redraw()
 
+    def append_plot_data(
+        self,
+        x_values: Sequence[float],
+        series: Sequence[dict[str, Any]],
+        *,
+        title: str,
+        xlabel: str,
+        ylabel: str,
+    ) -> None:
+        self._progressive_x_range = None
+        self._append_sequence += 1
+        incoming = []
+        for item in series:
+            copied = dict(item)
+            source_id = str(copied.get("file_id", copied.get("file_name", "default")))
+            dataset_name = str(copied.get("file_name", "")).strip() or str(title)
+            copied["file_id"] = f"{source_id}::append-{self._append_sequence}"
+            copied["file_name"] = dataset_name
+            copied["legend_label"] = f"{dataset_name} - {copied['label']}"
+            copied["x_values"] = copied.get("x_values", x_values)
+            incoming.append(copied)
+        self._overlay_file_ids.update(str(item["file_id"]) for item in incoming)
+        self._update_data(self._x_values, [*self._series_data, *incoming])
+        if incoming:
+            dataset_combo = self._settings_dialog.dataset_combo
+            dataset_index = dataset_combo.findData(incoming[-1]["file_id"])
+            if dataset_index >= 0:
+                dataset_combo.setCurrentIndex(dataset_index)
+        self._title = str(title)
+        self._xlabel = str(xlabel)
+        self._ylabel = str(ylabel)
+        self._redraw(reset_range=True)
+
     def add_file_data(
         self,
         x_values: Sequence[float],
@@ -407,7 +1127,14 @@ class PlotView(QWidget):
             if item["file_id"] not in incoming_ids
         ]
         incoming = [dict(item, x_values=item.get("x_values", x_values)) for item in series]
+        self._overlay_file_ids.update(incoming_ids)
         self._update_data(self._x_values, [*existing, *incoming])
+        if series:
+            preferred_id = str(series[-1].get("file_id", series[-1].get("file_name", "default")))
+            dataset_combo = self._settings_dialog.dataset_combo
+            dataset_index = dataset_combo.findData(preferred_id)
+            if dataset_index >= 0:
+                dataset_combo.setCurrentIndex(dataset_index)
         self._redraw(reset_range=True)
 
     def selected_parameters(self) -> list[str]:
@@ -437,7 +1164,16 @@ class PlotView(QWidget):
             if not math.isfinite(low) or not math.isfinite(high) or low >= high:
                 raise ValueError("progressive x range must be finite and increasing")
             self._progressive_x_range = (low, high)
-        self._update_data(x_values, series)
+        incoming_ids = {
+            str(item.get("file_id", str(item.get("file_name", "")) or "default"))
+            for item in series
+        }
+        overlays = [
+            item for item in self._series_data
+            if item["file_id"] in self._overlay_file_ids
+            and item["file_id"] not in incoming_ids
+        ]
+        self._update_data(x_values, [*overlays, *series])
         self._title = str(title)
         self._xlabel = str(xlabel)
         self._ylabel = str(ylabel)
@@ -447,6 +1183,7 @@ class PlotView(QWidget):
         self._progressive_x_range = None
         self._x_values = np.asarray([], dtype=float)
         self._series_data = []
+        self._overlay_file_ids.clear()
         if self._use_pyqtgraph:
             self._clear_markers()
         self._sync_series_controls()
@@ -477,15 +1214,25 @@ class PlotView(QWidget):
             )
             if not QColor(saved_color).isValid():
                 saved_color = ""
+            saved_visible = self._setting_bool(
+                self._trace_color_settings.value(
+                    self._trace_setting_key(file_id, label, "visibility"),
+                    item.get("visible", True),
+                ),
+                bool(item.get("visible", True)),
+            )
+            saved_marker = self._trace_color_settings.value(
+                self._trace_setting_key(file_id, label, "marker"), ""
+            )
+            if saved_marker not in _MARKERS.values():
+                saved_marker = ""
             palette_color = self._normalize_color(_TRACE_PALETTE[index % len(_TRACE_PALETTE)])
             current_color = (
                 old_style["color"] if old_style is not None
                 else saved_color or palette_color
             )
             current_color = self._normalize_color(current_color, palette_color)
-            legend_label = item.get("legend_label")
-            if not legend_label:
-                legend_label = f"{file_name} - {label}" if file_name else label
+            legend_label = f"{label} - {file_name}" if file_name else label
             updated.append({
                 "label": label,
                 "legend_label": str(legend_label),
@@ -493,15 +1240,28 @@ class PlotView(QWidget):
                 "file_id": file_id,
                 "x_values": series_x,
                 "values": values,
-                "visible": old_style["visible"] if old_style is not None else bool(item.get("visible", True)),
+                "visible": old_style["visible"] if old_style is not None else saved_visible,
                 "configured": bool(item.get("configured", False)),
                 "color": current_color,
-                "marker": old_style["marker"] if old_style is not None else "",
+                "marker": old_style["marker"] if old_style is not None else saved_marker,
             })
         self._x_values = x_array if x_array.size else (
             updated[0]["x_values"] if updated else np.asarray([], dtype=float)
         )
-        self._series_data = updated
+        updated_by_key = {
+            (entry["file_id"], entry["label"]): entry for entry in updated
+        }
+        prior_order = [
+            (entry["file_id"], entry["label"])
+            for entry in self._series_data
+        ]
+        retained_keys = [key for key in prior_order if key in updated_by_key]
+        retained_set = set(retained_keys)
+        self._series_data = [
+            *(updated_by_key[key] for key in retained_keys),
+            *(entry for entry in updated
+              if (entry["file_id"], entry["label"]) not in retained_set),
+        ]
         self._sync_series_controls()
 
     def _trace_color_setting_key(self, file_id: str, label: str) -> str:
@@ -510,50 +1270,170 @@ class PlotView(QWidget):
         return f"plots/trace_colors/{digest}"
 
     def _sync_series_controls(self) -> None:
-        while self._series_layout.count():
-            item = self._series_layout.takeAt(0)
-            widget = item.widget()
-            if widget is not None:
-                widget.setParent(None)
-                widget.deleteLater()
-
-        self._trace_checkboxes = {}
-        grouped: dict[str, list[dict[str, Any]]] = {}
+        selected_keys = {
+            item.data(Qt.ItemDataRole.UserRole)
+            for trace_list in (self._available_trace_list, self._selected_trace_list)
+            for item in trace_list.selectedItems()
+        }
+        selected_item = next(
+            (
+                item
+                for trace_list in (self._selected_trace_list, self._available_trace_list)
+                for item in trace_list.selectedItems()
+            ),
+            None,
+        )
+        current_item = selected_item or self._selected_trace_list.currentItem() or self._available_trace_list.currentItem()
+        current_key = (
+            current_item.data(Qt.ItemDataRole.UserRole) if current_item is not None else None
+        )
+        dataset_combo = self._settings_dialog.dataset_combo
+        current_dataset_id = dataset_combo.currentData()
+        datasets: dict[str, str] = {}
         for entry in self._series_data:
-            grouped.setdefault(entry["file_id"], []).append(entry)
+            datasets.setdefault(entry["file_id"], entry["file_name"])
+        dataset_combo.blockSignals(True)
+        dataset_combo.clear()
+        for file_id, file_name in datasets.items():
+            dataset_combo.addItem(file_name, file_id)
+        dataset_index = dataset_combo.findData(current_dataset_id)
+        if dataset_index < 0 and dataset_combo.count():
+            dataset_index = 0
+        dataset_combo.setCurrentIndex(dataset_index)
+        dataset_combo.blockSignals(False)
+        self._available_trace_list.clear()
+        self._selected_trace_list.clear()
+        self._trace_items = {}
+        for entry in self._series_data:
+            key = (entry["file_id"], entry["label"])
+            item = QListWidgetItem(entry["label"])
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setToolTip(entry["legend_label"])
+            item.setForeground(QBrush(QColor(entry["color"])))
+            if entry["visible"]:
+                item.setText(f"{entry['label']} - {entry['file_name']}")
+                self._selected_trace_list.addItem(item)
+                self._trace_items[key] = item
+                item.setSelected(key in selected_keys)
+                if key == current_key:
+                    self._selected_trace_list.setCurrentItem(item)
+        self._populate_available_traces()
+        self._filter_trace_lists(self._settings_dialog.trace_search.text())
+        self._on_selected_trace_changed(self._selected_trace_list.currentItem(), None)
 
-        for entries in grouped.values():
-            row_widget = QWidget(self._series_container)
-            row = QHBoxLayout(row_widget)
-            row.setContentsMargins(4, 2, 4, 2)
-            row.setSpacing(8)
-            file_label = QLabel(entries[0]["file_name"], row_widget)
-            file_label.setMinimumWidth(120)
-            file_label.setMaximumWidth(220)
-            file_label.setToolTip(entries[0]["file_name"])
-            file_label.setStyleSheet("font-weight: 600; color: #344054;")
-            row.addWidget(file_label)
-            for entry in entries:
-                key = (entry["file_id"], entry["label"])
-                checkbox = QCheckBox(entry["label"], row_widget)
-                checkbox.setChecked(entry["visible"])
-                checkbox.setToolTip(entry["legend_label"])
-                checkbox.setStyleSheet(
-                    f"QCheckBox::indicator:checked {{ background-color: {entry['color']}; "
-                    "border: 1px solid #667085; }}"
-                )
-                checkbox.toggled.connect(
-                    lambda checked, current_key=key: self._set_visible(current_key, checked)
-                )
-                checkbox.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
-                checkbox.customContextMenuRequested.connect(
-                    lambda position, current_key=key, control=checkbox:
-                    self._show_trace_context_menu(current_key, control, position)
-                )
-                row.addWidget(checkbox)
-                self._trace_checkboxes[key] = checkbox
-            row.addStretch(1)
-            self._series_layout.addWidget(row_widget)
+    def _populate_available_traces(self, _index: int = -1) -> None:
+        dataset_id = self._settings_dialog.dataset_combo.currentData()
+        self._available_trace_list.clear()
+        for entry in self._series_data:
+            if entry["file_id"] != dataset_id or entry["visible"]:
+                continue
+            key = (entry["file_id"], entry["label"])
+            item = QListWidgetItem(entry["label"])
+            item.setData(Qt.ItemDataRole.UserRole, key)
+            item.setToolTip(entry["legend_label"])
+            item.setForeground(QBrush(QColor(entry["color"])))
+            self._available_trace_list.addItem(item)
+            self._trace_items[key] = item
+        self._filter_trace_lists(self._settings_dialog.trace_search.text())
+
+    def _filter_trace_lists(self, text: str) -> None:
+        query = text.casefold().strip()
+        for trace_list in (self._available_trace_list, self._selected_trace_list):
+            for index in range(trace_list.count()):
+                item = trace_list.item(index)
+                item.setHidden(query not in item.text().casefold())
+
+    def _move_trace_items(self, source: QListWidget, visible: bool) -> None:
+        keys = [
+            item.data(Qt.ItemDataRole.UserRole)
+            for item in source.selectedItems()
+        ]
+        if not keys:
+            return
+        selected_keys = set(keys)
+        for entry in self._series_data:
+            if (entry["file_id"], entry["label"]) in selected_keys:
+                entry["visible"] = visible
+                self._save_trace_settings(entry)
+        self._sync_series_controls()
+        self._redraw()
+
+    def _on_selected_trace_changed(self, current, _previous) -> None:
+        self._settings_dialog.configure_trace_button.setEnabled(current is not None)
+        visible_entries = [entry for entry in self._series_data if entry["visible"]]
+        selected_index = next(
+            (
+                index for index, entry in enumerate(visible_entries)
+                if (entry["file_id"], entry["label"])
+                == (current.data(Qt.ItemDataRole.UserRole) if current is not None else None)
+            ),
+            -1,
+        )
+        self._settings_dialog.move_trace_up_button.setEnabled(selected_index > 0)
+        self._settings_dialog.move_trace_down_button.setEnabled(
+            0 <= selected_index < len(visible_entries) - 1
+        )
+
+    def _move_selected_trace(self, offset: int) -> None:
+        item = self._selected_trace_list.currentItem()
+        if item is None:
+            return
+        key = item.data(Qt.ItemDataRole.UserRole)
+        visible_indices = [
+            index for index, entry in enumerate(self._series_data)
+            if entry["visible"]
+        ]
+        selected_index = next(
+            (
+                index for index, data_index in enumerate(visible_indices)
+                if (self._series_data[data_index]["file_id"],
+                    self._series_data[data_index]["label"]) == key
+            ),
+            -1,
+        )
+        target_index = selected_index + offset
+        if selected_index < 0 or not 0 <= target_index < len(visible_indices):
+            return
+        source_data_index = visible_indices[selected_index]
+        target_data_index = visible_indices[target_index]
+        self._series_data[source_data_index], self._series_data[target_data_index] = (
+            self._series_data[target_data_index], self._series_data[source_data_index]
+        )
+        self._sync_series_controls()
+        moved_item = self._trace_items.get(key)
+        if moved_item is not None:
+            moved_item.setSelected(True)
+            self._selected_trace_list.setCurrentItem(moved_item)
+        self._redraw()
+
+    def _configure_selected_trace(self) -> None:
+        item = self._selected_trace_list.currentItem()
+        if item is None:
+            return
+        key = item.data(Qt.ItemDataRole.UserRole)
+        entry = next(
+            (series for series in self._series_data
+             if (series["file_id"], series["label"]) == key),
+            None,
+        )
+        if entry is None:
+            return
+        dialog = _TraceSettingsDialog(entry["color"], entry["marker"], self._settings_dialog)
+        dialog.setWindowTitle(f"Trace Settings: {entry['legend_label']}")
+        if dialog.exec() != QDialog.DialogCode.Accepted:
+            return
+        entry["color"] = dialog.color
+        entry["marker"] = dialog.marker
+        self._save_trace_settings(entry)
+        self._sync_series_controls()
+        self._redraw()
+
+    def _show_trace_list_context_menu(self, trace_list: QListWidget, position) -> None:
+        item = trace_list.itemAt(position)
+        if item is None:
+            return
+        key = item.data(Qt.ItemDataRole.UserRole)
+        self._show_trace_context_menu(key, trace_list, position)
 
     def _set_visible(self, key: tuple[str, str], visible: bool) -> None:
         entry = next(
@@ -563,13 +1443,21 @@ class PlotView(QWidget):
         if entry is None:
             return
         entry["visible"] = visible
+        self._save_trace_settings(entry)
+        self._sync_series_controls()
         self._redraw()
 
     def _set_marker(self, key: tuple[str, str], marker: str) -> None:
+        if marker not in _MARKERS.values():
+            return
         for entry in self._series_data:
             if (entry["file_id"], entry["label"]) == key:
                 entry["marker"] = marker
+                self._save_trace_settings(entry)
                 break
+        else:
+            return
+        self._sync_series_controls()
         self._redraw()
 
     def _choose_color(self, key: tuple[str, str]) -> None:
@@ -582,16 +1470,8 @@ class PlotView(QWidget):
         color = QColorDialog.getColor(QColor(entry["color"]), self, f"Series color: {entry['legend_label']}")
         if color.isValid():
             entry["color"] = color.name()
-            self._trace_color_settings.setValue(
-                self._trace_color_setting_key(*key), entry["color"]
-            )
-            self._trace_color_settings.sync()
-            checkbox = self._trace_checkboxes.get(key)
-            if checkbox is not None:
-                checkbox.setStyleSheet(
-                    f"QCheckBox::indicator:checked {{ background-color: {entry['color']}; "
-                    "border: 1px solid #667085; }}"
-                )
+            self._save_trace_settings(entry)
+            self._sync_series_controls()
             self._redraw()
 
     def _show_trace_context_menu(self, key, widget, position) -> None:
@@ -613,11 +1493,26 @@ class PlotView(QWidget):
         menu.exec(widget.mapToGlobal(position))
 
     def _on_axis_scale_changed(self, _selection: str = "") -> None:
+        x_is_log = self.x_scale_combo.currentText() == "Log"
+        if x_is_log != self._last_x_log:
+            was_log = self._last_x_log
+            self._last_x_log = x_is_log
+            for line, _label in self._marker_items:
+                data_x = 10.0 ** float(line.value()) if was_log else float(line.value())
+                if x_is_log and data_x > 0:
+                    line.setValue(math.log10(data_x))
+                elif not x_is_log:
+                    line.setValue(data_x)
         self._x_auto_range = True
         self._y_auto_range = True
         self._x_range = None
         self._y_range = None
         self._redraw(reset_range=True)
+        self._save_chart_settings()
+
+    def _on_matplotlib_x_scale_changed(self, _selection: str = "") -> None:
+        self._redraw()
+        self._save_chart_settings()
 
     def _on_display_mode_changed(self, selection: str) -> None:
         decibel_mode = selection == "Magnitude (dB)"
@@ -626,30 +1521,77 @@ class PlotView(QWidget):
                 self.y_scale_combo.setCurrentText("Linear")
             self.y_scale_combo.setEnabled(not decibel_mode)
         self._redraw(reset_range=True)
+        self._save_chart_settings()
 
-    def _apply_plot_size(self, _value: int = 0) -> None:
-        width = self.plot_width_spin.value()
-        height = self.plot_height_spin.value()
-        self._requested_canvas_size = (width, height)
-        self._trace_color_settings.setValue(f"{self._plot_size_setting_key}/width", width)
-        self._trace_color_settings.setValue(f"{self._plot_size_setting_key}/height", height)
-        self._trace_color_settings.sync()
-        self._fit_canvas_to_viewport()
+    def _make_action_button(self, icon_name, tooltip, object_name, callback):
+        button = QToolButton(self)
+        button.setObjectName(object_name)
+        button.setToolButtonStyle(Qt.ToolButtonStyle.ToolButtonIconOnly)
+        button.setIcon(self._chart_action_icon(icon_name))
+        button.setIconSize(QPixmap(20, 20).size())
+        button.setToolTip(tooltip)
+        button.setAccessibleName(tooltip)
+        button.clicked.connect(callback)
+        return button
 
-    def _fit_canvas_to_viewport(self) -> None:
-        available = self._canvas_scroll.viewport().size()
-        if available.width() <= 0 or available.height() <= 0:
-            return
-        requested_width, requested_height = self._requested_canvas_size
-        scale = min(
-            1.0,
-            available.width() / requested_width,
-            available.height() / requested_height,
-        )
-        self.canvas.setFixedSize(
-            max(1, int(requested_width * scale)),
-            max(1, int(requested_height * scale)),
-        )
+    @staticmethod
+    def _chart_action_icon(name: str) -> QIcon:
+        pixmap = QPixmap(20, 20)
+        pixmap.fill(Qt.GlobalColor.transparent)
+        painter = QPainter(pixmap)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing)
+        pen = QPen(QColor("#e4e7eb"), 1.6)
+        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+        pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
+        painter.setPen(pen)
+
+        if name == "settings":
+            for y, knob_x in ((5, 8), (10, 13), (15, 6)):
+                painter.drawLine(3, y, 17, y)
+                painter.setBrush(QColor("#34383d"))
+                painter.drawEllipse(knob_x - 1.8, y - 1.8, 3.6, 3.6)
+                painter.setBrush(Qt.BrushStyle.NoBrush)
+        elif name == "fit":
+            for x1, y1, x2, y2 in (
+                (8, 3, 3, 3), (3, 3, 3, 8),
+                (12, 3, 17, 3), (17, 3, 17, 8),
+                (3, 12, 3, 17), (3, 17, 8, 17),
+                (17, 12, 17, 17), (17, 17, 12, 17),
+            ):
+                painter.drawLine(x1, y1, x2, y2)
+        elif name == "marker-add":
+            painter.drawLine(3, 16, 17, 16)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawLine(10, 4, 10, 16)
+            painter.setPen(pen)
+            painter.drawLine(7, 6, 13, 6)
+            painter.drawLine(10, 3, 10, 9)
+        elif name == "marker-remove":
+            painter.drawLine(3, 16, 17, 16)
+            pen.setStyle(Qt.PenStyle.DashLine)
+            painter.setPen(pen)
+            painter.drawLine(6, 7, 6, 16)
+            painter.drawLine(12, 4, 12, 16)
+            pen.setStyle(Qt.PenStyle.SolidLine)
+            painter.setPen(pen)
+            painter.drawLine(9, 3, 16, 10)
+            painter.drawLine(16, 3, 9, 10)
+        elif name == "chart-add":
+            painter.drawRect(3, 5, 12, 12)
+            painter.drawLine(6, 13, 8, 10)
+            painter.drawLine(8, 10, 11, 12)
+            painter.drawLine(11, 12, 13, 8)
+            painter.drawLine(15, 4, 19, 4)
+            painter.drawLine(17, 2, 17, 6)
+
+        painter.end()
+        return QIcon(pixmap)
+
+    def _open_settings(self) -> None:
+        self._settings_dialog.show()
+        self._settings_dialog.raise_()
+        self._settings_dialog.activateWindow()
 
     def _open_axis_settings(self) -> None:
         dialog = _AxisRangeDialog(
@@ -664,6 +1606,7 @@ class PlotView(QWidget):
             self._y_auto_range = dialog.y_range is None
             self._x_range = dialog.x_range
             self._y_range = dialog.y_range
+            self._save_chart_settings()
             self._redraw(reset_range=True)
 
     def _fit_view(self) -> None:
@@ -671,6 +1614,7 @@ class PlotView(QWidget):
         self._y_auto_range = True
         self._x_range = None
         self._y_range = None
+        self._save_chart_settings()
         self._redraw(reset_range=True)
 
     def _on_plot_scene_clicked(self, event) -> None:
@@ -695,16 +1639,30 @@ class PlotView(QWidget):
             movable=True,
             pen=pg.mkPen("#d04a28", width=1.5, style=Qt.PenStyle.DashLine),
         )
-        label = pg.TextItem(color="#a83218", anchor=(0.5, 1.0), fill=pg.mkBrush(255, 255, 255, 220))
         self.plot_widget.addItem(line, ignoreBounds=True)
+        self._marker_sequence += 1
+        marker_number = self._marker_sequence
+        label = _MarkerReadout(
+            color="#7a271a",
+            fill=pg.mkBrush("#ffffff"),
+            border=pg.mkPen("#e4a79a"),
+        )
+        label.setObjectName(f"markerReadout{marker_number}")
         self.plot_widget.addItem(label, ignoreBounds=True)
         marker = (line, label)
         self._marker_items.append(marker)
-        line.sigPositionChanged.connect(lambda _line=line: self._update_marker_label(_line))
+        line.sigPositionChanged.connect(self._on_marker_line_moved)
         line.sigClicked.connect(
             lambda clicked_line, event, current=marker: self._on_marker_clicked(current, event)
         )
+        label.moved.connect(self._save_marker_positions)
+        self._position_overlay_widgets()
         self._update_marker_label(line)
+        self._save_marker_positions()
+
+    def _on_marker_line_moved(self, line) -> None:
+        self._update_marker_label(line)
+        self._save_marker_positions()
 
     def _on_marker_clicked(self, marker, event) -> None:
         if event.button() == Qt.MouseButton.RightButton:
@@ -712,6 +1670,9 @@ class PlotView(QWidget):
             self.plot_widget.removeItem(marker[1])
             if marker in self._marker_items:
                 self._marker_items.remove(marker)
+                for marker_line, _label in self._marker_items:
+                    self._update_marker_label(marker_line)
+                self._save_marker_positions()
 
     def _clear_markers(self) -> None:
         if not self._use_pyqtgraph:
@@ -720,6 +1681,8 @@ class PlotView(QWidget):
             self.plot_widget.removeItem(line)
             self.plot_widget.removeItem(label)
         self._marker_items.clear()
+        self._save_marker_positions()
+
 
     def _update_marker_label(self, line) -> None:
         for marker_line, label in self._marker_items:
@@ -729,27 +1692,102 @@ class PlotView(QWidget):
             x_value = 10.0 ** view_x if self.x_scale_combo.currentText() == "Log" else view_x
             lines = [f"{self._xlabel or 'X'}: {x_value:.6g}"]
             display_mode = self.display_mode_combo.currentText()
+            x_log = self.x_scale_combo.currentText() == "Log"
+            y_log = self.y_scale_combo.currentText() == "Log"
             for entry in self._series_data:
                 if not entry["visible"]:
                     continue
                 x_values = np.asarray(entry["x_values"], dtype=float)
                 y_values = _transform_values(entry["values"], display_mode)
                 valid = np.isfinite(x_values) & np.isfinite(y_values)
-                if self.x_scale_combo.currentText() == "Log":
+                if x_log:
                     valid &= x_values > 0
-                if self.y_scale_combo.currentText() == "Log":
+                if y_log:
                     valid &= y_values > 0
                 if np.count_nonzero(valid) == 0:
+                    lines.append(f"{entry['label']}: n/a")
                     continue
-                order = np.argsort(x_values[valid])
-                interpolated = np.interp(
-                    x_value, x_values[valid][order], y_values[valid][order]
-                )
+                sample_x = np.log10(x_values[valid]) if x_log else x_values[valid]
+                sample_y = np.log10(y_values[valid]) if y_log else y_values[valid]
+                order = np.argsort(sample_x)
+                sample_x = sample_x[order]
+                sample_y = sample_y[order]
+                if view_x < sample_x[0] or view_x > sample_x[-1]:
+                    lines.append(f"{entry['label']}: n/a")
+                    continue
+                interpolated = np.interp(view_x, sample_x, sample_y)
+                if y_log:
+                    interpolated = 10.0 ** interpolated
                 lines.append(f"{entry['label']}: {interpolated:.4g}")
-            label.setText("\n".join(lines))
-            y_top = self.plot_widget.getPlotItem().getViewBox().viewRange()[1][1]
-            label.setPos(x_value, y_top)
+            marker_number = self._marker_items.index((marker_line, label)) + 1
+            label.setText(f"Marker {marker_number}\n" + "\n".join(lines))
+            view_box = self.plot_widget.getViewBox()
+            x_range, y_range = view_box.viewRange()
+            x_span = x_range[1] - x_range[0]
+            y_span = y_range[1] - y_range[0]
+            if x_span and y_span:
+                place_right = view_x < x_range[0] + x_span * 0.72
+                label.setAnchor((0, 0) if place_right else (1, 0))
+                label.set_follow_position(
+                    view_x + (x_span * 0.015 if place_right else -x_span * 0.015),
+                    y_range[1] - y_span * 0.06,
+                )
             return
+
+    def _set_legend_scale(self, percent: int) -> None:
+        self._legend_scale_percent = int(percent)
+        if self._legend_item is not None:
+            self._legend_item.setScale(self._legend_scale_percent / 100.0)
+        self._save_chart_settings()
+
+    def _set_marker_scale(self, percent: int) -> None:
+        self._marker_scale_percent = int(percent)
+        self._position_overlay_widgets()
+        self._save_chart_settings()
+
+    def _sync_chart_legend(self, series) -> None:
+        if self._use_pyqtgraph:
+            plot_item = self.plot_widget.getPlotItem()
+            if not series:
+                self._legend_item = None
+                return
+            legend = pg.LegendItem(
+                brush=pg.mkBrush(255, 255, 255, 235),
+                pen=pg.mkPen("#d0d5dd"),
+                labelTextColor="#344054",
+            )
+            legend.setParentItem(plot_item.getViewBox())
+            legend.anchor((1, 0), (1, 0), offset=(-10, 10))
+            legend.setScale(self._legend_scale_percent / 100.0)
+            for entry in series:
+                symbol = _PG_SYMBOLS.get(entry["marker"])
+                sample = pg.PlotDataItem(
+                    pen=pg.mkPen(entry["color"], width=2),
+                    symbol=symbol,
+                    symbolSize=7,
+                    symbolBrush=pg.mkBrush(entry["color"]) if symbol else None,
+                    symbolPen=pg.mkPen(entry["color"]) if symbol else None,
+                )
+                legend_label = (
+                    f"{entry['label']} - {entry['file_name']}"
+                    if entry["file_name"] else entry["label"]
+                )
+                legend.addItem(sample, legend_label)
+            self._legend_item = legend if series else None
+            return
+
+        self._external_legend.clear()
+        for entry in series:
+            legend_label = (
+                f"{entry['label']} - {entry['file_name']}"
+                if entry["file_name"] else entry["label"]
+            )
+            item = QListWidgetItem(legend_label)
+            item.setForeground(QBrush(QColor(entry["color"])))
+            item.setToolTip(legend_label)
+            self._external_legend.addItem(item)
+        self._legend_panel.setVisible(bool(series))
+        self._position_overlay_widgets()
 
     def _redraw(self, _selection: str = "", *, reset_range: bool = False) -> None:
         if self._use_pyqtgraph:
@@ -769,10 +1807,10 @@ class PlotView(QWidget):
             plot_item.removeItem(curve)
         self._curve_items.clear()
 
-        legend = getattr(plot_item, "legend", None)
+        legend = self._legend_item
         if legend is not None:
             plot_item.scene().removeItem(legend)
-            plot_item.legend = None
+            self._legend_item = None
 
         x_log = self.x_scale_combo.currentText() == "Log"
         y_log = self.y_scale_combo.currentText() == "Log"
@@ -782,9 +1820,9 @@ class PlotView(QWidget):
         mode = self.display_mode_combo.currentText()
         ylabel = "VSWR" if mode == "VSWR" else mode
         plot_item.setLabel("left", ylabel or self._ylabel)
+        view_box.setBorder(pg.mkPen("#7a858f", width=1))
         visible_series = [entry for entry in self._series_data if entry["visible"]]
-        if visible_series:
-            plot_item.addLegend(offset=(10, 10))
+        self._sync_chart_legend(visible_series)
 
         for entry in visible_series:
             x_values = np.asarray(entry["x_values"], dtype=float)
@@ -846,12 +1884,13 @@ class PlotView(QWidget):
         self._curve_items.clear()
         self._smith_grid_items.clear()
 
-        legend = getattr(plot_item, "legend", None)
+        legend = self._legend_item
         if legend is not None:
             plot_item.scene().removeItem(legend)
-            plot_item.legend = None
+            self._legend_item = None
 
         plot_item.setLogMode(x=False, y=False)
+        view_box.setBorder(pg.mkPen("#7a858f", width=1))
         plot_item.showGrid(x=False, y=False)
         plot_item.setTitle(self._title)
         plot_item.setLabel("bottom", "Re(Γ)")
@@ -930,6 +1969,7 @@ class PlotView(QWidget):
         )
 
         visible_series = [entry for entry in self._series_data if entry["visible"]]
+        self._sync_chart_legend(visible_series)
         for entry in visible_series:
             reflection = np.asarray(entry["values"], dtype=complex)
             valid = np.isfinite(reflection.real) & np.isfinite(reflection.imag)
@@ -1088,12 +2128,15 @@ class PlotView(QWidget):
         legend = axes.get_legend()
         if legend is not None:
             legend.remove()
-        if visible_series:
-            axes.legend()
+        self._sync_chart_legend(visible_series)
+        for spine in axes.spines.values():
+            spine.set_color("#7a858f")
+            spine.set_linewidth(0.8)
 
         new_canvas = FigureCanvasQTAgg(figure)
-        self._root_layout.replaceWidget(self.canvas, new_canvas)
-        previous_canvas = self.canvas
+        new_canvas.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        previous_canvas = self._canvas_scroll.takeWidget()
+        self._canvas_scroll.setWidget(new_canvas)
         previous_figure = self.figure
         self.canvas = new_canvas
         self.figure = figure

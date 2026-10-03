@@ -564,7 +564,7 @@ def test_extruded_cut_uses_selected_base_and_records_sketch_definition(monkeypat
 
 def test_sketch_toolbar_uses_available_freecad_icon_assets():
     names = (
-        "Part_Extrude", "Part_Revolve", "Part_Box", "Part_Cylinder", "Part_Cut", "Std_Tool1", "Std_Tool2",
+        "Part_Extrude", "Part_Revolve", "Part_Box", "Part_Cylinder", "Part_Cut", "Part_Sketch_Face", "Std_Tool1", "Std_Tool2",
         "Std_Tool3", "Std_Tool4", "Std_Tool5", "Std_Tool6", "Std_Tool7",
         "Std_Tool8", "Std_Axis", "Std_Point", "Tree_Dimension",
         "view-measurement", "umf-measurement", "LinkArray", "Std_Plane",
@@ -635,7 +635,7 @@ def test_toolbar_groups_use_icon_only_buttons_and_size_for_all_columns():
 def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions():
     application = QApplication.instance() or QApplication([])
     window = QMainWindow()
-    window.resize(864, 700)
+    window.resize(1900, 700)
     window._viewport = Mock()
     window._viewport.is_parallel_projection.return_value = False
     for name in (
@@ -658,9 +658,10 @@ def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions(
     separators = [action for action in window._main_toolbar.actions() if action.isSeparator()]
     assert len(separators) == 7
     assert all(
-        window._main_toolbar.widgetForAction(action).width() == 18
+        window._main_toolbar.widgetForAction(action).width() == 24
         for action in separators
     )
+    assert window._main_toolbar.iconSize() == QSize(24, 24)
     window._main_toolbar.hide()
     window._workspace_toolbar.hide()
     window._sketch_context_toolbar.show()
@@ -682,7 +683,11 @@ def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions(
     for group in main_groups.values():
         group_layout = group.layout()
         if group_layout.count() > 1 and group_layout.itemAt(1).layout() is not None:
-            assert group_layout.itemAt(1).layout().rowCount() <= 2
+            assert group_layout.itemAt(1).layout().rowCount() == 1
+            assert all(
+                button.size() == QSize(28, 28)
+                for button in group.findChildren(QToolButton)
+            )
     main_3d_buttons = main_groups["3D"].findChildren(QToolButton)
     assert [button.defaultAction().text() for button in main_3d_buttons] == [
         "Box", "Cylinder", "Cone", "Sphere", "Open Region / PML", "Import STEP",
