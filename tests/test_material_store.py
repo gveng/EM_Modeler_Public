@@ -62,3 +62,28 @@ def test_add_global_material_uses_defaults_and_persists(tmp_path):
     assert record.source == "global"
     assert record.family == "Common"
     assert "New dielectric" in reloaded.global_records()
+
+
+def test_copy_builtin_material_to_project_preserves_builtin_and_copies_properties():
+    store = MaterialStore()
+    builtin = store.get_record("PEC")
+
+    copied = store.copy_builtin_to_project("PEC")
+
+    assert copied.source == "project"
+    assert copied.name == builtin.name
+    assert copied.uid != builtin.uid
+    assert copied.color == builtin.color
+    assert copied.er == builtin.er
+    assert store._builtin["PEC"] is builtin
+    assert store.project_materials_to_json()[0]["name"] == "PEC"
+
+
+def test_copy_builtin_material_rejects_missing_or_existing_project_record():
+    store = MaterialStore()
+    with pytest.raises(ValueError, match="does not exist"):
+        store.copy_builtin_to_project("Missing")
+
+    store.add_project_material("PEC")
+    with pytest.raises(ValueError, match="already exists"):
+        store.copy_builtin_to_project("PEC")

@@ -701,9 +701,9 @@ def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions(
     assert all(not button.defaultAction().icon().isNull() for button in tools_buttons)
     main_2d_buttons = main_groups["2D"].findChildren(QToolButton)
     assert [button.defaultAction().text() for button in main_2d_buttons] == [
-        "Sketch", "Planar", "Plate from Face/Edge", "Circular Plate",
+        "Sketch", "Planar", "Plate from Face/Edge", "Circular Plate", "Surface Extrusion",
     ]
-    circular_plate_action = main_2d_buttons[-1].defaultAction()
+    circular_plate_action = main_2d_buttons[3].defaultAction()
     assert circular_plate_action.icon().pixmap(QSize(18, 18)).toImage() == (
         _icon("Sketcher_CreateCircle").pixmap(QSize(18, 18)).toImage()
     )
@@ -719,7 +719,7 @@ def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions(
         "Select", "Delete", "Exit Sketch",
     ]
     expected_actions = {
-        "3D": ["Extrude", "Revolve", "Extruded Cut"],
+        "3D": ["Extrude", "Revolve", "Extruded Cut", "Surface Extrusion"],
         "2D": [
             "Line", "Polyline", "Corner Rectangle", "Center Rectangle", "Construction",
             "Vertex Snap", "Circle", "3-Point Arc", "Center Arc",
@@ -774,6 +774,7 @@ def test_main_window_builds_icon_only_sketch_tools_and_reuses_main_zoom_actions(
     window._viewport.set_parallel_projection.assert_called_with(True)
     assert not window._sketch_context_actions["Extrude"].icon().isNull()
     assert not window._sketch_context_actions["Revolve"].icon().isNull()
+    assert not window._sketch_context_actions["Surface Extrusion"].icon().isNull()
     for action_name, asset_name in (("Extrude", "Part_Extrude"), ("Revolve", "Part_Revolve")):
         assert (
             window._sketch_context_actions[action_name].icon().pixmap(QSize(18, 18)).toImage()

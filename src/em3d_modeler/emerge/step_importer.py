@@ -36,6 +36,9 @@ from pathlib import Path
 import vtk
 
 
+STEP_MESH_LINEAR_DEFLECTION = 0.1
+
+
 def import_step(filepath: str, mm_per_unit: float = 1.0) -> List[Dict[str, Any]]:
     """Import STEP geometry and scale its millimetre coordinates for the scene.
 
@@ -193,7 +196,7 @@ def _import_via_ocp_with_colors(filepath: str) -> List[Dict[str, Any]]:
                 continue
             
             # Tessellate
-            BRepMesh_IncrementalMesh(shape, 0.1, False, 0.5, True)
+            BRepMesh_IncrementalMesh(shape, STEP_MESH_LINEAR_DEFLECTION, False, 0.5, True)
 
             parent_color = _shape_color(shape)
 
@@ -254,7 +257,9 @@ def _import_via_ocp(filepath: str) -> List[Dict[str, Any]]:
         shape = reader.Shape(i)
 
         # Tessellate (linear deflection 0.1, angular 0.5 rad)
-        BRepMesh_IncrementalMesh(shape, 0.1, False, 0.5, True)
+        BRepMesh_IncrementalMesh(
+            shape, STEP_MESH_LINEAR_DEFLECTION, False, 0.5, True
+        )
 
         # Iterate over solids inside this shape – each becomes a separate body
         solid_explorer = TopExp_Explorer(shape, TopAbs_SOLID)
@@ -373,7 +378,7 @@ def _import_via_occ(filepath: str) -> List[Dict[str, Any]]:
     n_shapes = reader.NbShapes()
     for i in range(1, n_shapes + 1):
         shape = reader.Shape(i)
-        BRepMesh_IncrementalMesh(shape, 0.1, False, 0.5)
+        BRepMesh_IncrementalMesh(shape, STEP_MESH_LINEAR_DEFLECTION, False, 0.5)
         polydata = _occ_shape_to_vtk(shape)
         if polydata.GetNumberOfPoints() > 0:
             results.append({

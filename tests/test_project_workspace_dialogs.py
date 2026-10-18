@@ -2,8 +2,8 @@ from types import MethodType, SimpleNamespace
 from unittest.mock import Mock
 
 import pytest
-from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QHeaderView, QSplitter
+from PySide6.QtCore import QPoint, Qt
+from PySide6.QtWidgets import QApplication, QCheckBox, QComboBox, QDialog, QDialogButtonBox, QHeaderView, QMenu, QSplitter, QTreeWidget
 from PySide6.QtWidgets import QWidget
 
 from em3d_modeler.ui import main_window as main_window_module
@@ -11,6 +11,7 @@ from em3d_modeler.ui.main_window import MainWindow
 from em3d_modeler.ui.body_properties_widget import BodyPropertiesWidget
 from em3d_modeler.ui.project_tree_widget import (
     ProjectTreeWidget,
+    _BOUNDARY_TYPES,
     _OBJECT_BC_DEFAULT_PARAMS,
     _OBJECT_BC_TYPES,
     _parametric_range_values,
@@ -21,7 +22,25 @@ from em3d_modeler.ui.parameters_dialog import ParametersDialog
 def test_object_boundary_choices_include_finite_conductor_models():
     assert "Surface Impedance" in _OBJECT_BC_TYPES
     assert "Thin Conductor" in _OBJECT_BC_TYPES
+    assert "Periodic" not in _BOUNDARY_TYPES
+    assert "Periodic" not in _OBJECT_BC_TYPES
     assert _OBJECT_BC_DEFAULT_PARAMS["Thin Conductor"]["Thickness_mm"] == 0.035
+
+
+def test_new_project_defaults_global_boundaries_to_radiation():
+    app = QApplication.instance() or QApplication([])
+    tree = ProjectTreeWidget()
+
+    assert tree.get_settings()["boundaries"] == {
+        "Xmin": "Radiation",
+        "Xmax": "Radiation",
+        "Ymin": "Radiation",
+        "Ymax": "Radiation",
+        "Zmin": "Radiation",
+        "Zmax": "Radiation",
+    }
+    assert app is not None
+    tree.close()
 
 
 def test_open_project_uses_configured_workspace_directory(monkeypatch, tmp_path):
@@ -297,6 +316,45 @@ def test_adding_output_expands_its_simulation_group():
     assert app is not None
 
 
+def test_simulation_context_menus_offer_linked_output_and_new_simulation(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    tree = ProjectTreeWidget()
+    tree.load_settings({
+        "simulations": [{"name": "Simulation_1", "type": "ScatteredField"}],
+    })
+    simulation_item = tree._s_node.child(0)
+    output_group = tree._o_node.child(0)
+    clicked = {"item": simulation_item}
+    menus = []
+    tree._add_output_dialog = Mock()
+    tree._add_simulation_dialog = Mock()
+
+    monkeypatch.setattr(
+        QTreeWidget, "itemAt", lambda _tree, _position: clicked["item"]
+    )
+    monkeypatch.setattr(QMenu, "exec_", lambda menu, *_args: menus.append(menu))
+
+    tree._on_context_menu(QPoint(0, 0))
+    simulation_actions = {
+        action.text(): action for action in menus[-1].actions()
+    }
+    assert "Add Output Plot…" in simulation_actions
+    assert "Add Simulation…" in simulation_actions
+    simulation_actions["Add Output Plot…"].trigger()
+    tree._add_output_dialog.assert_called_once_with("Simulation_1")
+
+    clicked["item"] = output_group
+    tree._on_context_menu(QPoint(0, 0))
+    output_actions = {action.text(): action for action in menus[-1].actions()}
+    assert "Add Output Plot…" in output_actions
+    assert "Add Simulation…" in output_actions
+    output_actions["Add Output Plot…"].trigger()
+    tree._add_output_dialog.assert_called_with("Simulation_1")
+
+    assert app is not None
+    tree.close()
+
+
 def test_parametric_simulation_enables_progressive_plotting(monkeypatch):
     app = QApplication.instance() or QApplication([])
     tree = ProjectTreeWidget()
@@ -363,6 +421,111 @@ def test_parametric_output_can_select_live_plot_mode(monkeypatch):
     assert app is not None
 
 
+def test_output_dialog_saves_selected_eigenmode_number(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    tree = ProjectTreeWidget()
+    tree.load_settings({"simulations": [
+        {"name": "Cavity", "type": "Eigenmode"},
+    ]})
+
+    def accept_eigenmode_output(dialog):
+        plot_type = next(
+            combo
+            for combo in dialog.findChildren(main_window_module.QComboBox)
+            if combo.findText("eigen_field") >= 0
+        )
+        plot_type.setCurrentText("eigen_field")
+        mode_number = dialog.findChild(
+            main_window_module.QSpinBox, "eigenmodePlotNumber"
+        )
+        assert not mode_number.isHidden()
+        mode_number.setValue(2)
+        dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok).click()
+        return dialog.result()
+
+    monkeypatch.setattr(QDialog, "exec_", accept_eigenmode_output)
+    result = tree._output_dialog_data(
+        {
+            "name": "Mode shape",
+            "simulation": "Cavity",
+            "plot_type": "plot_eigenmode",
+        },
+        title="Add Output Plot",
+    )
+
+    assert result["plot_type"] == "eigen_field"
+    assert result["params"]["eigenmode_number"] == 2
+    assert result["params"]["eigen_field_level"] == "basic"
+    assert result["params"]["field_component"] == "Ez"
+    assert result["params"]["field_metric"] == "real"
+    assert result["plot_mode"] == "final"
+    assert app is not None
+
+
+def test_eigen_field_output_dialog_saves_advanced_settings(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    tree = ProjectTreeWidget()
+    tree.load_settings({"simulations": [
+        {"name": "Cavity", "type": "Eigenmode"},
+    ]})
+
+    def accept_advanced_eigen_field(dialog):
+        dialog.findChild(
+            main_window_module.QComboBox, "eigenFieldLevel"
+        ).setCurrentIndex(1)
+        dialog.findChild(
+            main_window_module.QComboBox, "eigenFieldComponent"
+        ).setCurrentIndex(
+            dialog.findChild(
+                main_window_module.QComboBox, "eigenFieldComponent"
+            ).findData("Hx")
+        )
+        dialog.findChild(
+            main_window_module.QComboBox, "eigenFieldMetric"
+        ).setCurrentIndex(
+            dialog.findChild(
+                main_window_module.QComboBox, "eigenFieldMetric"
+            ).findData("imag")
+        )
+        dialog.findChild(
+            main_window_module.QComboBox, "outputPlane"
+        ).setCurrentText("XZ")
+        dialog.findChild(
+            main_window_module.QLineEdit, "eigenFieldCutPositions"
+        ).setText("20, 80")
+        dialog.findChild(
+            main_window_module.QDoubleSpinBox, "eigenFieldCutSpacing"
+        ).setValue(0.25)
+        dialog.findChild(
+            main_window_module.QDoubleSpinBox, "eigenFieldGeometryOpacity"
+        ).setValue(0.6)
+        dialog.findChild(
+            main_window_module.QComboBox, "eigenFieldColormap"
+        ).setCurrentText("coolwarm")
+        dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok).click()
+        return dialog.result()
+
+    monkeypatch.setattr(QDialog, "exec_", accept_advanced_eigen_field)
+    result = tree._output_dialog_data(
+        {
+            "name": "Advanced mode",
+            "simulation": "Cavity",
+            "plot_type": "eigen_field",
+        },
+        title="Edit Output Plot",
+    )
+
+    assert result["params"]["eigen_field_level"] == "advanced"
+    assert result["params"]["field_component"] == "Hx"
+    assert result["params"]["field_metric"] == "imag"
+    assert result["params"]["plane"] == "XZ"
+    assert result["params"]["cut_positions"] == [0.2, 0.8]
+    assert result["params"]["cut_spacing_mm"] == 0.25
+    assert result["params"]["geometry_opacity"] == 0.6
+    assert result["params"]["colormap"] == "coolwarm"
+    assert app is not None
+
+
 def test_simulation_definition_edits_progressive_setting(monkeypatch):
     app = QApplication.instance() or QApplication([])
     tree = ProjectTreeWidget()
@@ -387,6 +550,94 @@ def test_simulation_definition_edits_progressive_setting(monkeypatch):
 
     assert result["progressive_sparams_enabled"] is True
     assert result["progressive_sparams_chunk_size"] == 7
+
+
+def test_eigenmode_dialog_saves_search_frequency_in_ghz(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    tree = ProjectTreeWidget()
+
+    def accept_eigenmode(dialog):
+        simulation_type = next(
+            combo
+            for combo in dialog.findChildren(main_window_module.QComboBox)
+            if combo.findData("Eigenmode") >= 0
+        )
+        assert simulation_type.currentText() == "Eigenmode (Beta)"
+        assert simulation_type.currentData() == "Eigenmode"
+        frequency = dialog.findChild(
+            main_window_module.QDoubleSpinBox, "eigenmodeSearchFrequency"
+        )
+        assert not frequency.isHidden()
+        frequency.setValue(2.45)
+        dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok).click()
+        return dialog.result()
+
+    monkeypatch.setattr(QDialog, "exec_", accept_eigenmode)
+    result = tree._simulation_dialog_data(
+        {"name": "Cavity", "type": "Eigenmode"},
+        title="Edit Simulation",
+    )
+
+    assert result["type"] == "Eigenmode"
+    assert result["EigenmodeSearchFrequency_GHz"] == 2.45
+    assert app is not None
+
+
+def test_sweep_dialog_configures_adaptive_mesh_refinement(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    tree = ProjectTreeWidget()
+
+    def accept_amr(dialog):
+        enabled = dialog.findChild(QCheckBox, "adaptiveMeshRefinementEnabled")
+        frequency = dialog.findChild(
+            main_window_module.QDoubleSpinBox,
+            "adaptiveMeshRefinementFrequency",
+        )
+        assert not enabled.isChecked()
+        assert not frequency.isEnabled()
+        enabled.setChecked(True)
+        assert frequency.isEnabled()
+        frequency.setValue(2.45)
+        dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok).click()
+        return dialog.result()
+
+    monkeypatch.setattr(QDialog, "exec_", accept_amr)
+    result = tree._simulation_dialog_data(
+        {
+            "name": "Patch sweep",
+            "type": "Sweep",
+            "Fmin_GHz": 1.0,
+            "Fmax_GHz": 3.0,
+        },
+        title="Edit Simulation",
+    )
+
+    assert result["adaptive_mesh_refinement_enabled"] is True
+    assert result["adaptive_mesh_refinement_frequency_GHz"] == 2.45
+    assert app is not None
+
+
+def test_simulation_dialog_opt_in_to_oversized_mesh_estimate(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    tree = ProjectTreeWidget()
+
+    def accept_allow_large_mesh(dialog):
+        allow_large_mesh = dialog.findChild(
+            QCheckBox, "allowOversizedMesh"
+        )
+        assert not allow_large_mesh.isChecked()
+        allow_large_mesh.setChecked(True)
+        dialog.findChild(QDialogButtonBox).button(QDialogButtonBox.Ok).click()
+        return dialog.result()
+
+    monkeypatch.setattr(QDialog, "exec_", accept_allow_large_mesh)
+    result = tree._simulation_dialog_data(
+        {"name": "Sweep", "type": "Sweep"},
+        title="Edit Simulation",
+    )
+
+    assert result["allow_oversized_mesh"] is True
+    assert app is not None
 
 
 @pytest.mark.parametrize(

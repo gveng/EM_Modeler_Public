@@ -246,6 +246,29 @@ class MaterialStore:
         self._project[rec.name] = rec
         return rec
 
+    def copy_builtin_to_project(self, name: str) -> MaterialRecord:
+        key = str(name).strip()
+        record = self._builtin.get(key)
+        if record is None:
+            raise ValueError(f"Builtin material '{key}' does not exist")
+        if key in self._project:
+            raise ValueError(f"Project material '{key}' already exists")
+        return self.upsert_project_record(
+            MaterialRecord(
+                uid=str(uuid.uuid4()),
+                name=record.name,
+                family=record.family,
+                er=record.er,
+                ur=record.ur,
+                tan_d=record.tan_d,
+                sigma=record.sigma,
+                color=record.color,
+                opacity=record.opacity,
+                source="project",
+                priority=record.priority,
+            )
+        )
+
     def upsert_global_record(self, record: MaterialRecord) -> MaterialRecord:
         if not self.global_db_path:
             raise ValueError("No global material database is configured")

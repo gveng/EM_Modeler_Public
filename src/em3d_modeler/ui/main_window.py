@@ -30,6 +30,8 @@ Layout
 from __future__ import annotations
 from datetime import datetime
 from html import escape
+import importlib
+from importlib import metadata as importlib_metadata
 from pathlib import Path
 from copy import deepcopy
 import os
@@ -53,6 +55,68 @@ _ICONS_DIR = next(
     (root / "Icons" for root in _RESOURCE_ROOTS if (root / "Icons").is_dir()),
     _APP_ROOT / "Icons",
 )
+
+
+def _runtime_diagnostic_rows() -> list[tuple[str, str]]:
+    """Describe the Python runtime and whether this process can import EMERGE."""
+    rows = [
+        ("Python executable", sys.executable or "Unavailable"),
+        ("Python version", sys.version.split()[0] if sys.version else "Unavailable"),
+    ]
+    emerge_module = None
+    try:
+        emerge_module = importlib.import_module("emerge")
+        import_status = "Imported successfully"
+    except Exception as exc:
+        import_status = f"Import failed: {type(exc).__name__}: {exc}"
+
+    version = None
+    if emerge_module is not None:
+        version = getattr(emerge_module, "__version__", None)
+        if version is None:
+            version = getattr(emerge_module, "version", None)
+    if version is None:
+        try:
+            version = importlib_metadata.version("emerge")
+        except Exception:
+            version = None
+
+    rows.extend((
+        ("EMERGE import status", import_status),
+        ("EMERGE version", str(version) if version is not None else "Unavailable"),
+    ))
+    return rows
+
+
+def _developed_plate_frame(anchor, width: float, height: float, direction):
+    origin_anchor = tuple(float(value) for value in anchor)
+    field_direction = tuple(float(value) for value in direction)
+    direction_length = math.sqrt(sum(value * value for value in field_direction))
+    if direction_length <= 1e-12:
+        raise ValueError("A non-zero direction is required to create a Plate surface.")
+    if (
+        not math.isfinite(width)
+        or not math.isfinite(height)
+        or width <= 0.0
+        or height <= 0.0
+    ):
+        raise ValueError("Plate width and height must be finite and greater than zero.")
+    field_direction = tuple(value / direction_length for value in field_direction)
+    axes = ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0), (0.0, 0.0, 1.0))
+    reference = min(
+        axes,
+        key=lambda axis: abs(sum(field_direction[index] * axis[index] for index in range(3))),
+    )
+    transverse = (
+        field_direction[1] * reference[2] - field_direction[2] * reference[1],
+        field_direction[2] * reference[0] - field_direction[0] * reference[2],
+        field_direction[0] * reference[1] - field_direction[1] * reference[0],
+    )
+    transverse_length = math.sqrt(sum(value * value for value in transverse))
+    u = tuple(value * width / transverse_length for value in transverse)
+    v = tuple(value * height for value in field_direction)
+    origin = tuple(origin_anchor[index] - 0.5 * u[index] for index in range(3))
+    return origin, u, v
 
 
 def _scale_profile_coordinates(profile, factor: float):
@@ -233,11 +297,38 @@ from PySide6.QtWidgets import (
     QAbstractItemView, QStyle,
 )
 from PySide6.QtCore import Qt, QProcess, QLocale, QSettings, QSize, QUrl, QTimer, QEventLoop, Signal
-from PySide6.QtGui  import QIcon, QKeySequence, QAction, QDesktopServices, QPainter, QPen, QColor, QBrush
+from PySide6.QtGui  import (
+    QIcon, QKeySequence, QAction, QDesktopServices, QPainter, QPen, QColor,
+    QBrush, QTextCharFormat, QTextCursor,
+)
+from shiboken6 import isValid as is_valid_qobject
 
 
 class _SimulationPreparationCancelled(Exception):
     pass
+
+
+class _IsolateWindow(QDialog):
+    """Small modeless control for leaving object-isolate mode."""
+
+    exit_requested = Signal()
+
+    def __init__(self, parent=None):
+        super().__init__(parent, Qt.Tool | Qt.WindowStaysOnTopHint)
+        self.setWindowTitle("Object Isolate")
+        self.setModal(False)
+        self.setAttribute(Qt.WA_DeleteOnClose, True)
+
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(6, 6, 6, 6)
+        button = QPushButton("Exit Isolate", self)
+        button.clicked.connect(self.close)
+        layout.addWidget(button)
+        self.setFixedSize(150, 52)
+
+    def closeEvent(self, event) -> None:
+        self.exit_requested.emit()
+        super().closeEvent(event)
 
 
 class _BooleanCutSetupDialog(QDialog):
@@ -448,6 +539,11 @@ class _PlotSubWindow(QMdiSubWindow):
 
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._content_updates_paused = False
+        self._content_updates_were_enabled = False
+        self._geometry_resume_timer = QTimer(self)
+        self._geometry_resume_timer.setSingleShot(True)
+        self._geometry_resume_timer.timeout.connect(self._resume_content_updates)
         self.setWindowFlags(
             Qt.SubWindow
             | Qt.WindowTitleHint
@@ -457,7 +553,37 @@ class _PlotSubWindow(QMdiSubWindow):
             | Qt.WindowCloseButtonHint
         )
 
+    def moveEvent(self, event) -> None:
+        self._pause_content_updates()
+        super().moveEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        self._pause_content_updates()
+        super().resizeEvent(event)
+
+    def _pause_content_updates(self) -> None:
+        content = self.widget()
+        if content is None:
+            return
+        if not self._content_updates_paused:
+            self._content_updates_were_enabled = content.updatesEnabled()
+            if self._content_updates_were_enabled:
+                content.setUpdatesEnabled(False)
+            self._content_updates_paused = True
+        self._geometry_resume_timer.start(120)
+
+    def _resume_content_updates(self) -> None:
+        if not self._content_updates_paused:
+            return
+        content = self.widget()
+        if content is not None and self._content_updates_were_enabled:
+            content.setUpdatesEnabled(True)
+            content.update()
+        self._content_updates_paused = False
+
     def closeEvent(self, event) -> None:
+        self._geometry_resume_timer.stop()
+        self._resume_content_updates()
         super().closeEvent(event)
         if event.isAccepted():
             self.closed.emit(self)
@@ -559,10 +685,14 @@ from ..emerge.python_script_exporter import (
     build_clean_emerge_python_script,
     export_emerge_python_script,
 )
+from ..emerge.mesh_algorithms import (
+    DEFAULT_MESH_ALGORITHM,
+    normalize_mesh_algorithm,
+)
 from ..emerge.step_bundle_exporter import export_debug_scene_step, export_objects_to_step_bundle
 from ..emerge.step_importer   import import_step
 from ..emerge.material_store  import MaterialStore
-from ..emerge.simulation_validator import validate_simulation
+from ..emerge.simulation_validator import ValidationFinding, validate_simulation
 from ..scene.em_objects       import set_selection_color
 from ..scene.param_expr       import evaluate_expression
 from .. import __version__, __release_date__, __license__
@@ -571,7 +701,7 @@ from .. import __version__, __release_date__, __license__
 # ������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������
 _UNITS  = UNIT_OPTIONS
 _EMERGE_SOLVERS = frozenset({
-    "PARDISO", "SUPERLU", "UMFPACK", "CUDSS", "AASDS", "MUMPS",
+    "PARDISO", "SUPERLU", "UMFPACK", "CUDSS", "AASDS", "MUMPS", "SPARTA",
 })
 _DOCS_ROOT = _APP_ROOT / "docs"
 _DOCS_HELP = _DOCS_ROOT / "HELP.md"
@@ -588,6 +718,16 @@ _MM_PER_UNIT = {
     "mil": 0.0254,
     "inch": 25.4,
 }
+
+_STANDARD_VIEW_ACTIONS = (
+    ("+X (YZ)", "right", "Ctrl+1"),
+    ("-X (YZ)", "left", "Ctrl+2"),
+    ("+Y (XZ)", "back", "Ctrl+3"),
+    ("-Y (XZ)", "front", "Ctrl+4"),
+    ("+Z (XY)", "top", "Ctrl+5"),
+    ("-Z (XY)", "bottom", "Ctrl+6"),
+    ("Isometric", "iso", "Ctrl+7"),
+)
 
 
 class MainWindow(QMainWindow):
@@ -614,6 +754,7 @@ class MainWindow(QMainWindow):
         self._material_store = MaterialStore()
         self._sim_steps_dirty = True
         self._sim_script_dirty = True
+        self._sim_ready = False
         self._sim_step_bundle_ready = False
         self._sim_step_bundle_cache: dict = {"entries": [], "skipped": []}
         self._simulation_step_export_cache: dict[tuple, dict] = {}
@@ -622,7 +763,13 @@ class MainWindow(QMainWindow):
         self._sim_status_running = False
         self._sim_status_completed_jobs = 0
         self._sim_status_total_jobs = 0
+        self._sim_log_progress_active = False
+        self._sim_log_progress_deferred = False
+        self._sim_log_progress_expected_steps = 0
+        self._sim_log_progress_completed_steps = 0
         self._boolean_decimation_enabled = False
+        self._save_mesh_after_sweep = False
+        self._allow_oversized_mesh = False
         self._workspace_path = ""
         self._global_material_db_path = ""
         self._sim_cached_script = ""
@@ -641,10 +788,14 @@ class MainWindow(QMainWindow):
 
         # Simulation & Mesh settings (app-wide defaults)
         self._sim_solver = "PARDISO"
-        self._sim_parallel_enabled = True
+        self._sim_cudss_precision = "auto"
+        self._sim_parallel_enabled = False
+        self._sim_worker_processes = 2
         self._sim_pardiso_threads = 8
         self._sim_acc_threads = 10
         self._mesh_resolution = 0.3  # 1/3 wavelength, ~3.3 lines/wavelength
+        self._mesh_algorithm = "DELAUNAY"
+        self._curved_boundary_meshing_enabled = True
         self._curved_boundary_resolution = 20
         self._refinement_boundary_size_mm = 0.25
         self._refinement_face_size_mm = 0.1
@@ -657,6 +808,9 @@ class MainWindow(QMainWindow):
         self._history_redo: list[list[dict]] = []
         self._history_restoring = False
         self._sketch_after_plane_defined = False
+        self._isolate_visibility_snapshot: list[tuple[object, bool]] | None = None
+        self._isolate_scene = None
+        self._isolate_window: _IsolateWindow | None = None
 
         self._load_app_settings()
         set_selection_color(self._selection_color)
@@ -680,9 +834,6 @@ class MainWindow(QMainWindow):
         # ������ panels ������������������������������������������������������������������������������������������������������������������������������������������������������������������������������������
         self._project_tree   = ProjectTreeWidget()
         self._body_props     = BodyPropertiesWidget()
-        self._viewport       = Viewport3DWidget()
-        self._viewport.set_plane_triad_size(self._plane_triad_size)
-        self._viewport.set_adaptive_grid(self._adaptive_grid_enabled, self._adaptive_grid_margin)
         self._materials      = MaterialsWidget(self)
         self._info_bar       = InfoBarWidget()
 
@@ -715,7 +866,6 @@ class MainWindow(QMainWindow):
         model_layout = QVBoxLayout(model_page)
         model_layout.setContentsMargins(0, 0, 0, 0)
         model_layout.setSpacing(0)
-        model_layout.addWidget(self._viewport, stretch=1)
         self._model_window = _PlotSubWindow(self._workspace_area)
         self._model_window.setWindowTitle("Model")
         self._model_window.setMinimumSize(480, 360)
@@ -723,12 +873,14 @@ class MainWindow(QMainWindow):
         self._model_window.closed.connect(self._on_workspace_subwindow_closed)
         self._workspace_area.addSubWindow(self._model_window)
         self._workspace_windows["Model"] = self._model_window
+        for native_host in (self._workspace_area, self._model_window):
+            native_host.setAttribute(Qt.WA_DontCreateNativeAncestors)
+            native_host.setAttribute(Qt.WA_NativeWindow)
+            native_host.winId()
         self._model_window.resize(700, 520)
         self._model_window.move(24, 24)
         centre_layout.addWidget(self._workspace_area, stretch=1)
         centre_layout.addWidget(self._info_bar)
-        self._workspace_area.show()
-        self._model_window.show()
 
         # ������ right column ������������������������������������������������������������������������������������������������������������������������������������������������������������������
         self._materials.setMinimumWidth(190)
@@ -740,9 +892,20 @@ class MainWindow(QMainWindow):
         main_splitter.addWidget(centre_widget)
         main_splitter.addWidget(self._materials)
         main_splitter.setCollapsible(2, False)
+        main_splitter.setStretchFactor(1, 1)
         main_splitter.setSizes([230, 900, 210])
 
         self.setCentralWidget(main_splitter)
+        # QVTK creates a native window in __init__; initialize it after the MDI
+        # hierarchy is native so moving the Model window moves the render view.
+        self._viewport = Viewport3DWidget(model_page)
+        self._viewport.set_plane_triad_size(self._plane_triad_size)
+        self._viewport.set_adaptive_grid(
+            self._adaptive_grid_enabled, self._adaptive_grid_margin
+        )
+        model_layout.addWidget(self._viewport, stretch=1)
+        self._workspace_area.show()
+        self._model_window.show()
         self._update_left_splitter_layout()
 
     def _schedule_left_splitter_layout(self, _has_content: bool = False) -> None:
@@ -799,6 +962,10 @@ class MainWindow(QMainWindow):
         self._act_saveas = file_menu.addAction("Save Project &As...", self._save_project_as)
         file_menu.addSeparator()
         file_menu.addAction("&Import STEP...",            self._import_step)
+        file_menu.addAction(
+            "Import IPC-2581B Board JSON (Simulation Model)...",
+            self._import_ipc2581_board_json_3d,
+        )
         file_menu.addSeparator()
         self._recent_menu = file_menu.addMenu("Recent Projects")
         self._refresh_recent_projects()
@@ -827,25 +994,12 @@ class MainWindow(QMainWindow):
         # View
         view_menu = mb.addMenu("&View")
         view_menu.addAction("Reset Camera",       self._viewport.reset_camera, Qt.Key_Home)
-        act_view_top = view_menu.addAction("Top (XY)", lambda: self._set_view("top"))
-        act_view_top.setShortcut(QKeySequence("Ctrl+1"))
-        act_view_bottom = view_menu.addAction("Bottom (-XY)", lambda: self._set_view("bottom"))
-        act_view_bottom.setShortcuts([
-            QKeySequence("Ctrl+6"),
-            QKeySequence("Ctrl+Shift+1"),
-        ])
-        act_view_front = view_menu.addAction("Front (XZ)", lambda: self._set_view("front"))
-        act_view_front.setShortcut(QKeySequence("Ctrl+2"))
-        act_view_back = view_menu.addAction("Back (-XZ)", lambda: self._set_view("back"))
-        act_view_back.setShortcuts([
-            QKeySequence("Ctrl+Shift+2"),
-        ])
-        act_view_right = view_menu.addAction("Right (YZ)", lambda: self._set_view("right"))
-        act_view_right.setShortcut(QKeySequence("Ctrl+3"))
-        act_view_left = view_menu.addAction("Left (-YZ)", lambda: self._set_view("left"))
-        act_view_left.setShortcut(QKeySequence("Ctrl+Shift+3"))
-        act_view_iso = view_menu.addAction("Isometric", lambda: self._set_view("iso"))
-        act_view_iso.setShortcut(QKeySequence("Ctrl+4"))
+        for label, view, shortcut in _STANDARD_VIEW_ACTIONS:
+            action = view_menu.addAction(
+                label,
+                lambda _checked=False, selected_view=view: self._set_view(selected_view),
+            )
+            action.setShortcut(QKeySequence(shortcut))
         view_menu.addSeparator()
         view_menu.addAction("Set Reference Plane...", self._open_reference_plane_dialog)
         view_menu.addAction("Reset Reference Plane", self._viewport.reset_reference_plane)
@@ -1006,6 +1160,57 @@ class MainWindow(QMainWindow):
             self._append_chart_keys.pop(output_name, None)
 
     def _show_chart(self, key: str, plot_data: dict, *, progressive: bool = False) -> None:
+        info_bar = getattr(self, "_info_bar", None)
+        update_progress = getattr(info_bar, "set_preparation_progress", None)
+        plot_views = getattr(self, "_plot_views", {})
+        plot_subwindows = getattr(self, "_plot_subwindows", {})
+        append_keys = getattr(self, "_append_chart_keys", {})
+        output_name = self._chart_output_name(key)
+        append_key = append_keys.get(output_name)
+        target_exists = (
+            plot_views.get(key) is not None and plot_subwindows.get(key) is not None
+        ) or (
+            append_key is not None and plot_views.get(append_key) is not None
+        )
+        show_loading = not progressive or not target_exists
+
+        if not show_loading:
+            return MainWindow._show_chart_content(
+                self,
+                key,
+                plot_data,
+                progressive=progressive,
+            )
+
+        if callable(update_progress):
+            update_progress(
+                "Loading graph...",
+                show_in_model_view=True,
+                status="LOAD",
+            )
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+        try:
+            return MainWindow._show_chart_content(
+                self,
+                key,
+                plot_data,
+                progressive=progressive,
+            )
+        finally:
+            if callable(update_progress):
+                update_progress(
+                    "",
+                    show_in_model_view=True,
+                    reset=True,
+                )
+
+    def _show_chart_content(
+        self,
+        key: str,
+        plot_data: dict,
+        *,
+        progressive: bool = False,
+    ) -> None:
         output_name = self._chart_output_name(key)
         append_key = self._append_chart_keys.get(output_name)
         is_farfield_3d = (
@@ -1481,6 +1686,62 @@ class MainWindow(QMainWindow):
         plotter.off_screen = True
         return np.asarray(plotter.screenshot(return_img=True))
 
+    @staticmethod
+    def _farfield_pattern_db_floor(farfield) -> float:
+        """Keep the 3D pattern radius visible while retaining absolute dBV/m colors."""
+        import numpy as np
+
+        magnitude = np.asarray(farfield.normE, dtype=float)
+        finite_positive = magnitude[np.isfinite(magnitude) & (magnitude > 0.0)]
+        if not finite_positive.size:
+            raise RuntimeError(
+                "The saved far-field contains no finite, non-zero electric-field values."
+            )
+        peak_db = float(20.0 * np.log10(float(np.max(finite_positive))))
+        return peak_db - 40.0
+
+    @staticmethod
+    def _farfield_integration_faces(loaded_sim, params: dict):
+        geometries = [
+            geometry
+            for geometry in loaded_sim.all_geos()
+            if callable(getattr(geometry, "boundary", None))
+        ]
+        if not geometries:
+            raise ValueError("Far-field plotting requires boundary faces in the result model.")
+
+        selected_name = str(params.get("integration_object", "")).strip()
+        if selected_name:
+            exact_matches = [
+                geometry for geometry in geometries
+                if str(getattr(geometry, "name", "")).strip() == selected_name
+            ]
+            if len(exact_matches) > 1:
+                raise ValueError(
+                    f"Far-field integration object {selected_name!r} is missing or ambiguous in the result model."
+                )
+            if exact_matches:
+                return exact_matches[0].boundary()
+
+            group_prefix = f"{selected_name}_"
+            group_matches = [
+                geometry for geometry in geometries
+                if str(getattr(geometry, "name", "")).strip().startswith(group_prefix)
+            ]
+            if not group_matches:
+                raise ValueError(
+                    f"Far-field integration object {selected_name!r} is missing from the result model."
+                )
+            faces = group_matches[0].boundary()
+            for geometry in group_matches[1:]:
+                faces = faces + geometry.boundary()
+            return faces
+
+        faces = geometries[0].boundary()
+        for geometry in geometries[1:]:
+            faces = faces + geometry.boundary()
+        return faces
+
     def _report_farfield_data(self, output: dict, loaded_sim, grid, simdata_path, params: dict):
         import numpy as np
 
@@ -1494,6 +1755,8 @@ class MainWindow(QMainWindow):
         farfield_data = getattr(grid, "ff", None)
         if farfield_data is None:
             farfield_data = getattr(grid, "E", getattr(grid, "farfield", None))
+        if str(params.get("integration_object", "")).strip():
+            farfield_data = None
 
         if farfield_data is None:
             mw_data = getattr(getattr(loaded_sim, "data", None), "mw", None)
@@ -1508,15 +1771,7 @@ class MainWindow(QMainWindow):
                 frequencies[int(np.argmin(np.abs(frequencies - requested_frequency)))]
             )
             field_entry = field_data.find(freq=selected_frequency)
-            boundary_geometries = [
-                geometry for geometry in loaded_sim.all_geos()
-                if callable(getattr(geometry, "boundary", None))
-            ]
-            if not boundary_geometries:
-                raise ValueError("Far-field plotting requires boundary faces in the result model.")
-            faces = boundary_geometries[0].boundary()
-            for geometry in boundary_geometries[1:]:
-                faces = faces + geometry.boundary()
+            faces = self._farfield_integration_faces(loaded_sim, params)
             if plot_type == "plot_ff_3d":
                 farfield = field_entry.farfield_3d(faces)
                 display = loaded_sim.display
@@ -1525,7 +1780,7 @@ class MainWindow(QMainWindow):
                     component="normE",
                     quantity="abs",
                     dB=True,
-                    dBfloor=-40,
+                    dBfloor=self._farfield_pattern_db_floor(farfield),
                     opacity=0.75,
                 )
                 plotter = getattr(display, "_plot", None)
@@ -1877,7 +2132,18 @@ class MainWindow(QMainWindow):
             "Create a circular Plate by snapping its center and radius to the configured grid spacing"
         )
         act_circular_plate.triggered.connect(lambda: self._start_draw("circular_plate"))
-        add_group("2D", [act_sketch, act_planar, act_plate_face, act_circular_plate], columns=3)
+        act_surface_sweep = QAction(_icon("Part_Revolve"), "Surface Extrusion", self)
+        act_surface_sweep.setToolTip(
+            "Extrude one sketch contour, or a complete circular edge selected in Edge mode, "
+            "along its normal to a selected target face; the face determines the direction and "
+            "length, with a live uncapped-sheet preview. For a body edge, exit Sketch mode."
+        )
+        act_surface_sweep.triggered.connect(self._viewport._request_surface_sweep)
+        add_group(
+            "2D",
+            [act_sketch, act_planar, act_plate_face, act_circular_plate, act_surface_sweep],
+            columns=3,
+        )
 
         # ������ Boolean operations ������������������������������������������������������������������������������������������������������������
         act_cut = QAction(_icon("Part_Cut"), "Cut", self)
@@ -1930,6 +2196,8 @@ class MainWindow(QMainWindow):
         act_play = QAction(_icon("media-playback-start"), "Play", self)
         act_play.setToolTip("Open simulation panel (EMERGE Python script + verbose output)")
         act_play.triggered.connect(self._open_simulation_window)
+        self._play_action = act_play
+        act_play.setEnabled(getattr(self, "_sim_ready", False))
 
         act_check_simulation = QAction(_icon("dagViewPass"), "Check Simulation", self)
         act_check_simulation.setToolTip("Validate geometry, solver, boundaries, ports and port connectivity")
@@ -2017,7 +2285,7 @@ class MainWindow(QMainWindow):
         unsupported = "Not yet supported by the viewport sketch engine."
         extrude = sketch_action(
             "Extrude", "Part_Extrude", self._viewport._sketch_request_extrude,
-            "Extrude the closed sketch profile.",
+            "Solid-extrude a closed sketch profile only; use Surface Extrusion outside Sketch mode for a body edge.",
         )
         revolve = sketch_action(
             "Revolve", "Part_Revolve", self._viewport._sketch_begin_revolve,
@@ -2027,10 +2295,18 @@ class MainWindow(QMainWindow):
             "Extruded Cut", "Part_Cut", self._viewport._sketch_request_extruded_cut,
             "Subtract the sketch extrusion from the single selected base object.",
         )
+        surface_sweep = sketch_action(
+            "Surface Extrusion", "Part_Revolve", self._viewport._request_surface_sweep,
+            "Extrude the sketch contour along its plane normal to a selected target face. For a body edge, exit Sketch mode, select it in Edge mode, then select the target face.",
+        )
         self._sketch_context_actions = {
-            action.text(): action for action in (extrude, revolve, extruded_cut)
+            action.text(): action
+            for action in (extrude, revolve, extruded_cut, surface_sweep)
         }
-        add_group("3D", [extrude, revolve, extruded_cut], toolbar=sketch_tb, compact=True)
+        add_group(
+            "3D", [extrude, revolve, extruded_cut, surface_sweep],
+            toolbar=sketch_tb, compact=True,
+        )
 
         def set_tool(tool_name):
             return lambda _checked=False: self._viewport._sketch_set_tool(tool_name)
@@ -2179,6 +2455,7 @@ class MainWindow(QMainWindow):
         self._viewport.sketch_extrude_requested.connect(self._on_extrude_requested)
         self._viewport.sketch_cut_requested.connect(self._on_extruded_cut_requested)
         self._viewport.sketch_revolve_requested.connect(self._on_revolve_requested)
+        self._viewport.sketch_sweep_requested.connect(self._on_surface_sweep_requested)
         self._viewport.sketch_finished.connect(self._on_viewport_sketch_finished)
         self._viewport.status_message.connect(self._info_bar.set_info)
         self._viewport.picked_coords.connect(self._info_bar.set_coords)
@@ -2194,6 +2471,9 @@ class MainWindow(QMainWindow):
         self._body_props.material_picker_requested.connect(self._open_material_picker)
         self._body_props.project_parameters_changed.connect(self._on_project_parameters_changed)
         self._body_props.set_formula_resolver(self._resolve_formula_text)
+        self._body_props.set_material_assignment_validator(
+            self._viewport.scene.material_assignment_error
+        )
         self._sync_project_variable_names()
 
         # Materials tree ��� selection (single + multi)
@@ -2209,6 +2489,7 @@ class MainWindow(QMainWindow):
         self._materials.grid_adaptive_changed.connect(self._on_grid_adaptive_changed)
         self._materials.objects_hide.connect(self._on_materials_hide)
         self._materials.objects_show.connect(self._on_materials_show)
+        self._materials.objects_isolate.connect(self._on_materials_isolate)
         self._materials.transform_edit_requested.connect(self._on_transform_edit_requested)
         self._materials.pattern_edit_requested.connect(self._create_object_pattern)
         self._materials.feature_edit_requested.connect(self._edit_sketch_feature)
@@ -2216,6 +2497,12 @@ class MainWindow(QMainWindow):
         self._materials.objects_model_role_changed.connect(self._on_materials_model_role_changed)
         self._materials.object_rename.connect(self._on_materials_rename)
         self._materials.objects_bulk_rename.connect(self._on_materials_bulk_rename)
+        self._materials.group_create_requested.connect(self._on_object_group_create)
+        self._materials.subgroup_create_requested.connect(self._on_object_subgroup_create)
+        self._materials.group_assign_requested.connect(self._on_object_group_assign)
+        self._materials.group_delete_requested.connect(self._on_object_group_delete)
+        self._materials.subgroup_delete_requested.connect(self._on_object_subgroup_delete)
+        self._materials.group_priority_changed.connect(self._on_object_group_priority_changed)
         self._materials.assign_port_requested.connect(self._on_assign_port_requested)
         self._materials.assign_boundary_requested.connect(self._on_assign_boundary_requested)
         self._materials.assign_mesh_resolution_requested.connect(self._on_assign_mesh_resolution_requested)
@@ -2231,6 +2518,7 @@ class MainWindow(QMainWindow):
     def _reset_simulation_cache(self) -> None:
         self._sim_steps_dirty = True
         self._sim_script_dirty = True
+        MainWindow._set_simulation_ready(self, False)
         self._sim_step_bundle_ready = False
         self._sim_step_bundle_cache = {"entries": [], "skipped": []}
         self._simulation_step_export_cache = {}
@@ -2239,6 +2527,7 @@ class MainWindow(QMainWindow):
         self._sim_cached_script_bundle = {"master": "", "scripts": []}
 
     def _mark_simulation_dirty(self, *, steps: bool = False, script: bool = True) -> None:
+        MainWindow._set_simulation_ready(self, False)
         if steps:
             self._sim_steps_dirty = True
             self._sim_step_bundle_ready = False
@@ -2246,6 +2535,23 @@ class MainWindow(QMainWindow):
             self._sim_full_scene_step_dirty = True
         if script:
             self._sim_script_dirty = True
+
+    def _set_simulation_ready(self, ready: bool) -> None:
+        """Enable Play and Run only while current simulation inputs are checked."""
+        self._sim_ready = bool(ready)
+        play_action = getattr(self, "_play_action", None)
+        if play_action is not None:
+            play_action.setEnabled(self._sim_ready)
+        MainWindow._update_simulation_run_enabled(self)
+
+    def _update_simulation_run_enabled(self) -> None:
+        """Keep Run disabled while inputs are unchecked or a process is active."""
+        run_button = getattr(self, "_sim_btn_run", None)
+        if run_button is None:
+            return
+        process = getattr(self, "_sim_process", None)
+        process_running = process is not None and process.state() != QProcess.NotRunning
+        run_button.setEnabled(bool(getattr(self, "_sim_ready", False)) and not process_running)
 
     def _on_scene_changed(self) -> None:
         if not self._history_restoring:
@@ -2256,12 +2562,20 @@ class MainWindow(QMainWindow):
         self._mark_simulation_dirty(steps=True, script=True)
 
     def _history_reset(self) -> None:
-        self._history_undo = [self._viewport.scene.to_json(cache_meshes=True)]
+        self._history_undo = [MainWindow._history_snapshot(self)]
         self._history_redo = []
         self._update_history_actions()
 
+    def _history_snapshot(self) -> dict:
+        scene = self._viewport.scene
+        groups_to_json = getattr(scene, "object_groups_to_json", None)
+        return {
+            "objects": scene.to_json(cache_meshes=True),
+            "object_groups": groups_to_json() if callable(groups_to_json) else [],
+        }
+
     def _history_record(self) -> None:
-        current = self._viewport.scene.to_json(cache_meshes=True)
+        current = MainWindow._history_snapshot(self)
         if self._history_undo and current == self._history_undo[-1]:
             return
         self._history_undo.append(current)
@@ -2276,10 +2590,20 @@ class MainWindow(QMainWindow):
             self._act_undo.setEnabled(len(self._history_undo) > 1)
             self._act_redo.setEnabled(bool(self._history_redo))
 
-    def _restore_history_snapshot(self, snapshot: list[dict]) -> None:
+    def _restore_history_snapshot(self, snapshot: dict | list[dict]) -> None:
         self._history_restoring = True
         try:
-            self._viewport.scene.from_json(deepcopy(snapshot))
+            if isinstance(snapshot, dict):
+                self._viewport.scene.from_json(deepcopy(snapshot.get("objects", [])))
+                groups_from_json = getattr(
+                    self._viewport.scene,
+                    "object_groups_from_json",
+                    None,
+                )
+                if callable(groups_from_json):
+                    groups_from_json(deepcopy(snapshot.get("object_groups", [])))
+            else:
+                self._viewport.scene.from_json(deepcopy(snapshot))
             self._viewport.scene.deselect_all()
             self._refresh_materials()
             self._sync_port_reference_state()
@@ -2343,7 +2667,7 @@ class MainWindow(QMainWindow):
         form = QFormLayout(dlg)
         distance = QDoubleSpinBox(dlg); distance.setRange(0.001, 1e6); distance.setDecimals(4); distance.setValue(10.0)
         thickness = QDoubleSpinBox(dlg); thickness.setRange(0.001, 1e6); thickness.setDecimals(4); thickness.setValue(10.0)
-        boundary = QComboBox(dlg); boundary.addItems(["Open", "Radiation", "PML"])
+        boundary = QComboBox(dlg); boundary.addItems(["Open", "Radiation", "PML"]); boundary.setCurrentText("Radiation")
         pml_layers = QSpinBox(dlg); pml_layers.setRange(1, 20); pml_layers.setValue(1)
         pml_mesh_layers = QSpinBox(dlg); pml_mesh_layers.setRange(1, 50); pml_mesh_layers.setValue(5)
         pml_exponent = QDoubleSpinBox(dlg); pml_exponent.setRange(0.1, 10.0); pml_exponent.setDecimals(3); pml_exponent.setValue(1.5)
@@ -3387,6 +3711,7 @@ class MainWindow(QMainWindow):
             )
             return
 
+        keep_tools = False  # Only Boolean Cut can retain its tools.
         if op == "cut":
             setup = _BooleanCutSetupDialog(sel, self)
             if setup.exec_() != QDialog.Accepted:
@@ -3834,16 +4159,31 @@ class MainWindow(QMainWindow):
                 for item in raw_points
             ):
                 continue
+            history = deepcopy(history)
+            raw_points = history.get("points", [])
             points = []
             resolved_points = []
             point_items = []
+            params = obj.get_parameters()
+            formulas = getattr(obj, "param_formulas", {}) or {}
             for item in raw_points:
                 if not isinstance(item, dict):
                     continue
                 point = item.get("value")
+                if not isinstance(point, (list, tuple)) or len(point) != 3:
+                    continue
                 snap = item.get("snap", {})
                 resolved = self._resolve_creation_snap(snap, objects_by_name) if isinstance(snap, dict) else None
-                current_point = resolved if resolved is not None else point
+                current_point = list(resolved) if resolved is not None else list(point)
+                manual_axes = snap.get("manual_axes", []) if isinstance(snap, dict) else []
+                if resolved is not None and isinstance(manual_axes, (list, tuple)):
+                    stored_point = list(point)
+                    for axis_name in manual_axes:
+                        axis_index = {"x": 0, "y": 1, "z": 2}.get(
+                            str(axis_name).strip().lower()
+                        )
+                        if axis_index is not None:
+                            current_point[axis_index] = stored_point[axis_index]
                 if not isinstance(current_point, (list, tuple)) or len(current_point) != 3:
                     continue
                 points.append(current_point)
@@ -3851,8 +4191,6 @@ class MainWindow(QMainWindow):
                 point_items.append(item)
             if not points:
                 continue
-            params = obj.get_parameters()
-            formulas = getattr(obj, "param_formulas", {}) or {}
             mode = str(history.get("mode", "")).lower()
             if type(obj).__name__ in {"BoxObject", "PlateObject"} and len(points) >= 2:
                 first, second = points[0], points[1]
@@ -3863,11 +4201,85 @@ class MainWindow(QMainWindow):
                     "YZ": (1, 2),
                 }.get(plane, (0, 1, 2))
                 coordinate_keys = ("X1", "Y1", "Z1"), ("X2", "Y2", "Z2")
+                actor = getattr(obj, "actor", None)
+                identity_transform = actor is None or all(
+                    math.isclose(
+                        float(actual),
+                        float(expected),
+                        rel_tol=0.0,
+                        abs_tol=1e-12,
+                    )
+                    for actual_values, expected_values in (
+                        (actor.GetPosition(), (0.0, 0.0, 0.0)),
+                        (actor.GetOrientation(), (0.0, 0.0, 0.0)),
+                        (actor.GetScale(), (1.0, 1.0, 1.0)),
+                    )
+                    for actual, expected in zip(actual_values, expected_values)
+                )
+                if identity_transform:
+                    for point_index, keys in enumerate(coordinate_keys):
+                        item = point_items[point_index]
+                        stored_point = item.get("value")
+                        if not isinstance(stored_point, (list, tuple)) or len(stored_point) != 3:
+                            continue
+                        snap = item.get("snap")
+                        resolved = resolved_points[point_index]
+                        for axis_index in in_plane_axes:
+                            key = keys[axis_index]
+                            if key in formulas or key not in params:
+                                continue
+                            try:
+                                current_value = float(params[key])
+                                historical_value = float(stored_point[axis_index])
+                            except (TypeError, ValueError):
+                                continue
+                            if math.isclose(
+                                current_value,
+                                historical_value,
+                                rel_tol=1e-12,
+                                abs_tol=1e-12,
+                            ):
+                                continue
+                            if resolved is not None:
+                                try:
+                                    snapped_value = float(resolved[axis_index])
+                                except (TypeError, ValueError, IndexError):
+                                    continue
+                                if math.isclose(
+                                    current_value,
+                                    snapped_value,
+                                    rel_tol=1e-12,
+                                    abs_tol=1e-12,
+                                ):
+                                    continue
+                            points[point_index][axis_index] = current_value
+                            updated_point = list(stored_point)
+                            updated_point[axis_index] = current_value
+                            item["value"] = updated_point
+                            if (
+                                resolved is not None
+                                and isinstance(snap, dict)
+                                and str(snap.get("object", "")).strip()
+                            ):
+                                manual_axes = snap.get("manual_axes", [])
+                                if not isinstance(manual_axes, (list, tuple)):
+                                    manual_axes = []
+                                manual_axes = {
+                                    str(axis).strip().lower()
+                                    for axis in manual_axes
+                                    if str(axis).strip().lower() in {"x", "y", "z"}
+                                }
+                                manual_axes.add("xyz"[axis_index])
+                                snap["manual_axes"] = [
+                                    axis for axis in "xyz" if axis in manual_axes
+                                ]
                 for keys, point in zip(coordinate_keys, (first, second)):
                     for axis_index in in_plane_axes:
                         key = keys[axis_index]
                         if key not in formulas:
                             params[key] = float(point[axis_index])
+                for item, point in zip(point_items, points):
+                    item["value"] = [float(value) for value in point]
             elif mode in {"cylinder", "cone", "sphere", "ellipsoid", "torus"}:
                 resolved = resolved_points[0]
                 original = point_items[0].get("value")
@@ -3885,6 +4297,7 @@ class MainWindow(QMainWindow):
                 continue
             obj.set_parameters(params)
             obj.refresh_appearance()
+            obj.creation_history = history
 
     def _sync_boolean_provenance(self, changed_source=None) -> None:
         for result in list(self._viewport.scene.objects):
@@ -4551,7 +4964,106 @@ class MainWindow(QMainWindow):
         if len(objects) > 1:
             self._info_bar.set_info(f"{len(objects)} objects selected (Ctrl+click to extend)")
 
-    def _on_params_changed(self, obj, _params) -> None:
+    def _sync_creation_history_after_parameter_edit(
+        self,
+        obj,
+        new_params: dict,
+        previous_params: dict | None,
+    ) -> None:
+        if (
+            type(obj).__name__ not in {"BoxObject", "PlateObject"}
+            or not isinstance(new_params, dict)
+            or not isinstance(previous_params, dict)
+        ):
+            return
+        history = getattr(obj, "creation_history", None)
+        points = history.get("points") if isinstance(history, dict) else None
+        if not isinstance(points, list) or len(points) < 2:
+            return
+
+        plane = str(history.get("plane", getattr(obj, "creation_plane", "XY"))).upper()
+        in_plane_axes = {
+            "XY": (0, 1),
+            "XZ": (0, 2),
+            "YZ": (1, 2),
+        }.get(plane, (0, 1, 2))
+        formulas = getattr(obj, "param_formulas", {}) or {}
+        coordinate_keys = (
+            ("X1", "Y1", "Z1"),
+            ("X2", "Y2", "Z2"),
+        )
+        updated_history = deepcopy(history)
+        updated_points = updated_history.get("points", [])
+        changed = False
+
+        for point_index, keys in enumerate(coordinate_keys):
+            if point_index >= len(updated_points):
+                break
+            point_item = updated_points[point_index]
+            if not isinstance(point_item, dict):
+                continue
+            value = point_item.get("value")
+            if not isinstance(value, (list, tuple)) or len(value) != 3:
+                continue
+            point_value = [float(component) for component in value]
+            changed_axes = []
+            for axis_index in in_plane_axes:
+                key = keys[axis_index]
+                if key in formulas or key not in new_params or key not in previous_params:
+                    continue
+                try:
+                    current_value = float(new_params[key])
+                    previous_value = float(previous_params[key])
+                except (TypeError, ValueError):
+                    continue
+                if math.isclose(current_value, previous_value, rel_tol=1e-12, abs_tol=1e-12):
+                    continue
+                point_value[axis_index] = current_value
+                changed_axes.append("xyz"[axis_index])
+                changed = True
+
+            if not changed_axes:
+                continue
+            point_item["value"] = point_value
+            snap = point_item.get("snap")
+            if isinstance(snap, dict) and str(snap.get("object", "")).strip():
+                stored_manual_axes = snap.get("manual_axes", [])
+                if not isinstance(stored_manual_axes, (list, tuple)):
+                    stored_manual_axes = []
+                manual_axes = {
+                    str(axis).strip().lower()
+                    for axis in stored_manual_axes
+                    if str(axis).strip().lower() in {"x", "y", "z"}
+                }
+                manual_axes.update(changed_axes)
+                snap["manual_axes"] = [
+                    axis for axis in "xyz" if axis in manual_axes
+                ]
+
+        if changed:
+            obj.creation_history = updated_history
+
+    def _on_params_changed(self, obj, _params, previous_params=None) -> None:
+        if isinstance(_params, dict) and isinstance(previous_params, dict):
+            previous_material = previous_params.get("Material")
+            current_material = _params.get("Material", getattr(obj, "material", None))
+            if current_material and current_material != previous_material:
+                record = self._material_store.get_record(str(current_material))
+                if record is not None:
+                    color = QColor(record.color)
+                    if color.isValid():
+                        obj.custom_color = (
+                            color.redF(),
+                            color.greenF(),
+                            color.blueF(),
+                        )
+                        obj.refresh_appearance()
+        if previous_params is not None:
+            self._sync_creation_history_after_parameter_edit(
+                obj,
+                _params,
+                previous_params,
+            )
         self._sync_boolean_provenance(obj)
         if not self._history_restoring:
             source_name = str(getattr(obj, "name", "")).strip()
@@ -4681,6 +5193,14 @@ class MainWindow(QMainWindow):
         if rec is None:
             return
 
+        assignment_error = self._viewport.scene.material_assignment_error(
+            selected_objects,
+            rec.name,
+        )
+        if assignment_error:
+            QMessageBox.warning(self, "Group Material", assignment_error)
+            return
+
         if dlg.appended_names:
             added = self._material_store.append_global_to_project(dlg.appended_names)
             if added:
@@ -4706,18 +5226,27 @@ class MainWindow(QMainWindow):
         name = rec.name
         self._draw_material = name
 
-        if len(selected_objects) > 1:
-            for obj in selected_objects:
-                obj.material = name
-                obj.refresh_appearance()
-            self._history_record()
-            self._viewport._render()
-            self._refresh_materials()
-            self._info_bar.set_info(f"Material '{name}' applied to {len(selected_objects)} objects")
-            self._mark_simulation_dirty(steps=True, script=True)
+        assigned_record = self._material_store.get_record(name) or rec
+        color = QColor(assigned_record.color)
+        if not color.isValid():
+            QMessageBox.warning(
+                self,
+                "Assign Material",
+                f"Material '{name}' has an invalid library color: {assigned_record.color}",
+            )
             return
 
-        self._body_props.set_selected_material(name)
+        color_rgb = (color.redF(), color.greenF(), color.blueF())
+        for obj in selected_objects:
+            obj.material = name
+            obj.custom_color = color_rgb
+            obj.refresh_appearance()
+        self._history_record()
+        self._viewport._render()
+        self._refresh_materials()
+        self._body_props.set_selection(selected_objects)
+        self._info_bar.set_info(f"Material '{name}' and its library color applied to {len(selected_objects)} objects")
+        self._mark_simulation_dirty(steps=True, script=True)
 
     def _on_material_tree_select(self, obj) -> None:
         self._viewport.scene.select(obj)
@@ -4755,6 +5284,69 @@ class MainWindow(QMainWindow):
         self._materials.highlight(objects)  # Preserve selection after refresh
         self._viewport._render()
         self._info_bar.set_info(f"Shown {len(objects)} object(s)")
+
+    def _on_materials_isolate(self, objects: list) -> None:
+        scene = self._viewport.scene
+        isolated_objects = [obj for obj in objects if obj in scene.objects]
+        if not isolated_objects:
+            return
+
+        # Keep the original state if the user isolates another object before
+        # leaving isolate mode.
+        if self._isolate_visibility_snapshot is None:
+            self._isolate_visibility_snapshot = [
+                (obj, obj.is_visible()) for obj in scene.objects
+            ]
+            self._isolate_scene = scene
+            scene.set_object_added_callback(self._on_isolate_object_added)
+
+        isolated_ids = {id(obj) for obj in isolated_objects}
+        for obj in scene.objects:
+            obj.set_visible(id(obj) in isolated_ids)
+        scene.refresh_adaptive_grid()
+
+        if self._isolate_window is None:
+            self._isolate_window = _IsolateWindow(self)
+            self._isolate_window.exit_requested.connect(
+                lambda: self._exit_isolate(close_window=False)
+            )
+        self._refresh_materials()
+        self._materials.highlight(isolated_objects)
+        self._viewport._render()
+        self._isolate_window.show()
+        self._isolate_window.raise_()
+
+    def _on_isolate_object_added(self, obj) -> None:
+        """Keep objects added during isolation hidden until isolate mode ends."""
+        snapshot = self._isolate_visibility_snapshot
+        if snapshot is None:
+            return
+        if not any(existing is obj for existing, _visible in snapshot):
+            snapshot.append((obj, obj.is_visible()))
+        obj.set_visible(False)
+
+    def _exit_isolate(self, *, close_window: bool = False) -> None:
+        snapshot = self._isolate_visibility_snapshot
+        if snapshot is None:
+            return
+
+        self._isolate_visibility_snapshot = None
+        isolate_window = self._isolate_window
+        self._isolate_window = None
+        scene = self._isolate_scene or self._viewport.scene
+        self._isolate_scene = None
+        scene.set_object_added_callback(None)
+
+        if close_window and isolate_window is not None:
+            isolate_window.close()
+
+        current_object_ids = {id(obj) for obj in scene.objects}
+        for obj, visible in snapshot:
+            if id(obj) in current_object_ids:
+                obj.set_visible(visible)
+        scene.refresh_adaptive_grid()
+        self._refresh_materials()
+        self._viewport._render()
 
     def _on_transform_edit_requested(self, objects) -> None:
         if not isinstance(objects, (list, tuple)):
@@ -4835,6 +5427,110 @@ class MainWindow(QMainWindow):
         self._info_bar.set_info(f"Renamed to: {new_name}")
         self._mark_simulation_dirty(steps=True, script=True)
 
+    def _finish_object_group_change(self) -> None:
+        self._viewport.scene_changed.emit()
+        self._viewport._render()
+
+    def _report_object_group_error(self, exc: ValueError) -> None:
+        QMessageBox.warning(self, "Object Groups", str(exc))
+
+    def _on_object_group_create(self, objects: list, name: str) -> None:
+        try:
+            self._viewport.scene.create_object_group(name, objects)
+        except ValueError as exc:
+            self._report_object_group_error(exc)
+            return
+        self._finish_object_group_change()
+
+    def _on_object_group_priority_changed(self, group, delta: int) -> None:
+        scene = self._viewport.scene
+        root = group if group in scene.object_groups else next(
+            (parent for parent in scene.object_groups if group in parent.subgroups),
+            None,
+        )
+        if root is None:
+            self._report_object_group_error(
+                ValueError("The target group is no longer in the scene.")
+            )
+            return
+        members = [
+            *root.objects,
+            *(obj for subgroup in root.subgroups for obj in subgroup.objects),
+        ]
+        materials = {
+            str(getattr(obj, "material", "")).strip()
+            for obj in members
+            if str(getattr(obj, "material", "")).strip()
+        }
+        if len(materials) != 1:
+            self._report_object_group_error(
+                ValueError(
+                    "A group priority requires all group members and subgroups "
+                    "to use the same material."
+                )
+            )
+            return
+        settings = self._project_tree.get_settings()
+        material_priorities = settings.get("material_priorities", {})
+        if not isinstance(material_priorities, dict):
+            material_priorities = {}
+        material = next(iter(materials))
+        current_priority = (
+            root.priority
+            if root.priority is not None
+            else int(material_priorities.get(material, 0))
+        )
+        try:
+            scene.set_object_group_priority(root, current_priority + int(delta))
+        except ValueError as exc:
+            self._report_object_group_error(exc)
+            return
+        self._viewport.scene_changed.emit()
+        self._info_bar.set_info(
+            f"Group '{root.name}' priority set to {root.priority}"
+        )
+
+    def _on_object_subgroup_create(
+        self,
+        parent,
+        objects: list,
+        name: str,
+    ) -> None:
+        try:
+            self._viewport.scene.create_object_subgroup(parent, name, objects)
+        except ValueError as exc:
+            self._report_object_group_error(exc)
+            return
+        self._finish_object_group_change()
+
+    def _on_object_group_assign(self, objects: list, group, subgroup) -> None:
+        try:
+            self._viewport.scene.assign_objects_to_group(
+                objects,
+                group,
+                subgroup,
+            )
+        except ValueError as exc:
+            self._report_object_group_error(exc)
+            return
+        self._finish_object_group_change()
+
+    def _on_object_group_delete(self, group) -> None:
+        try:
+            self._viewport.scene.delete_object_group(group)
+        except ValueError as exc:
+            self._report_object_group_error(exc)
+            return
+        self._finish_object_group_change()
+
+    def _on_object_subgroup_delete(self, parent, subgroup) -> None:
+        try:
+            self._viewport.scene.delete_object_subgroup(parent, subgroup)
+        except ValueError as exc:
+            self._report_object_group_error(exc)
+            return
+        self._finish_object_group_change()
+
     def _on_materials_bulk_rename(self, objects: list, base_name: str, start_index: int) -> None:
         if not objects or not base_name:
             return
@@ -4873,10 +5569,10 @@ class MainWindow(QMainWindow):
         )
         self._mark_simulation_dirty(steps=True, script=True)
 
-    def _on_assign_port_requested(self, obj) -> None:
+    def _on_assign_port_requested(self, obj, port_type: str) -> None:
         if obj is None:
             return
-        self._project_tree.assign_port_to_object(obj.name)
+        self._project_tree.assign_port_to_object(obj.name, port_type)
         self._info_bar.set_info(f"Port assignment updated for {obj.name}")
 
     def _on_assign_boundary_requested(self, objects: list) -> None:
@@ -5150,6 +5846,197 @@ class MainWindow(QMainWindow):
                 f"STEP imported: {len(added)} solid(s) from {Path(path).name}"
             )
 
+    def _import_ipc2581_board_json_3d(self) -> None:
+        """Import clipped Board JSON exported by the standalone IPC-2581 importer."""
+        from PySide6.QtCore import Qt
+        from PySide6.QtWidgets import QInputDialog, QWidget
+
+        from ..emerge.ipc2581_board_json import (
+            BoardJSONImportError,
+            board_json_to_preview_groups,
+            load_board_json,
+            via_plating_requests,
+        )
+
+        path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Import IPC-2581B Board JSON",
+            "",
+            "Board JSON (*.json);;All Files (*)",
+        )
+        if not path:
+            return
+        parent = self if isinstance(self, QWidget) else None
+        progress = None
+        if parent is not None:
+            progress = QProgressDialog(
+                "Reading IPC-2581B board JSON...",
+                "",
+                0,
+                0,
+                parent,
+            )
+            progress.setWindowTitle("Import IPC-2581B Board JSON")
+            progress.setWindowModality(Qt.WindowModality.WindowModal)
+            progress.setCancelButton(None)
+            progress.setMinimumDuration(0)
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+            progress.show()
+
+        def update_progress(
+            label: str,
+            *,
+            value: int | None = None,
+            maximum: int | None = None,
+            indeterminate: bool = False,
+        ) -> None:
+            if progress is None:
+                return
+            progress.setLabelText(label)
+            if maximum is not None:
+                progress.setRange(0, max(1, maximum))
+            if indeterminate:
+                progress.setRange(0, 0)
+            elif value is not None:
+                progress.setValue(value)
+            QApplication.processEvents()
+
+        update_progress("Reading IPC-2581B board JSON...")
+        try:
+            board = load_board_json(path)
+            try:
+                default_curve_segments = int(
+                    getattr(self, "_curved_boundary_resolution", 20)
+                )
+            except (TypeError, ValueError):
+                default_curve_segments = 20
+            default_curve_segments = max(6, min(1000, default_curve_segments))
+            if progress is not None:
+                progress.close()
+            curve_segments_per_circle, accepted = QInputDialog.getInt(
+                self,
+                "PCB curve detail",
+                "Segments per full circle in imported STEP geometry:",
+                value=default_curve_segments,
+                min=6,
+                max=1000,
+                step=1,
+            )
+            if not accepted:
+                return
+            if progress is not None:
+                progress.show()
+
+            via_thicknesses_mm: dict[str, float] = {}
+            requests = via_plating_requests(board)
+            if requests:
+                if progress is not None:
+                    progress.close()
+                via_count = sum(count for _, count in requests)
+                while True:
+                    raw_thickness, accepted = QInputDialog.getText(
+                        self,
+                        "Via plating thickness",
+                        f"Enter copper plating thickness in mm for all "
+                        f"{via_count} plated via(s).",
+                    )
+                    if not accepted:
+                        if progress is not None:
+                            progress.close()
+                        return
+                    try:
+                        thickness = float(raw_thickness.strip())
+                    except (TypeError, ValueError):
+                        thickness = 0.0
+                    if math.isfinite(thickness) and thickness > 0.0:
+                        via_thicknesses_mm = {
+                            key: thickness for key, _ in requests
+                        }
+                        break
+                    QMessageBox.warning(
+                        self,
+                        "Invalid via plating thickness",
+                        "Thickness must be a finite number greater than zero.",
+                    )
+                if progress is not None:
+                    progress.show()
+            feature_count = len(board.get("features", []))
+            update_progress(
+                f"Validating and building simulation geometry "
+                f"({feature_count} features)..."
+            )
+            groups = board_json_to_preview_groups(
+                board,
+                mm_per_scene_unit=_MM_PER_UNIT.get(self._units, 1.0),
+                simulation_ready=True,
+                via_plating_thicknesses_mm=via_thicknesses_mm,
+                curve_segments_per_circle=curve_segments_per_circle,
+            )
+        except BoardJSONImportError as exc:
+            if progress is not None:
+                progress.close()
+            QMessageBox.warning(self, "IPC-2581B PCB Import", str(exc))
+            return
+        except Exception as exc:
+            if progress is not None:
+                progress.close()
+            QMessageBox.critical(self, "IPC-2581B PCB Import Error", str(exc))
+            return
+
+        from ..scene.em_objects import MeshObject
+
+        added = []
+        update_progress(
+            f"Adding PCB model objects (0/{len(groups)})...",
+            value=0,
+            maximum=len(groups),
+        )
+        try:
+            for index, group in enumerate(groups, start=1):
+                obj = MeshObject(
+                    name=group.name,
+                    polydata=group.polydata,
+                    material=(
+                        "Dielectric"
+                        if group.object_role == "dielectric"
+                        else self._draw_material
+                    ),
+                    ipc2581_step_geometry=group.step_geometry,
+                )
+                obj.is_model = bool(group.metadata["simulation_authoritative"])
+                obj.creation_history = {
+                    "mode": "ipc2581_board_json",
+                    "source_file": str(Path(path).expanduser().resolve()),
+                    **group.metadata,
+                    "feature_count": group.feature_count,
+                }
+                self._viewport.scene.add_object(obj)
+                added.append(obj)
+                update_progress(
+                    f"Adding PCB model objects ({index}/{len(groups)})...",
+                    value=index,
+                )
+
+            if added:
+                update_progress(
+                    "Refreshing the 3D view...",
+                    indeterminate=True,
+                )
+                self._viewport.scene.select(added[-1])
+                self._viewport.object_selected.emit(added[-1])
+                self._viewport.selection_changed.emit([added[-1]])
+                self._viewport.scene_changed.emit()
+                self._viewport._render()
+                self._refresh_materials()
+                self._info_bar.set_info(
+                    f"IPC-2581B PCB model imported: {len(added)} object(s) "
+                    f"from {Path(path).name}; native STEP geometry is ready for simulation"
+                )
+        finally:
+            if progress is not None:
+                progress.close()
+
     def _open_simulation_window(self) -> None:
         dlg = getattr(self, "_sim_dlg", None)
         if dlg is None:
@@ -5167,10 +6054,15 @@ class MainWindow(QMainWindow):
             _btn_clear_log.clicked.connect(lambda: self._sim_log_view.clear() if hasattr(self, "_sim_log_view") else None)
             log_top_row.addWidget(_btn_clear_log)
             log_layout.addLayout(log_top_row)
-            self._sim_log_view = QPlainTextEdit(log_box)
-            self._sim_log_view.setReadOnly(True)
-            self._sim_log_view.setLineWrapMode(QPlainTextEdit.NoWrap)
-            log_layout.addWidget(self._sim_log_view)
+            log_view = QPlainTextEdit(log_box)
+            self._sim_log_view = log_view
+            log_view.destroyed.connect(
+                lambda _obj=None, destroyed_view=log_view:
+                MainWindow._forget_sim_log_view(self, destroyed_view)
+            )
+            log_view.setReadOnly(True)
+            log_view.setLineWrapMode(QPlainTextEdit.NoWrap)
+            log_layout.addWidget(log_view)
 
             self._sim_output_tabs = QTabWidget(dlg)
             self._sim_output_tabs.addTab(log_box, "Execution Log")
@@ -5227,6 +6119,7 @@ class MainWindow(QMainWindow):
 
             self._sim_btn_run = QPushButton("Run")
             self._sim_btn_run.clicked.connect(self._on_sim_run)
+            self._sim_btn_run.setEnabled(bool(getattr(self, "_sim_ready", False)))
             btn_row.addWidget(self._sim_btn_run)
 
             self._sim_btn_stop = QPushButton("Stop")
@@ -5258,18 +6151,13 @@ class MainWindow(QMainWindow):
         self._sim_log_view.clear()
         self._show_workspace_window("Simulation")
         QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
-        cached_script = getattr(self, "_sim_cached_script_bundle", {}).get("master", "")
-        if getattr(self, "_sim_script_dirty", True) or not cached_script:
-            try:
-                master_script = self._generate_simulation_assets(
-                    show_progress=True,
-                    force_script=False,
-                )
-                if master_script:
-                    script_path = self._write_cached_simulation_scripts()
-                    self._append_sim_log(f"[info] Scripts regenerated and saved: {script_path.parent}")
-            except Exception as exc:
-                self._append_sim_log(f"[error] Failed to generate script: {exc}")
+        # Check Simulation prepares all assets. Play only presents that prepared bundle;
+        # it must not repeat STEP export or EMERGE script generation.
+        script_bundle = getattr(
+            self, "_sim_cached_script_bundle", {"master": "", "scripts": []}
+        )
+        MainWindow._update_simulation_script_tabs(self, script_bundle)
+        MainWindow._update_simulation_run_enabled(self)
 
     def _on_sim_option_changed(self, _checked: bool) -> None:
         self._mark_simulation_dirty(steps=False, script=True)
@@ -5278,7 +6166,159 @@ class MainWindow(QMainWindow):
             info_bar.set_info("Simulation options changed. Generate Script or Run to apply.")
 
     def _on_check_simulation(self) -> None:
-        findings = self._simulation_validation_findings()
+        MainWindow._set_simulation_ready(self, False)
+        info_bar = getattr(self, "_info_bar", None)
+        last_progress = 0.0
+
+        def update_check_progress(
+            message: str,
+            fraction: float,
+            *,
+            status: str = "PREP",
+            complete: bool = False,
+        ) -> None:
+            nonlocal last_progress
+            fraction = 1.0 if complete else min(0.98, max(0.0, float(fraction)))
+            last_progress = max(last_progress, fraction)
+            update = getattr(info_bar, "set_preparation_progress", None)
+            if callable(update):
+                update(
+                    message,
+                    completed=round(last_progress * 100),
+                    total=100,
+                    show_in_model_view=True,
+                    status=status,
+                )
+            QApplication.processEvents(QEventLoop.ExcludeUserInputEvents)
+
+        def report_validation_progress(message: str, fraction: float) -> None:
+            update_check_progress(message, 0.02 + 0.27 * fraction)
+
+        def report_asset_progress(
+            message: str,
+            completed: int = 0,
+            total: int = 0,
+            current_fraction: float | None = None,
+            log: bool = False,
+        ) -> None:
+            if not message:
+                # Asset generation's finally block clears its own progress. Keep
+                # the Check Simulation progress visible until its report closes.
+                return
+            if log:
+                append_log = getattr(self, "_append_sim_log", None)
+                if callable(append_log):
+                    append_log(f"[prep] {message}")
+            if message.startswith("Preparing simulation assets"):
+                asset_fraction = 0.0
+            elif message.startswith("Exporting complete-scene STEP"):
+                asset_fraction = 0.02
+            elif message.startswith("Complete-scene STEP export finished"):
+                asset_fraction = 0.12
+            elif message.startswith("Complete-scene STEP:"):
+                asset_fraction = min(0.12, max(0.02, float(current_fraction or 0.02)))
+            elif message.startswith("Updating simulation script tabs"):
+                asset_fraction = 0.98
+            elif total > 0:
+                current = max(0.0, float(current_fraction or 0.0))
+                asset_fraction = 0.12 + 0.82 * min(
+                    1.0, (max(0, completed) + current) / total
+                )
+            else:
+                asset_fraction = 0.12
+            update_check_progress(message, 0.30 + 0.62 * asset_fraction)
+
+        update_check_progress("Validating simulation inputs...", 0.0)
+        self._sim_check_validation_progress_callback = report_validation_progress
+        try:
+            findings = self._simulation_validation_findings()
+        except Exception as exc:
+            findings = [
+                ValidationFinding(
+                    "ERROR",
+                    "Validation",
+                    f"Simulation validation failed: {exc}",
+                )
+            ]
+            self._append_sim_log(f"[error] Simulation validation failed: {exc}")
+        finally:
+            try:
+                del self._sim_check_validation_progress_callback
+            except AttributeError:
+                pass
+        runtime_rows = _runtime_diagnostic_rows()
+        update_check_progress("Simulation validation checks complete", 0.30)
+
+        errors = [finding for finding in findings if finding.severity == "ERROR"]
+        preparation_status = "Not prepared: resolve simulation errors first."
+        assets_prepared = False
+        if not errors:
+            self._sim_check_validation_findings = findings
+            self._sim_check_asset_progress_callback = report_asset_progress
+            try:
+                master_script = self._generate_simulation_assets(
+                    show_progress=True,
+                    force_script=False,
+                )
+                assets_prepared = bool(
+                    master_script
+                    and not getattr(self, "_sim_script_dirty", True)
+                    and getattr(self, "_sim_step_bundle_ready", False)
+                )
+                if assets_prepared:
+                    MainWindow._set_simulation_ready(self, True)
+                    preparation_status = "Prepared: STEP geometry and EMERGE scripts are ready."
+                    update_check_progress(
+                        "Simulation assets and scripts are ready",
+                        0.96,
+                    )
+                else:
+                    preparation_status = "Preparation failed or was cancelled; run Check Simulation again."
+                    findings.insert(
+                        0,
+                        ValidationFinding(
+                            "ERROR",
+                            "Asset preparation",
+                            preparation_status,
+                        ),
+                    )
+                    update_check_progress(
+                        preparation_status,
+                        max(last_progress, 0.90),
+                        status="FAIL",
+                    )
+            except Exception as exc:
+                self._append_sim_log(f"[error] Failed to prepare simulation assets: {exc}")
+                preparation_status = f"Preparation failed: {exc}"
+                findings.insert(
+                    0,
+                    ValidationFinding(
+                        "ERROR",
+                        "Asset preparation",
+                        preparation_status,
+                    ),
+                )
+                update_check_progress(
+                    "Simulation asset preparation failed",
+                    max(last_progress, 0.90),
+                    status="FAIL",
+                )
+            finally:
+                for attribute in (
+                    "_sim_check_validation_findings",
+                    "_sim_check_asset_progress_callback",
+                ):
+                    try:
+                        delattr(self, attribute)
+                    except AttributeError:
+                        pass
+        else:
+            update_check_progress(
+                "Validation found errors; preparing the check report",
+                0.94,
+                status="FAIL",
+            )
+
         counts = {
             severity: sum(1 for finding in findings if finding.severity == severity)
             for severity in ("ERROR", "WARNING", "OK")
@@ -5289,13 +6329,29 @@ class MainWindow(QMainWindow):
         for finding in findings:
             color = colors.get(finding.severity, "#e8edf5")
             symbol = symbols.get(finding.severity, finding.severity)
+            is_preparation_failure = (
+                finding.severity == "ERROR"
+                and finding.category == "Asset preparation"
+            )
+            row_style = (
+                "background-color:#4b1f24;font-weight:700;"
+                if is_preparation_failure
+                else ""
+            )
             rows.append(
-                "<tr>"
-                f"<td style='color:{color};font-weight:600;padding:5px 10px'>{symbol}</td>"
-                f"<td style='padding:5px 10px'>{escape(finding.category)}</td>"
-                f"<td style='padding:5px 10px'>{escape(finding.message)}</td>"
+                f"<tr style='{row_style}'>"
+                f"<td style='color:{color};font-weight:700;padding:7px 10px'>{symbol}</td>"
+                f"<td style='padding:7px 10px'>{escape(finding.category)}</td>"
+                f"<td style='padding:7px 10px'>{escape(finding.message)}</td>"
                 "</tr>"
             )
+        runtime_html_rows = "".join(
+            "<tr>"
+            f"<th align='left' style='padding:5px 10px'>{escape(label)}</th>"
+            f"<td style='padding:5px 10px;word-break:break-word'>{escape(value)}</td>"
+            "</tr>"
+            for label, value in runtime_rows
+        )
 
         dlg = QDialog(self)
         dlg.setWindowTitle("Simulation Check")
@@ -5305,14 +6361,23 @@ class MainWindow(QMainWindow):
             f"Errors: {counts['ERROR']}    Warnings: {counts['WARNING']}    Passed: {counts['OK']}",
             dlg,
         )
-        summary.setStyleSheet("font-weight: bold; padding: 6px;")
+        summary.setStyleSheet(
+            "font-weight: bold; padding: 6px; color: #ffb6bb; "
+            "background-color: #4b1f24; border: 1px solid #ef6b73; border-radius: 3px;"
+            if counts["ERROR"]
+            else "font-weight: bold; padding: 6px;"
+        )
         layout.addWidget(summary)
         report = QTextBrowser(dlg)
         report.setHtml(
             "<table cellspacing='0' width='100%' style='color:#dce4ef'>"
             "<tr><th align='left'>Status</th><th align='left'>Category</th><th align='left'>Check</th></tr>"
             + "".join(rows)
-            + "</table>"
+            + "</table><h3>Runtime diagnostics</h3>"
+            + "<table cellspacing='0' width='100%' style='color:#dce4ef'>"
+            + runtime_html_rows
+            + "</table><h3>Asset preparation</h3>"
+            + f"<p>{escape(preparation_status)}</p>"
         )
         layout.addWidget(report)
         buttons = QDialogButtonBox(QDialogButtonBox.Close, dlg)
@@ -5322,14 +6387,46 @@ class MainWindow(QMainWindow):
             f"[check] Simulation validation: {counts['ERROR']} error(s), "
             f"{counts['WARNING']} warning(s), {counts['OK']} passed."
         )
-        dlg.exec()
+        if assets_prepared:
+            completion_message = "Check complete — ready to run."
+        elif errors:
+            completion_message = "Check complete — validation errors found."
+        else:
+            completion_message = "Check complete — asset preparation failed or was cancelled."
+        update_check_progress(
+            completion_message,
+            1.0,
+            status="CHECK" if assets_prepared else "FAIL",
+            complete=True,
+        )
+        try:
+            dlg.exec()
+        finally:
+            clear = getattr(info_bar, "set_preparation_progress", None)
+            if callable(clear):
+                clear("", show_in_model_view=True, reset=True)
 
     def _simulation_validation_findings(self):
+        progress_callback = getattr(
+            self, "_sim_check_validation_progress_callback", None
+        )
+        model_objects = self._viewport.scene.objects
+        emerge_import_status = None
+        emerge_version = None
+        if any(type(obj).__name__ == "SweptSurfaceObject" for obj in model_objects):
+            runtime = dict(_runtime_diagnostic_rows())
+            emerge_import_status = runtime.get("EMERGE import status")
+            emerge_version = runtime.get("EMERGE version")
         return validate_simulation(
-            self._viewport.scene.objects,
+            model_objects,
             self._project_tree.get_settings(),
             self._material_store.material_export_catalog(),
             self._collect_plate_lumped_ports(),
+            self._viewport.scene.group_object_priorities(),
+            mm_per_unit=_MM_PER_UNIT.get(self._units, 1.0),
+            progress_callback=progress_callback,
+            emerge_import_status=emerge_import_status,
+            emerge_version=emerge_version,
         )
 
     def _normalize_log_level(self, value: str) -> str:
@@ -5370,10 +6467,14 @@ class MainWindow(QMainWindow):
         if not isinstance(settings_ports, list):
             return []
 
-        plate_by_name = {
+        port_object_by_name = {
             str(obj.name): obj
             for obj in self._viewport.scene.objects
-            if self._is_plate_role_object(obj) and bool(getattr(obj, "is_model", True))
+            if (
+                (MainWindow._is_plate_role_object(obj)
+                 or type(obj).__name__ == "SweptSurfaceObject")
+                and bool(getattr(obj, "is_model", True))
+            )
         }
         air_objects = [
             obj for obj in self._viewport.scene.objects
@@ -5398,50 +6499,65 @@ class MainWindow(QMainWindow):
             obj_name = str(port.get("object", "")).strip()
             if not obj_name:
                 continue
-            plate = plate_by_name.get(obj_name)
-            if plate is None:
+            port_object = port_object_by_name.get(obj_name)
+            if port_object is None:
                 continue
-
-            if type(plate).__name__ == "PlateObject":
-                p = plate.get_parameters()
-                xmin, xmax = sorted([float(p.get("X1", 0.0)), float(p.get("X2", 0.0))])
-                ymin, ymax = sorted([float(p.get("Y1", 0.0)), float(p.get("Y2", 0.0))])
-                zmin, zmax = sorted([float(p.get("Z1", 0.0)), float(p.get("Z2", 0.0))])
-                points_are_world = False
+            is_swept_surface = type(port_object).__name__ == "SweptSurfaceObject"
+            if is_swept_surface:
+                # Open sheet surfaces support LumpedPort only. WaveguidePort is
+                # defined on an AIR-region opening and remains plate/volume-only.
+                if port_type != "LumpedPort":
+                    continue
+                p = port_object.get_parameters()
+                origin = list(port_object.anchor)
+                u = [0.0, 0.0, 0.0]
+                v = [0.0, 0.0, 0.0]
+                width = float(p.get("ProfilePerimeter", 0.0))
+                height = float(p.get("ExtrusionLength", 0.0))
+                geometry_direction = [
+                    float(value) for value in p.get("Direction", (0.0, 0.0, 1.0))
+                ]
             else:
-                bounds = plate.actor.GetBounds()
-                xmin, xmax, ymin, ymax, zmin, zmax = [float(value) for value in bounds]
-                points_are_world = True
+                plate = port_object
 
-            spans = [xmax - xmin, ymax - ymin, zmax - zmin]
-            normal_axis = min(range(3), key=lambda i: abs(spans[i]))
-            tangent_axes = [a for a in (0, 1, 2) if a != normal_axis]
+                if type(plate).__name__ == "PlateObject":
+                    p = plate.get_parameters()
+                    xmin, xmax = sorted([float(p.get("X1", 0.0)), float(p.get("X2", 0.0))])
+                    ymin, ymax = sorted([float(p.get("Y1", 0.0)), float(p.get("Y2", 0.0))])
+                    zmin, zmax = sorted([float(p.get("Z1", 0.0)), float(p.get("Z2", 0.0))])
+                    points_are_world = False
+                else:
+                    bounds = plate.actor.GetBounds()
+                    xmin, xmax, ymin, ymax, zmin, zmax = [float(value) for value in bounds]
+                    points_are_world = True
 
-            mins = [xmin, ymin, zmin]
-            maxs = [xmax, ymax, zmax]
-            corners = {
-                0: ((xmin, ymin, zmin), (xmin, ymax, zmin), (xmin, ymax, zmax), (xmin, ymin, zmax)),
-                1: ((xmin, ymin, zmin), (xmax, ymin, zmin), (xmax, ymin, zmax), (xmin, ymin, zmax)),
-                2: ((xmin, ymin, zmin), (xmax, ymin, zmin), (xmax, ymax, zmin), (xmin, ymax, zmin)),
-            }[normal_axis]
-            matrix = plate.actor.GetMatrix()
-            world = [(*point, 1.0) for point in corners] if points_are_world else [matrix.MultiplyPoint([*point, 1.0]) for point in corners]
-            origin = list(world[0][:3])
-            u = [world[1][axis] - world[0][axis] for axis in range(3)]
-            v = [world[3][axis] - world[0][axis] for axis in range(3)]
+                spans = [xmax - xmin, ymax - ymin, zmax - zmin]
+                normal_axis = min(range(3), key=lambda i: abs(spans[i]))
 
-            normal_local = [0.0, 0.0, 0.0]
-            normal_local[normal_axis] = 1.0
-            normal_tip_local = [
-                origin_local + component
-                for origin_local, component in zip(corners[0], normal_local)
-            ]
-            normal_origin_world = (*corners[0], 1.0) if points_are_world else matrix.MultiplyPoint([*corners[0], 1.0])
-            normal_tip_world = (*normal_tip_local, 1.0) if points_are_world else matrix.MultiplyPoint([*normal_tip_local, 1.0])
-            normal_vector = [
-                normal_tip_world[axis] - normal_origin_world[axis]
-                for axis in range(3)
-            ]
+                corners = {
+                    0: ((xmin, ymin, zmin), (xmin, ymax, zmin), (xmin, ymax, zmax), (xmin, ymin, zmax)),
+                    1: ((xmin, ymin, zmin), (xmax, ymin, zmin), (xmax, ymin, zmax), (xmin, ymin, zmax)),
+                    2: ((xmin, ymin, zmin), (xmax, ymin, zmin), (xmax, ymax, zmin), (xmin, ymax, zmin)),
+                }[normal_axis]
+                matrix = plate.actor.GetMatrix()
+                world = [(*point, 1.0) for point in corners] if points_are_world else [matrix.MultiplyPoint([*point, 1.0]) for point in corners]
+                origin = list(world[0][:3])
+                u = [world[1][axis] - world[0][axis] for axis in range(3)]
+                v = [world[3][axis] - world[0][axis] for axis in range(3)]
+
+                normal_local = [0.0, 0.0, 0.0]
+                normal_local[normal_axis] = 1.0
+                normal_tip_local = [
+                    origin_local + component
+                    for origin_local, component in zip(corners[0], normal_local)
+                ]
+                normal_origin_world = (*corners[0], 1.0) if points_are_world else matrix.MultiplyPoint([*corners[0], 1.0])
+                normal_tip_world = (*normal_tip_local, 1.0) if points_are_world else matrix.MultiplyPoint([*normal_tip_local, 1.0])
+                normal_vector = [
+                    normal_tip_world[axis] - normal_origin_world[axis]
+                    for axis in range(3)
+                ]
+                geometry_direction = normal_vector
 
             params = port.get("params", {}) if isinstance(port.get("params", {}), dict) else {}
             configured_direction = [
@@ -5455,12 +6571,17 @@ class MainWindow(QMainWindow):
                 # definition and must be preserved in the generated script.
                 direction = [value / direction_magnitude for value in configured_direction]
             else:
-                normal_length = sum(value * value for value in normal_vector) ** 0.5
+                normal_length = sum(value * value for value in geometry_direction) ** 0.5
                 direction = (
-                    [value / normal_length for value in normal_vector]
+                    [value / normal_length for value in geometry_direction]
                     if normal_length > 1e-12
                     else [0.0, 0.0, 1.0]
                 )
+            if is_swept_surface:
+                origin, u, v = _developed_plate_frame(
+                    port_object.anchor, width, height, direction
+                )
+                origin, u, v = list(origin), list(u), list(v)
             if port_type == "WaveguidePort":
                 mode_text = str(params.get("Mode", "TE10")).strip().upper()
                 mode_type = "TM" if mode_text.startswith("TM") else "TE"
@@ -5476,6 +6597,9 @@ class MainWindow(QMainWindow):
                 mode = (1, 0)
                 z0 = float(params.get("Resistance_Ohm", 50.0))
                 power = float(params.get("Voltage_V", 1.0))
+            if not is_swept_surface:
+                width = sum(value * value for value in u) ** 0.5
+                height = sum(value * value for value in v) ** 0.5
             entry = {
                     # EMERGE requires contiguous technical port IDs (1..N).
                     # The user-selected number remains available as metadata/display.
@@ -5484,11 +6608,12 @@ class MainWindow(QMainWindow):
                     "name": str(port.get("name", f"Port_{port_index}")),
                     "type": port_type,
                     "plate_name": obj_name,
+                    "is_swept_surface": is_swept_surface,
                     "origin": origin,
                     "u": u,
                     "v": v,
-                    "width": sum(value * value for value in u) ** 0.5,
-                    "height": sum(value * value for value in v) ** 0.5,
+                    "width": width,
+                    "height": height,
                     "direction": direction,
                     "z0": z0,
                     "power": power,
@@ -5519,7 +6644,10 @@ class MainWindow(QMainWindow):
         }
         entries = []
         for obj in self._viewport.scene.objects:
-            if not self._is_plate_role_object(obj) or not bool(getattr(obj, "is_model", True)):
+            if (
+                not self._is_plate_role_object(obj)
+                or not bool(getattr(obj, "is_model", True))
+            ):
                 continue
             if str(getattr(obj, "name", "")).strip() in port_names:
                 continue
@@ -5571,8 +6699,12 @@ class MainWindow(QMainWindow):
                     "NumberOfPointsFormula": item.get("NumberOfPointsFormula", ""),
                     "ActiveVariable": item.get("ActiveVariable", ""),
                     "EigenmodeCount": item.get("EigenmodeCount", 5),
+                    "EigenmodeSearchFrequency_GHz": item.get(
+                        "EigenmodeSearchFrequency_GHz", 1.0
+                    ),
                     "ParamName": item.get("ParamName", ""),
                     "ParamValues": item.get("ParamValues", ""),
+                    "allow_oversized_mesh": bool(item.get("allow_oversized_mesh", False)),
                     "progressive_sparams_enabled": bool(item.get("progressive_sparams_enabled", False)),
                     "progressive_sparams_chunk_size": max(
                         1, int(item.get("progressive_sparams_chunk_size", 10))
@@ -5601,8 +6733,12 @@ class MainWindow(QMainWindow):
             "NumberOfPointsFormula": legacy.get("NumberOfPointsFormula", ""),
             "ActiveVariable": legacy.get("ActiveVariable", ""),
             "EigenmodeCount": legacy.get("EigenmodeCount", 5),
+            "EigenmodeSearchFrequency_GHz": legacy.get(
+                "EigenmodeSearchFrequency_GHz", 1.0
+            ),
             "ParamName": legacy.get("ParamName", ""),
             "ParamValues": legacy.get("ParamValues", ""),
+            "allow_oversized_mesh": bool(legacy.get("allow_oversized_mesh", False)),
             "progressive_sparams_enabled": bool(legacy.get("progressive_sparams_enabled", False)),
             "progressive_sparams_chunk_size": max(
                 1, int(legacy.get("progressive_sparams_chunk_size", 10))
@@ -5718,6 +6854,7 @@ class MainWindow(QMainWindow):
         material_priorities: dict,
         excluded_object_names: set[str],
         progress_callback=None,
+        phase_callback=None,
         mm_per_unit: float = 1.0,
     ) -> dict:
         def log_export(level: str, message: str) -> None:
@@ -5735,12 +6872,19 @@ class MainWindow(QMainWindow):
                     level=normalized_level,
                 )
 
+        scene = getattr(getattr(self, "_viewport", None), "scene", None)
+        get_group_priorities = getattr(scene, "group_object_priorities", None)
+        object_priorities = (
+            get_group_priorities() if callable(get_group_priorities) else {}
+        )
         result = export_objects_to_step_bundle(
             objects=objects,
             bundle_dir=bundle_dir,
             material_priorities=material_priorities,
+            object_priorities=object_priorities,
             excluded_object_names=excluded_object_names,
             progress_callback=progress_callback,
+            phase_callback=phase_callback,
             log_callback=log_export,
             mm_per_unit=mm_per_unit,
         )
@@ -5770,6 +6914,7 @@ class MainWindow(QMainWindow):
         excluded_object_names: set[str],
         cache_token: tuple | None = None,
         progress_callback=None,
+        phase_callback=None,
         mm_per_unit: float = 1.0,
     ) -> dict:
         cache = getattr(self, "_simulation_step_export_cache", None)
@@ -5798,6 +6943,7 @@ class MainWindow(QMainWindow):
             material_priorities=material_priorities,
             excluded_object_names=excluded_object_names,
             progress_callback=progress_callback,
+            phase_callback=phase_callback,
             mm_per_unit=mm_per_unit,
         )
         cache[cache_key] = result
@@ -5815,10 +6961,19 @@ class MainWindow(QMainWindow):
         priority_key = tuple(
             sorted((str(name), repr(value)) for name, value in material_priorities.items())
         ) if isinstance(material_priorities, dict) else ()
+        scene = getattr(getattr(self, "_viewport", None), "scene", None)
+        get_group_priorities = getattr(scene, "group_object_priorities", None)
+        group_priority_key = tuple(sorted(
+            (str(name), repr(value))
+            for name, value in (
+                get_group_priorities() if callable(get_group_priorities) else {}
+            ).items()
+        ))
         return (
             str(bundle_dir.expanduser().resolve()),
             tuple(sorted(str(name) for name in excluded_object_names)),
             priority_key,
+            group_priority_key,
             float(mm_per_unit),
             cache_token,
         )
@@ -5937,7 +7092,22 @@ class MainWindow(QMainWindow):
         runtime_solver = str(runtime_cfg.get("solver", self._sim_solver)).strip().upper()
         if runtime_solver not in _EMERGE_SOLVERS:
             runtime_solver = self._sim_solver
+        runtime_cudss_precision = str(
+            runtime_cfg.get(
+                "cudss_precision",
+                getattr(self, "_sim_cudss_precision", "auto"),
+            )
+        ).strip().lower()
+        if runtime_cudss_precision not in {"auto", "single", "double"}:
+            runtime_cudss_precision = "auto"
         runtime_parallel = bool(runtime_cfg.get("parallel_enabled", self._sim_parallel_enabled))
+        runtime_worker_processes = max(
+            1,
+            min(
+                256,
+                int(runtime_cfg.get("worker_processes", self._sim_worker_processes)),
+            ),
+        )
         runtime_pardiso_threads = max(1, int(runtime_cfg.get("pardiso_threads", self._sim_pardiso_threads)))
         runtime_acc_threads = max(1, int(runtime_cfg.get("acc_threads", self._sim_acc_threads)))
         runtime_plot_sparams = bool(runtime_cfg.get("plot_sparams_after_sim", self._sim_plot_sparams_after_sim))
@@ -5948,6 +7118,11 @@ class MainWindow(QMainWindow):
                 mesh_fraction = max(0.01, min(1.0, float(mesh_cfg.get("default_fraction", mesh_fraction))))
             except Exception:
                 pass
+        mesh_algorithm = normalize_mesh_algorithm(
+            mesh_cfg.get("algorithm", getattr(self, "_mesh_algorithm", "DELAUNAY"))
+            if isinstance(mesh_cfg, dict)
+            else getattr(self, "_mesh_algorithm", "DELAUNAY")
+        )
 
         enabled_sims = self._enabled_simulations(settings)
         work_total = sum(
@@ -5971,13 +7146,41 @@ class MainWindow(QMainWindow):
                     log,
                 )
 
+        def report_step_progress(done: int, total: int, object_name: str) -> None:
+            fraction = done / total if total else None
+            report_progress(
+                f"STEP export: {object_name} ({done}/{total})",
+                0.7 * fraction if fraction is not None else None,
+            )
+
+        def report_step_phase(
+            done: int,
+            total: int,
+            object_name: str,
+            phase: str,
+            phase_fraction: float,
+        ) -> None:
+            fraction = (done + phase_fraction) / total if total else None
+            report_progress(
+                f"STEP export: {object_name} — {phase}",
+                0.7 * fraction if fraction is not None else None,
+            )
+
         scripts: list[dict] = []
         sweep_geometry_recomputed = False
+        report_progress("Preparing simulation scripts", 0.0, log=True)
         for idx, sim_cfg in enumerate(enabled_sims, start=1):
             sim_name = str(sim_cfg.get("name", f"Simulation_{idx}")).strip() or f"Simulation_{idx}"
             child_settings = dict(settings)
             child_mesh_cfg = dict(mesh_cfg) if isinstance(mesh_cfg, dict) else {}
+            child_mesh_cfg["algorithm"] = mesh_algorithm
+            child_mesh_cfg["curved_boundary_meshing_enabled"] = bool(
+                getattr(self, "_curved_boundary_meshing_enabled", True)
+            )
             child_mesh_cfg["curved_boundary_resolution"] = self._curved_boundary_resolution
+            child_mesh_cfg["allow_oversized_mesh"] = bool(
+                getattr(self, "_allow_oversized_mesh", False)
+            )
             child_settings["mesh"] = child_mesh_cfg
             child_settings["simulations"] = [dict(sim_cfg)]
             child_settings["simulation"] = {
@@ -6049,11 +7252,28 @@ class MainWindow(QMainWindow):
                             or not isinstance(port_metadata.get("plate_entries"), list)
                             or step_bundle is None
                         ):
-                            def report_step_progress(done: int, total: int, object_name: str) -> None:
+                            def report_param_step_progress(
+                                done: int, total: int, object_name: str
+                            ) -> None:
                                 fraction = done / total if total else None
                                 report_progress(
-                                    f"STEP {parameter_index}/{len(parameter_values)}: {object_name} ({done}/{total})",
-                                    fraction,
+                                    f"STEP {parameter_index}/{len(parameter_values)}: "
+                                    f"{object_name} ({done}/{total})",
+                                    0.7 * fraction if fraction is not None else None,
+                                )
+
+                            def report_param_step_phase(
+                                done: int,
+                                total: int,
+                                object_name: str,
+                                phase: str,
+                                phase_fraction: float,
+                            ) -> None:
+                                fraction = (done + phase_fraction) / total if total else None
+                                report_progress(
+                                    f"STEP {parameter_index}/{len(parameter_values)}: "
+                                    f"{object_name} — {phase}",
+                                    0.7 * fraction if fraction is not None else None,
                                 )
 
                             report_progress(
@@ -6083,13 +7303,14 @@ class MainWindow(QMainWindow):
                                     material_priorities=material_priorities,
                                     excluded_object_names=plate_names,
                                     cache_token=cache_token,
-                                    progress_callback=report_step_progress,
+                                    progress_callback=report_param_step_progress,
+                                    phase_callback=report_param_step_phase,
                                     mm_per_unit=_MM_PER_UNIT.get(getattr(self, "_units", "mm"), 1.0),
                                 )
                             metadata = step_bundle.setdefault("_parametric_port_metadata", {})
                             metadata[port_metadata_key] = port_metadata
                         else:
-                            report_progress("Reusing cached STEP and port geometry", 1.0)
+                            report_progress("Reusing cached STEP and port geometry", 0.7)
 
                         step_simulation = dict(sim_cfg)
                         step_simulation["ParamValues"] = parameter_value
@@ -6123,14 +7344,23 @@ class MainWindow(QMainWindow):
                             lumped_ports=port_metadata["lumped_ports"],
                             plate_entries=port_metadata["plate_entries"],
                             solver=runtime_solver,
+                            cudss_precision=runtime_cudss_precision,
                             parallel_enabled=runtime_parallel,
+                            worker_processes=runtime_worker_processes,
                             pardiso_threads=runtime_pardiso_threads,
                             acc_threads=runtime_acc_threads,
                             mesh_resolution_fraction=mesh_fraction,
                             plot_sparams_after_sim=runtime_plot_sparams,
                             progressive_sparams_enabled=bool(step_simulation.get("progressive_sparams_enabled", False)),
-                            export_sparams_after_sim=True,
+                            export_sparams_after_sim=runtime_export_sparams,
+                            save_mesh_after_sweep=getattr(
+                                self, "_save_mesh_after_sweep", False
+                            ),
                             simulation_override=step_simulation,
+                        )
+                        report_progress(
+                            f"Preparing clean script {parameter_index}/{len(parameter_values)}: {sim_name}",
+                            0.95,
                         )
                         clean_filename = f"{Path(step_filename).stem}_clean.py"
                         clean_script_text = build_clean_emerge_python_script(
@@ -6194,10 +7424,8 @@ class MainWindow(QMainWindow):
                 bundle_dir=simulation_root,
                 material_priorities=settings.get("material_priorities", {}),
                 excluded_object_names=plate_names,
-                progress_callback=lambda done, total, object_name: report_progress(
-                    f"STEP: {object_name} ({done}/{total})",
-                    done / total if total else None,
-                ),
+                progress_callback=report_step_progress,
+                phase_callback=report_step_phase,
                 mm_per_unit=_MM_PER_UNIT.get(getattr(self, "_units", "mm"), 1.0),
             )
             export_issues = _boolean_step_export_issues(simulation_step_bundle)
@@ -6217,15 +7445,19 @@ class MainWindow(QMainWindow):
                 lumped_ports=self._collect_plate_lumped_ports(),
                 plate_entries=self._collect_emerge_plates(),
                 solver=runtime_solver,
+                cudss_precision=runtime_cudss_precision,
                 parallel_enabled=runtime_parallel,
+                worker_processes=runtime_worker_processes,
                 pardiso_threads=runtime_pardiso_threads,
                 acc_threads=runtime_acc_threads,
                 mesh_resolution_fraction=mesh_fraction,
                 plot_sparams_after_sim=runtime_plot_sparams,
                 progressive_sparams_enabled=bool(sim_cfg.get("progressive_sparams_enabled", False)),
                 export_sparams_after_sim=runtime_export_sparams,
+                save_mesh_after_sweep=getattr(self, "_save_mesh_after_sweep", False),
                 simulation_override=sim_cfg,
             )
+            report_progress(f"Preparing clean script: {sim_name}", 0.95)
             clean_filename = f"{Path(filename).stem}_clean.py"
             clean_script_text = build_clean_emerge_python_script(
                 script_text,
@@ -6246,6 +7478,7 @@ class MainWindow(QMainWindow):
             )
             work_completed += 1
             report_progress(f"Generated script: {sim_name}", log=True)
+        report_progress("Generating simulation master script", 0.98, log=True)
         master_script = self._build_master_simulation_script(
             scripts,
         )
@@ -6310,7 +7543,9 @@ class MainWindow(QMainWindow):
     def _generate_simulation_assets(self, show_progress: bool = True, force_script: bool = False, force_step_export: bool = False) -> str | None:
         need_script = force_script or self._sim_script_dirty or (not self._sim_cached_script_bundle.get("master", ""))
         if need_script:
-            findings = self._simulation_validation_findings()
+            findings = getattr(self, "_sim_check_validation_findings", None)
+            if findings is None:
+                findings = self._simulation_validation_findings()
             errors = [finding for finding in findings if finding.severity == "ERROR"]
             for finding in errors:
                 self._append_sim_log(f"[error] Preflight {finding.category}: {finding.message}")
@@ -6318,9 +7553,19 @@ class MainWindow(QMainWindow):
                 self._append_sim_log("[error] Script generation stopped: resolve preflight errors first.")
                 return None
 
-        progress_callback = self._set_simulation_preparation_progress if show_progress else None
+        active_check_progress = getattr(
+            self, "_sim_check_asset_progress_callback", None
+        )
+        progress_callback = (
+            active_check_progress
+            if show_progress and callable(active_check_progress)
+            else self._set_simulation_preparation_progress if show_progress else None
+        )
         if progress_callback is not None:
-            progress_callback("Preparing simulation assets...", log=True)
+            if callable(active_check_progress):
+                progress_callback("Preparing simulation assets...", 0, 1, 0.0, True)
+            else:
+                progress_callback("Preparing simulation assets...", log=True)
         sim_objects = self._simulation_model_objects()
 
         need_step_export = force_step_export or self._sim_steps_dirty or (not self._sim_step_bundle_ready)
@@ -6358,12 +7603,35 @@ class MainWindow(QMainWindow):
                 ) or "Project"
                 debug_step_path = self._simulation_bundle_dir() / f"{safe_project_name}_Debug_All.step"
                 try:
+                    def report_debug_step_phase(
+                        done: int,
+                        total: int,
+                        object_name: str,
+                        phase: str,
+                        phase_fraction: float,
+                    ) -> None:
+                        completed_fraction = (
+                            (done + phase_fraction) / total if total else 0.0
+                        )
+                        if progress_callback is not None:
+                            progress_callback(
+                                f"Complete-scene STEP: {object_name} — {phase}",
+                                0,
+                                1,
+                                0.02 + 0.10 * completed_fraction,
+                                False,
+                            )
+
                     if progress_callback is not None:
-                        progress_callback("Exporting complete-scene STEP...", log=True)
+                        if callable(active_check_progress):
+                            progress_callback("Exporting complete-scene STEP...", 0, 1, 0.0, True)
+                        else:
+                            progress_callback("Exporting complete-scene STEP...", log=True)
                     debug_result = export_debug_scene_step(
                         objects=sim_objects,
                         step_path=debug_step_path,
                         mm_per_unit=_MM_PER_UNIT.get(getattr(self, "_units", "mm"), 1.0),
+                        phase_callback=report_debug_step_phase,
                         log_callback=lambda level, message: self._append_step_export_log(
                             f"[{level.lower()}] {message}", level=self._normalize_log_level(level)
                         ),
@@ -6372,7 +7640,10 @@ class MainWindow(QMainWindow):
                         f"[info] Complete scene STEP exported: {debug_result['exported']} object(s) to {debug_step_path}"
                     )
                     if progress_callback is not None:
-                        progress_callback("Complete-scene STEP export finished.", log=True)
+                        if callable(active_check_progress):
+                            progress_callback("Complete-scene STEP export finished.", 0, 1, 1.0, True)
+                        else:
+                            progress_callback("Complete-scene STEP export finished.", log=True)
                     self._sim_full_scene_step_dirty = False
                 except Exception as exc:
                     warning = f"[warn] Debug STEP export failed: {exc}"
@@ -6402,6 +7673,14 @@ class MainWindow(QMainWindow):
                 script_bundle = self._sim_cached_script_bundle
                 script = str(script_bundle.get("master", ""))
 
+            if callable(active_check_progress):
+                progress_callback(
+                    "Updating simulation script tabs...",
+                    0,
+                    1,
+                    0.0,
+                    False,
+                )
             self._update_simulation_script_tabs(script_bundle)
             return script
         except _SimulationPreparationCancelled:
@@ -6595,6 +7874,12 @@ class MainWindow(QMainWindow):
         return terminated
 
     def _on_sim_run(self) -> None:
+        if not getattr(self, "_sim_ready", False):
+            self._append_sim_log(
+                "[warn] Simulation not started because Check Simulation has not succeeded for the current inputs."
+            )
+            return
+
         proc = getattr(self, "_sim_process", None)
         if proc is not None and proc.state() != QProcess.NotRunning:
             self._append_sim_log("[warn] A simulation process is already running.")
@@ -6606,6 +7891,11 @@ class MainWindow(QMainWindow):
                 return
         except Exception as exc:
             self._append_sim_log(f"[error] Simulation not started because project save failed: {exc}")
+            return
+        if not getattr(self, "_sim_ready", False):
+            self._append_sim_log(
+                "[warn] Simulation not started because saving changed the checked project inputs."
+            )
             return
 
         try:
@@ -6632,6 +7922,10 @@ class MainWindow(QMainWindow):
         )
         self._sim_status_completed_jobs = 0
         self._sim_status_current_fraction = None
+        self._sim_log_progress_active = False
+        self._sim_log_progress_deferred = False
+        self._sim_log_progress_expected_steps = 0
+        self._sim_log_progress_completed_steps = 0
         self._sim_status_running = True
         MainWindow._refresh_simulation_status(self)
 
@@ -6716,7 +8010,30 @@ class MainWindow(QMainWindow):
 
     def _process_sim_stdout_line(self, line: str) -> None:
         prefix = "EM3D_SPARAM_PROGRESS:"
+        started_prefix = "EM3D_JOB_STARTED:"
         completed_prefix = "EM3D_JOB_COMPLETED:"
+        if line.startswith(started_prefix):
+            try:
+                job = json.loads(line[len(started_prefix):])
+                if not isinstance(job, dict):
+                    raise ValueError("job-start payload must be an object")
+                expected_steps = job.get("expected_solver_completions")
+                progressive_active = job.get("progressive_sparams_active")
+                if (
+                    type(expected_steps) is not int
+                    or expected_steps < 0
+                    or not isinstance(progressive_active, bool)
+                ):
+                    raise ValueError("job progress metadata is invalid")
+                self._sim_log_progress_active = expected_steps > 0
+                self._sim_log_progress_deferred = progressive_active
+                self._sim_log_progress_expected_steps = expected_steps
+                self._sim_log_progress_completed_steps = 0
+                self._sim_status_current_fraction = None
+                MainWindow._refresh_simulation_status(self)
+            except (TypeError, ValueError, KeyError) as exc:
+                self._append_sim_log(f"[warn] Invalid job-start event: {exc}")
+            return
         if line.startswith(completed_prefix):
             try:
                 job = json.loads(line[len(completed_prefix):])
@@ -6728,9 +8045,47 @@ class MainWindow(QMainWindow):
                     int(getattr(self, "_sim_status_completed_jobs", 0)) + 1,
                 )
                 self._sim_status_current_fraction = None
+                self._sim_log_progress_active = False
+                self._sim_log_progress_deferred = False
+                self._sim_log_progress_expected_steps = 0
+                self._sim_log_progress_completed_steps = 0
                 MainWindow._refresh_simulation_status(self)
             except (TypeError, ValueError, KeyError) as exc:
                 self._append_sim_log(f"[warn] Invalid completed-job event: {exc}")
+            return
+        if "] Elapsed time taken:" in line:
+            if getattr(self, "_sim_log_progress_active", False):
+                expected_steps = int(
+                    getattr(self, "_sim_log_progress_expected_steps", 0)
+                )
+                completed_steps = min(
+                    expected_steps,
+                    int(getattr(self, "_sim_log_progress_completed_steps", 0)) + 1,
+                )
+                self._sim_log_progress_completed_steps = completed_steps
+                if expected_steps > 0 and not getattr(
+                    self, "_sim_log_progress_deferred", False
+                ):
+                    self._sim_status_current_fraction = completed_steps / expected_steps
+                    MainWindow._refresh_simulation_status(self)
+            self._append_sim_log(line)
+            return
+        if "[warning] Progressive plot update skipped " in line:
+            if (
+                getattr(self, "_sim_log_progress_active", False)
+                and getattr(self, "_sim_log_progress_deferred", False)
+            ):
+                self._sim_log_progress_deferred = False
+                expected_steps = int(
+                    getattr(self, "_sim_log_progress_expected_steps", 0)
+                )
+                completed_steps = int(
+                    getattr(self, "_sim_log_progress_completed_steps", 0)
+                )
+                if expected_steps > 0:
+                    self._sim_status_current_fraction = completed_steps / expected_steps
+                    MainWindow._refresh_simulation_status(self)
+            self._append_sim_log(line)
             return
         if not line.startswith(prefix):
             self._append_sim_log(line)
@@ -6739,6 +8094,17 @@ class MainWindow(QMainWindow):
             payload = json.loads(line[len(prefix):])
             self._update_progressive_sparams_plot(payload)
         except (TypeError, ValueError, KeyError) as exc:
+            if getattr(self, "_sim_log_progress_active", False):
+                self._sim_log_progress_deferred = False
+                expected_steps = int(
+                    getattr(self, "_sim_log_progress_expected_steps", 0)
+                )
+                completed_steps = int(
+                    getattr(self, "_sim_log_progress_completed_steps", 0)
+                )
+                if expected_steps > 0:
+                    self._sim_status_current_fraction = completed_steps / expected_steps
+                    MainWindow._refresh_simulation_status(self)
             self._append_sim_log(f"[warn] Invalid progressive S-parameter update: {exc}")
 
     def _ensure_progressive_sparams_plot(self) -> bool:
@@ -7052,10 +8418,13 @@ class MainWindow(QMainWindow):
         self._close_simulation_job()
         self._sim_status_running = False
         self._sim_status_current_fraction = None
+        self._sim_log_progress_active = False
+        self._sim_log_progress_deferred = False
+        self._sim_log_progress_expected_steps = 0
+        self._sim_log_progress_completed_steps = 0
         MainWindow._refresh_simulation_status(self)
         self._append_sim_log(f"[info] Simulation finished with exit code {exit_code}.")
-        if hasattr(self, "_sim_btn_run"):
-            self._sim_btn_run.setEnabled(True)
+        MainWindow._update_simulation_run_enabled(self)
         if hasattr(self, "_sim_btn_stop"):
             self._sim_btn_stop.setEnabled(False)
 
@@ -7065,18 +8434,41 @@ class MainWindow(QMainWindow):
             return
         self._sim_status_running = False
         self._sim_status_current_fraction = None
+        self._sim_log_progress_active = False
+        self._sim_log_progress_deferred = False
+        self._sim_log_progress_expected_steps = 0
+        self._sim_log_progress_completed_steps = 0
         MainWindow._refresh_simulation_status(self)
         self._append_sim_log(f"[error] Simulation process error: {process.errorString()}")
-        if hasattr(self, "_sim_btn_run"):
-            self._sim_btn_run.setEnabled(True)
+        MainWindow._update_simulation_run_enabled(self)
         if hasattr(self, "_sim_btn_stop"):
             self._sim_btn_stop.setEnabled(False)
 
     def _append_sim_log(self, message: str) -> None:
-        if not hasattr(self, "_sim_log_view"):
+        log_view = getattr(self, "_sim_log_view", None)
+        if log_view is None or not is_valid_qobject(log_view):
+            self._sim_log_view = None
             return
         if message:
-            self._sim_log_view.appendPlainText(message)
+            scroll_bar = log_view.verticalScrollBar()
+            was_at_bottom = scroll_bar.value() >= scroll_bar.maximum()
+            previous_scroll_value = scroll_bar.value()
+            cursor = QTextCursor(log_view.document())
+            cursor.movePosition(QTextCursor.End)
+            if not log_view.document().isEmpty():
+                cursor.insertBlock()
+            char_format = QTextCharFormat()
+            if message.lstrip().lower().startswith(("[warn]", "[warning]")):
+                char_format.setForeground(QColor("#e8b45c"))
+            cursor.insertText(message, char_format)
+            if was_at_bottom:
+                scroll_bar.setValue(scroll_bar.maximum())
+            else:
+                scroll_bar.setValue(previous_scroll_value)
+
+    def _forget_sim_log_view(self, destroyed_view) -> None:
+        if getattr(self, "_sim_log_view", None) is destroyed_view:
+            self._sim_log_view = None
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� sketch
     @staticmethod
@@ -7509,6 +8901,41 @@ class MainWindow(QMainWindow):
         self._refresh_materials()
         self._info_bar.set_info(f"Revolved body created: {obj.name}")
 
+    def _on_surface_sweep_requested(
+        self,
+        profile,
+        extrusion_length,
+        direction,
+        closed,
+        from_sketch=False,
+        profile_curve=None,
+    ) -> None:
+        """Create the confirmed profile extrusion through scene/history signals."""
+        from ..scene.em_objects import SweptSurfaceObject
+
+        try:
+            obj = SweptSurfaceObject(
+                profile_pts=profile,
+                extrusion_length=extrusion_length,
+                direction=direction,
+                closed=closed,
+                material=self._draw_material,
+                profile_curve=profile_curve,
+            )
+        except (TypeError, ValueError) as exc:
+            self._info_bar.set_info(f"Unable to create Surface Extrusion: {exc}")
+            return
+        if from_sketch:
+            obj.sketch_definition = self._viewport.sketch_definition()
+        self._viewport.scene.add_object(obj)
+        self._viewport.scene.select(obj)
+        self._viewport.object_selected.emit(obj)
+        self._viewport.selection_changed.emit([obj])
+        self._viewport.scene_changed.emit()
+        self._viewport._render()
+        self._refresh_materials()
+        self._info_bar.set_info(f"Surface Extrusion created: {obj.name}")
+
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� reference plane
     def _open_reference_plane_dialog(self, start_sketch: bool = False) -> None:
         vp = self._viewport
@@ -7772,9 +9199,28 @@ class MainWindow(QMainWindow):
         solver = str(settings.value("simulation/solver", self._sim_solver)).strip().upper()
         if solver in _EMERGE_SOLVERS:
             self._sim_solver = solver
+        cudss_precision = str(
+            settings.value(
+                "simulation/cudss_precision",
+                "auto",
+            )
+        ).strip().lower()
+        self._sim_cudss_precision = (
+            cudss_precision
+            if cudss_precision in {"auto", "single", "double"}
+            else "auto"
+        )
 
         try:
-            self._sim_parallel_enabled = bool(int(settings.value("simulation/parallel_enabled", 1)))
+            self._sim_parallel_enabled = bool(int(settings.value("simulation/parallel_enabled", 0)))
+        except Exception:
+            pass
+
+        try:
+            self._sim_worker_processes = min(
+                256,
+                max(1, int(settings.value("simulation/worker_processes", 2))),
+            )
         except Exception:
             pass
 
@@ -7793,16 +9239,41 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
+        self._mesh_algorithm = normalize_mesh_algorithm(
+            settings.value("mesh/algorithm", "DELAUNAY")
+        )
+
         try:
             self._curved_boundary_resolution = max(3, int(settings.value("mesh/curved_boundary_resolution", 20)))
         except Exception:
             pass
 
         try:
+            self._curved_boundary_meshing_enabled = bool(
+                int(settings.value("mesh/curved_boundary_meshing_enabled", 1))
+            )
+        except (TypeError, ValueError):
+            self._curved_boundary_meshing_enabled = True
+
+        try:
             self._refinement_boundary_size_mm = max(1e-6, float(settings.value("mesh/refinement_boundary_size_mm", 0.25)))
             self._refinement_face_size_mm = max(1e-6, float(settings.value("mesh/refinement_face_size_mm", 0.1)))
             self._refinement_growth_rate = max(1.001, float(settings.value("mesh/refinement_growth_rate", 3.0)))
             self._refinement_max_size_mm = max(0.0, float(settings.value("mesh/refinement_max_size_mm", 0.0)))
+        except Exception:
+            pass
+
+        try:
+            self._save_mesh_after_sweep = bool(
+                int(settings.value("mesh/save_after_sweep", 0))
+            )
+        except Exception:
+            pass
+
+        try:
+            self._allow_oversized_mesh = bool(
+                int(settings.value("mesh/allow_oversized_mesh", 0))
+            )
         except Exception:
             pass
 
@@ -7846,15 +9317,27 @@ class MainWindow(QMainWindow):
 
         # Save simulation & mesh settings
         settings.setValue("simulation/solver", self._sim_solver)
+        settings.setValue("simulation/cudss_precision", self._sim_cudss_precision)
         settings.setValue("simulation/parallel_enabled", int(self._sim_parallel_enabled))
+        settings.setValue("simulation/worker_processes", int(self._sim_worker_processes))
         settings.setValue("simulation/pardiso_threads", int(self._sim_pardiso_threads))
         settings.setValue("simulation/acc_threads", int(self._sim_acc_threads))
         settings.setValue("mesh/resolution", float(self._mesh_resolution))
+        settings.setValue(
+            "mesh/algorithm",
+            normalize_mesh_algorithm(getattr(self, "_mesh_algorithm", "DELAUNAY")),
+        )
+        settings.setValue(
+            "mesh/curved_boundary_meshing_enabled",
+            int(self._curved_boundary_meshing_enabled),
+        )
         settings.setValue("mesh/curved_boundary_resolution", int(self._curved_boundary_resolution))
         settings.setValue("mesh/refinement_boundary_size_mm", float(self._refinement_boundary_size_mm))
         settings.setValue("mesh/refinement_face_size_mm", float(self._refinement_face_size_mm))
         settings.setValue("mesh/refinement_growth_rate", float(self._refinement_growth_rate))
         settings.setValue("mesh/refinement_max_size_mm", float(self._refinement_max_size_mm))
+        settings.setValue("mesh/save_after_sweep", int(self._save_mesh_after_sweep))
+        settings.setValue("mesh/allow_oversized_mesh", int(self._allow_oversized_mesh))
         settings.setValue("simulation/plot_sparams_after_sim", int(self._sim_plot_sparams_after_sim))
         settings.setValue("simulation/export_sparams_after_sim", int(self._sim_export_sparams_after_sim))
         settings.setValue("utility/export_full_scene_step", int(self._export_full_scene_step))
@@ -7867,6 +9350,32 @@ class MainWindow(QMainWindow):
         dlg = getattr(self, "_settings_dlg", None)
         if dlg is None:
             return
+        project_settings = self._project_tree.get_settings()
+        runtime_settings = project_settings.get("runtime", {})
+        project_solver = str(
+            runtime_settings.get("solver", self._sim_solver)
+        ).strip().upper() if isinstance(runtime_settings, dict) else self._sim_solver
+        if project_solver not in _EMERGE_SOLVERS:
+            project_solver = self._sim_solver
+        project_cudss_precision = (
+            runtime_settings.get(
+                "cudss_precision",
+                getattr(self, "_sim_cudss_precision", "auto"),
+            )
+            if isinstance(runtime_settings, dict)
+            else getattr(self, "_sim_cudss_precision", "auto")
+        )
+        project_mesh_cfg = project_settings.get("mesh", {})
+        default_mesh_algorithm = getattr(
+            self,
+            "_mesh_algorithm",
+            DEFAULT_MESH_ALGORITHM,
+        )
+        project_mesh_algorithm = normalize_mesh_algorithm(
+            project_mesh_cfg.get("algorithm", default_mesh_algorithm)
+            if isinstance(project_mesh_cfg, dict)
+            else default_mesh_algorithm
+        )
         dlg.set_values(
             units=self._units,
             decimal_separator=self._decimal_separator,
@@ -7876,16 +9385,26 @@ class MainWindow(QMainWindow):
             plane_triad_size=self._plane_triad_size,
             selection_color=self._selection_color,
             locale=self._ui_locale,
-            solver=self._sim_solver,
+            solver=project_solver,
+            cudss_precision=project_cudss_precision,
             parallel_enabled=self._sim_parallel_enabled,
+            worker_processes=self._sim_worker_processes,
             pardiso_threads=self._sim_pardiso_threads,
             acc_threads=self._sim_acc_threads,
             mesh_resolution=self._mesh_resolution,
+            mesh_algorithm=project_mesh_algorithm,
+            curved_boundary_meshing_enabled=getattr(
+                self,
+                "_curved_boundary_meshing_enabled",
+                True,
+            ),
             curved_boundary_resolution=self._curved_boundary_resolution,
             refinement_boundary_size_mm=self._refinement_boundary_size_mm,
             refinement_face_size_mm=self._refinement_face_size_mm,
             refinement_growth_rate=self._refinement_growth_rate,
             refinement_max_size_mm=self._refinement_max_size_mm,
+            save_mesh_after_sweep=self._save_mesh_after_sweep,
+            allow_oversized_mesh=self._allow_oversized_mesh,
             plot_sparams_after_sim=self._sim_plot_sparams_after_sim,
             export_sparams_after_sim=self._sim_export_sparams_after_sim,
             export_full_scene_step=self._export_full_scene_step,
@@ -8003,9 +9522,31 @@ class MainWindow(QMainWindow):
 
         old_units = self._units
         old_locale = self._ui_locale
-        old_mesh_resolution = self._mesh_resolution
-        old_curved_boundary_resolution = self._curved_boundary_resolution
         old_export_full_scene_step = self._export_full_scene_step
+        old_simulation_settings = (
+            self._sim_solver,
+            getattr(self, "_sim_cudss_precision", "auto"),
+            self._sim_parallel_enabled,
+            self._sim_worker_processes,
+            self._sim_pardiso_threads,
+            self._sim_acc_threads,
+            self._mesh_resolution,
+            getattr(self, "_mesh_algorithm", "DELAUNAY"),
+            self._curved_boundary_meshing_enabled,
+            self._curved_boundary_resolution,
+            self._refinement_boundary_size_mm,
+            self._refinement_face_size_mm,
+            self._refinement_growth_rate,
+            self._refinement_max_size_mm,
+            self._save_mesh_after_sweep,
+            self._allow_oversized_mesh,
+            self._sim_plot_sparams_after_sim,
+            self._sim_export_sparams_after_sim,
+            self._export_full_scene_step,
+            self._boolean_decimation_enabled,
+            self._workspace_path,
+            self._global_material_db_path,
+        )
 
         if units != old_units:
             self._convert_scene_units(old_units, units)
@@ -8029,15 +9570,46 @@ class MainWindow(QMainWindow):
         solver = str(values.get("solver", self._sim_solver)).strip().upper()
         if solver in _EMERGE_SOLVERS:
             self._sim_solver = solver
+        cudss_precision = str(
+            values.get(
+                "cudss_precision",
+                getattr(self, "_sim_cudss_precision", "auto"),
+            )
+        ).strip().lower()
+        self._sim_cudss_precision = (
+            cudss_precision
+            if cudss_precision in {"auto", "single", "double"}
+            else "auto"
+        )
         self._sim_parallel_enabled = bool(values.get("parallel_enabled", self._sim_parallel_enabled))
+        self._sim_worker_processes = max(
+            1,
+            min(256, int(values.get("worker_processes", self._sim_worker_processes))),
+        )
         self._sim_pardiso_threads = max(1, int(values.get("pardiso_threads", self._sim_pardiso_threads)))
         self._sim_acc_threads = max(1, int(values.get("acc_threads", self._sim_acc_threads)))
         self._mesh_resolution = max(0.01, min(1.0, float(values.get("mesh_resolution", self._mesh_resolution))))
+        self._mesh_algorithm = normalize_mesh_algorithm(
+            values.get("mesh_algorithm", getattr(self, "_mesh_algorithm", "DELAUNAY"))
+        )
+        self._project_tree.set_mesh_algorithm(self._mesh_algorithm)
+        self._curved_boundary_meshing_enabled = bool(
+            values.get(
+                "curved_boundary_meshing_enabled",
+                self._curved_boundary_meshing_enabled,
+            )
+        )
         self._curved_boundary_resolution = max(3, int(values.get("curved_boundary_resolution", self._curved_boundary_resolution)))
         self._refinement_boundary_size_mm = max(1e-6, float(values.get("refinement_boundary_size_mm", self._refinement_boundary_size_mm)))
         self._refinement_face_size_mm = max(1e-6, float(values.get("refinement_face_size_mm", self._refinement_face_size_mm)))
         self._refinement_growth_rate = max(1.001, float(values.get("refinement_growth_rate", self._refinement_growth_rate)))
         self._refinement_max_size_mm = max(0.0, float(values.get("refinement_max_size_mm", self._refinement_max_size_mm)))
+        self._save_mesh_after_sweep = bool(
+            values.get("save_mesh_after_sweep", self._save_mesh_after_sweep)
+        )
+        self._allow_oversized_mesh = bool(
+            values.get("allow_oversized_mesh", self._allow_oversized_mesh)
+        )
         self._sim_plot_sparams_after_sim = bool(values.get("plot_sparams_after_sim", self._sim_plot_sparams_after_sim))
         self._sim_export_sparams_after_sim = bool(values.get("export_sparams_after_sim", self._sim_export_sparams_after_sim))
         self._export_full_scene_step = bool(values.get("export_full_scene_step", self._export_full_scene_step))
@@ -8052,16 +9624,39 @@ class MainWindow(QMainWindow):
             self._sim_full_scene_step_dirty = True
         self._project_tree.set_runtime_settings({
             "solver": self._sim_solver,
+            "cudss_precision": self._sim_cudss_precision,
             "parallel_enabled": self._sim_parallel_enabled,
+            "worker_processes": self._sim_worker_processes,
             "pardiso_threads": self._sim_pardiso_threads,
             "acc_threads": self._sim_acc_threads,
             "plot_sparams_after_sim": self._sim_plot_sparams_after_sim,
             "export_sparams_after_sim": self._sim_export_sparams_after_sim,
         })
-        if (
-            self._mesh_resolution != old_mesh_resolution
-            or self._curved_boundary_resolution != old_curved_boundary_resolution
-        ):
+        current_simulation_settings = (
+            self._sim_solver,
+            self._sim_cudss_precision,
+            self._sim_parallel_enabled,
+            self._sim_worker_processes,
+            self._sim_pardiso_threads,
+            self._sim_acc_threads,
+            self._mesh_resolution,
+            self._mesh_algorithm,
+            self._curved_boundary_meshing_enabled,
+            self._curved_boundary_resolution,
+            self._refinement_boundary_size_mm,
+            self._refinement_face_size_mm,
+            self._refinement_growth_rate,
+            self._refinement_max_size_mm,
+            self._save_mesh_after_sweep,
+            self._allow_oversized_mesh,
+            self._sim_plot_sparams_after_sim,
+            self._sim_export_sparams_after_sim,
+            self._export_full_scene_step,
+            self._boolean_decimation_enabled,
+            self._workspace_path,
+            self._global_material_db_path,
+        )
+        if current_simulation_settings != old_simulation_settings:
             self._mark_simulation_dirty(script=True)
 
         if selection_color != self._selection_color:
@@ -8138,6 +9733,7 @@ class MainWindow(QMainWindow):
             material_priorities = {}
         self._materials.refresh(
             by_mat,
+            groups=scene.object_groups,
             planes=scene.reference_planes,
             active_plane=scene.active_plane,
             plane_triad_visible=self._viewport.is_plane_triad_visible(),
@@ -8222,16 +9818,8 @@ class MainWindow(QMainWindow):
         return candidates
 
     def _resolve_emerge_simulation_ctor(self):
-        # EMERGE API differs across versions/distributions.
-        # Some builds require importing emerge_iron before emerge symbols are exposed.
         import importlib
         import pkgutil
-
-        for bootstrap in ("emerge_iron",):
-            try:
-                importlib.import_module(bootstrap)
-            except Exception:
-                pass
 
         self._import_installed_emerge()
 
@@ -8343,6 +9931,7 @@ class MainWindow(QMainWindow):
         results_dir: Path | None = None,
         *,
         allow_irregular: bool = False,
+        allow_field_only: bool = False,
     ):
         sim_ctor = self._resolve_emerge_simulation_ctor()
 
@@ -8374,6 +9963,16 @@ class MainWindow(QMainWindow):
                 mw_data = getattr(getattr(sim, "data", None), "mw", None)
                 if mw_data is None:
                     raise RuntimeError("Loaded simulation has no microwave data.")
+                MainWindow._restore_background_field_maps(mw_data)
+                if allow_field_only:
+                    field_data = getattr(mw_data, "field", None)
+                    field_count = getattr(field_data, "n", None)
+                    if field_count is None and field_data is not None:
+                        entries = getattr(field_data, "_data_entries", None)
+                        field_count = len(entries) if entries is not None else 0
+                    if not field_data or not field_count:
+                        raise RuntimeError("Loaded simulation has no saved field data.")
+                    return sim, None, simdata
                 scalar = getattr(mw_data, "scalar", None)
                 try:
                     grid = getattr(scalar, "grid", None)
@@ -8394,6 +9993,44 @@ class MainWindow(QMainWindow):
         raise RuntimeError(
             f"No simdata.emerge found for simulation '{simulation_name}' in {self._simulation_bundle_dir()}"
         )
+
+    @staticmethod
+    def _restore_background_field_maps(mw_data) -> None:
+        """Re-key saved scattered-field maps with their BackgroundField objects."""
+        field_data = getattr(mw_data, "field", None)
+        entries = getattr(field_data, "_data_entries", ())
+        key_prefix = "__em3d_modeler_background_field_key__:"
+
+        for mw_field in entries:
+            background_fields = getattr(mw_field, "background_fields", ())
+            if not background_fields:
+                continue
+
+            for attribute in ("excitation", "_fields"):
+                original = getattr(mw_field, attribute, None)
+                if not isinstance(original, dict):
+                    continue
+                restored = {}
+                changed = False
+                for key, value in original.items():
+                    if isinstance(key, str) and key.startswith(key_prefix):
+                        encoded_index = key[len(key_prefix):].split(":", 1)[0]
+                        try:
+                            background_index = int(encoded_index)
+                        except ValueError:
+                            background_index = -1
+                        if 0 <= background_index < len(background_fields):
+                            key = background_fields[background_index]
+                            changed = True
+                    restored[key] = value
+                if changed:
+                    setattr(mw_field, attribute, restored)
+
+            excitation = getattr(mw_field, "excitation", None)
+            if not excitation:
+                restore_vector = getattr(mw_field, "set_field_vector", None)
+                if callable(restore_vector):
+                    restore_vector()
 
     def _grid_port_numbers(self, grid) -> list[int]:
         port_map = getattr(grid, "_portmap", None)
@@ -8494,19 +10131,12 @@ class MainWindow(QMainWindow):
             frequencies[int(np.argmin(np.abs(frequencies - requested_frequency)))]
         )
         field_entry = field_data.find(freq=selected_frequency)
-        geometries = list(loaded_sim.all_geos())
-        boundary_geometries = [
+        faces = self._farfield_integration_faces(loaded_sim, plot_params)
+        geometries = [
             geometry
-            for geometry in geometries
+            for geometry in loaded_sim.all_geos()
             if callable(getattr(geometry, "boundary", None))
         ]
-        if not boundary_geometries:
-            raise RuntimeError(
-                "Far-field plotting requires at least one geometry with boundary faces."
-            )
-        faces = boundary_geometries[0].boundary()
-        for geometry in boundary_geometries[1:]:
-            faces = faces + geometry.boundary()
         farfield = field_entry.farfield_3d(faces)
         display = getattr(loaded_sim, "display", None)
         if display is None:
@@ -8550,7 +10180,7 @@ class MainWindow(QMainWindow):
             component="normE",
             quantity="abs",
             dB=True,
-            dBfloor=-40,
+            dBfloor=self._farfield_pattern_db_floor(farfield),
             rmax=rmax,
             opacity=0.75,
         )
@@ -8559,12 +10189,283 @@ class MainWindow(QMainWindow):
         display.show()
         return selected_frequency
 
+    def _show_eigenmode_display(
+        self, loaded_sim, mode_number: int, plot_params: dict | None = None
+    ) -> float:
+        """Display one saved eigenmode using the selected EMERGE field settings."""
+        import numpy as np
+
+        settings = plot_params if isinstance(plot_params, dict) else {}
+        component = str(settings.get("field_component", "Ez")).strip()
+        metric = str(settings.get("field_metric", "real")).strip().lower()
+        plane = str(settings.get("plane", "XY")).strip().upper()
+        level = str(settings.get("eigen_field_level", "basic")).strip().lower()
+        components = {"Ex", "Ey", "Ez", "Hx", "Hy", "Hz", "normE", "normH"}
+        metrics = {"real", "imag", "abs"}
+        plane_axes = {
+            "XY": (2, "z", (0, 1)),
+            "XZ": (1, "y", (0, 2)),
+            "YZ": (0, "x", (1, 2)),
+        }
+        if component not in components:
+            raise ValueError(f"Unsupported field component: {component!r}.")
+        if metric not in metrics:
+            raise ValueError(f"Unsupported field quantity: {metric!r}.")
+        if plane not in plane_axes:
+            raise ValueError(f"Unsupported cut plane: {plane!r}.")
+        if level not in {"basic", "advanced"}:
+            raise ValueError(f"Unsupported Eigen field setting level: {level!r}.")
+
+        mw_data = getattr(getattr(loaded_sim, "data", None), "mw", None)
+        field_data = getattr(mw_data, "field", None)
+        if field_data is None:
+            raise RuntimeError("The simulation has no saved eigenmode fields.")
+        field_count = getattr(field_data, "n", None)
+        if field_count is None:
+            try:
+                field_count = len(field_data)
+            except TypeError:
+                field_count = 0
+        if mode_number < 1 or mode_number > int(field_count):
+            raise ValueError(
+                f"Eigenmode {mode_number} is unavailable; the saved results contain "
+                f"{int(field_count)} mode(s)."
+            )
+        field = field_data[mode_number - 1]
+        bounds = getattr(getattr(field, "basis", None), "bounds", None)
+        if bounds is None or len(bounds) < 3:
+            raise RuntimeError("The selected eigenmode has no spatial bounds.")
+        x_min, x_max = map(float, bounds[0])
+        y_min, y_max = map(float, bounds[1])
+        z_min, z_max = map(float, bounds[2])
+        spans = (x_max - x_min, y_max - y_min, z_max - z_min)
+        if not all(np.isfinite(value) and value > 0.0 for value in spans):
+            raise RuntimeError("The selected eigenmode has invalid spatial bounds.")
+
+        normal_axis, coordinate_key, in_plane_axes = plane_axes[plane]
+        normal_min, normal_max = map(float, bounds[normal_axis])
+        plane_spans = (spans[in_plane_axes[0]], spans[in_plane_axes[1]])
+        max_plane_span = max(plane_spans)
+        if level == "advanced":
+            raw_positions = settings.get("cut_positions", [0.25, 0.5, 0.75])
+            if not isinstance(raw_positions, (list, tuple)) or not raw_positions:
+                raise ValueError("Advanced cut positions must contain at least one value.")
+            if len(raw_positions) > 24:
+                raise ValueError("A maximum of 24 cut positions is supported.")
+            try:
+                cut_fractions = [float(value) for value in raw_positions]
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Cut positions must be numeric fractions from 0 to 1.") from exc
+            if any(
+                not np.isfinite(value) or not 0.0 <= value <= 1.0
+                for value in cut_fractions
+            ) or len(set(cut_fractions)) != len(cut_fractions):
+                raise ValueError(
+                    "Cut positions must be unique fractions from 0 to 1."
+                )
+            try:
+                spacing_mm = float(settings.get("cut_spacing_mm", 0.0))
+                geometry_opacity = float(settings.get("geometry_opacity", 0.1))
+            except (TypeError, ValueError, OverflowError) as exc:
+                raise ValueError("Advanced spacing and opacity must be numeric.") from exc
+            colormap = str(settings.get("colormap", "rainbow")).strip()
+            if not np.isfinite(spacing_mm) or spacing_mm < 0.0:
+                raise ValueError("Cut spacing must be finite and non-negative.")
+            if (
+                not np.isfinite(geometry_opacity)
+                or not 0.0 <= geometry_opacity <= 1.0
+            ):
+                raise ValueError("Geometry opacity must be between 0 and 1.")
+            if colormap not in {"rainbow", "coolwarm", "gray"}:
+                raise ValueError(f"Unsupported field colormap: {colormap!r}.")
+            cut_spacing_m = spacing_mm / 1000.0 if spacing_mm > 0.0 else 0.0
+        else:
+            cut_fractions = [0.25, 0.5, 0.75]
+            geometry_opacity = 0.1
+            colormap = "rainbow"
+            cut_spacing_m = 0.0
+
+        if cut_spacing_m == 0.0:
+            cut_spacing_m = max(
+                min(0.0005, max_plane_span / 30.0),
+                max_plane_span / 300.0,
+            )
+        if cut_spacing_m > min(plane_spans) / 2.0:
+            raise ValueError(
+                "Cut spacing is too coarse for the selected plane; reduce it or use automatic spacing."
+            )
+        estimated_samples = (
+            int(plane_spans[0] / cut_spacing_m + 1)
+            * int(plane_spans[1] / cut_spacing_m + 1)
+            * len(cut_fractions)
+        )
+        if estimated_samples > 2_000_000:
+            raise ValueError(
+                "The selected cut spacing and positions would generate too many field samples; "
+                "use a coarser spacing."
+            )
+        cut_positions = [
+            normal_min + (normal_max - normal_min) * fraction
+            for fraction in cut_fractions
+        ]
+        display = getattr(loaded_sim, "display", None)
+        if display is None:
+            raise RuntimeError("The EMERGE field renderer is unavailable.")
+        if not all(
+            callable(getattr(display, method_name, None))
+            for method_name in ("populate", "add_field", "show")
+        ):
+            raise RuntimeError("The EMERGE field renderer lacks required plotting methods.")
+
+        displays = getattr(self, "_farfield_displays", None)
+        if displays is None:
+            displays = []
+            self._farfield_displays = displays
+        displays.append(display)
+        try:
+            display.populate(opacity=geometry_opacity)
+            for position in cut_positions:
+                cut = field.cutplane(
+                    ds=cut_spacing_m,
+                    **{coordinate_key: position},
+                )
+                plotted_field = cut.scalar(component, metric)
+                if component in {"normE", "normH"}:
+                    vector = "E" if component == "normE" else "H"
+                    raw_values = np.sqrt(
+                        sum(
+                            np.abs(np.asarray(getattr(cut, f"{vector}{axis}"))) ** 2
+                            for axis in "xyz"
+                        )
+                    )
+                else:
+                    raw_values = np.asarray(getattr(cut, component))
+                if metric == "real":
+                    plotted_field.F = raw_values.real
+                elif metric == "imag":
+                    plotted_field.F = raw_values.imag
+                else:
+                    plotted_field.F = np.abs(raw_values)
+                display.add_field(plotted_field, cmap=colormap)
+            display.show()
+        except Exception as exc:
+            displays.remove(display)
+            try:
+                plotter = getattr(display, "_plot", None)
+                if plotter is not None:
+                    plotter.close()
+                display.clean()
+            except Exception as cleanup_error:
+                raise RuntimeError(
+                    f"Eigenmode plot failed ({exc}); display cleanup also failed "
+                    f"({cleanup_error})."
+                ) from exc
+            raise
+
+        return float(np.real(field.freq))
+
+    def _show_scattered_field_3d_display(
+        self, loaded_sim, plot_params: dict
+    ) -> float:
+        """Display saved relative scattered E fields in EMERGE's 3D viewer."""
+        import copy
+        import numpy as np
+
+        mw_data = getattr(getattr(loaded_sim, "data", None), "mw", None)
+        field_data = getattr(mw_data, "field", None)
+        entries = getattr(field_data, "_data_entries", None)
+        if entries is None:
+            try:
+                entries = list(field_data) if field_data is not None else []
+            except TypeError:
+                entries = []
+        if not entries:
+            raise RuntimeError("The simulation has no saved scattered-field data.")
+
+        saved_frequencies = []
+        valid_entries = []
+        for entry in entries:
+            try:
+                frequency = float(np.real(entry.freq))
+            except (AttributeError, TypeError, ValueError, OverflowError):
+                continue
+            if np.isfinite(frequency) and frequency > 0.0:
+                saved_frequencies.append(frequency)
+                valid_entries.append(entry)
+        if not saved_frequencies:
+            raise RuntimeError(
+                "Saved scattered-field data has no valid frequency information."
+            )
+
+        requested_frequency_ghz = float(
+            plot_params.get("frequency_GHz", 0.0) or 0.0
+        )
+        requested_frequency = requested_frequency_ghz * 1e9
+        if not np.isfinite(requested_frequency) or requested_frequency <= 0.0:
+            requested_frequency = (
+                min(saved_frequencies) + max(saved_frequencies)
+            ) / 2.0
+        selected_frequency = min(
+            saved_frequencies,
+            key=lambda frequency: abs(frequency - requested_frequency),
+        )
+
+        find_field = getattr(field_data, "find", None)
+        if callable(find_field):
+            field_entry = find_field(freq=selected_frequency)
+        else:
+            field_entry = valid_entries[saved_frequencies.index(selected_frequency)]
+        # EMERGE's ``relative`` property changes its receiver, so never apply it
+        # to the saved object owned by the loaded simulation.
+        relative = copy.copy(field_entry).relative
+        display = getattr(loaded_sim, "display", None)
+        if display is None:
+            raise RuntimeError("The EMERGE scattered-field renderer is unavailable.")
+        if not all(
+            callable(getattr(display, method_name, None))
+            for method_name in ("populate", "add_field", "show")
+        ):
+            raise RuntimeError(
+                "The EMERGE scattered-field renderer lacks required plotting methods."
+            )
+
+        displays = getattr(self, "_farfield_displays", None)
+        if displays is None:
+            displays = []
+            self._farfield_displays = displays
+        displays.append(display)
+        try:
+            display.populate()
+            display.add_field(relative.grid(N=1000).vector("E"))
+            display.add_field(
+                relative.grid(N=10_000).scalar("Ey", "real"),
+                symmetrize=True,
+            )
+            display.show()
+        except Exception as exc:
+            displays.remove(display)
+            try:
+                plotter = getattr(display, "_plot", None)
+                if plotter is not None:
+                    plotter.close()
+                display.clean()
+            except Exception as cleanup_error:
+                raise RuntimeError(
+                    f"Scattered-field plot failed ({exc}); display cleanup also "
+                    f"failed ({cleanup_error})."
+                ) from exc
+            raise
+
+        return selected_frequency
+
     def _on_output_plot_requested(
         self, payload: dict, *, results_dir: Path | None = None
     ) -> None:
         name = str(payload.get("name", "Output")).strip() or "Output"
         sim_name = str(payload.get("simulation", "")).strip()
         plot_type = str(payload.get("plot_type", "plot_sp")).strip() or "plot_sp"
+        if plot_type == "plot_eigenmode":
+            plot_type = "eigen_field"
         plot_params = payload.get("params", {}) if isinstance(payload.get("params", {}), dict) else {}
 
         if not sim_name:
@@ -8636,15 +10537,33 @@ class MainWindow(QMainWindow):
             ),
             {},
         )
+        is_eigenmode_plot = plot_type == "eigen_field"
+        is_scattered_field_plot = plot_type == "plot_sf_3d"
+        if is_eigenmode_plot and str(
+            simulation_config.get("type", "")
+        ).strip().lower() != "eigenmode":
+            message = "Eigenmode field plots require an Eigenmode simulation."
+            QMessageBox.warning(self, "Output", message)
+            self._append_sim_log(f"[warn] Output '{name}' failed: {message}")
+            return
         is_parametric_sparameter = (
             str(simulation_config.get("type", "")).strip().lower() == "parametric"
             and plot_type in {"plot_sp", "plot_vswr", "smith", "plot"}
         )
+        load_options = {
+            "results_dir": results_dir,
+            "allow_irregular": (
+                is_parametric_sparameter
+                or is_eigenmode_plot
+                or is_scattered_field_plot
+            ),
+        }
+        if is_eigenmode_plot or is_scattered_field_plot:
+            load_options["allow_field_only"] = True
         try:
             loaded_sim, grid, simdata_path = self._load_sim_grid_from_results(
                 sim_name,
-                results_dir=results_dir,
-                allow_irregular=is_parametric_sparameter,
+                **load_options,
             )
         except Exception as exc:
             result_dirs = (
@@ -8653,6 +10572,18 @@ class MainWindow(QMainWindow):
                 else self._candidate_results_dirs_for_sim(sim_name)
             )
             if not any(self._simdata_file_in_dir(path) is not None for path in result_dirs):
+                if is_eigenmode_plot or is_scattered_field_plot:
+                    output_kind = (
+                        "scattered-field" if is_scattered_field_plot else "Eigenmode"
+                    )
+                    message = (
+                        f"No saved EMERGE results were found for '{sim_name}'. "
+                        f"The {output_kind} simulation must complete successfully before "
+                        f"it can be plotted. Check the simulation log. Details: {exc}"
+                    )
+                    QMessageBox.warning(self, "Output", message)
+                    self._append_sim_log(f"[warn] Output '{name}' failed: {message}")
+                    return
                 chart_key = f"{sim_name}::{name}"
                 self._show_chart(
                     chart_key,
@@ -8677,6 +10608,57 @@ class MainWindow(QMainWindow):
             return
 
         import numpy as np
+
+        if is_eigenmode_plot:
+            mode_number = max(1, int(plot_params.get("eigenmode_number", 1)))
+            try:
+                mode_frequency_hz = self._show_eigenmode_display(
+                    loaded_sim,
+                    mode_number,
+                    plot_params,
+                )
+            except (RuntimeError, ValueError, TypeError, IndexError, AttributeError) as exc:
+                QMessageBox.warning(
+                    self,
+                    "Eigenmode output",
+                    f"Could not plot eigenmode {mode_number}: {exc}",
+                )
+                self._append_sim_log(
+                    f"[warn] Eigenmode output '{name}' could not be plotted: {exc}"
+                )
+                return
+            mode_frequency_ghz = mode_frequency_hz / 1e9
+            self._info_bar.set_info(
+                f"Eigenmode {mode_number} plotted at {mode_frequency_ghz:.9g} GHz"
+            )
+            self._append_sim_log(
+                f"[info] Eigenmode {mode_number} plotted at "
+                f"{mode_frequency_ghz:.9g} GHz from {simdata_path}"
+            )
+            return
+
+        if is_scattered_field_plot:
+            try:
+                selected_frequency = self._show_scattered_field_3d_display(
+                    loaded_sim, plot_params
+                )
+            except Exception as exc:
+                message = f"Could not plot the 3D scattered field: {exc}"
+                QMessageBox.warning(self, "Scattered-field output", message)
+                self._append_sim_log(
+                    f"[warn] Scattered-field output '{name}' could not be plotted: {exc}"
+                )
+                return
+            selected_frequency_ghz = selected_frequency / 1e9
+            self._info_bar.set_info(
+                f"Output plotted: {name} ({plot_type}) at "
+                f"{selected_frequency_ghz:.9g} GHz from {simdata_path}"
+            )
+            self._append_sim_log(
+                f"[info] Output plotted: {name} ({plot_type}) at "
+                f"{selected_frequency_ghz:.9g} GHz from {simdata_path}"
+            )
+            return
 
         if is_parametric_sparameter and hasattr(grid, "_data_entries"):
             from .chart_data import make_parametric_sparameter_plot_data
@@ -8755,18 +10737,9 @@ class MainWindow(QMainWindow):
                         frequencies[int(np.argmin(np.abs(frequencies - requested_frequency)))]
                     )
                     field_entry = field_data.find(freq=selected_frequency)
-                    boundary_geometries = [
-                        geometry
-                        for geometry in loaded_sim.all_geos()
-                        if callable(getattr(geometry, "boundary", None))
-                    ]
-                    if not boundary_geometries:
-                        raise RuntimeError(
-                            "Far-field plotting requires at least one geometry with boundary faces."
-                        )
-                    faces = boundary_geometries[0].boundary()
-                    for geometry in boundary_geometries[1:]:
-                        faces = faces + geometry.boundary()
+                    faces = self._farfield_integration_faces(
+                        loaded_sim, plot_params
+                    )
                     plane_axes = {
                         "XY": ((1.0, 0.0, 0.0), (0.0, 0.0, 1.0)),
                         "XZ": ((1.0, 0.0, 0.0), (0.0, 1.0, 0.0)),
@@ -9010,6 +10983,7 @@ class MainWindow(QMainWindow):
 
     # ��������������������������������������������������������������������������������������������������������������������������������������������������������� project file
     def _new_project(self) -> None:
+        self._exit_isolate(close_window=True)
         self._close_simulation_panel()
         self._close_all_plot_windows()
         self._close_floating_dialogs()
@@ -9031,8 +11005,9 @@ class MainWindow(QMainWindow):
         self._project_tree.reset_settings()
         self._sync_project_variable_names()
         self._project_tree.set_runtime_settings({
-            "solver": self._sim_solver,
             "parallel_enabled": self._sim_parallel_enabled,
+            "cudss_precision": getattr(self, "_sim_cudss_precision", "auto"),
+            "worker_processes": self._sim_worker_processes,
             "pardiso_threads": self._sim_pardiso_threads,
             "acc_threads": self._sim_acc_threads,
             "plot_sparams_after_sim": self._sim_plot_sparams_after_sim,
@@ -9062,6 +11037,7 @@ class MainWindow(QMainWindow):
         simulation_window.deleteLater()
         self._sim_subwindow = None
         self._sim_dlg = None
+        self._sim_log_view = None
         self._rebuild_window_menu()
 
     def _close_floating_dialogs(self) -> None:
@@ -9079,8 +11055,7 @@ class MainWindow(QMainWindow):
             setattr(self, attr, None)
 
     def _close_farfield_displays(self) -> None:
-        """Close any external (pyvista) far-field viewer windows that were
-        opened from the far-field 3D plot action."""
+        """Close external EMERGE result viewers opened from output plots."""
         for display in list(getattr(self, "_farfield_displays", [])):
             try:
                 plotter = getattr(display, "_plot", None)
@@ -9131,6 +11106,7 @@ class MainWindow(QMainWindow):
     def _load_project_path(self, path: str) -> None:
         try:
             data = ProjectFile.load(path)
+            self._exit_isolate(close_window=True)
             loaded_name = str(data.get("project_name", "")).strip()
             self._project_name = loaded_name if loaded_name and loaded_name != "Untitled" else Path(path).stem
             self._project_path = str(Path(path).expanduser().resolve())
@@ -9144,7 +11120,9 @@ class MainWindow(QMainWindow):
                 project_settings = dict(project_settings)
                 project_settings["runtime"] = {
                     "solver": self._sim_solver,
+                    "cudss_precision": self._sim_cudss_precision,
                     "parallel_enabled": self._sim_parallel_enabled,
+                    "worker_processes": self._sim_worker_processes,
                     "pardiso_threads": self._sim_pardiso_threads,
                     "acc_threads": self._sim_acc_threads,
                     "plot_sparams_after_sim": self._sim_plot_sparams_after_sim,
@@ -9155,7 +11133,22 @@ class MainWindow(QMainWindow):
             solver = str(runtime.get("solver", self._sim_solver)).strip().upper()
             if solver in _EMERGE_SOLVERS:
                 self._sim_solver = solver
+            cudss_precision = str(
+                runtime.get(
+                    "cudss_precision",
+                    getattr(self, "_sim_cudss_precision", "auto"),
+                )
+            ).strip().lower()
+            self._sim_cudss_precision = (
+                cudss_precision
+                if cudss_precision in {"auto", "single", "double"}
+                else "auto"
+            )
             self._sim_parallel_enabled = bool(runtime.get("parallel_enabled", self._sim_parallel_enabled))
+            self._sim_worker_processes = max(
+                1,
+                min(256, int(runtime.get("worker_processes", self._sim_worker_processes))),
+            )
             self._sim_pardiso_threads = max(1, int(runtime.get("pardiso_threads", self._sim_pardiso_threads)))
             self._sim_acc_threads = max(1, int(runtime.get("acc_threads", self._sim_acc_threads)))
             self._sim_plot_sparams_after_sim = bool(runtime.get("plot_sparams_after_sim", self._sim_plot_sparams_after_sim))
@@ -9163,6 +11156,18 @@ class MainWindow(QMainWindow):
             self._recompute_simulation_parameters()
             self._sync_log_verbosity_from_settings()
             self._viewport.scene.from_json(data.get("objects", []))
+            self._viewport.scene.object_groups_from_json(
+                data.get("object_groups", [])
+            )
+            mixed_groups = self._viewport.scene.groups_with_mixed_materials()
+            if mixed_groups:
+                QMessageBox.warning(
+                    self,
+                    "Object Groups",
+                    "Some saved groups contain multiple materials and cannot use "
+                    "group priority until their members are made uniform:\n"
+                    + "\n".join(mixed_groups),
+                )
             self._viewport.scene.reference_planes_from_json(
                 data.get("reference_planes", []),
                 data.get("active_plane_name"),
@@ -9279,6 +11284,7 @@ class MainWindow(QMainWindow):
                 project_name  = self._project_name,
                 settings      = self._project_tree.get_settings(),
                 objects_json  = self._viewport.scene.to_json(),
+                object_groups = self._viewport.scene.object_groups_to_json(),
                 units         = self._units,
                 grid_size     = self._viewport.scene._grid_size,
                 grid_spacing  = self._viewport.scene._grid_spacing,
@@ -9420,6 +11426,10 @@ class MainWindow(QMainWindow):
     def _sync_material_choices(self) -> None:
         names = self._material_store.all_project_names()
         self._body_props.set_materials(names)
+        self._body_props.set_material_colors({
+            name: record.color
+            for name, record in self._material_store.project_records().items()
+        })
         if self._draw_material not in names and names:
             self._draw_material = names[0]
 

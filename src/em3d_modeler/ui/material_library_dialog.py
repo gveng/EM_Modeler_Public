@@ -239,6 +239,10 @@ class MaterialLibraryDialog(QDialog):
         self._edit_btn.clicked.connect(self._edit_material)
         actions.addWidget(self._edit_btn)
 
+        self._copy_btn = QPushButton("Copy to Project Library")
+        self._copy_btn.clicked.connect(self._copy_to_project)
+        actions.addWidget(self._copy_btn)
+
         self._delete_btn = QPushButton("Delete Project Material")
         self._delete_btn.clicked.connect(self._delete_material)
         actions.addWidget(self._delete_btn)
@@ -342,11 +346,13 @@ class MaterialLibraryDialog(QDialog):
         editable = rec is not None and rec.source in {"project", "global"}
         project_custom = rec is not None and rec.source == "project"
         global_selected = rec is not None and self._source_combo.currentIndex() == 1
+        builtin_selected = rec is not None and rec.source == "builtin" and self._source_combo.currentIndex() == 0
         self._edit_btn.setText(
             "Edit Global Material..." if rec is not None and rec.source == "global"
             else "Edit Project Material..."
         )
         self._edit_btn.setEnabled(editable)
+        self._copy_btn.setEnabled(builtin_selected)
         self._delete_btn.setEnabled(project_custom)
         self._append_btn.setEnabled(global_selected)
 
@@ -405,6 +411,17 @@ class MaterialLibraryDialog(QDialog):
             return
         if self._store.delete_project_record(rec.name):
             self._mark_changed()
+
+    def _copy_to_project(self) -> None:
+        rec = self._current_record()
+        if rec is None or rec.source != "builtin" or self._source_combo.currentIndex() != 0:
+            return
+        try:
+            self._store.copy_builtin_to_project(rec.name)
+        except (ValueError, TypeError) as exc:
+            QMessageBox.warning(self, "Material Library", f"Unable to copy material: {exc}")
+            return
+        self._mark_changed()
 
     def _append_global(self) -> None:
         rec = self._current_record()

@@ -1644,6 +1644,7 @@ class PlotView(QWidget):
                 "label": entry["label"],
                 "file_name": entry["file_name"],
                 "configured": bool(entry["configured"]),
+                "visible": bool(entry["visible"]),
                 "x_values": np.asarray(entry["x_values"], dtype=float).tolist(),
                 "complex": bool(np.iscomplexobj(values)),
                 "values": encoded_values,
@@ -1719,6 +1720,7 @@ class PlotView(QWidget):
                     "label": label,
                     "file_name": file_name if isinstance(file_name, str) else "",
                     "configured": bool(item.get("configured", False)),
+                    "visible": bool(item.get("visible", True)),
                     "x_values": x_values,
                     "values": values,
                 })
@@ -1892,6 +1894,27 @@ class PlotView(QWidget):
             for item in series
         }
         appended_series = self._load_appended_series() if persist else []
+        configured_parameters = {
+            str(item.get("label", "")).strip().upper()
+            for item in series
+            if item.get("configured") is True
+        }
+        if configured_parameters:
+            series = [
+                {
+                    **item,
+                    "_visibility_override": (
+                        str(item.get("label", "")).strip().upper()
+                        in configured_parameters
+                    ),
+                }
+                for item in series
+            ]
+            for item in appended_series:
+                visible = str(item["label"]).strip().upper() in configured_parameters
+                item["configured"] = visible
+                item["visible"] = visible
+                item["_visibility_override"] = visible
         self._appended_file_ids = {
             str(item["file_id"]) for item in appended_series
         }
@@ -2109,6 +2132,9 @@ class PlotView(QWidget):
                 ),
                 bool(item.get("visible", True)),
             )
+            visibility_override = item.get("_visibility_override")
+            if isinstance(visibility_override, bool):
+                saved_visible = visibility_override
             saved_marker = self._trace_color_settings.value(
                 self._trace_setting_key(file_id, label, "marker"), ""
             )

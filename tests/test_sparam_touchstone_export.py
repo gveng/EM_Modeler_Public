@@ -4,6 +4,7 @@ import io
 import json
 import math
 import os
+import re
 import sys
 from types import ModuleType
 from types import SimpleNamespace
@@ -38,6 +39,208 @@ class _FakeGrid:
     def model_S(self, output_port, input_port, frequencies):
         base = output_port * 10 + input_port
         return [complex(base + 100 + index, 0.5) for index, _ in enumerate(frequencies)]
+
+
+class _FakeDataSet:
+    def __init__(self):
+        self.entries = []
+
+    def iter(self):
+        return iter(self.entries)
+
+    @property
+    def n(self):
+        return len(self.entries)
+
+
+def test_emerge_version_detection_uses_metadata_without_importing_emerge(monkeypatch):
+    import builtins
+    import importlib.metadata as importlib_metadata
+
+    original_import = builtins.__import__
+
+    def reject_emerge_import(name, *args, **kwargs):
+        if name == "emerge" or name.startswith("emerge."):
+            raise AssertionError("Version detection must not import EMERGE in the UI process")
+        return original_import(name, *args, **kwargs)
+
+    monkeypatch.setattr(builtins, "__import__", reject_emerge_import)
+    monkeypatch.setattr(
+        importlib_metadata,
+        "version",
+        lambda name: "3.0.0a20" if name == "emerge" else pytest.fail(name),
+    )
+
+    assert python_script_exporter._detect_emerge_version() == "3.0.0a20"
+
+
+def test_generated_scripts_gate_on_emerge_3_api_release(monkeypatch):
+    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "3.0.0a20")
+    script = python_script_exporter.export_emerge_python_script(
+        project_name="ApiCompatibilityTest",
+        settings={"simulations": [{"name": "Sweep", "type": "Sweep"}]},
+        step_entries=[],
+        run_sweep=False,
+    )
+    module = ast.parse(script)
+    api_guard_nodes = [
+        node for node in module.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id == "_MINIMUM_EMERGE_API_VERSION"
+                for target in node.targets
+            )
+        )
+        or (
+            isinstance(node, ast.FunctionDef)
+            and node.name in {
+                "_emerge_api_release",
+                "_emerge_api_version_at_least",
+                "_require_emerge_api_version",
+            }
+        )
+    ]
+    namespace = {"re": re}
+    exec(compile(ast.Module(body=api_guard_nodes, type_ignores=[]), "generated_script.py", "exec"), namespace)
+
+    assert namespace["_emerge_api_release"]("3.0.0a20") == (3, 0, 0)
+    assert namespace["_emerge_api_version_at_least"]("3.0.0")
+    assert namespace["_emerge_api_version_at_least"]("3.0.0a20")
+    assert namespace["_emerge_api_version_at_least"]("3.1.2")
+    assert not namespace["_emerge_api_version_at_least"]("2.8.0")
+    assert not namespace["_emerge_api_version_at_least"]("unknown")
+    assert not namespace["_emerge_api_version_at_least"]("3.0.0garbage")
+    with pytest.raises(RuntimeError, match="EMERGE API 3.0.0 or later is required"):
+        namespace["_require_emerge_api_version"]("2.8.0", "runtime")
+
+    clean_script = build_clean_emerge_python_script(script, "sweep")
+    clean_mesh_helper = next(
+        node for node in ast.parse(clean_script).body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_generate_mesh_with_size_check_override"
+    )
+    clean_nodes = [
+        node for node in clean_mesh_helper.body
+        if (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id in {"_clean_emerge_version", "_clean_emerge_match"}
+                for target in node.targets
+            )
+        )
+        or (
+            isinstance(node, ast.If)
+            and any(
+                isinstance(child, ast.Name)
+                and child.id == "_clean_emerge_match"
+                for child in ast.walk(node.test)
+            )
+        )
+    ]
+    with pytest.raises(RuntimeError, match="EMERGE API 3.0.0 or later is required"):
+        exec(
+            compile(ast.Module(body=clean_nodes, type_ignores=[]), "clean_script.py", "exec"),
+            {"em": SimpleNamespace(__version__="2.8.0"), "re": re},
+        )
+    clean_namespace = {"em": SimpleNamespace(__version__="3.0.0a20"), "re": re}
+    exec(
+        compile(ast.Module(body=clean_nodes, type_ignores=[]), "clean_script.py", "exec"),
+        clean_namespace,
+    )
+    assert clean_namespace["_clean_emerge_version"] == "3.0.0a20"
+
+
+def test_generated_sweep_runs_adaptive_mesh_refinement_at_configured_frequency():
+    script = python_script_exporter.export_emerge_python_script(
+        project_name="AdaptiveMeshRefinementTest",
+        settings={
+            "simulations": [{
+                "name": "Patch sweep",
+                "type": "Sweep",
+                "Fmin_GHz": 1.0,
+                "Fmax_GHz": 3.0,
+                "adaptive_mesh_refinement_enabled": True,
+                "adaptive_mesh_refinement_frequency_GHz": 2.45,
+            }],
+        },
+        step_entries=[],
+    )
+
+    ast.parse(script)
+    assert "if not callable(getattr(simulationObj, 'adaptive_mesh_refinement', None)):" in script
+    amr_call = "simulationObj.adaptive_mesh_refinement(frequency=2450000000.0)"
+    assert amr_call in script
+    assert script.index("simulationObj.generate_mesh()") < script.index(amr_call)
+    assert script.index(amr_call) < script.index(
+        "simulationResult = _run_configured_sweep()"
+    )
+
+
+def test_adaptive_mesh_refinement_is_not_emitted_when_disabled_or_sweep_is_skipped():
+    settings = {
+        "simulations": [{
+            "name": "Sweep",
+            "type": "Sweep",
+            "Fmin_GHz": 1.0,
+            "Fmax_GHz": 3.0,
+            "adaptive_mesh_refinement_enabled": True,
+            "adaptive_mesh_refinement_frequency_GHz": 2.45,
+        }],
+    }
+
+    skipped_script = python_script_exporter.export_emerge_python_script(
+        project_name="AdaptiveMeshRefinementSetupOnly",
+        settings=settings,
+        step_entries=[],
+        run_sweep=False,
+    )
+    assert "simulationObj.adaptive_mesh_refinement(" not in skipped_script
+
+    disabled_settings = {
+        "simulations": [{
+            "name": "Sweep",
+            "type": "Sweep",
+            "Fmin_GHz": 1.0,
+            "Fmax_GHz": 3.0,
+        }],
+    }
+    disabled_script = python_script_exporter.export_emerge_python_script(
+        project_name="AdaptiveMeshRefinementDisabled",
+        settings=disabled_settings,
+        step_entries=[],
+    )
+    assert "simulationObj.adaptive_mesh_refinement(" not in disabled_script
+
+
+@pytest.mark.parametrize(
+    ("sim_type", "frequency_ghz", "message"),
+    [
+        ("Parametric", 2.0, "Sweep simulations only"),
+        ("Sweep", 0.0, "positive passband frequency"),
+        ("Sweep", 3.5, "within the configured Sweep range"),
+    ],
+)
+def test_adaptive_mesh_refinement_rejects_unsupported_or_invalid_settings(
+    sim_type, frequency_ghz, message
+):
+    with pytest.raises(ValueError, match=message):
+        python_script_exporter.export_emerge_python_script(
+            project_name="InvalidAdaptiveMeshRefinement",
+            settings={
+                "simulations": [{
+                    "name": sim_type,
+                    "type": sim_type,
+                    "Fmin_GHz": 1.0,
+                    "Fmax_GHz": 3.0,
+                    "adaptive_mesh_refinement_enabled": True,
+                    "adaptive_mesh_refinement_frequency_GHz": frequency_ghz,
+                }],
+            },
+            step_entries=[],
+        )
 
 
 class _FailingFitGrid(_FakeGrid):
@@ -278,13 +481,144 @@ def test_generated_simulation_script_uses_configured_log_verbosity(monkeypatch):
         run_sweep=False,
     )
 
-    assert 'em.Simulation(PROJECT_NAME, loglevel="TRACE", save_file=True, write_log=True)' in script
+    assert (
+        'em.Simulation(PROJECT_NAME, loglevel="TRACE", save_file=True, '
+        'write_log=True, store_system=\'msgpack\')'
+    ) in script
 
 
-def _progressive_sweep_namespace(script, *, version="3.0.0a16", omit_sample=None):
+def _generated_mesh_helper(script):
+    module = ast.parse(script)
+    return next(
+        node for node in module.body
+        if isinstance(node, ast.FunctionDef)
+        and node.name == "_generate_mesh_with_size_check_override"
+    )
+
+
+def _run_generated_mesh_helper(mesh_helper, allow_oversized_mesh, *, raises=False):
+    class FakeSimulationError(Exception):
+        pass
+
     class FakeSimulation:
         def __init__(self):
-            scalar = SimpleNamespace(_variables=[], _data_entries=[])
+            self.settings = SimpleNamespace(size_check=True)
+            self.mesh_calls = []
+
+        def generate_mesh(self):
+            self.mesh_calls.append(self.settings.size_check)
+            if raises:
+                raise FakeSimulationError("mesh generation failed")
+
+    simulation = FakeSimulation()
+    namespace = {
+        "ALLOW_OVERSIZED_MESH": allow_oversized_mesh,
+        "simulationObj": simulation,
+    }
+    exec(
+        compile(ast.Module(body=[mesh_helper], type_ignores=[]), "mesh_guard.py", "exec"),
+        namespace,
+    )
+    return simulation, namespace["_generate_mesh_with_size_check_override"], FakeSimulationError
+
+
+def test_mesh_size_guard_preserves_default_check_and_calls_mesh_once(monkeypatch, capsys):
+    monkeypatch.setattr(
+        python_script_exporter, "_detect_emerge_version", lambda: "unknown"
+    )
+    script = python_script_exporter.export_emerge_python_script(
+        project_name="MeshSizeGuardTest",
+        settings={"simulations": [{"name": "Sweep", "type": "Sweep"}]},
+        step_entries=[],
+        run_sweep=True,
+    )
+    mesh_helper = _generated_mesh_helper(script)
+    assert "ALLOW_OVERSIZED_MESH = False" in script
+    assert sum(
+        isinstance(node, ast.Call)
+        and isinstance(node.func, ast.Attribute)
+        and node.func.attr == "generate_mesh"
+        for node in ast.walk(mesh_helper)
+    ) == 1
+    assert not any(isinstance(node, ast.Try) for node in ast.walk(mesh_helper))
+
+    simulation, generate_mesh, _ = _run_generated_mesh_helper(mesh_helper, False)
+    generate_mesh()
+    assert simulation.mesh_calls == [True]
+    assert simulation.settings.size_check is True
+    assert "[warn]" not in capsys.readouterr().out
+
+
+@pytest.mark.parametrize(
+    "settings",
+    [
+        {
+            "mesh": {"allow_oversized_mesh": True},
+            "simulations": [{"name": "Sweep", "type": "Sweep"}],
+        },
+        {
+            "simulations": [{
+                "name": "Sweep",
+                "type": "Sweep",
+                "allow_oversized_mesh": True,
+            }],
+        },
+    ],
+)
+def test_mesh_size_guard_bypasses_check_before_one_mesh_call_when_opted_in(
+    settings, monkeypatch, capsys
+):
+    monkeypatch.setattr(
+        python_script_exporter, "_detect_emerge_version", lambda: "unknown"
+    )
+    script = python_script_exporter.export_emerge_python_script(
+        project_name="MeshSizeGuardOptInTest",
+        settings=settings,
+        step_entries=[],
+        run_sweep=True,
+    )
+    mesh_helper = _generated_mesh_helper(script)
+    assert "ALLOW_OVERSIZED_MESH = True" in script
+
+    simulation, generate_mesh, _ = _run_generated_mesh_helper(mesh_helper, True)
+    generate_mesh()
+
+    assert simulation.mesh_calls == [False]
+    assert simulation.settings.size_check is False
+    warning = capsys.readouterr().out
+    assert "[warn]" in warning
+    assert "substantial RAM" in warning
+
+
+def test_mesh_size_guard_does_not_catch_or_retry_mesh_errors(monkeypatch):
+    monkeypatch.setattr(
+        python_script_exporter, "_detect_emerge_version", lambda: "unknown"
+    )
+    script = python_script_exporter.export_emerge_python_script(
+        project_name="MeshSizeGuardFailureTest",
+        settings={"simulations": [{
+            "name": "Sweep",
+            "type": "Sweep",
+            "allow_oversized_mesh": True,
+        }]},
+        step_entries=[],
+        run_sweep=True,
+    )
+    mesh_helper = _generated_mesh_helper(script)
+    simulation, generate_mesh, mesh_error = _run_generated_mesh_helper(
+        mesh_helper, True, raises=True
+    )
+
+    with pytest.raises(mesh_error, match="mesh generation failed"):
+        generate_mesh()
+    assert simulation.mesh_calls == [False]
+    assert simulation.settings.size_check is False
+
+
+def _progressive_sweep_namespace(script, *, version="3.0.0a20", omit_sample=None):
+    class FakeSimulation:
+        def __init__(self):
+            scalar = _FakeDataSet()
             self.mw = SimpleNamespace(data=SimpleNamespace(scalar=scalar))
             self.mw.set_frequency = self.set_frequency
             self.mw.set_frequency_range = self.set_frequency_range
@@ -303,21 +637,21 @@ def _progressive_sweep_namespace(script, *, version="3.0.0a16", omit_sample=None
             self.run_calls += 1
             scalar = self.mw.data.scalar
             for frequency in self.frequencies:
-                sample_index = len(scalar._variables)
+                sample_index = scalar.n
                 if sample_index == omit_sample:
                     continue
                 matrix = np.asarray([
                     [complex(sample_index + 1, 1), complex(sample_index + 2, 2)],
                     [complex(sample_index + 3, 3), complex(sample_index + 4, 4)],
                 ])
-                scalar._variables.append({"freq": frequency})
-                scalar._data_entries.append(SimpleNamespace(freq=frequency, Sp=matrix))
+                scalar.entries.append(SimpleNamespace(freq=frequency, Sp=matrix))
             return self.mw.data
 
     simulation = FakeSimulation()
     namespace = {
         "simulationObj": simulation,
         "RUNTIME_EMERGE_VERSION": version,
+        "re": re,
         "FMIN_GHZ": 1.0,
         "FMAX_GHZ": 2.0,
         "NPOINTS": 23,
@@ -332,13 +666,38 @@ def _progressive_sweep_namespace(script, *, version="3.0.0a16", omit_sample=None
             )
         ),
         "JOB_NAME": "Sweep",
+        "MULTIPROCESSING_ENABLED": False,
         "json": json,
         "math": math,
         "np": np,
     }
     tree = ast.parse(script)
-    helper_names = {"_validate_progressive_samples", "_emit_progressive_sparams", "_run_progressive_sweep"}
-    helpers = [node for node in tree.body if isinstance(node, ast.FunctionDef) and node.name in helper_names]
+    helper_names = {
+        "_emerge_api_release",
+        "_emerge_api_version_at_least",
+        "_require_progressive_sparams_api",
+        "_run_configured_sweep",
+        "_validate_progressive_samples",
+        "_emit_progressive_sparams",
+        "_run_progressive_sweep",
+    }
+    helpers = [
+        node for node in tree.body
+        if (
+            isinstance(node, ast.FunctionDef)
+            and node.name in helper_names
+        ) or (
+            isinstance(node, ast.Assign)
+            and any(
+                isinstance(target, ast.Name)
+                and target.id in {
+                    "_MINIMUM_EMERGE_API_VERSION",
+                    "PROGRESSIVE_SPARAMS_API_SUPPORTED",
+                }
+                for target in node.targets
+            )
+        )
+    ]
     exec(compile(ast.Module(body=helpers, type_ignores=[]), "generated_script.py", "exec"), namespace)
     return simulation, namespace
 
@@ -368,7 +727,9 @@ def test_progressive_sweep_reuses_accumulated_data_and_restores_full_band(monkey
     assert simulation.run_calls == 3
     assert simulation.range_calls == [(1e9, 2e9, 23), (1e9, 2e9, 23)]
     assert script.count("simulationObj.generate_mesh()") == 1
-    assert script.rindex("simulationObj.generate_mesh()") < script.index("simulationResult = _run_progressive_sweep()")
+    assert script.rindex("_generate_mesh_with_size_check_override()") < script.index(
+        "simulationResult = _run_progressive_sweep()"
+    )
     assert [len(event["frequencies"]) for event in events] == [10, 10, 3]
     assert [event["completed_samples"] for event in events] == [10, 20, 23]
     assert events[-1]["complete"] is True
@@ -379,7 +740,7 @@ def test_progressive_sweep_reuses_accumulated_data_and_restores_full_band(monkey
 
 
 def test_progressive_sweep_uses_configured_update_interval(monkeypatch):
-    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "3.0.0a16")
+    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "3.0.0a20")
     script = python_script_exporter.export_emerge_python_script(
         project_name="ProgressiveIntervalTest",
         settings={"simulations": [{
@@ -408,8 +769,11 @@ def test_progressive_sweep_uses_configured_update_interval(monkeypatch):
     assert [event["completed_samples"] for event in events] == [7, 14, 21, 23]
 
 
-def test_progressive_sweep_rejects_unverified_version_and_missing_samples(monkeypatch):
-    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "3.0.0")
+@pytest.mark.parametrize("version", ["2.8.0", "unknown"])
+def test_progressive_sweep_rejects_versions_before_3_0_and_missing_samples(
+    monkeypatch, version
+):
+    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "3.0.0a20")
     script = python_script_exporter.export_emerge_python_script(
         project_name="ProgressiveTest",
         settings={"simulations": [{"name": "Sweep", "type": "Sweep"}]},
@@ -419,8 +783,8 @@ def test_progressive_sweep_rejects_unverified_version_and_missing_samples(monkey
         run_sweep=False,
     )
 
-    simulation, namespace = _progressive_sweep_namespace(script, version="3.0.0")
-    with pytest.raises(RuntimeError, match="requires EMERGE 3.0.0a16"):
+    simulation, namespace = _progressive_sweep_namespace(script, version=version)
+    with pytest.raises(RuntimeError, match="requires the EMERGE 3.0.0 sweep/data API"):
         namespace["_run_progressive_sweep"]()
     assert simulation.run_calls == 0
 
@@ -432,7 +796,7 @@ def test_progressive_sweep_rejects_unverified_version_and_missing_samples(monkey
 
 
 def test_parametric_progress_helper_emits_completed_frequency_sweep(monkeypatch):
-    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "3.0.0a16")
+    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "3.0.0a20")
     script = python_script_exporter.export_emerge_python_script(
         project_name="ProgressiveParametricTest",
         settings={"simulations": [{
@@ -460,7 +824,7 @@ def test_parametric_progress_helper_emits_completed_frequency_sweep(monkeypatch)
         and node.name == "_emit_progressive_parametric_sparams"
     )
     namespace = {
-        "RUNTIME_EMERGE_VERSION": "3.0.0a16",
+        "RUNTIME_EMERGE_VERSION": "3.0.0a20",
         "NPOINTS": 3,
         "FMIN_GHZ": 1.0,
         "FMAX_GHZ": 2.0,
@@ -471,13 +835,15 @@ def test_parametric_progress_helper_emits_completed_frequency_sweep(monkeypatch)
     }
     exec(compile(ast.Module(body=[helper], type_ignores=[]), "generated_script.py", "exec"), namespace)
     frequencies = np.linspace(1e9, 2e9, 3)
-    result = SimpleNamespace(scalar=SimpleNamespace(
-        _variables=[{"freq": frequency} for frequency in frequencies],
-        _data_entries=[
-            SimpleNamespace(freq=frequency, Sp=np.asarray([[complex(index, 0.5)]]))
-            for index, frequency in enumerate(frequencies, start=1)
-        ],
-    ))
+    result_entries = [
+        SimpleNamespace(freq=frequency, Sp=np.asarray([[complex(index, 0.5)]]))
+        for index, frequency in enumerate(frequencies, start=1)
+    ]
+    result = SimpleNamespace(
+        scalar=_FakeDataSet(),
+    )
+    result.scalar.entries.extend(result_entries)
+    namespace["PROGRESSIVE_SPARAMS_API_SUPPORTED"] = True
     output = io.StringIO()
 
     with contextlib.redirect_stdout(output):
@@ -505,7 +871,7 @@ def test_parametric_progress_helper_emits_completed_frequency_sweep(monkeypatch)
 
 
 def test_parametric_runner_emits_configured_frequency_chunks(monkeypatch):
-    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "3.0.0a16")
+    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "3.0.0a20")
     script = python_script_exporter.export_emerge_python_script(
         project_name="ParametricChunkRunnerTest",
         settings={"simulations": [{
@@ -536,7 +902,7 @@ def test_parametric_runner_emits_configured_frequency_chunks(monkeypatch):
 
     class FakeSimulation:
         def __init__(self, invalid_sample=None):
-            scalar = SimpleNamespace(_variables=[], _data_entries=[])
+            scalar = _FakeDataSet()
             self.mw = SimpleNamespace(data=SimpleNamespace(scalar=scalar))
             self.mw.set_frequency_range = self.set_frequency_range
             self.mw.set_frequency = self.set_frequency
@@ -556,13 +922,12 @@ def test_parametric_runner_emits_configured_frequency_chunks(monkeypatch):
             self.run_calls += 1
             scalar = self.mw.data.scalar
             for frequency in self.frequencies:
-                scalar._variables.append({"freq": frequency})
                 value = (
                     complex(float("nan"), 0.0)
-                    if len(scalar._data_entries) == self.invalid_sample
-                    else complex(len(scalar._data_entries) + 1, 0.5)
+                    if scalar.n == self.invalid_sample
+                    else complex(scalar.n + 1, 0.5)
                 )
-                scalar._data_entries.append(SimpleNamespace(
+                scalar.entries.append(SimpleNamespace(
                     freq=frequency,
                     Sp=np.asarray([[value]]),
                 ))
@@ -580,19 +945,25 @@ def test_parametric_runner_emits_configured_frequency_chunks(monkeypatch):
         "PROGRESSIVE_SPARAMS_ENABLED": True,
         "PROGRESSIVE_SPARAMS_HAVE_PORTS": True,
         "PROGRESSIVE_SPARAMS_CHUNK_SIZE": 2,
-        "RUNTIME_EMERGE_VERSION": "3.0.0a16",
+        "RUNTIME_EMERGE_VERSION": "3.0.0a20",
+        "PROGRESSIVE_SPARAMS_API_SUPPORTED": True,
+        "MULTIPROCESSING_ENABLED": False,
         "simulationObj": simulation,
         "os": SimpleNamespace(environ={}),
         "np": np,
         "json": json,
         "math": math,
     }
-    helper = next(
+    helpers = [
         node for node in tree.body
         if isinstance(node, ast.FunctionDef)
-        and node.name == "_emit_progressive_parametric_sparams"
-    )
-    exec(compile(ast.Module(body=[helper], type_ignores=[]), "generated_script.py", "exec"), namespace)
+        and node.name in {
+            "_run_configured_sweep",
+            "_require_progressive_sparams_api",
+            "_emit_progressive_parametric_sparams",
+        }
+    ]
+    exec(compile(ast.Module(body=helpers, type_ignores=[]), "generated_script.py", "exec"), namespace)
     output = io.StringIO()
 
     with contextlib.redirect_stdout(output):
@@ -611,6 +982,10 @@ def test_parametric_runner_emits_configured_frequency_chunks(monkeypatch):
 
     invalid_simulation = FakeSimulation(invalid_sample=0)
     invalid_namespace = {**namespace, "simulationObj": invalid_simulation}
+    exec(
+        compile(ast.Module(body=helpers, type_ignores=[]), "generated_script.py", "exec"),
+        invalid_namespace,
+    )
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
         exec(compile(ast.Module(body=[run_block], type_ignores=[]), "generated_script.py", "exec"), invalid_namespace)
@@ -622,7 +997,7 @@ def test_parametric_runner_emits_configured_frequency_chunks(monkeypatch):
 
 
 def test_single_value_parametric_worker_sets_parameter_before_geometry_and_mesh(monkeypatch):
-    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "3.0.0a16")
+    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "3.0.0a20")
     script = python_script_exporter.export_emerge_python_script(
         project_name="ParametricStepWorkerTest",
         settings={"simulations": [{
@@ -675,11 +1050,13 @@ def test_parametric_irregular_grid_exports_one_touchstone_per_value(monkeypatch,
     frequencies = [1e9, 2e9, 1e9, 2e9]
 
     class IrregularScalar:
-        _variables = [{"freq": frequency} for frequency in frequencies]
-        _data_entries = [
+        entries = [
             SimpleNamespace(freq=frequency, Sp=np.asarray([[complex(index, 0.0)]]))
             for index, frequency in enumerate(frequencies, start=1)
         ]
+
+        def iter(self):
+            return iter(self.entries)
 
         @property
         def grid(self):
@@ -707,14 +1084,16 @@ def test_parametric_nonfinite_final_samples_are_not_exported(monkeypatch, tmp_pa
     frequencies = [1e9, 2e9, 1e9, 2e9]
 
     class ParametricScalar:
-        _variables = [{"freq": frequency} for frequency in frequencies]
-        _data_entries = [
+        entries = [
             SimpleNamespace(
                 freq=frequency,
                 Sp=np.asarray([[complex(float("nan") if index == 1 else index, 0.0)]]),
             )
             for index, frequency in enumerate(frequencies, start=1)
         ]
+
+        def iter(self):
+            return iter(self.entries)
 
     output = io.StringIO()
     with contextlib.redirect_stdout(output):
@@ -733,7 +1112,7 @@ def test_parametric_nonfinite_final_samples_are_not_exported(monkeypatch, tmp_pa
 def test_progressive_sweep_setting_is_read_from_simulation_definition(
     monkeypatch, enabled, legacy_argument
 ):
-    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "3.0.0a16")
+    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "3.0.0a20")
     script = python_script_exporter.export_emerge_python_script(
         project_name="PerSimulationProgressiveTest",
         settings={"simulations": [{
@@ -898,12 +1277,61 @@ def test_clean_emerge_script_keeps_solver_commands_without_runtime_wrapper(monke
     assert "simulationObj.mw.run_sweep()" in clean_script
     assert "simulationObj.save()" in clean_script
     assert "_postprocess_sparams" not in clean_script
+    mesh_helper_name = "def _generate_mesh_with_size_check_override():"
+    assert mesh_helper_name in clean_script
+    mesh_helper = clean_script.split(mesh_helper_name, 1)[1].split("\n\n", 1)[0]
+    assert "ALLOW_OVERSIZED_MESH" in mesh_helper
+    assert "[warn] Bypassing the mesh size check" in mesh_helper
+    assert "substantial RAM" in mesh_helper
+    assert "simulationObj.settings.size_check = False" in mesh_helper
+    assert mesh_helper.count("simulationObj.generate_mesh()") == 1
+    assert "Simulation requires too many elements." not in mesh_helper
+    assert "except " not in mesh_helper
+    sweep_helper_name = "def _run_configured_sweep():"
+    sweep_helper = clean_script.split(sweep_helper_name, 1)[1].split("\n\n", 1)[0]
+    save_helper_name = "def _save_simulation_with_serializable_background_field_maps():"
+    save_helper = clean_script.split(save_helper_name, 1)[1].split("\n\n", 1)[0]
+    clean_script_without_mesh_helper = clean_script.replace(
+        mesh_helper_name + mesh_helper + "\n\n", "", 1
+    )
+    clean_script_without_helpers = clean_script_without_mesh_helper.replace(
+        sweep_helper_name + sweep_helper + "\n\n", "", 1
+    )
+    clean_script_without_helpers = clean_script_without_helpers.replace(
+        save_helper_name + save_helper + "\n\n", "", 1
+    )
     assert not any(
         line.lstrip().startswith(("if ", "try:", "raise "))
-        for line in clean_script.splitlines()
+        for line in clean_script_without_helpers.splitlines()
     )
     assert "hasattr(" not in clean_script
     assert "simulationResult" not in clean_script
+
+
+def test_clean_emerge_script_does_not_run_sweep_from_progressive_compatibility_guard(
+    monkeypatch,
+):
+    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "unknown")
+    full_script = python_script_exporter.export_emerge_python_script(
+        project_name="ProgressiveCleanExportTest",
+        settings={"simulations": [{"name": "Sweep", "type": "Sweep"}]},
+        step_entries=[],
+        progressive_sparams_enabled=True,
+        lumped_ports=[{"index": 1, "name": "Port_1", "type": "LumpedPort"}],
+        run_sweep=True,
+    )
+    assert "JOB_TYPE in ('sweep', 'parametric')" in full_script
+
+    clean_script = build_clean_emerge_python_script(full_script, "sweep")
+
+    ast.parse(clean_script)
+    assert clean_script.count("simulationObj.mw.run_sweep()") == 1
+    assert clean_script.index("simulationObj.mw.set_resolution(MESH_RESOLUTION)") < (
+        clean_script.rindex("_run_configured_sweep()")
+    )
+    assert clean_script.rindex("_run_configured_sweep()") < (
+        clean_script.index("simulationObj.save()")
+    )
 
 
 def test_clean_emerge_script_precomputes_scaled_lumped_port_dimensions(monkeypatch):
@@ -923,7 +1351,7 @@ def test_clean_emerge_script_precomputes_scaled_lumped_port_dimensions(monkeypat
     )
 
     clean_script = build_clean_emerge_python_script(full_script, "sweep")
-    mesh_call = "simulationObj.generate_mesh()"
+    mesh_call = "\n_generate_mesh_with_size_check_override()"
 
     ast.parse(clean_script)
     assert "port[1]['bc'].width = 10.0" in clean_script
@@ -934,7 +1362,11 @@ def test_clean_emerge_script_precomputes_scaled_lumped_port_dimensions(monkeypat
     assert clean_script.index(mesh_call) < clean_script.index("port[1]['bc'].width = 0.01")
     assert "hasattr(" not in clean_script
     assert "_scaled_lumped_port_dimensions" not in clean_script
-    assert "try:" not in clean_script
+    scaled_mesh_start = clean_script.index("port[1]['bc'].width = 10.0")
+    scaled_mesh_end = clean_script.index("port[1]['bc'].height = 0.002") + len(
+        "port[1]['bc'].height = 0.002"
+    )
+    assert "try:" not in clean_script[scaled_mesh_start:scaled_mesh_end]
 
 
 def test_clean_emerge_script_keeps_generated_geometry_group_when_used():
@@ -973,7 +1405,10 @@ def test_clean_emerge_script_removes_runtime_guard_that_only_raises():
 @pytest.mark.parametrize(
     ("simulation_type", "expected_command"),
     [
-        ("Eigenmode", "simulationObj.mw.run_eigenmode(EIGENMODE_COUNT)"),
+        (
+            "Eigenmode",
+            "simulationObj.mw.eigenmode(EIGENMODE_SEARCH_FREQUENCY_HZ, nmodes=EIGENMODE_COUNT)",
+        ),
         ("Parametric", "simulationObj.mw.run_sweep()"),
     ],
 )
@@ -983,16 +1418,66 @@ def test_clean_emerge_script_keeps_selected_job_command(
     monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "unknown")
     full_script = python_script_exporter.export_emerge_python_script(
         project_name="CleanExportTest",
-        settings={"simulations": [{"name": "Job", "type": simulation_type}]},
+        settings={"simulations": [{
+            "name": "Job",
+            "type": simulation_type,
+            "EigenmodeSearchFrequency_GHz": 2.45,
+            "EigenmodeCount": 4,
+        }]},
         step_entries=[],
         run_sweep=True,
     )
+    assert expected_command in full_script
+    if simulation_type == "Eigenmode":
+        assert "simulationObj.state.set_modified()" in full_script
+        assert full_script.index("simulationObj.state.set_modified()") < full_script.index(
+            "simulationObj.save()"
+        )
 
     clean_script = build_clean_emerge_python_script(full_script, simulation_type.lower())
 
     ast.parse(clean_script)
     assert expected_command in clean_script
+    if simulation_type == "Eigenmode":
+        assert "simulationObj.state.set_modified()" in clean_script
+        assert "EIGENMODE_SEARCH_FREQUENCY_HZ = 2450000000.0" in clean_script
+        assert "EIGENMODE_COUNT = 4" in clean_script
     assert "_postprocess_sparams" not in clean_script
+
+
+def test_exported_output_configs_keep_eigenmode_plot_selection(monkeypatch):
+    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "unknown")
+    script = python_script_exporter.export_emerge_python_script(
+        project_name="EigenmodePlotTest",
+        settings={
+            "simulations": [{"name": "Cavity", "type": "Eigenmode"}],
+            "outputs": [{
+                "name": "Second mode",
+                "simulation": "Cavity",
+                "plot_type": "plot_eigenmode",
+                "params": {
+                    "eigenmode_number": 2,
+                    "eigen_field_level": "advanced",
+                    "field_component": "Hx",
+                    "field_metric": "imag",
+                    "plane": "XZ",
+                    "cut_positions": [0.2, 0.8],
+                    "cut_spacing_mm": 0.25,
+                    "geometry_opacity": 0.6,
+                    "colormap": "coolwarm",
+                },
+            }],
+        },
+        step_entries=[],
+        run_sweep=True,
+    )
+
+    assert "'plot_type': 'eigen_field'" in script
+    assert "'eigenmode_number': 2" in script
+    assert "'field_component': 'Hx'" in script
+    assert "'field_metric': 'imag'" in script
+    assert "'plane': 'XZ'" in script
+    assert "'cut_positions': [0.2, 0.8]" in script
 
 
 def _read_touchstone(path):
@@ -1074,6 +1559,80 @@ def test_generated_script_header_includes_em3d_modeler_version(tmp_path, monkeyp
     assert "TARGET_EMERGE_VERSION" in script
 
 
+def test_mesh_export_is_after_successful_sweep_and_avoids_existing_files(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "unknown")
+    script = python_script_exporter.export_emerge_python_script(
+        project_name="MeshExportTest",
+        settings={},
+        step_entries=[],
+        run_sweep=True,
+        save_mesh_after_sweep=True,
+    )
+    ast.parse(script)
+    assert "SAVE_MESH_AFTER_SWEEP = True" in script
+    assert script.index("simulationObj.mw.run_sweep()") < script.index(
+        "if SAVE_MESH_AFTER_SWEEP:"
+    ) < script.index("simulationObj.save()")
+
+    clean_script = build_clean_emerge_python_script(script, "sweep")
+    ast.parse(clean_script)
+    assert "if SAVE_MESH_AFTER_SWEEP:" in clean_script
+    assert "JOB_TYPE" not in clean_script
+    assert "EM3D_JOB_STARTED:" not in clean_script
+
+    mesh_block = next(
+        node
+        for node in ast.parse(script).body
+        if isinstance(node, ast.If)
+        and isinstance(node.test, ast.Name)
+        and node.test.id == "SAVE_MESH_AFTER_SWEEP"
+    )
+    existing_mesh = os.path.join(str(tmp_path), "Simulation_1_mesh.msh")
+    with open(existing_mesh, "w", encoding="utf-8") as mesh_file:
+        mesh_file.write("unrelated existing mesh")
+    exported_paths = []
+
+    class Simulation:
+        def export(self, path):
+            exported_paths.append(path)
+            with open(path, "w", encoding="utf-8") as mesh_file:
+                mesh_file.write("exported mesh")
+
+    namespace = {
+        "SAVE_MESH_AFTER_SWEEP": True,
+        "RESULTS_DIR": str(tmp_path),
+        "_MESH_OUTPUT_STEM": "Simulation_1",
+        "os": os,
+        "simulationObj": Simulation(),
+    }
+    exec(
+        compile(ast.Module(body=[mesh_block], type_ignores=[]), "<mesh-export>", "exec"),
+        namespace,
+    )
+
+    assert len(exported_paths) == 1
+    assert os.path.basename(exported_paths[0]) == "Simulation_1_mesh_2.msh"
+    with open(existing_mesh, encoding="utf-8") as mesh_file:
+        assert mesh_file.read() == "unrelated existing mesh"
+    with open(exported_paths[0], encoding="utf-8") as mesh_file:
+        assert mesh_file.read() == "exported mesh"
+
+
+def test_mesh_export_is_disabled_without_a_successful_sweep(monkeypatch):
+    monkeypatch.setattr(python_script_exporter, "_detect_emerge_version", lambda: "unknown")
+    script = python_script_exporter.export_emerge_python_script(
+        project_name="MeshExportTest",
+        settings={},
+        step_entries=[],
+        run_sweep=False,
+        save_mesh_after_sweep=True,
+    )
+
+    assert "SAVE_MESH_AFTER_SWEEP = False" in script
+
+
 @pytest.mark.parametrize("export_enabled", [False, True])
 def test_postprocess_plot_falls_back_to_raw_samples_when_fit_fails(
     tmp_path, monkeypatch, capsys, export_enabled
@@ -1148,3 +1707,147 @@ def test_postprocess_reuses_successful_export_fit_for_plot(tmp_path, monkeypatch
     touchstone_dir = tmp_path / "Touchstone"
     assert (touchstone_dir / "TouchstoneTest_Sweep_20260925-123456_original.s2p").is_file()
     assert (touchstone_dir / "TouchstoneTest_Sweep_20260925-123456_fit.s2p").is_file()
+
+
+def _generated_job_started_event(script):
+    module = ast.parse(script)
+    body = module.body
+    marker_index = next(
+        index
+        for index, node in enumerate(body)
+        if (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "print"
+            and any(
+                isinstance(child, ast.Constant)
+                and child.value == "EM3D_JOB_STARTED:"
+                for child in ast.walk(node.value)
+            )
+        )
+    )
+    marker_nodes = [
+        node
+        for node in ast.walk(module)
+        if (
+            isinstance(node, ast.Expr)
+            and isinstance(node.value, ast.Call)
+            and isinstance(node.value.func, ast.Name)
+            and node.value.func.id == "print"
+            and any(
+                isinstance(child, ast.Constant)
+                and child.value == "EM3D_JOB_STARTED:"
+                for child in ast.walk(node.value)
+            )
+        )
+    ]
+    assert len(marker_nodes) == 1
+
+    start_index = next(
+        index
+        for index, node in enumerate(body)
+        if isinstance(node, ast.Assign)
+        and any(
+            isinstance(target, ast.Name)
+            and target.id == "_job_start_parametric_values"
+            for target in node.targets
+        )
+    )
+    constants = {
+        "JOB_NAME",
+        "JOB_TYPE",
+        "NPOINTS",
+        "PARAM_VALUES",
+        "PROGRESSIVE_SPARAMS_ENABLED",
+        "PROGRESSIVE_SPARAMS_HAVE_PORTS",
+    }
+    namespace = {"json": json}
+    for node in body[:start_index]:
+        if not isinstance(node, ast.Assign):
+            continue
+        for target in node.targets:
+            if isinstance(target, ast.Name) and target.id in constants:
+                namespace[target.id] = ast.literal_eval(node.value)
+
+    output = io.StringIO()
+    with contextlib.redirect_stdout(output):
+        exec(
+            compile(
+                ast.Module(body=body[start_index : marker_index + 1], type_ignores=[]),
+                "<job-start-marker>",
+                "exec",
+            ),
+            namespace,
+        )
+    marker_line = output.getvalue().strip()
+    assert marker_line.startswith("EM3D_JOB_STARTED:")
+    prefix = "EM3D_JOB_STARTED:"
+    return json.loads(marker_line[len(prefix) :])
+
+
+@pytest.mark.parametrize(
+    (
+        "simulation_type",
+        "param_values",
+        "progressive_enabled",
+        "has_ports",
+        "expected_completions",
+        "progressive_active",
+    ),
+    [
+        ("Sweep", "", True, True, 7, True),
+        ("ScatteredField", "", True, False, 7, False),
+        ("Parametric", "0.1, 0.2,,0.4", True, True, 21, True),
+        ("Parametric", "", True, False, 7, False),
+        ("Unsupported", "", True, True, 0, False),
+        ("Sweep", "", False, True, 7, False),
+    ],
+)
+def test_generated_worker_emits_structured_job_started_marker(
+    simulation_type,
+    param_values,
+    progressive_enabled,
+    has_ports,
+    expected_completions,
+    progressive_active,
+):
+    script = python_script_exporter.export_emerge_python_script(
+        project_name="JobStartedMarkerTest",
+        settings=(
+            {"open_region": {"enabled": True, "object": "Air"}}
+            if simulation_type == "ScatteredField"
+            else {}
+        ),
+        step_entries=(
+            [{"object_name": "Air", "material": "AIR", "step_file": "Air.step"}]
+            if simulation_type == "ScatteredField"
+            else []
+        ),
+        simulation_override={
+            "name": "Marker simulation",
+            "type": simulation_type,
+            "NumberOfPoints": 7,
+            "Fmin_GHz": 1.0,
+            "Fmax_GHz": 7.0,
+            "Fstep_GHz": 1.0,
+            "ParamName": "width",
+            "ParamValues": param_values,
+        },
+        progressive_sparams_enabled=progressive_enabled,
+        lumped_ports=(
+            [{"index": 1, "name": "Port_1", "type": "LumpedPort"}]
+            if has_ports
+            else []
+        ),
+    )
+
+    event = _generated_job_started_event(script)
+
+    assert event == {
+        "simulation_name": "Marker simulation",
+        "simulation_type": simulation_type.lower(),
+        "expected_solver_completions": expected_completions,
+        "progressive_sparams_active": progressive_active,
+    }
+    assert "print(f'[job] Results directory: {RESULTS_DIR}')" in script

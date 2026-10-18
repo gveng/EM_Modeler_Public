@@ -405,6 +405,7 @@ class BoxObject(EMObject):
         return "\n".join(part for part in lines if part)
 
 
+
 # ═══════════════════════════════════════════════════════════════════════════════
 class CylinderObject(EMObject):
     """Cylinder with axis along X, Y, or Z."""
@@ -1676,6 +1677,472 @@ class RevolvedObject(EMObject):
 
 
 # ═══════════════════════════════════════════════════════════════════════════════
+class SweptSurfaceObject(EMObject):
+    """A lateral ruled sheet swept linearly from an ordered 3-D profile.
+
+    Closed profiles use their polygon centroid as the anchor; open profiles use
+    their first vertex. ``displacement`` is the vector from that anchor to the
+    selected endpoint. The generated geometry contains one quad per profile
+    edge and intentionally has no end caps or thickness.
+    """
+
+    def __init__(
+        self,
+        name: str = "",
+        profile_pts=None,
+        displacement=(0.0, 0.0, 10.0),
+        closed: bool | None = None,
+        material: str = "PEC",
+        extrusion_length: float | None = None,
+        direction=None,
+        profile_perimeter: float | None = None,
+        profile_curve: Dict[str, Any] | None = None,
+    ):
+        initial_profile = profile_pts if profile_pts is not None else [
+            (0.0, 0.0, 0.0), (10.0, 0.0, 0.0)
+        ]
+        self._profile_pts, self._closed = self._parse_profile(initial_profile, closed)
+        self._profile_curve = self._parse_profile_curve(profile_curve)
+        self._validate_profile_curve_points(
+            self._profile_pts, self._closed, self._profile_curve
+        )
+        if extrusion_length is None and direction is None:
+            self._displacement = self._parse_displacement(displacement)
+        elif extrusion_length is None or direction is None:
+            raise ValueError("ExtrusionLength and Direction must be specified together")
+        else:
+            self._displacement = self._displacement_from_length_direction(
+                extrusion_length, direction
+            )
+        self._profile_perimeter = (
+            2.0 * math.pi * float(self._profile_curve["radius"])
+            if self._profile_curve is not None
+            else self._compute_profile_perimeter(self._profile_pts, self._closed)
+        )
+        if profile_perimeter is not None:
+            supplied_perimeter = _finite_float(profile_perimeter, "ProfilePerimeter")
+            if supplied_perimeter <= 0.0 or not math.isclose(
+                supplied_perimeter, self._profile_perimeter, rel_tol=1e-9, abs_tol=1e-9
+            ):
+                raise ValueError(
+                    "ProfilePerimeter must match the stored profile contour length"
+                )
+        self._anchor = self._compute_anchor(self._profile_pts, self._closed)
+        self._surface = self._make_surface(
+            self._profile_pts, self._displacement, self._closed
+        )
+        super().__init__(name or _auto_name("SweptSurface"), material)
+
+    @staticmethod
+    def _parse_closed(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, str):
+            normalized = value.strip().lower()
+            if normalized in {"true", "1"}:
+                return True
+            if normalized in {"false", "0"}:
+                return False
+        raise ValueError("Closed must be a boolean")
+
+    @classmethod
+    def _parse_profile(
+        cls, value: Any, closed: bool | None
+    ) -> tuple[list[tuple[float, float, float]], bool]:
+        if isinstance(value, str):
+            try:
+                value = ast.literal_eval(value)
+            except (SyntaxError, ValueError) as exc:
+                raise ValueError("ProfilePts must be a literal sequence of 3-D points") from exc
+        if not isinstance(value, (list, tuple)):
+            raise ValueError("ProfilePts must be a sequence of 3-D points")
+
+        points = []
+        for point in value:
+            if not isinstance(point, (list, tuple)) or len(point) != 3:
+                raise ValueError("ProfilePts must contain only (x, y, z) points")
+            points.append(_vector3(point, "ProfilePts"))
+        if len(points) < 2:
+            raise ValueError("ProfilePts must contain at least two distinct points")
+
+        inferred_closed = points[0] == points[-1]
+        is_closed = inferred_closed if closed is None else cls._parse_closed(closed)
+        if is_closed and inferred_closed:
+            points.pop()
+
+        minimum = 3 if is_closed else 2
+        if len(points) < minimum or len(set(points)) < minimum:
+            raise ValueError(
+                f"ProfilePts must contain at least {minimum} distinct points"
+            )
+        edge_count = len(points) if is_closed else len(points) - 1
+        if any(points[index] == points[(index + 1) % len(points)]
+               for index in range(edge_count)):
+            raise ValueError("ProfilePts must not contain zero-length edges")
+
+        if is_closed:
+            origin = points[0]
+            area_vector = [0.0, 0.0, 0.0]
+            for index in range(1, len(points) - 1):
+                first = tuple(points[index][axis] - origin[axis] for axis in range(3))
+                second = tuple(points[index + 1][axis] - origin[axis] for axis in range(3))
+                cross = (
+                    first[1] * second[2] - first[2] * second[1],
+                    first[2] * second[0] - first[0] * second[2],
+                    first[0] * second[1] - first[1] * second[0],
+                )
+                for axis in range(3):
+                    area_vector[axis] += cross[axis]
+            if not all(math.isfinite(component) for component in area_vector):
+                raise ValueError("ProfilePts must enclose a finite, non-zero area")
+            if math.hypot(*area_vector) == 0.0:
+                raise ValueError("Closed ProfilePts must enclose a non-zero area")
+
+        return points, is_closed
+
+    @staticmethod
+    def _parse_displacement(value: Any) -> tuple[float, float, float]:
+        if isinstance(value, str):
+            try:
+                value = ast.literal_eval(value)
+            except (SyntaxError, ValueError) as exc:
+                raise ValueError("Displacement must be a literal 3-D vector") from exc
+        displacement = _vector3(value, "Displacement")
+        if math.hypot(*displacement) == 0.0:
+            raise ValueError("Displacement must be non-zero")
+        return displacement
+
+    @staticmethod
+    def _displacement_from_length_direction(
+        length: Any, direction: Any
+    ) -> tuple[float, float, float]:
+        extrusion_length = _finite_float(length, "ExtrusionLength")
+        if extrusion_length <= 0.0:
+            raise ValueError("ExtrusionLength must be greater than zero")
+        unit_direction = _vector3(direction, "Direction")
+        magnitude = math.hypot(*unit_direction)
+        if magnitude <= 1e-12:
+            raise ValueError("Direction must be a non-zero world-space vector")
+        unit_direction = tuple(value / magnitude for value in unit_direction)
+        return tuple(
+            _finite_float(component * extrusion_length, "Displacement")
+            for component in unit_direction
+        )
+
+    @staticmethod
+    def _compute_profile_perimeter(
+        points: list[tuple[float, float, float]], closed: bool
+    ) -> float:
+        edge_count = len(points) if closed else len(points) - 1
+        perimeter = sum(
+            math.dist(points[index], points[(index + 1) % len(points)])
+            for index in range(edge_count)
+        )
+        if not math.isfinite(perimeter) or perimeter <= 0.0:
+            raise ValueError("Profile contour must have a finite, non-zero length")
+        return perimeter
+
+    @staticmethod
+    def _parse_profile_curve(value: Any) -> Dict[str, Any] | None:
+        if value is None:
+            return None
+        if not isinstance(value, dict) or value.get("kind") != "circle":
+            raise ValueError("ProfileCurve must describe a supported exact circle")
+
+        center = _vector3(value.get("center"), "ProfileCurve center")
+        normal = _vector3(value.get("normal"), "ProfileCurve normal")
+        x_axis = _vector3(value.get("x_axis"), "ProfileCurve x_axis")
+        radius = _finite_float(value.get("radius"), "ProfileCurve radius")
+        normal_length = math.hypot(*normal)
+        if radius <= 0.0 or normal_length <= 1e-12:
+            raise ValueError("ProfileCurve circle must have a positive radius and axis")
+        normal = tuple(component / normal_length for component in normal)
+        projection = sum(x_axis[index] * normal[index] for index in range(3))
+        x_axis = tuple(
+            x_axis[index] - projection * normal[index] for index in range(3)
+        )
+        x_length = math.hypot(*x_axis)
+        if x_length <= 1e-12:
+            raise ValueError("ProfileCurve x_axis must not be parallel to its normal")
+        x_axis = tuple(component / x_length for component in x_axis)
+        return {
+            "kind": "circle",
+            "center": list(center),
+            "radius": radius,
+            "normal": list(normal),
+            "x_axis": list(x_axis),
+        }
+
+    @staticmethod
+    def _validate_profile_curve_points(
+        points: list[tuple[float, float, float]],
+        closed: bool,
+        profile_curve: Dict[str, Any] | None,
+    ) -> None:
+        if profile_curve is None:
+            return
+        if not closed:
+            raise ValueError("An exact circular ProfileCurve must be closed")
+        center = tuple(profile_curve["center"])
+        normal = tuple(profile_curve["normal"])
+        radius = float(profile_curve["radius"])
+        tolerance = max(radius * 1e-8, 1e-9)
+        for point in points:
+            relative = tuple(point[axis] - center[axis] for axis in range(3))
+            plane_distance = abs(sum(relative[axis] * normal[axis] for axis in range(3)))
+            projected = tuple(
+                relative[axis] - normal[axis] * sum(
+                    relative[index] * normal[index] for index in range(3)
+                )
+                for axis in range(3)
+            )
+            radial_distance = math.hypot(*projected)
+            if (
+                plane_distance > tolerance
+                or abs(radial_distance - radius) > tolerance
+            ):
+                raise ValueError(
+                    "ProfilePts must lie on the exact ProfileCurve circle"
+                )
+
+    @staticmethod
+    def sample_profile_curve(
+        profile_curve: Dict[str, Any], point_count: int
+    ) -> list[tuple[float, float, float]]:
+        curve = SweptSurfaceObject._parse_profile_curve(profile_curve)
+        if curve is None:
+            raise ValueError("An exact profile curve is required")
+        if isinstance(point_count, bool) or int(point_count) < 3:
+            raise ValueError("A sampled circular profile needs at least three points")
+        center = tuple(curve["center"])
+        normal = tuple(curve["normal"])
+        x_axis = tuple(curve["x_axis"])
+        y_axis = (
+            normal[1] * x_axis[2] - normal[2] * x_axis[1],
+            normal[2] * x_axis[0] - normal[0] * x_axis[2],
+            normal[0] * x_axis[1] - normal[1] * x_axis[0],
+        )
+        radius = float(curve["radius"])
+        return [
+            tuple(
+                center[axis]
+                + radius * (
+                    x_axis[axis] * math.cos(2.0 * math.pi * index / point_count)
+                    + y_axis[axis] * math.sin(2.0 * math.pi * index / point_count)
+                )
+                for axis in range(3)
+            )
+            for index in range(point_count)
+        ]
+
+    @staticmethod
+    def _compute_anchor(
+        points: list[tuple[float, float, float]], closed: bool
+    ) -> tuple[float, float, float]:
+        if not closed:
+            return points[0]
+
+        # Signed fan-triangle areas give the conventional area centroid for
+        # planar profiles, including concave profiles.
+        origin = points[0]
+        area_vector = [0.0, 0.0, 0.0]
+        triangles = []
+        for index in range(1, len(points) - 1):
+            first = tuple(points[index][axis] - origin[axis] for axis in range(3))
+            second = tuple(points[index + 1][axis] - origin[axis] for axis in range(3))
+            cross = (
+                first[1] * second[2] - first[2] * second[1],
+                first[2] * second[0] - first[0] * second[2],
+                first[0] * second[1] - first[1] * second[0],
+            )
+            for axis in range(3):
+                area_vector[axis] += cross[axis]
+            triangles.append((cross, points[index], points[index + 1]))
+
+        magnitude = math.hypot(*area_vector)
+        normal = tuple(component / magnitude for component in area_vector)
+        weighted_sum = [0.0, 0.0, 0.0]
+        total_weight = 0.0
+        for cross, first_point, second_point in triangles:
+            weight = sum(cross[axis] * normal[axis] for axis in range(3))
+            centroid = tuple(
+                (origin[axis] + first_point[axis] + second_point[axis]) / 3.0
+                for axis in range(3)
+            )
+            total_weight += weight
+            for axis in range(3):
+                weighted_sum[axis] += weight * centroid[axis]
+        if total_weight == 0.0 or not math.isfinite(total_weight):
+            raise ValueError("Closed ProfilePts must enclose a finite, non-zero area")
+        anchor = tuple(value / total_weight for value in weighted_sum)
+        if not all(math.isfinite(value) for value in anchor):
+            raise ValueError("ProfilePts must have a finite anchor")
+        return anchor
+
+    @staticmethod
+    def _make_surface(
+        points: list[tuple[float, float, float]],
+        displacement: tuple[float, float, float],
+        closed: bool,
+    ) -> vtk.vtkPolyData:
+        surface_points = vtk.vtkPoints()
+        surface_points.SetDataTypeToDouble()
+        for point in points:
+            surface_points.InsertNextPoint(*point)
+        for point in points:
+            translated = tuple(
+                _finite_float(point[axis] + displacement[axis], "Swept ProfilePts")
+                for axis in range(3)
+            )
+            surface_points.InsertNextPoint(*translated)
+
+        polygons = vtk.vtkCellArray()
+        edge_count = len(points) if closed else len(points) - 1
+        point_count = len(points)
+        for index in range(edge_count):
+            following = (index + 1) % point_count
+            polygons.InsertNextCell(4)
+            polygons.InsertCellPoint(index)
+            polygons.InsertCellPoint(following)
+            polygons.InsertCellPoint(point_count + following)
+            polygons.InsertCellPoint(point_count + index)
+
+        surface = vtk.vtkPolyData()
+        surface.SetPoints(surface_points)
+        surface.SetPolys(polygons)
+        surface.Modified()
+        return surface
+
+    @property
+    def anchor(self) -> tuple[float, float, float]:
+        """Return the closed-profile centroid or open-profile first vertex."""
+        return self._anchor
+
+    @property
+    def endpoint(self) -> tuple[float, float, float]:
+        """Return the world-space point selected as the sweep endpoint."""
+        return tuple(
+            self._anchor[axis] + self._displacement[axis] for axis in range(3)
+        )
+
+    @property
+    def extrusion_length(self) -> float:
+        """Return the positive distance from the profile plane to the target plane."""
+        return math.hypot(*self._displacement)
+
+    @property
+    def direction(self) -> tuple[float, float, float]:
+        """Return the signed world-space unit extrusion direction."""
+        length = self.extrusion_length
+        return tuple(component / length for component in self._displacement)
+
+    @property
+    def profile_perimeter(self) -> float:
+        """Return the closed contour perimeter or open contour path length."""
+        return self._profile_perimeter
+
+    @property
+    def surface(self) -> vtk.vtkPolyData:
+        """Return the lateral sheet polydata (without caps)."""
+        return self._surface
+
+    def _build(self) -> None:
+        mapper = vtk.vtkPolyDataMapper()
+        mapper.SetInputData(self._surface)
+        self._actor = vtk.vtkActor()
+        self._actor.SetMapper(mapper)
+        self._apply_appearance(self._actor)
+
+    def get_parameters(self) -> Dict[str, Any]:
+        params = {
+            "ProfilePts": [list(point) for point in self._profile_pts],
+            "Closed": self._closed,
+            "ProfilePerimeter": self._profile_perimeter,
+            "ExtrusionLength": self.extrusion_length,
+            "Direction": list(self.direction),
+            "Material": self.material,
+            "Opacity": self.opacity,
+        }
+        if self._profile_curve is not None:
+            params["ProfileCurve"] = {
+                key: list(value) if isinstance(value, list) else value
+                for key, value in self._profile_curve.items()
+            }
+        if self.custom_color is not None:
+            params["Color"] = (
+                f"#{int(self.custom_color[0] * 255):02x}"
+                f"{int(self.custom_color[1] * 255):02x}"
+                f"{int(self.custom_color[2] * 255):02x}"
+            )
+        return params
+
+    def set_parameters(self, params: Dict[str, Any]) -> None:
+        profile_value = params.get("ProfilePts", self._profile_pts)
+        closed_value = params.get(
+            "Closed", None if "ProfilePts" in params else self._closed
+        )
+        profile, closed = self._parse_profile(profile_value, closed_value)
+        profile_curve = self._parse_profile_curve(
+            params.get("ProfileCurve", self._profile_curve)
+        )
+        self._validate_profile_curve_points(profile, closed, profile_curve)
+        if "ExtrusionLength" in params or "Direction" in params:
+            if "ExtrusionLength" not in params or "Direction" not in params:
+                raise ValueError(
+                    "ExtrusionLength and Direction must be specified together"
+                )
+            displacement = self._displacement_from_length_direction(
+                params["ExtrusionLength"], params["Direction"]
+            )
+        else:
+            # Existing project files store the full endpoint displacement vector.
+            displacement = self._parse_displacement(
+                params.get("Displacement", self._displacement)
+            )
+        perimeter = (
+            2.0 * math.pi * float(profile_curve["radius"])
+            if profile_curve is not None
+            else self._compute_profile_perimeter(profile, closed)
+        )
+        if "ProfilePerimeter" in params:
+            stored_perimeter = _finite_float(
+                params["ProfilePerimeter"], "ProfilePerimeter"
+            )
+            if stored_perimeter <= 0.0 or not math.isclose(
+                stored_perimeter, perimeter, rel_tol=1e-9, abs_tol=1e-9
+            ):
+                raise ValueError(
+                    "ProfilePerimeter must match the stored profile contour length"
+                )
+        anchor = self._compute_anchor(profile, closed)
+        surface = self._make_surface(profile, displacement, closed)
+        material = params.get("Material", self.material)
+        opacity = _finite_float(params.get("Opacity", self.opacity), "Opacity")
+        color = _color_from_parameters(params, self.custom_color)
+
+        self._profile_pts = profile
+        self._closed = closed
+        self._profile_curve = profile_curve
+        self._displacement = displacement
+        self._profile_perimeter = perimeter
+        self._anchor = anchor
+        self._surface = surface
+        self.material = material
+        self.opacity = opacity
+        self.custom_color = color
+        mapper = self._actor.GetMapper()
+        mapper.SetInputData(self._surface)
+        mapper.Update()
+        self.refresh_appearance()
+
+    def to_emerge_script(self) -> str:
+        return (
+            f'# SweptSurfaceObject "{self.name}" — lateral sheet geometry only; '
+            "simulation export is not implemented here"
+        )
+
+
+# ═══════════════════════════════════════════════════════════════════════════════
 class MeshObject(EMObject):
     """Generic triangulated mesh (e.g. imported from STEP via pythonOCC)."""
 
@@ -1688,7 +2155,8 @@ class MeshObject(EMObject):
                  plate_role: bool = False,
                  boolean_op: str | None = None,
                  boolean_source_names: List[str] | None = None,
-                 boolean_sources_data: List[Dict[str, Any]] | None = None):
+                 boolean_sources_data: List[Dict[str, Any]] | None = None,
+                 ipc2581_step_geometry: Dict[str, Any] | None = None):
         self._polydata = polydata
         self.step_source_path = step_source_path
         self.step_solid_name = step_solid_name or (name or "")
@@ -1700,6 +2168,15 @@ class MeshObject(EMObject):
         self.boolean_mesh_reduction = 0.0
         self.boolean_source_names = [str(x) for x in (boolean_source_names or []) if str(x)]
         self.boolean_sources_data = [x for x in (boolean_sources_data or []) if isinstance(x, dict)]
+        if isinstance(ipc2581_step_geometry, dict):
+            copied_geometry = _json_safe_copy(ipc2581_step_geometry)
+            if copied_geometry is None:
+                raise ValueError(
+                    "IPC2581StepGeometry must contain JSON-safe finite values"
+                )
+            self.ipc2581_step_geometry = copied_geometry
+        else:
+            self.ipc2581_step_geometry = None
         self.circular_plate = False
         self.circular_plate_center = (0.0, 0.0, 0.0)
         self.circular_plate_radius = 1.0
@@ -1789,6 +2266,8 @@ class MeshObject(EMObject):
             p["BooleanSourceNames"] = list(self.boolean_source_names)
         if self.boolean_sources_data:
             p["BooleanSourcesData"] = list(self.boolean_sources_data)
+        if self.ipc2581_step_geometry is not None:
+            p["IPC2581StepGeometry"] = deepcopy(self.ipc2581_step_geometry)
         if self.custom_color is not None:
             p["Color"] = f"#{int(self.custom_color[0]*255):02x}{int(self.custom_color[1]*255):02x}{int(self.custom_color[2]*255):02x}"
         return p
@@ -1857,6 +2336,14 @@ class MeshObject(EMObject):
         src_data = params.get("BooleanSourcesData", self.boolean_sources_data)
         if isinstance(src_data, list):
             self.boolean_sources_data = [x for x in src_data if isinstance(x, dict)]
+        step_geometry = params.get("IPC2581StepGeometry", self.ipc2581_step_geometry)
+        if "IPC2581StepGeometry" in params and not isinstance(step_geometry, dict):
+            raise ValueError("IPC2581StepGeometry must be an object")
+        if isinstance(step_geometry, dict):
+            copied_geometry = _json_safe_copy(step_geometry)
+            if copied_geometry is None:
+                raise ValueError("IPC2581StepGeometry must contain JSON-safe finite values")
+            self.ipc2581_step_geometry = copied_geometry
         if (
             "PlateRole" not in params
             and self.boolean_op == "cut"
@@ -1882,4 +2369,3 @@ class MeshObject(EMObject):
             self.creation_plane_reference_tag(),
         ]
         return "\n".join(part for part in lines if part)
-

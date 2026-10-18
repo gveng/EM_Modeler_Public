@@ -1244,6 +1244,89 @@ def test_appended_curve_data_is_compressed_in_sidecar_not_qsettings(memory_qsett
     assert app is not None
 
 
+def test_restored_appended_dataset_uses_project_configured_sparameters(memory_qsettings):
+    app = QApplication.instance() or QApplication([])
+    key = "configured-overlay-visibility"
+    base_series = [
+        {
+            "label": "S11",
+            "file_id": "simulation-run",
+            "file_name": "simulation-run",
+            "values": [0.1 + 0.2j],
+            "visible": True,
+            "configured": True,
+        },
+        {
+            "label": "S21",
+            "file_id": "simulation-run",
+            "file_name": "simulation-run",
+            "values": [0.3 + 0.4j],
+            "visible": False,
+            "configured": False,
+        },
+        {
+            "label": "S51",
+            "file_id": "simulation-run",
+            "file_name": "simulation-run",
+            "values": [0.5 + 0.6j],
+            "visible": True,
+            "configured": True,
+        },
+    ]
+    appended_series = [
+        {
+            "label": label,
+            "file_id": "touchstone-file",
+            "file_name": "measurement.s5p",
+            "values": [complex(index, 0.1)],
+            "visible": True,
+            "configured": True,
+        }
+        for index, label in enumerate(("S11", "S21", "S51"), start=1)
+    ]
+
+    source = PlotView("plot_sp", settings_key=key)
+    source.set_plot_data(
+        [1.0], base_series,
+        title="Configured output", xlabel="Frequency (GHz)", ylabel="Magnitude",
+    )
+    source._set_visible(("simulation-run", "S21"), True)
+    source.add_file_data([1.0], appended_series)
+    assert [item["visible"] for item in source._load_appended_series()] == [
+        True, True, True,
+    ]
+
+    restored = PlotView("plot_sp", settings_key=key)
+    restored.set_plot_data(
+        [1.0], base_series,
+        title="Configured output", xlabel="Frequency (GHz)", ylabel="Magnitude",
+    )
+
+    overlay = {
+        item["label"]: item
+        for item in restored._series_data
+        if item["file_id"] == "touchstone-file"
+    }
+    assert {label: item["visible"] for label, item in overlay.items()} == {
+        "S11": True,
+        "S21": False,
+        "S51": True,
+    }
+    assert {label: item["configured"] for label, item in overlay.items()} == {
+        "S11": True,
+        "S21": False,
+        "S51": True,
+    }
+    assert not next(
+        item for item in restored._series_data
+        if item["file_id"] == "simulation-run" and item["label"] == "S21"
+    )["visible"]
+    assert restored.selected_parameters() == ["S11", "S51"]
+    source.close()
+    restored.close()
+    assert app is not None
+
+
 def test_loaded_dataset_and_chart_settings_restore_together(memory_qsettings):
     app = QApplication.instance() or QApplication([])
     key = "loaded-overlay-settings"

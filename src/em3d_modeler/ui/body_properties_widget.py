@@ -22,7 +22,7 @@ Multi-selection   → shows object count, common material combo, opacity slider,
 """
 from __future__ import annotations
 import re
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QLabel, QLineEdit,
@@ -104,7 +104,7 @@ class _VariableCompleterDelegate(QStyledItemDelegate):
 class BodyPropertiesWidget(QWidget):
     """Bottom-left panel: body name, material, opacity and geometry parameters."""
 
-    params_changed = Signal(object, dict)          # (EMObject, new_params)  – single
+    params_changed = Signal(object, dict, dict)    # (EMObject, new_params, previous_params)
     bulk_material_changed = Signal(str, list)      # (material, [EMObject])  – multi
     bulk_style_changed = Signal(str, str, list)    # (material, color_hex, [EMObject])
     model_role_changed = Signal(object, bool)      # (EMObject, is_model)
@@ -121,8 +121,10 @@ class BodyPropertiesWidget(QWidget):
         self._project_mode = False
         self._has_content = False
         self._formula_resolver = None
+        self._material_assignment_validator: Callable[[List[EMObject], str], Optional[str]] | None = None
         self._project_variable_names: List[str] = []
         self._materials: List[str] = ["PEC"]
+        self._material_colors: Dict[str, str] = {}
         self._color_hex: str = "#bebee6"
 
         layout = QVBoxLayout(self)
@@ -153,7 +155,8 @@ class BodyPropertiesWidget(QWidget):
 
         # ── Material row
         mat_row = QHBoxLayout()
-        mat_row.addWidget(QLabel("Material:"))
+        self._mat_label = QLabel("Material:")
+        mat_row.addWidget(self._mat_label)
         self._mat_combo = QComboBox()
         self._mat_combo.addItems(self._materials)
         self._mat_combo.currentTextChanged.connect(self._material_changed)
@@ -368,6 +371,19 @@ class BodyPropertiesWidget(QWidget):
         finally:
             self._blocked = False
 
+    def set_material_colors(self, colors: Dict[str, str]) -> None:
+        self._material_colors = {
+            str(name).strip(): str(color).strip()
+            for name, color in colors.items()
+            if str(name).strip() and str(color).strip()
+        }
+
+    def set_material_assignment_validator(
+        self,
+        validator: Callable[[List[EMObject], str], Optional[str]] | None,
+    ) -> None:
+        self._material_assignment_validator = validator
+
     def set_selected_material(self, material_name: str) -> None:
         idx = self._mat_combo.findText(material_name)
         if idx < 0:
@@ -388,6 +404,8 @@ class BodyPropertiesWidget(QWidget):
         self._title.setText("Properties")
         self._name_widget.setVisible(False)
         self._name_edit.setText("")
+        self._mat_label.setText("Material:")
+        self._mat_label.setToolTip("")
         self._table.setColumnCount(3)
         self._table.setHorizontalHeaderLabels(["Parameter", "Value", "Resolved"])
         self._table.setRowCount(0)
@@ -405,6 +423,8 @@ class BodyPropertiesWidget(QWidget):
         self._set_content_visible(True)
         self._set_panel_content(True)
         self._title.setText("Properties")
+        self._mat_label.setText("Material:")
+        self._mat_label.setToolTip("")
         self._name_widget.setVisible(True)
         self._name_edit.setText(obj.name)
         self._mat_combo.setEnabled(True)
@@ -454,6 +474,7 @@ class BodyPropertiesWidget(QWidget):
                 (f"Position{axis}", value)
                 for axis, value in zip("XYZ", obj.sketch_reference_point())
             ]
+        exclude.add("IPC2581StepGeometry")
         rows = position_rows + [(k, v) for k, v in params.items() if k not in exclude]
         # Always expose Color in Properties so user can assign it even when
         # the object currently uses only material-based coloring.
@@ -505,20 +526,46 @@ class BodyPropertiesWidget(QWidget):
         self._apply_color_bulk_chk.setEnabled(True)
         self._apply_color_bulk_chk.setVisible(True)
         self._apply_btn.setVisible(True)
-        # Show material of the last selected
-        if self._mat_combo.findText(objects[-1].material) < 0:
-            self.set_materials(self._materials + [objects[-1].material])
-        idx = self._mat_combo.findText(objects[-1].material)
-        self._mat_combo.setCurrentIndex(max(idx, 0))
+        materials = {
+            str(getattr(obj, "material", "")).strip()
+            for obj in objects
+        }
+        if len(materials) > 1:
+            self._mat_label.setText("Material to apply (mixed selection):")
+            self._mat_label.setToolTip(
+                "Selected objects have different materials. Choose a target material, "
+                "then apply it to all selected objects."
+            )
+            self._mat_combo.setCurrentIndex(-1)
+        else:
+            self._mat_label.setText("Material:")
+            self._mat_label.setToolTip("")
+            material = objects[-1].material
+            if self._mat_combo.findText(material) < 0:
+                self.set_materials(self._materials + [material])
+            idx = self._mat_combo.findText(material)
+            self._mat_combo.setCurrentIndex(max(idx, 0))
         self._opacity_slider.setValue(int(objects[-1].opacity * 100))
         if hasattr(objects[-1], "_base_color"):
             r, g, b = objects[-1]._base_color()
             self._set_color_hex(f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}")
+        if len(materials) == 1:
+            library_color = QColor(self._material_colors.get(next(iter(materials)), ""))
+            if library_color.isValid():
+                self._set_color_hex(library_color.name())
 
     def _set_color_hex(self, color_hex: str) -> None:
         self._color_hex = color_hex
         self._color_value.setText(color_hex)
         self._color_preview.setStyleSheet(f"border:1px solid #666; background:{color_hex};")
+        for row in range(self._table.rowCount()):
+            key_item = self._table.item(row, 0)
+            value_item = self._table.item(row, 1)
+            if key_item is None or value_item is None or key_item.text() != "Color":
+                continue
+            value_item.setText(color_hex)
+            value_item.setBackground(QColor(color_hex))
+            break
 
     # ─────────────────────────────────────────────────── editing
     def _name_changed(self) -> None:
@@ -526,8 +573,13 @@ class BodyPropertiesWidget(QWidget):
             return
         new_name = self._name_edit.text().strip()
         if new_name and new_name != self._obj.name:
+            previous_params = self._obj.get_parameters()
             self._obj.name = new_name
-            self.params_changed.emit(self._obj, self._obj.get_parameters())
+            self.params_changed.emit(
+                self._obj,
+                self._obj.get_parameters(),
+                previous_params,
+            )
 
     def _collect_params(self) -> Dict[str, Any]:
         params: Dict[str, Any] = {}
@@ -537,6 +589,7 @@ class BodyPropertiesWidget(QWidget):
             "StepSolidName",
             "StepGeometryModified",
             "StepExportOffset",
+            "IPC2581StepGeometry",
             "BooleanOperation",
             "BooleanSourceNames",
             "BooleanSourcesData",
@@ -627,6 +680,11 @@ class BodyPropertiesWidget(QWidget):
     def _material_changed(self, _text: str) -> None:
         if self._blocked:
             return
+        color_value = self._material_colors.get(_text)
+        if color_value:
+            color = QColor(color_value)
+            if color.isValid():
+                self._set_color_hex(color.name())
         if len(self._selection) == 1 and self._obj:
             self._apply_single()
         # For multi: user must click "Apply to all"
@@ -655,22 +713,51 @@ class BodyPropertiesWidget(QWidget):
             for o in self._selection:
                 o.opacity = value / 100.0
                 o.refresh_appearance()
-            self.params_changed.emit(self._selection[-1], {})
+            self.params_changed.emit(self._selection[-1], {}, {})
 
     def _apply_single(self) -> None:
         if self._obj is None:
             return
+        previous_params = self._obj.get_parameters()
         try:
             params, formulas = self._collect_params()
         except Exception as exc:
             QMessageBox.warning(self, "Invalid Formula", str(exc))
             return
+        material = str(params.get("Material", self._obj.material))
+        if material != self._obj.material and self._material_assignment_validator is not None:
+            error = self._material_assignment_validator([self._obj], material)
+            if error:
+                QMessageBox.warning(self, "Group Material", error)
+                self._blocked = True
+                try:
+                    self._mat_combo.setCurrentText(self._obj.material)
+                    if hasattr(self._obj, "_base_color"):
+                        r, g, b = self._obj._base_color()
+                        self._set_color_hex(
+                            f"#{int(r*255):02x}{int(g*255):02x}{int(b*255):02x}"
+                        )
+                finally:
+                    self._blocked = False
+                return
         self._obj.set_parameters(params)
         self._obj.param_formulas = formulas
-        self.params_changed.emit(self._obj, params)
+        self.params_changed.emit(self._obj, params, previous_params)
 
     def _apply_bulk(self) -> None:
         material = self._mat_combo.currentText()
+        if not material:
+            QMessageBox.warning(
+                self,
+                "Material Required",
+                "Choose a material before applying it to the selected objects.",
+            )
+            return
+        if self._material_assignment_validator is not None:
+            error = self._material_assignment_validator(self._selection, material)
+            if error:
+                QMessageBox.warning(self, "Group Material", error)
+                return
         opacity  = self._opacity_slider.value() / 100.0
         apply_color = self._apply_color_bulk_chk.isChecked()
 
@@ -704,7 +791,7 @@ class BodyPropertiesWidget(QWidget):
             return
         if self._mat_combo.findText(name) < 0:
             self.set_materials(self._materials + [name])
+        self.material_added.emit(name)
         idx = self._mat_combo.findText(name)
         if idx >= 0:
             self._mat_combo.setCurrentIndex(idx)
-        self.material_added.emit(name)

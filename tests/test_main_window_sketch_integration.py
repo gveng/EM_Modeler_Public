@@ -15,6 +15,7 @@ from PySide6.QtWidgets import QApplication, QDialog, QDialogButtonBox, QMainWind
 
 import em3d_modeler.ui.main_window as main_window_module
 from em3d_modeler.ui.main_window import MainWindow, _BooleanCutSetupDialog
+from em3d_modeler.ui.body_properties_widget import BodyPropertiesWidget
 from em3d_modeler.drawing.sketch_engine import SketchEngine
 from em3d_modeler.scene.em_objects import (
     BoxObject, CylinderObject, ExtrudedObject, MeshObject, PlateObject, RevolvedObject,
@@ -151,6 +152,140 @@ def test_snap_resolution_uses_matching_duplicate_name_source():
     MainWindow._regenerate_snap_dependent_objects(window, [plate, *sources])
 
     assert plate.get_parameters()["Z1"] == pytest.approx(1.55)
+
+
+def test_manual_plate_dimension_edit_survives_snap_regeneration():
+    anchor_actor = vtk.vtkActor()
+    anchor = SimpleNamespace(name="Anchor", actor=anchor_actor)
+    plate = PlateObject("Plate", 0, 0, 0, 5, 10, 0)
+    plate.creation_history = {
+        "mode": "planar",
+        "plane": "XY",
+        "points": [
+            {
+                "value": [0, 0, 0],
+                "snap": {"kind": "surface", "object": "Anchor", "local": [0, 0, 0]},
+            },
+            {"value": [5, 10, 0], "snap": {"kind": "grid"}},
+        ],
+    }
+    previous_params = plate.get_parameters()
+    new_params = dict(previous_params)
+    new_params["X2"] = 8
+    plate.set_parameters(new_params)
+    plate.param_formulas = {}
+
+    window = SimpleNamespace(
+        _resolve_creation_snap=lambda snap, _objects: (
+            list(anchor_actor.GetPosition()) if snap.get("object") else None
+        )
+    )
+    MainWindow._sync_creation_history_after_parameter_edit(
+        window,
+        plate,
+        new_params,
+        previous_params,
+    )
+
+    MainWindow._regenerate_snap_dependent_objects(window, [plate, anchor])
+    assert plate.x2 == pytest.approx(8)
+
+    anchor_actor.SetPosition(3, 4, 2)
+    MainWindow._regenerate_snap_dependent_objects(window, [plate, anchor])
+    assert (plate.x1, plate.y1, plate.z1) == pytest.approx((3, 4, 0))
+    assert (plate.x2, plate.y2, plate.z2) == pytest.approx((8, 10, 0))
+
+
+def test_legacy_saved_plate_edits_migrate_to_snap_overrides():
+    anchor_actor = vtk.vtkActor()
+    anchor = SimpleNamespace(name="Anchor", actor=anchor_actor)
+    plate = PlateObject("Plate", 2, 0, 0, 8, 10, 0)
+    plate.creation_history = {
+        "mode": "planar",
+        "plane": "XY",
+        "points": [
+            {
+                "value": [0, 0, 0],
+                "snap": {"kind": "surface", "object": "Anchor", "local": [0, 0, 0]},
+            },
+            {"value": [5, 10, 0], "snap": {"kind": "grid"}},
+        ],
+    }
+    window = SimpleNamespace(
+        _resolve_creation_snap=lambda snap, _objects: (
+            list(anchor_actor.GetPosition()) if snap.get("object") else None
+        )
+    )
+
+    MainWindow._regenerate_snap_dependent_objects(window, [plate, anchor])
+    assert (plate.x1, plate.x2) == pytest.approx((2, 8))
+    assert plate.creation_history["points"][0]["snap"]["manual_axes"] == ["x"]
+    assert plate.creation_history["points"][1]["value"][0] == pytest.approx(8)
+
+    anchor_actor.SetPosition(4, 6, 0)
+    MainWindow._regenerate_snap_dependent_objects(window, [plate, anchor])
+    assert (plate.x1, plate.y1, plate.x2, plate.y2) == pytest.approx((2, 6, 8, 10))
+
+
+def test_body_properties_emits_previous_geometry_parameters():
+    app = QApplication.instance() or QApplication([])
+    widget = BodyPropertiesWidget()
+    plate = PlateObject("Plate", 0, 0, 0, 5, 10, 0)
+    widget.set_object(plate)
+    emitted = []
+    widget.params_changed.connect(lambda *args: emitted.append(args))
+
+    x2_row = next(
+        row
+        for row in range(widget._table.rowCount())
+        if widget._table.item(row, 0).text() == "X2"
+    )
+    widget._table.item(x2_row, 1).setText("8")
+
+    assert len(emitted) == 1
+    assert emitted[0][1]["X2"] == pytest.approx(8)
+    assert emitted[0][2]["X2"] == pytest.approx(5)
+    assert QApplication.instance() is app
+
+
+def test_manual_edit_of_snapped_plate_corner_keeps_other_snap_axes():
+    anchor_actor = vtk.vtkActor()
+    anchor = SimpleNamespace(name="Anchor", actor=anchor_actor)
+    plate = PlateObject("Plate", 0, 0, 0, 5, 10, 0)
+    plate.creation_history = {
+        "mode": "planar",
+        "plane": "XY",
+        "points": [
+            {
+                "value": [0, 0, 0],
+                "snap": {"kind": "surface", "object": "Anchor", "local": [0, 0, 0]},
+            },
+            {"value": [5, 10, 0], "snap": {"kind": "grid"}},
+        ],
+    }
+    previous_params = plate.get_parameters()
+    new_params = dict(previous_params)
+    new_params["X1"] = 2
+    plate.set_parameters(new_params)
+    plate.param_formulas = {}
+
+    window = SimpleNamespace(
+        _resolve_creation_snap=lambda snap, _objects: (
+            list(anchor_actor.GetPosition()) if snap.get("object") else None
+        )
+    )
+    MainWindow._sync_creation_history_after_parameter_edit(
+        window,
+        plate,
+        new_params,
+        previous_params,
+    )
+
+    anchor_actor.SetPosition(4, 6, 0)
+    MainWindow._regenerate_snap_dependent_objects(window, [plate, anchor])
+
+    assert (plate.x1, plate.y1, plate.z1) == pytest.approx((2, 6, 0))
+    assert plate.creation_history["points"][0]["snap"]["manual_axes"] == ["x"]
 
 
 def test_boolean_recompute_restores_same_named_sources_individually(monkeypatch):
@@ -429,6 +564,58 @@ def test_boolean_cut_applies_each_tool_to_every_base(monkeypatch, keep_tools):
     assert (tools[0] in scene.objects) is keep_tools
 
 
+def test_boolean_fuse_replaces_all_sources_without_cut_tool_options(monkeypatch):
+    from em3d_modeler.scene import boolean_ops
+
+    sources = [
+        BoxObject("Base", 0, 0, 0, 2, 2, 2),
+        BoxObject("Tool_1", 1, 0, 0, 3, 2, 2),
+        BoxObject("Tool_2", 2, 0, 0, 4, 2, 2),
+    ]
+    scene = SceneManager(vtk.vtkRenderer())
+    for obj in sources:
+        scene.add_object(obj)
+        scene.select_add(obj)
+    fuse_calls = []
+    monkeypatch.setattr(
+        main_window_module,
+        "_BooleanCutSetupDialog",
+        Mock(side_effect=AssertionError("Fuse must not open the cut setup dialog")),
+    )
+    monkeypatch.setattr(
+        main_window_module.QMessageBox,
+        "question",
+        staticmethod(lambda *_args, **_kwargs: main_window_module.QMessageBox.Yes),
+    )
+    monkeypatch.setattr(
+        boolean_ops,
+        "fuse_many",
+        lambda objects, **_kwargs: (
+            fuse_calls.append(list(objects)) or vtk.vtkPolyData()
+        ),
+    )
+    window = SimpleNamespace(
+        _viewport=SimpleNamespace(
+            scene=scene,
+            object_selected=SimpleNamespace(emit=Mock()),
+            selection_changed=SimpleNamespace(emit=Mock()),
+            scene_changed=SimpleNamespace(emit=Mock()),
+            _render=Mock(),
+        ),
+        _boolean_decimation_enabled=False,
+        _is_plate_role_object=lambda _obj: False,
+        _serialize_object_snapshot=lambda _obj: {},
+        _refresh_materials=Mock(),
+        _info_bar=SimpleNamespace(set_info=Mock()),
+    )
+
+    MainWindow._do_boolean(window, "fuse", "Fuse")
+
+    assert fuse_calls == [sources]
+    assert [obj.name for obj in scene.objects] == ["Fuse_Base"]
+    assert "tools retained" not in window._info_bar.set_info.call_args.args[0]
+
+
 def test_parametric_recompute_recenters_generated_air_and_pml_regions():
     model = BoxObject("Model", 10, 20, 30, 40, 60, 80, "Copper")
     air = BoxObject("Air_Region", -10, -10, -10, 60, 70, 90, "AIR")
@@ -530,6 +717,157 @@ def test_progressive_stdout_parser_buffers_split_json_lines():
     window._update_progressive_sparams_plot.assert_called_once_with(payload)
     window._append_sim_log.assert_called_once_with("[info] done")
     assert window._sim_stdout_buffer == ""
+
+
+def test_solver_log_progress_advances_by_completed_frequency_solve():
+    from em3d_modeler.ui.info_bar_widget import InfoBarWidget
+
+    info_bar = InfoBarWidget()
+    window = SimpleNamespace(
+        _sim_status_running=True,
+        _sim_status_completed_jobs=0,
+        _sim_status_total_jobs=1,
+        _sim_status_current_fraction=None,
+        _sim_log_progress_active=False,
+        _sim_log_progress_expected_steps=0,
+        _sim_log_progress_completed_steps=0,
+        _info_bar=info_bar,
+        _append_sim_log=Mock(),
+    )
+    MainWindow._process_sim_stdout_line(
+        window,
+        'EM3D_JOB_STARTED:{"simulation_name":"Sweep","simulation_type":"sweep",'
+        '"expected_solver_completions":4,"progressive_sparams_active":false}',
+    )
+
+    MainWindow._process_sim_stdout_line(
+        window, "0:00:01.250 INFO: [p00/t00-j001] Elapsed time taken: 1.250 seconds"
+    )
+    assert window._sim_status_current_fraction == pytest.approx(0.25)
+    assert info_bar._sim_progress.value() == 25
+    MainWindow._process_sim_stdout_line(
+        window, "[p00/t00-j002] Elapsed time taken: 1.100 seconds"
+    )
+    assert window._sim_status_current_fraction == pytest.approx(0.5)
+    assert info_bar._sim_progress.value() == 50
+    assert window._sim_log_progress_completed_steps == 2
+    assert window._append_sim_log.call_count == 2
+
+
+def test_solver_log_progress_does_not_override_progressive_sparams():
+    window = SimpleNamespace(
+        _sim_status_running=True,
+        _sim_status_completed_jobs=0,
+        _sim_status_total_jobs=1,
+        _sim_status_current_fraction=None,
+        _sim_log_progress_active=False,
+        _sim_log_progress_expected_steps=0,
+        _sim_log_progress_completed_steps=0,
+        _append_sim_log=Mock(),
+    )
+    MainWindow._process_sim_stdout_line(
+        window,
+        'EM3D_JOB_STARTED:{"simulation_name":"Sweep","simulation_type":"sweep",'
+        '"expected_solver_completions":4,"progressive_sparams_active":true}',
+    )
+    MainWindow._process_sim_stdout_line(
+        window, "[p00/t00-j001] Elapsed time taken: 1.250 seconds"
+    )
+    assert window._sim_log_progress_active
+    assert window._sim_log_progress_deferred
+    assert window._sim_status_current_fraction is None
+    assert window._sim_log_progress_completed_steps == 1
+    window._append_sim_log.assert_called_once_with(
+        "[p00/t00-j001] Elapsed time taken: 1.250 seconds"
+    )
+
+
+def test_solver_log_progress_takes_over_when_progressive_updates_fall_back():
+    window = SimpleNamespace(
+        _sim_status_running=True,
+        _sim_status_completed_jobs=0,
+        _sim_status_total_jobs=1,
+        _sim_status_current_fraction=None,
+        _sim_log_progress_active=False,
+        _sim_log_progress_deferred=False,
+        _sim_log_progress_expected_steps=0,
+        _sim_log_progress_completed_steps=0,
+        _append_sim_log=Mock(),
+    )
+    MainWindow._process_sim_stdout_line(
+        window,
+        'EM3D_JOB_STARTED:{"simulation_name":"Parametric","simulation_type":"parametric",'
+        '"expected_solver_completions":4,"progressive_sparams_active":true}',
+    )
+    MainWindow._process_sim_stdout_line(
+        window, "[p00/t00-j001] Elapsed time taken: 1.250 seconds"
+    )
+    assert window._sim_status_current_fraction is None
+    MainWindow._process_sim_stdout_line(
+        window,
+        "[warning] Progressive plot update skipped for width=1; simulation will continue",
+    )
+
+    assert not window._sim_log_progress_deferred
+    assert window._sim_status_current_fraction == pytest.approx(0.25)
+    MainWindow._process_sim_stdout_line(
+        window, "[p00/t00-j002] Elapsed time taken: 1.100 seconds"
+    )
+    assert window._sim_status_current_fraction == pytest.approx(0.5)
+
+
+def test_sim_log_renders_warning_lines_in_yellow():
+    from PySide6.QtGui import QTextCursor
+    from PySide6.QtWidgets import QApplication, QPlainTextEdit
+
+    app = QApplication.instance() or QApplication([])
+    log_view = QPlainTextEdit()
+    window = SimpleNamespace(_sim_log_view=log_view)
+
+    MainWindow._append_sim_log(window, "[warn] EMerge mesh-size check bypassed.")
+    MainWindow._append_sim_log(window, "[info] Continuing as configured.")
+
+    assert log_view.toPlainText() == (
+        "[warn] EMerge mesh-size check bypassed.\n"
+        "[info] Continuing as configured."
+    )
+    cursor = log_view.textCursor()
+    cursor.setPosition(0)
+    cursor.movePosition(QTextCursor.Right, QTextCursor.KeepAnchor, 1)
+    assert cursor.charFormat().foreground().color().name() == "#e8b45c"
+    assert app is not None
+
+
+def test_sim_log_append_preserves_scroll_unless_already_at_bottom():
+    from PySide6.QtWidgets import QApplication, QPlainTextEdit
+
+    app = QApplication.instance() or QApplication([])
+    log_view = QPlainTextEdit()
+    log_view.resize(420, 160)
+    log_view.setPlainText("\n".join(f"line {index}" for index in range(100)))
+    log_view.show()
+    app.processEvents()
+    scroll_bar = log_view.verticalScrollBar()
+    scroll_bar.setValue(20)
+    previous_scroll_value = scroll_bar.value()
+    window = SimpleNamespace(_sim_log_view=log_view)
+
+    MainWindow._append_sim_log(window, "[info] appended while reading history")
+
+    assert scroll_bar.value() == previous_scroll_value
+
+    scroll_bar.setValue(max(0, scroll_bar.maximum() - 1))
+    previous_scroll_value = scroll_bar.value()
+    MainWindow._append_sim_log(window, "[info] appended one line above the bottom")
+
+    assert scroll_bar.value() == previous_scroll_value
+
+    scroll_bar.setValue(scroll_bar.maximum())
+    MainWindow._append_sim_log(window, "[info] appended while following the log")
+
+    assert scroll_bar.value() == scroll_bar.maximum()
+    log_view.close()
+    assert app is not None
 
 
 def test_completed_job_stdout_event_dispatches_final_output_plotting():
@@ -950,6 +1288,82 @@ def test_append_mode_replaces_progressive_run_with_final_data():
     assert window._append_progressive_run_ids == {}
 
 
+@pytest.mark.parametrize(
+    ("existing_chart", "progressive", "expect_loading"),
+    [
+        (False, False, True),
+        (True, False, True),
+        (False, True, True),
+        (True, True, False),
+    ],
+)
+def test_show_chart_reports_loading_status_for_new_and_reopened_graphs(
+    monkeypatch, existing_chart, progressive, expect_loading
+):
+    from em3d_modeler.ui.info_bar_widget import InfoBarWidget
+
+    app = QApplication.instance() or QApplication([])
+    info_bar = InfoBarWidget()
+    observed = []
+    window = SimpleNamespace(
+        _info_bar=info_bar,
+        _plot_views={"Sweep::Output": object()} if existing_chart else {},
+        _plot_subwindows={"Sweep::Output": object()} if existing_chart else {},
+        _append_chart_keys={},
+        _chart_output_name=MainWindow._chart_output_name,
+    )
+
+    def capture_chart_render(_self, _key, _plot_data, *, progressive=False):
+        observed.append((
+            info_bar._msg.text(),
+            info_bar._sim_status.text(),
+            info_bar._sim_progress.minimum(),
+            info_bar._sim_progress.maximum(),
+        ))
+
+    monkeypatch.setattr(MainWindow, "_show_chart_content", capture_chart_render)
+    MainWindow._show_chart(
+        window,
+        "Sweep::Output",
+        {"title": "Output"},
+        progressive=progressive,
+    )
+
+    if expect_loading:
+        assert observed == [("Loading graph...", "LOAD", 0, 0)]
+    else:
+        assert observed == [("Ready.", "RUN", 0, 100)]
+    assert not info_bar._sim_status.isVisible()
+    assert info_bar._msg.text() == "Ready."
+    assert app is not None
+
+
+def test_show_chart_clears_loading_status_when_rendering_fails(monkeypatch):
+    from em3d_modeler.ui.info_bar_widget import InfoBarWidget
+
+    app = QApplication.instance() or QApplication([])
+    info_bar = InfoBarWidget()
+    window = SimpleNamespace(
+        _info_bar=info_bar,
+        _plot_views={},
+        _plot_subwindows={},
+        _append_chart_keys={},
+        _chart_output_name=MainWindow._chart_output_name,
+    )
+    monkeypatch.setattr(
+        MainWindow,
+        "_show_chart_content",
+        Mock(side_effect=RuntimeError("render failed")),
+    )
+
+    with pytest.raises(RuntimeError, match="render failed"):
+        MainWindow._show_chart(window, "Sweep::Output", {"title": "Output"})
+
+    assert not info_bar._sim_status.isVisible()
+    assert info_bar._msg.text() == "Ready."
+    assert app is not None
+
+
 def test_generate_plot_uses_saved_touchstone_without_loading_emerge(tmp_path):
     touchstone_dir = tmp_path / "Touchstone"
     touchstone_dir.mkdir()
@@ -989,7 +1403,9 @@ def test_generate_plot_uses_saved_touchstone_without_loading_emerge(tmp_path):
 
 
 def test_generate_plot_ff_3d_opens_emerge_window_at_nearest_solved_frequency():
-    farfield = object()
+    import numpy as np
+
+    farfield = SimpleNamespace(normE=np.asarray([1e-3, 1e-2]))
     field_entry = SimpleNamespace(farfield_3d=Mock(return_value=farfield))
     field_data = SimpleNamespace(find=Mock(return_value=field_entry))
     geometry = SimpleNamespace(boundary=Mock(return_value=["face"]))
@@ -1011,6 +1427,8 @@ def test_generate_plot_ff_3d_opens_emerge_window_at_nearest_solved_frequency():
     window = SimpleNamespace(
         _project_name="Model",
         _load_sim_grid_from_results=Mock(return_value=(loaded_sim, grid, "simdata.emerge")),
+        _farfield_integration_faces=MainWindow._farfield_integration_faces,
+        _farfield_pattern_db_floor=MainWindow._farfield_pattern_db_floor,
         _show_chart=show_chart,
         _info_bar=SimpleNamespace(set_info=Mock()),
         _append_sim_log=Mock(),
@@ -1039,7 +1457,7 @@ def test_generate_plot_ff_3d_opens_emerge_window_at_nearest_solved_frequency():
         component="normE",
         quantity="abs",
         dB=True,
-        dBfloor=-40,
+        dBfloor=-80,
         rmax=None,
         opacity=0.75,
     )
@@ -1047,8 +1465,181 @@ def test_generate_plot_ff_3d_opens_emerge_window_at_nearest_solved_frequency():
     assert window._farfield_displays == [display]
     display.clean.assert_not_called()
     assert "at 1 GHz" in window._info_bar.set_info.call_args.args[0]
-    assert "at 1 GHz" in window._info_bar.set_info.call_args.args[0]
-    assert "at 1 GHz" in window._append_sim_log.call_args.args[0]
+
+
+def test_eigenmode_plot_adds_three_ez_cuts_to_emerge_display():
+    import numpy as np
+
+    field_plot = SimpleNamespace(F=None)
+    cut = SimpleNamespace(
+        Ez=np.asarray([1 + 2j, -3 + 4j]),
+        scalar=Mock(return_value=field_plot),
+    )
+    field = SimpleNamespace(
+        freq=2.45e9,
+        basis=SimpleNamespace(
+            bounds=((0.0, 0.04), (0.0, 0.02), (-0.01, 0.02))
+        ),
+        cutplane=Mock(return_value=cut),
+    )
+    display = SimpleNamespace(
+        populate=Mock(),
+        add_field=Mock(),
+        show=Mock(),
+        _plot=SimpleNamespace(close=Mock()),
+        clean=Mock(),
+    )
+    loaded_sim = SimpleNamespace(
+        data=SimpleNamespace(mw=SimpleNamespace(field=[field])),
+        display=display,
+    )
+    window = SimpleNamespace(_farfield_displays=[])
+
+    frequency = MainWindow._show_eigenmode_display(window, loaded_sim, 1)
+
+    assert frequency == 2.45e9
+    display.populate.assert_called_once_with(opacity=0.1)
+    assert field.cutplane.call_count == 3
+    assert [call.kwargs["z"] for call in field.cutplane.call_args_list] == pytest.approx(
+        [-0.0025, 0.005, 0.0125]
+    )
+    assert all(
+        call.kwargs["ds"] > 0
+        for call in field.cutplane.call_args_list
+    )
+    assert cut.scalar.call_count == 3
+    assert np.array_equal(field_plot.F, [1.0, -3.0])
+    assert display.add_field.call_count == 3
+    assert all(call.kwargs == {"cmap": "rainbow"} for call in display.add_field.call_args_list)
+    display.show.assert_called_once_with()
+    assert window._farfield_displays == [display]
+
+
+def test_advanced_eigen_field_plot_uses_selected_component_plane_and_metric():
+    import numpy as np
+
+    field_plot = SimpleNamespace(F=None)
+    cut = SimpleNamespace(
+        Hx=np.asarray([1 + 2j, -3 + 4j]),
+        scalar=Mock(return_value=field_plot),
+    )
+    field = SimpleNamespace(
+        freq=2.45e9,
+        basis=SimpleNamespace(
+            bounds=((0.0, 0.04), (0.0, 0.02), (-0.01, 0.02))
+        ),
+        cutplane=Mock(return_value=cut),
+    )
+    display = SimpleNamespace(
+        populate=Mock(),
+        add_field=Mock(),
+        show=Mock(),
+        _plot=SimpleNamespace(close=Mock()),
+        clean=Mock(),
+    )
+    loaded_sim = SimpleNamespace(
+        data=SimpleNamespace(mw=SimpleNamespace(field=[field])),
+        display=display,
+    )
+    window = SimpleNamespace(_farfield_displays=[])
+
+    MainWindow._show_eigenmode_display(
+        window,
+        loaded_sim,
+        1,
+        {
+            "eigen_field_level": "advanced",
+            "field_component": "Hx",
+            "field_metric": "imag",
+            "plane": "XZ",
+            "cut_positions": [0.2, 0.8],
+            "geometry_opacity": 0.6,
+            "colormap": "coolwarm",
+        },
+    )
+
+    assert [call.kwargs["y"] for call in field.cutplane.call_args_list] == pytest.approx(
+        [0.004, 0.016]
+    )
+    assert all(call.args == ("Hx", "imag") for call in cut.scalar.call_args_list)
+    assert np.array_equal(field_plot.F, [2.0, 4.0])
+    display.populate.assert_called_once_with(opacity=0.6)
+    assert all(call.kwargs == {"cmap": "coolwarm"} for call in display.add_field.call_args_list)
+
+
+def test_eigenmode_plot_dispatch_opens_emerge_display_for_saved_mode():
+    loaded_sim = SimpleNamespace()
+    settings = {
+        "simulations": [{"name": "Cavity", "type": "Eigenmode"}],
+    }
+    window = SimpleNamespace(
+        _project_name="Model",
+        _project_tree=SimpleNamespace(get_settings=lambda: settings),
+        _load_sim_grid_from_results=Mock(
+            return_value=(loaded_sim, None, Path("simdata.emerge"))
+        ),
+        _show_eigenmode_display=Mock(return_value=2.45e9),
+        _info_bar=SimpleNamespace(set_info=Mock()),
+        _append_sim_log=Mock(),
+    )
+
+    MainWindow._on_output_plot_requested(
+        window,
+        {
+            "name": "Mode shape",
+            "simulation": "Cavity",
+            "plot_type": "eigen_field",
+            "params": {"eigenmode_number": 2},
+        },
+    )
+
+    window._load_sim_grid_from_results.assert_called_once_with(
+        "Cavity",
+        results_dir=None,
+        allow_irregular=True,
+        allow_field_only=True,
+    )
+    window._show_eigenmode_display.assert_called_once_with(
+        loaded_sim, 2, {"eigenmode_number": 2}
+    )
+    assert "2.45 GHz" in window._info_bar.set_info.call_args.args[0]
+    assert "2.45 GHz" in window._append_sim_log.call_args.args[0]
+
+
+def test_eigenmode_plot_explains_missing_results_after_unsuccessful_run(
+    tmp_path, monkeypatch
+):
+    warning = Mock()
+    monkeypatch.setattr(main_window_module.QMessageBox, "warning", warning)
+    window = SimpleNamespace(
+        _project_name="Model",
+        _project_tree=SimpleNamespace(get_settings=lambda: {
+            "simulations": [{"name": "Cavity", "type": "Eigenmode"}],
+        }),
+        _load_sim_grid_from_results=Mock(
+            side_effect=RuntimeError("No simdata.emerge found")
+        ),
+        _candidate_results_dirs_for_sim=Mock(return_value=[tmp_path]),
+        _simdata_file_in_dir=Mock(return_value=None),
+        _show_chart=Mock(),
+        _append_sim_log=Mock(),
+    )
+
+    MainWindow._on_output_plot_requested(
+        window,
+        {
+            "name": "Mode shape",
+            "simulation": "Cavity",
+            "plot_type": "plot_eigenmode",
+            "params": {"eigenmode_number": 1},
+        },
+    )
+
+    warning.assert_called_once()
+    message = warning.call_args.args[2]
+    assert "must complete successfully before it can be plotted" in message
+    assert "Check the simulation log" in message
+    window._show_chart.assert_not_called()
 
 
 def test_generate_plot_opens_empty_chart_when_simulation_has_no_results(tmp_path):
@@ -1167,6 +1758,217 @@ def test_results_loader_can_return_raw_scalar_for_irregular_parametric_data(tmp_
     assert simulation is loaded_simulation
     assert isinstance(scalar, IrregularScalar)
     assert loaded_path == simdata
+
+
+def test_results_loader_can_return_saved_eigenmode_fields_without_scalar_grid(tmp_path):
+    result_dir = tmp_path / "Model_Cavity.EMResults"
+    result_dir.mkdir()
+    simdata = result_dir / "simdata.emerge"
+    simdata.write_text("", encoding="ascii")
+    field_data = SimpleNamespace(n=1)
+    loaded_simulation = SimpleNamespace(
+        data=SimpleNamespace(mw=SimpleNamespace(field=field_data))
+    )
+    window = SimpleNamespace(
+        _resolve_emerge_simulation_ctor=lambda: lambda *_args, **_kwargs: loaded_simulation,
+        _simdata_file_in_dir=lambda directory: (
+            Path(directory) / "simdata.emerge"
+            if (Path(directory) / "simdata.emerge").is_file()
+            else None
+        ),
+        _simulation_bundle_dir=lambda: tmp_path,
+    )
+
+    simulation, scalar, loaded_path = MainWindow._load_sim_grid_from_results(
+        window,
+        "Cavity",
+        result_dir,
+        allow_field_only=True,
+    )
+
+    assert simulation is loaded_simulation
+    assert scalar is None
+    assert loaded_path == simdata
+
+
+def test_results_loader_can_return_scattered_fields_without_scalar_grid(tmp_path):
+    result_dir = tmp_path / "Model_Scattered.EMResults"
+    result_dir.mkdir()
+    simdata = result_dir / "simdata.emerge"
+    simdata.write_text("", encoding="ascii")
+
+    class MicrowaveData:
+        field = SimpleNamespace(n=1)
+
+        @property
+        def scalar(self):
+            raise AssertionError("field-only load must not access scalar data")
+
+    loaded_simulation = SimpleNamespace(data=SimpleNamespace(mw=MicrowaveData()))
+    window = SimpleNamespace(
+        _resolve_emerge_simulation_ctor=lambda: lambda *_args, **_kwargs: loaded_simulation,
+        _simdata_file_in_dir=lambda directory: (
+            Path(directory) / "simdata.emerge"
+            if (Path(directory) / "simdata.emerge").is_file()
+            else None
+        ),
+        _simulation_bundle_dir=lambda: tmp_path,
+    )
+
+    simulation, grid, loaded_path = MainWindow._load_sim_grid_from_results(
+        window,
+        "Scattered",
+        result_dir,
+        allow_irregular=True,
+        allow_field_only=True,
+    )
+
+    assert simulation is loaded_simulation
+    assert grid is None
+    assert loaded_path == simdata
+
+
+def test_scattered_field_3d_display_uses_relative_fields_and_nearest_frequency():
+    calls = []
+
+    class RelativeField:
+        def grid(self, *, N):
+            calls.append(("grid", N))
+            return self
+
+        def vector(self, component):
+            calls.append(("vector", component))
+            return "E-vector"
+
+        def scalar(self, component, quantity):
+            calls.append(("scalar", component, quantity))
+            return "Ey-real"
+
+    class SavedField:
+        def __init__(self, frequency):
+            self.freq = frequency
+            self.relative_was_read = False
+
+        @property
+        def relative(self):
+            self.relative_was_read = True
+            calls.append(("relative",))
+            return RelativeField()
+
+    saved_fields = [SavedField(0.9e9), SavedField(1.0e9), SavedField(1.1e9)]
+    field_data = SimpleNamespace(
+        _data_entries=saved_fields,
+        find=Mock(side_effect=lambda *, freq: next(
+            field for field in saved_fields if field.freq == freq
+        )),
+    )
+    display = SimpleNamespace(
+        populate=Mock(side_effect=lambda: calls.append(("populate",))),
+        add_field=Mock(
+            side_effect=lambda field, **kwargs: calls.append(
+                ("add_field", field, kwargs)
+            )
+        ),
+        show=Mock(side_effect=lambda: calls.append(("show",))),
+        _plot=SimpleNamespace(close=Mock()),
+        clean=Mock(),
+    )
+    loaded_sim = SimpleNamespace(
+        data=SimpleNamespace(mw=SimpleNamespace(field=field_data)),
+        display=display,
+    )
+    window = SimpleNamespace(_farfield_displays=[])
+
+    frequency = MainWindow._show_scattered_field_3d_display(
+        window, loaded_sim, {"frequency_GHz": 1.04}
+    )
+
+    assert frequency == 1.0e9
+    field_data.find.assert_called_once_with(freq=1.0e9)
+    assert [field.relative_was_read for field in saved_fields] == [False] * 3
+    assert calls == [
+        ("relative",),
+        ("populate",),
+        ("grid", 1000),
+        ("vector", "E"),
+        ("add_field", "E-vector", {}),
+        ("grid", 10_000),
+        ("scalar", "Ey", "real"),
+        ("add_field", "Ey-real", {"symmetrize": True}),
+        ("show",),
+    ]
+    assert window._farfield_displays == [display]
+    display.clean.assert_not_called()
+
+
+def test_scattered_field_output_dispatch_loads_field_only_and_reports_frequency():
+    loaded_sim = SimpleNamespace()
+    window = SimpleNamespace(
+        _project_name="Model",
+        _project_tree=SimpleNamespace(
+            get_settings=lambda: {
+                "simulations": [{"name": "Scattered", "type": "ScatteredField"}]
+            }
+        ),
+        _load_sim_grid_from_results=Mock(
+            return_value=(loaded_sim, None, Path("simdata.emerge"))
+        ),
+        _show_scattered_field_3d_display=Mock(return_value=1.0e9),
+        _info_bar=SimpleNamespace(set_info=Mock()),
+        _append_sim_log=Mock(),
+    )
+
+    MainWindow._on_output_plot_requested(
+        window,
+        {
+            "name": "Relative field",
+            "simulation": "Scattered",
+            "plot_type": "plot_sf_3d",
+            "params": {"frequency_GHz": 1.04},
+        },
+    )
+
+    window._load_sim_grid_from_results.assert_called_once_with(
+        "Scattered",
+        results_dir=None,
+        allow_irregular=True,
+        allow_field_only=True,
+    )
+    window._show_scattered_field_3d_display.assert_called_once_with(
+        loaded_sim, {"frequency_GHz": 1.04}
+    )
+    assert "1 GHz" in window._info_bar.set_info.call_args.args[0]
+    assert "1 GHz" in window._append_sim_log.call_args.args[0]
+
+
+def test_plot_sf_3d_export_saves_fields_in_standard_and_clean_scripts():
+    from em3d_modeler.emerge.python_script_exporter import (
+        build_clean_emerge_python_script,
+        export_emerge_python_script,
+    )
+
+    script = export_emerge_python_script(
+        project_name="ScatteredFieldExport",
+        settings={
+            "simulations": [{"name": "Scattered", "type": "Sweep"}],
+            "outputs": [
+                {
+                    "name": "Relative field",
+                    "simulation": "Scattered",
+                    "plot_type": "plot_sf_3d",
+                    "params": {"frequency_GHz": 1.25},
+                }
+            ],
+        },
+        step_entries=[],
+        run_sweep=False,
+    )
+
+    assert "'plot_type': 'plot_sf_3d'" in script
+    assert "SAVE_FARFIELDS = any(" in script
+    assert "simulationObj.mw.save_fields = ['E', 'H']" in script
+    clean_script = build_clean_emerge_python_script(script, "sweep")
+    assert "simulationObj.mw.save_fields = ['E', 'H']" in clean_script
 
 
 def test_completed_parametric_plot_uses_nested_touchstones_without_root_results(tmp_path):
@@ -1793,6 +2595,7 @@ def test_sketch_toolbar_shows_select_delete_and_exit_actions():
         _sketch_request_extrude=Mock(),
         _sketch_begin_revolve=Mock(),
         _sketch_request_extruded_cut=Mock(),
+        _request_surface_sweep=Mock(),
         _sketch_set_selection_mode=Mock(),
         _sketch_delete_selected=Mock(),
         _sketch_set_tool=Mock(),
@@ -1870,7 +2673,8 @@ def test_tools_menu_does_not_offer_report():
     )
     for name in (
         "_new_project", "_close_project", "_open_project", "_save_project",
-        "_save_project_as", "_import_step", "_export_emerge",
+        "_save_project_as", "_import_step", "_import_ipc2581_board_json_3d",
+        "_export_emerge",
         "_set_global_material_db", "_reload_global_material_db",
         "_delete_selected", "_set_cancel_drawing_enabled", "_undo", "_redo",
         "_update_history_actions", "_set_view", "_open_reference_plane_dialog",

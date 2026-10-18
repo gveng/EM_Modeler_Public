@@ -15,7 +15,7 @@
 # Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
 
 """Persistent info and simulation status bar below the workspace tabs."""
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QProgressBar
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QLabel, QProgressBar, QSizePolicy
 from PySide6.QtCore    import Qt
 from PySide6.QtGui     import QColor, QPalette
 
@@ -33,6 +33,8 @@ class InfoBarWidget(QWidget):
         self._icon.setFixedWidth(18)
         self._msg   = QLabel("Ready.")
         self._msg.setAlignment(Qt.AlignVCenter | Qt.AlignLeft)
+        self._msg.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+        self._msg.setMinimumWidth(0)
         self._coords = QLabel("")
         self._coords.setAlignment(Qt.AlignVCenter | Qt.AlignRight)
         self._coords.setFixedWidth(220)
@@ -59,6 +61,7 @@ class InfoBarWidget(QWidget):
         self._sim_running = False
         self._sim_preparing = False
         self._preparation_message = ""
+        self._check_progress_active = False
         self._sim_status.hide()
         self._sim_progress.hide()
         self._sim_progress_label.hide()
@@ -129,11 +132,31 @@ class InfoBarWidget(QWidget):
         completed: int = 0,
         total: int = 0,
         current_fraction: float | None = None,
+        show_in_model_view: bool = False,
+        status: str = "PREP",
+        reset: bool = False,
     ) -> None:
         self._preparation_message = str(message)
         self._sim_preparing = bool(self._preparation_message)
+        self._check_progress_active = self._sim_preparing and bool(show_in_model_view)
         if self._sim_preparing:
-            self._sim_status.setText("PREP")
+            normalized_status = str(status or "PREP").strip().upper()
+            self._sim_status.setText(normalized_status)
+            if normalized_status == "FAIL":
+                self._sim_status.setStyleSheet(
+                    "background:#5a2730; color:#ffd7dc; border:1px solid #a94b59; "
+                    "border-radius:3px; font-weight:700; padding:2px 5px;"
+                )
+            elif normalized_status == "CHECK":
+                self._sim_status.setStyleSheet(
+                    "background:#214d37; color:#b7f7ce; border:1px solid #3c815d; "
+                    "border-radius:3px; font-weight:700; padding:2px 5px;"
+                )
+            else:
+                self._sim_status.setStyleSheet(
+                    "background:#59471f; color:#ffe3a1; border:1px solid #927638; "
+                    "border-radius:3px; font-weight:700; padding:2px 5px;"
+                )
             self._sim_status.setVisible(True)
             self._sim_progress.setVisible(True)
             self._sim_progress_label.setVisible(True)
@@ -152,26 +175,38 @@ class InfoBarWidget(QWidget):
                 self._sim_progress.setRange(0, 0)
                 self._sim_progress_label.setText("...")
         else:
+            self._check_progress_active = False
             self._sim_status.setText("RUN")
+            self._sim_status.setStyleSheet(
+                "background:#214d37; color:#b7f7ce; border:1px solid #3c815d; "
+                "border-radius:3px; font-weight:700; padding:2px 5px;"
+            )
             self._sim_progress.setRange(0, 100)
             self._sim_status.setVisible(self._sim_running)
             self._sim_progress.setVisible(self._sim_running)
             self._sim_progress_label.setVisible(self._sim_running)
+            if reset:
+                self._sim_progress.setValue(0)
+                self._sim_progress_label.setText("0%")
         self._refresh_message()
 
     def _refresh_message(self) -> None:
-        if self._model_view:
-            self._msg.setText(self._model_message)
+        if self._check_progress_active and self._sim_preparing:
+            message = self._preparation_message
+        elif self._model_view:
+            message = self._model_message
         elif self._sim_preparing:
-            self._msg.setText(self._preparation_message)
+            message = self._preparation_message
         elif self._sim_running:
-            self._msg.setText("Simulation RUN")
+            message = "Simulation RUN"
         else:
-            self._msg.setText("No simulation running")
+            message = "No simulation running"
+        self._msg.setText(message)
+        self._msg.setToolTip(message)
 
     def set_coords(self, x: float, y: float, z: float, units: str = "mm") -> None:
         self._coords.setText(
-            f"X: {x:8.2f}  Y: {y:8.2f}  Z: {z:8.2f}  {units}"
+            f"X: {x:8.3f}  Y: {y:8.3f}  Z: {z:8.3f}  {units}"
         )
 
     def clear_coords(self) -> None:

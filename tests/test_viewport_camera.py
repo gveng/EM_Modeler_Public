@@ -6,7 +6,7 @@ import pytest
 import vtk
 
 from em3d_modeler.ui.viewport_widget import Viewport3DWidget
-from em3d_modeler.ui.main_window import MainWindow
+from em3d_modeler.ui.main_window import MainWindow, _STANDARD_VIEW_ACTIONS
 
 
 class _Signal:
@@ -96,3 +96,15 @@ def test_top_and_bottom_views_are_opposites_and_fit_visible_scene():
     assert camera.SetPosition.call_args.args == (0, 0, -300)
     assert camera.SetViewUp.call_args.args == (0, 1, 0)
     assert viewport.fit_all.call_count == 2
+
+
+def test_standard_view_shortcuts_follow_requested_axis_order():
+    assert _STANDARD_VIEW_ACTIONS == (
+        ("+X (YZ)", "right", "Ctrl+1"),
+        ("-X (YZ)", "left", "Ctrl+2"),
+        ("+Y (XZ)", "back", "Ctrl+3"),
+        ("-Y (XZ)", "front", "Ctrl+4"),
+        ("+Z (XY)", "top", "Ctrl+5"),
+        ("-Z (XY)", "bottom", "Ctrl+6"),
+        ("Isometric", "iso", "Ctrl+7"),
+    )

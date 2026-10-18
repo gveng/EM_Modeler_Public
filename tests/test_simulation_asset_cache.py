@@ -12,9 +12,10 @@ from PySide6.QtCore import QPoint, Qt
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import (
-    QApplication, QCheckBox, QComboBox, QGroupBox, QMainWindow, QMenu, QMessageBox, QTabWidget,
-    QVBoxLayout, QWidget,
+    QApplication, QCheckBox, QComboBox, QDialog, QGroupBox, QMainWindow, QMenu, QMessageBox, QTabWidget,
+    QPlainTextEdit, QVBoxLayout, QWidget,
 )
+from shiboken6 import delete as delete_qobject
 
 from em3d_modeler.ui import main_window
 from em3d_modeler.emerge import step_bundle_exporter, step_importer
@@ -168,6 +169,40 @@ def test_step_import_and_export_scale_geometry_without_mutating_scene(monkeypatc
     assert cube.GetOutput().GetBounds() == pytest.approx((-0.5, 0.5, -0.5, 0.5, -0.5, 0.5))
 
 
+def test_group_object_priority_overrides_material_priority_in_step_export(monkeypatch, tmp_path):
+    cube = vtk.vtkCubeSource()
+    cube.Update()
+    mapper = vtk.vtkPolyDataMapper()
+    mapper.SetInputConnection(cube.GetOutputPort())
+    actor = vtk.vtkActor()
+    actor.SetMapper(mapper)
+    obj = SimpleNamespace(
+        name="GroupedBody",
+        actor=actor,
+        material="Copper",
+        boolean_op="",
+    )
+
+    def write_mesh(_polydata, step_path, log_callback=None):
+        step_path.write_text("STEP", encoding="ascii")
+
+    monkeypatch.setattr(
+        step_bundle_exporter,
+        "build_occ_shape_for_export",
+        lambda *_args, **_kwargs: None,
+    )
+    monkeypatch.setattr(step_bundle_exporter, "_write_step_from_polydata", write_mesh)
+
+    result = step_bundle_exporter.export_objects_to_step_bundle(
+        [obj],
+        tmp_path / "group-priority",
+        material_priorities={"Copper": 10},
+        object_priorities={"GroupedBody": 2},
+    )
+
+    assert result["entries"][0]["priority"] == 5201
+
+
 def test_tools_menu_contains_standalone_step_export():
     app = QApplication.instance() or QApplication([])
     window = QMainWindow()
@@ -179,7 +214,8 @@ def test_tools_menu_contains_standalone_step_export():
     )
     for name in (
         "_new_project", "_close_project", "_open_project", "_save_project",
-        "_save_project_as", "_import_step", "_refresh_recent_projects",
+        "_save_project_as", "_import_step", "_import_ipc2581_board_json_3d",
+        "_refresh_recent_projects",
         "_export_emerge", "_set_global_material_db", "_reload_global_material_db",
         "_delete_selected", "_set_cancel_drawing_enabled", "_undo", "_redo",
         "_update_history_actions", "_set_view", "_open_reference_plane_dialog",
@@ -311,7 +347,10 @@ def test_master_script_uses_frozen_worker_for_child_jobs():
     assert "[sys.executable, '-u', child_path]" in script
 
 
-def test_parametric_bundle_exports_one_geometry_and_worker_per_value(monkeypatch, tmp_path):
+@pytest.mark.parametrize("export_sparams", [False, True])
+def test_parametric_bundle_exports_one_geometry_and_worker_per_value(
+    monkeypatch, tmp_path, export_sparams
+):
     geometry_state = {"width": 0.1}
     model_object = SimpleNamespace(name="Body")
     settings = {
@@ -322,12 +361,13 @@ def test_parametric_bundle_exports_one_geometry_and_worker_per_value(monkeypatch
             "enabled": True,
             "ParamName": "width",
             "ParamValues": "0.2,0.4",
+            "allow_oversized_mesh": False,
             "Fmin_GHz": 1.0,
             "Fmax_GHz": 2.0,
             "NumberOfPoints": 3,
         }],
         "mesh": {},
-        "runtime": {},
+        "runtime": {"export_sparams_after_sim": export_sparams},
         "outputs": [],
     }
     step_exports = []
@@ -365,12 +405,14 @@ def test_parametric_bundle_exports_one_geometry_and_worker_per_value(monkeypatch
         _project_tree=SimpleNamespace(get_settings=lambda: settings),
         _sim_solver="PARDISO",
         _sim_parallel_enabled=False,
+        _sim_worker_processes=2,
         _sim_pardiso_threads=1,
         _sim_acc_threads=1,
         _sim_plot_sparams_after_sim=False,
         _sim_export_sparams_after_sim=False,
         _mesh_resolution=0.2,
         _curved_boundary_resolution=20,
+        _allow_oversized_mesh=True,
         _project_name="Model",
         _units="mm",
         _material_store=SimpleNamespace(material_export_catalog=lambda: {}),
@@ -414,7 +456,18 @@ def test_parametric_bundle_exports_one_geometry_and_worker_per_value(monkeypatch
     assert [call["simulation_override"]["ParamValues"] for call in worker_calls[:2]] == [
         "0.2", "0.4",
     ]
-    assert all(call["export_sparams_after_sim"] is True for call in worker_calls)
+    assert all(
+        call["export_sparams_after_sim"] is export_sparams
+        for call in worker_calls
+    )
+    assert all(
+        call["settings"]["mesh"]["allow_oversized_mesh"] is True
+        for call in worker_calls
+    )
+    assert all(
+        call["simulation_override"]["allow_oversized_mesh"] is False
+        for call in worker_calls
+    )
     assert all(len(call["step_entries"]) == 1 for call in worker_calls)
     assert [call["lumped_ports"][0]["origin"] for call in worker_calls] == [
         0.2, 0.4, 0.2, 0.4,
@@ -481,6 +534,7 @@ def test_sweep_bundle_places_worker_and_geometry_under_simulation_folder(monkeyp
         _project_tree=SimpleNamespace(get_settings=lambda: settings),
         _sim_solver="PARDISO",
         _sim_parallel_enabled=False,
+        _sim_worker_processes=2,
         _sim_pardiso_threads=1,
         _sim_acc_threads=1,
         _sim_plot_sparams_after_sim=False,
@@ -706,6 +760,16 @@ def test_info_bar_shows_simulation_progress_outside_model_tab():
     assert app is not None
 
 
+def test_info_bar_shows_coordinates_to_three_decimal_places():
+    app = QApplication.instance() or QApplication([])
+    info_bar = InfoBarWidget()
+
+    info_bar.set_coords(1.71099172, -1.71099172, 0.0048)
+
+    assert info_bar._coords.text() == "X:    1.711  Y:   -1.711  Z:    0.005  mm"
+    assert app is not None
+
+
 def test_info_bar_shows_simulation_asset_preparation_progress():
     app = QApplication.instance() or QApplication([])
     info_bar = InfoBarWidget()
@@ -799,6 +863,7 @@ def test_closing_new_project_disposes_simulation_panel():
     window = QMainWindow()
     area = _workspace_area_stub(window)
     simulation_dialog = QWidget()
+    log_view = QPlainTextEdit(simulation_dialog)
     log_level_combo = QComboBox(simulation_dialog)
     log_level_combo.addItems(["Trace", "Debug", "Info", "Warning", "Error"])
     simulation_window = main_window._PlotSubWindow(area)
@@ -808,6 +873,7 @@ def test_closing_new_project_disposes_simulation_panel():
     window._workspace_windows["Simulation"] = simulation_window
     window._sim_subwindow = simulation_window
     window._sim_dlg = simulation_dialog
+    window._sim_log_view = log_view
     window._sim_log_level = log_level_combo
     window._sim_log_verbosity = "INFO"
     window._project_tree = SimpleNamespace(get_log_verbosity=lambda: "Warning")
@@ -822,11 +888,24 @@ def test_closing_new_project_disposes_simulation_panel():
     assert "Simulation" not in window._workspace_windows
     assert window._sim_subwindow is None
     assert window._sim_dlg is None
+    assert window._sim_log_view is None
     assert window._sim_log_level is None
     window._shutdown_simulation_process.assert_called_once_with()
     window._rebuild_window_menu.assert_called_once_with()
     main_window.MainWindow._sync_log_verbosity_from_settings(window)
     window.close()
+
+
+def test_append_sim_log_ignores_deleted_text_widget():
+    app = QApplication.instance() or QApplication([])
+    log_view = QPlainTextEdit()
+    window = SimpleNamespace(_sim_log_view=log_view)
+    delete_qobject(log_view)
+
+    main_window.MainWindow._append_sim_log(window, "[info] stale log view")
+
+    assert window._sim_log_view is None
+    assert app is not None
 
 
 def test_window_menu_exposes_chart_arrangement_commands():
@@ -874,6 +953,8 @@ def test_chart_opens_as_floating_window_and_can_be_closed():
     area = _workspace_area_stub(window)
     window.setCentralWidget(area)
     window._sim_dlg = None
+    window._chart_output_name = main_window.MainWindow._chart_output_name
+    window._append_chart_keys = {}
     window._on_plot_subwindow_closed = lambda key, closed: main_window.MainWindow._on_plot_subwindow_closed(
         window, key, closed
     )
@@ -1141,6 +1222,161 @@ def test_simulation_option_change_defers_script_generation():
     )
 
 
+def test_successful_simulation_check_prepares_assets_and_enables_play(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    window = QMainWindow()
+    window._sim_ready = False
+    window._play_action = Mock()
+    window._sim_btn_run = Mock()
+    window._simulation_validation_findings = Mock(return_value=[])
+    window._generate_simulation_assets = Mock(return_value="master script")
+    window._sim_script_dirty = False
+    window._sim_step_bundle_ready = True
+    window._append_sim_log = Mock()
+    monkeypatch.setattr(main_window, "_runtime_diagnostic_rows", lambda: [])
+    monkeypatch.setattr(QDialog, "exec", lambda _dialog: QDialog.Accepted)
+
+    main_window.MainWindow._on_check_simulation(window)
+
+    window._generate_simulation_assets.assert_called_once_with(
+        show_progress=True,
+        force_script=False,
+    )
+    assert window._sim_ready is True
+    assert window._play_action.setEnabled.call_args_list == [
+        ((False,), {}),
+        ((True,), {}),
+    ]
+    assert window._sim_btn_run.setEnabled.call_args_list == [
+        ((False,), {}),
+        ((True,), {}),
+    ]
+    app.processEvents()
+    window.close()
+
+
+def test_repeated_successful_check_reuses_prepared_assets(monkeypatch, tmp_path):
+    app = QApplication.instance() or QApplication([])
+    window = QMainWindow()
+    window._sim_ready = False
+    window._play_action = Mock()
+    window._sim_btn_run = Mock()
+    window._simulation_validation_findings = Mock(return_value=[])
+    window._sim_script_dirty = True
+    window._sim_steps_dirty = True
+    window._sim_step_bundle_ready = False
+    window._sim_step_bundle_cache = {"entries": [], "skipped": []}
+    window._simulation_step_export_cache = {}
+    window._sim_cached_script_bundle = {"master": "", "scripts": []}
+    window._sim_cached_script = ""
+    window._sim_full_scene_step_dirty = False
+    window._export_full_scene_step = False
+    window._project_name = "Project"
+    window._sim_preparation_active = False
+    window._simulation_model_objects = lambda: []
+    window._simulation_bundle_dir = lambda: tmp_path
+    window._reset_step_export_log = Mock()
+    window._append_step_export_log = Mock()
+    window._build_simulation_script_bundle = Mock(
+        return_value={"master": "prepared master", "scripts": []}
+    )
+    window._set_simulation_preparation_progress = Mock()
+    window._update_simulation_script_tabs = Mock()
+    window._info_bar = SimpleNamespace(set_info=Mock())
+    window._append_sim_log = Mock()
+    window._generate_simulation_assets = lambda **kwargs: (
+        main_window.MainWindow._generate_simulation_assets(window, **kwargs)
+    )
+    monkeypatch.setattr(main_window, "_runtime_diagnostic_rows", lambda: [])
+    monkeypatch.setattr(QDialog, "exec", lambda _dialog: QDialog.Accepted)
+
+    main_window.MainWindow._on_check_simulation(window)
+    main_window.MainWindow._on_check_simulation(window)
+
+    window._build_simulation_script_bundle.assert_called_once()
+    assert window._sim_steps_dirty is False
+    assert window._sim_step_bundle_ready is True
+    assert window._sim_script_dirty is False
+    assert window._sim_ready is True
+    app.processEvents()
+    window.close()
+
+
+def test_failed_simulation_check_keeps_play_disabled(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    window = QMainWindow()
+    window._sim_ready = False
+    window._play_action = Mock()
+    window._sim_btn_run = Mock()
+    window._simulation_validation_findings = Mock(return_value=[
+        SimpleNamespace(severity="ERROR", category="Ports", message="invalid dimensions")
+    ])
+    window._generate_simulation_assets = Mock()
+    window._append_sim_log = Mock()
+    monkeypatch.setattr(main_window, "_runtime_diagnostic_rows", lambda: [])
+    monkeypatch.setattr(QDialog, "exec", lambda _dialog: QDialog.Accepted)
+
+    main_window.MainWindow._on_check_simulation(window)
+
+    window._generate_simulation_assets.assert_not_called()
+    assert window._sim_ready is False
+    window._play_action.setEnabled.assert_called_once_with(False)
+    window._sim_btn_run.setEnabled.assert_called_once_with(False)
+    app.processEvents()
+    window.close()
+
+
+def test_simulation_input_changes_invalidate_play_readiness():
+    play_action = Mock()
+    window = SimpleNamespace(
+        _sim_ready=True,
+        _play_action=play_action,
+        _sim_btn_run=Mock(),
+        _sim_steps_dirty=False,
+        _sim_script_dirty=False,
+        _sim_step_bundle_ready=True,
+        _simulation_step_export_cache={"cached": "step"},
+        _sim_full_scene_step_dirty=False,
+    )
+
+    main_window.MainWindow._mark_simulation_dirty(window, steps=True, script=True)
+
+    assert window._sim_ready is False
+    assert window._sim_steps_dirty is True
+    assert window._sim_script_dirty is True
+    assert window._sim_step_bundle_ready is False
+    assert window._simulation_step_export_cache == {}
+    assert window._sim_full_scene_step_dirty is True
+    play_action.setEnabled.assert_called_once_with(False)
+    window._sim_btn_run.setEnabled.assert_called_once_with(False)
+
+
+def test_project_settings_change_invalidates_play_readiness():
+    play_action = Mock()
+    info_bar = SimpleNamespace(set_info=Mock())
+    window = SimpleNamespace(
+        _sim_ready=True,
+        _play_action=play_action,
+        _sim_btn_run=Mock(),
+        _sync_project_variable_names=Mock(),
+        _sync_log_verbosity_from_settings=Mock(),
+        _sync_port_reference_state=Mock(),
+        _info_bar=info_bar,
+        _sim_steps_dirty=False,
+        _sim_script_dirty=False,
+    )
+    window._mark_simulation_dirty = lambda **kwargs: (
+        main_window.MainWindow._mark_simulation_dirty(window, **kwargs)
+    )
+
+    main_window.MainWindow._on_settings_changed(window)
+
+    assert window._sim_ready is False
+    assert window._sim_script_dirty is True
+    play_action.setEnabled.assert_called_once_with(False)
+    window._sim_btn_run.setEnabled.assert_called_once_with(False)
+
+
 def test_simulation_dialog_shows_cached_master_and_worker_scripts():
     app = QApplication.instance() or QApplication([])
     bundle = {
@@ -1172,6 +1408,12 @@ def test_simulation_dialog_shows_cached_master_and_worker_scripts():
         window, key
     )
     window._info_bar = Mock()
+    window._sim_ready = False
+    window._sim_steps_dirty = False
+    window._sim_script_dirty = False
+    window._sim_step_bundle_ready = True
+    window._simulation_step_export_cache = {}
+    window._sim_full_scene_step_dirty = False
     window._sim_cached_script_bundle = bundle
     window._append_sim_log = lambda _message: None
     window._write_cached_simulation_scripts = lambda: None
@@ -1186,14 +1428,9 @@ def test_simulation_dialog_shows_cached_master_and_worker_scripts():
         "_on_sim_stop",
     ):
         setattr(window, handler_name, lambda *_args: None)
-
-    def generate_assets(**_kwargs):
-        assert window._sim_subwindow.isVisible()
-        assert window._sim_dlg.isVisible()
-        main_window.MainWindow._update_simulation_script_tabs(window, bundle)
-        return bundle["master"]
-
-    window._generate_simulation_assets = generate_assets
+    window._generate_simulation_assets = Mock(
+        side_effect=AssertionError("Play must not generate simulation assets")
+    )
 
     window.show()
     main_window.MainWindow._open_simulation_window(window)
@@ -1213,6 +1450,7 @@ def test_simulation_dialog_shows_cached_master_and_worker_scripts():
     assert window._sim_subwindow.widget() is window._sim_dlg
     assert window._sim_subwindow in area.subWindowList()
     assert area.activeSubWindow() is window._sim_subwindow
+    window._generate_simulation_assets.assert_not_called()
 
     row = window._sim_dlg.layout().itemAt(0).layout()
     row_labels = [
@@ -1234,10 +1472,14 @@ def test_simulation_dialog_shows_cached_master_and_worker_scripts():
     assert row.itemAt(10).widget().text() == "Stop"
     assert isinstance(window._sim_chk_boolean_debug, QCheckBox)
     assert not window._sim_chk_boolean_debug.isVisible()
+    assert not window._sim_btn_run.isEnabled()
 
+    main_window.MainWindow._set_simulation_ready(window, True)
+    assert window._sim_btn_run.isEnabled()
     window._sim_subwindow.close()
     assert not window._sim_subwindow.isVisible()
     main_window.MainWindow._open_simulation_window(window)
+    window._generate_simulation_assets.assert_not_called()
     assert window._sim_subwindow.widget() is window._sim_dlg
     assert window._sim_subwindow.isVisible()
     assert window._sim_dlg.isVisible()
@@ -1247,8 +1489,14 @@ def test_simulation_dialog_shows_cached_master_and_worker_scripts():
     assert window._sim_script_tabs.currentWidget().isVisible()
     assert window._sim_chk_run_sweep.isVisible()
     assert not window._sim_chk_boolean_debug.isVisible()
+    assert window._sim_btn_run.isEnabled()
     assert area.activeSubWindow() is window._sim_subwindow
 
+    main_window.MainWindow._mark_simulation_dirty(window, script=True)
+    assert not window._sim_btn_run.isEnabled()
+    window._sim_subwindow.close()
+    main_window.MainWindow._open_simulation_window(window)
+    assert not window._sim_btn_run.isEnabled()
     window._sim_subwindow.close()
     window.close()
 

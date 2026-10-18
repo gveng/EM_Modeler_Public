@@ -20,7 +20,7 @@ Structure
 ─────────
   [Project Name]
   ├── Boundaries
-  │   ├── Xmin  [PML|PEC|PMC|Open|Periodic]
+  │   ├── Xmin  [PML|PEC|PMC|Open|Radiation]
   │   ├── Xmax  …
   │   ├── Ymin / Ymax
   │   └── Zmin / Zmax
@@ -48,15 +48,16 @@ from PySide6.QtWidgets import (
     QStyle,
 )
 from PySide6.QtCore import Qt, Signal, QLocale, QSize
+from ..emerge.mesh_algorithms import normalize_mesh_algorithm
 from PySide6.QtGui import QColor, QBrush, QAction, QIcon
 from .formula_widgets import FormulaDoubleSpinBox as QDoubleSpinBox
 from ..scene.param_expr import evaluate_expression
 
 
 # ──────────────────────────────────────────────────────────────────── constants
-_BOUNDARY_TYPES = ["PML", "PEC", "PMC", "Open", "Radiation", "Periodic"]
+_BOUNDARY_TYPES = ["PML", "PEC", "PMC", "Open", "Radiation"]
 _BOUNDARY_KEYS  = ["Xmin", "Xmax", "Ymin", "Ymax", "Zmin", "Zmax"]
-_PORT_TYPES = ["WaveguidePort", "LumpedPort", "PlaneWave"]
+_PORT_TYPES = ["WaveguidePort", "LumpedPort"]
 
 _PORT_TYPE_DEFAULT_PARAMS = {
     "WaveguidePort": {"Mode": "TE10", "Impedance_Ohm": 50.0, "Excitation": 1.0},
@@ -66,7 +67,7 @@ _PORT_TYPE_DEFAULT_PARAMS = {
 }
 
 _OBJECT_BC_TYPES = [
-    "PML", "PEC", "PMC", "Open", "Periodic", "Radiation",
+    "PML", "PEC", "PMC", "Open", "Radiation",
     "Surface Impedance", "Thin Conductor",
 ]
 _OBJECT_BC_DEFAULT_PARAMS = {
@@ -74,15 +75,24 @@ _OBJECT_BC_DEFAULT_PARAMS = {
     "PEC": {},
     "PMC": {},
     "Open": {},
-    "Periodic": {"PairAxis": "X"},
     "Radiation": {"Order": 1},
     "Surface Impedance": {},
     "Thin Conductor": {"Thickness_mm": 0.035},
 }
 
 _LOG_VERBOSITY_LEVELS = ["Trace", "Debug", "Info", "Warning", "Error"]
-_SIMULATION_TYPES = ["Sweep", "Eigenmode", "Parametric"]
-_OUTPUT_PLOT_TYPES = ["plot_sp", "plot_vswr", "smith", "plot", "plot_ff", "plot_ff_polar", "plot_ff_3d"]
+_SIMULATION_TYPES = ["Sweep", "Eigenmode", "Parametric", "ScatteredField"]
+_OUTPUT_PLOT_TYPES = [
+    "plot_sp",
+    "plot_vswr",
+    "smith",
+    "plot",
+    "plot_ff",
+    "plot_ff_polar",
+    "plot_ff_3d",
+    "eigen_field",
+    "plot_sf_3d",
+]
 
 _SECTION_STYLES = {
     "Boundaries": (QStyle.SP_MessageBoxWarning, QColor("#d98c3f"), QColor("#3a2d20")),
@@ -97,6 +107,28 @@ _SECTION_THEME_ICONS = {
     "Outputs": ("office-chart-line", "view-statistics", "x-office-chart"),
 }
 
+_DELETABLE_ROW_TAGS = {
+    "__bc_idx__",
+    "__port_idx__",
+    "__sim_idx__",
+    "__mesh_obj__",
+    "__mesh_refinement__",
+    "__out_idx__",
+}
+
+
+class _ProjectSettingsTree(QTreeWidget):
+    """Settings tree that routes Delete to its selected homogeneous row group."""
+
+    delete_requested = Signal()
+
+    def keyPressEvent(self, event) -> None:
+        if event.key() == Qt.Key_Delete:
+            self.delete_requested.emit()
+            event.accept()
+            return
+        super().keyPressEvent(event)
+
 
 def _default_simulation_item() -> Dict[str, Any]:
     return {
@@ -108,14 +140,24 @@ def _default_simulation_item() -> Dict[str, Any]:
         "Fstep_GHz": 0.1,
         "NumberOfPoints": 21,
         "EigenmodeCount": 5,
+        "EigenmodeSearchFrequency_GHz": 1.0,
+        "adaptive_mesh_refinement_enabled": False,
+        "adaptive_mesh_refinement_frequency_GHz": 0.0,
         "ParamName": "",
         "ParamValues": "",
         "ParamValuesMode": "range",
         "ParamStart": "0",
         "ParamEnd": "1",
         "ParamStep": "1",
+        "ScatteredDefinition": "EA",
+        "ScatteredThetaDeg": 90.0,
+        "ScatteredPhiDeg": 0.0,
+        "ScatteredPsiDeg": 0.0,
+        "ScatteredPowerDensity_W_m2": 1.0,
+        "ScatteredPhaseOrigin": "GCS",
         "progressive_sparams_enabled": False,
         "progressive_sparams_chunk_size": 10,
+        "allow_oversized_mesh": False,
         "sparam_fitting": {"enabled": False, "points": 1001},
         "LogVerbosity": "Info",
     }
@@ -131,7 +173,7 @@ def _default_output_item(simulation_name: str, idx: int) -> Dict[str, Any]:
     }
 
 _DEFAULT_SETTINGS: Dict[str, Any] = {
-    "boundaries": {k: "PML" for k in _BOUNDARY_KEYS},
+    "boundaries": {k: "Radiation" for k in _BOUNDARY_KEYS},
     "open_region": {"enabled": False, "object": ""},
     "ports":      [],
     "object_boundaries": [],
@@ -141,7 +183,9 @@ _DEFAULT_SETTINGS: Dict[str, Any] = {
     "mesh":       {"default_fraction": 0.3, "emerge_scale_factor": 1.0, "object_resolutions": {}, "local_refinements": []},
     "runtime": {
         "solver": "PARDISO",
-        "parallel_enabled": True,
+        "cudss_precision": "auto",
+        "parallel_enabled": False,
+        "worker_processes": 2,
         "pardiso_threads": 8,
         "acc_threads": 10,
         "plot_sparams_after_sim": True,
@@ -222,7 +266,11 @@ class ProjectTreeWidget(QWidget):
         layout.setContentsMargins(2, 2, 2, 2)
         layout.setSpacing(2)
 
-        self._tree = QTreeWidget()
+        self._tree = _ProjectSettingsTree()
+        self._tree.delete_requested.connect(self._delete_selected_entries)
+        self._tree.setToolTip(
+            "Press Delete to remove selected rows of one entry type."
+        )
         self._tree.setColumnCount(2)
         self._tree.setHeaderLabels(["Item", "Value"])
         self._tree.setSelectionMode(QTreeWidget.ExtendedSelection)
@@ -298,6 +346,18 @@ class ProjectTreeWidget(QWidget):
             current = {}
             self._settings["runtime"] = current
         current.update(_deep_copy(runtime))
+        self.settings_changed.emit()
+
+    def set_mesh_algorithm(self, algorithm: str) -> None:
+        """Save the selected 3D mesher with this project."""
+        mesh_cfg = self._settings.setdefault("mesh", {})
+        if not isinstance(mesh_cfg, dict):
+            mesh_cfg = {}
+            self._settings["mesh"] = mesh_cfg
+        normalized = normalize_mesh_algorithm(algorithm)
+        if mesh_cfg.get("algorithm") == normalized:
+            return
+        mesh_cfg["algorithm"] = normalized
         self.settings_changed.emit()
 
     def _parse_formula_float(self, text: str) -> float:
@@ -377,8 +437,18 @@ class ProjectTreeWidget(QWidget):
             runtime.pop("progressive_sparams_enabled", False)
         )
         solver = str(runtime.get("solver", "PARDISO")).strip().upper()
-        runtime["solver"] = solver if solver in {"PARDISO", "SUPERLU", "UMFPACK", "CUDSS", "AASDS", "MUMPS"} else "PARDISO"
-        runtime["parallel_enabled"] = bool(runtime.get("parallel_enabled", True))
+        runtime["solver"] = solver if solver in {"PARDISO", "SUPERLU", "UMFPACK", "CUDSS", "AASDS", "MUMPS", "SPARTA"} else "PARDISO"
+        cudss_precision = str(runtime.get("cudss_precision", "auto")).strip().lower()
+        runtime["cudss_precision"] = (
+            cudss_precision
+            if cudss_precision in {"auto", "single", "double"}
+            else "auto"
+        )
+        runtime["parallel_enabled"] = bool(runtime.get("parallel_enabled", False))
+        try:
+            runtime["worker_processes"] = min(256, max(1, int(runtime.get("worker_processes", 2))))
+        except (TypeError, ValueError):
+            runtime["worker_processes"] = 2
         try:
             runtime["pardiso_threads"] = max(1, int(runtime.get("pardiso_threads", 8)))
             runtime["acc_threads"] = max(1, int(runtime.get("acc_threads", 10)))
@@ -399,6 +469,9 @@ class ProjectTreeWidget(QWidget):
         if not isinstance(mesh_cfg, dict):
             mesh_cfg = {}
             merged["mesh"] = mesh_cfg
+
+        if "algorithm" in mesh_cfg:
+            mesh_cfg["algorithm"] = normalize_mesh_algorithm(mesh_cfg["algorithm"])
 
         try:
             mesh_cfg["default_fraction"] = max(0.01, min(1.0, float(mesh_cfg.get("default_fraction", 0.3))))
@@ -601,7 +674,7 @@ class ProjectTreeWidget(QWidget):
             domain_item.setForeground(0, warn_brush)
             domain_item.setForeground(1, warn_brush)
         for k in _BOUNDARY_KEYS:
-            v = self._settings["boundaries"].get(k, "PML")
+            v = self._settings["boundaries"].get(k, "Radiation")
             boundary_item = self._make_leaf(self._b_node, k, v, editable=True)
             boundary_item.setData(0, Qt.UserRole, ("__boundary_key__", k))
 
@@ -678,6 +751,8 @@ class ProjectTreeWidget(QWidget):
             else:
                 txt = (f"Port {port_number}: {port.get('type','?')} "
                        f"@ [{port.get('x',0)},{port.get('y',0)},{port.get('z',0)}]")
+            if str(port.get("type", "")).strip() == "PlaneWave":
+                txt += "  [LEGACY - configure ScatteredField manually]"
             if missing_obj:
                 txt += "  [MISSING OBJECT]"
             row = QTreeWidgetItem([txt, ""])
@@ -698,7 +773,11 @@ class ProjectTreeWidget(QWidget):
             if not isinstance(sim, dict):
                 continue
             name = str(sim.get("name", f"Simulation_{i+1}")).strip() or f"Simulation_{i+1}"
-            sim_type = str(sim.get("type", "Sweep")).strip().title()
+            sim_type = str(sim.get("type", "Sweep")).strip()
+            if sim_type.lower() == "scatteredfield":
+                sim_type = "ScatteredField"
+            else:
+                sim_type = sim_type.title()
             enabled = bool(sim.get("enabled", True))
             if sim_type == "Eigenmode":
                 summary = f"modes={int(sim.get('EigenmodeCount', 5))}"
@@ -706,6 +785,11 @@ class ProjectTreeWidget(QWidget):
                 pname = str(sim.get("ParamName", "")).strip()
                 pvals = str(sim.get("ParamValues", "")).strip()
                 summary = f"{pname}={pvals}" if pname and pvals else (pname or pvals or "parametric")
+            elif sim_type == "ScatteredField":
+                definition = str(sim.get("ScatteredDefinition", "EA")).strip().upper()
+                theta = sim.get("ScatteredThetaDeg", 90.0)
+                phi = sim.get("ScatteredPhiDeg", 0.0)
+                summary = f"{definition} θ={theta:g}°, φ={phi:g}°"
             else:
                 fmin = sim.get("Fmin_GHz", 0.1)
                 fmax = sim.get("Fmax_GHz", 10.0)
@@ -1027,103 +1111,239 @@ class ProjectTreeWidget(QWidget):
 
         tag, idx = role
         menu = QMenu(self._tree)
+        # Output simulation groups store a simulation name rather than an
+        # integer row index, so they must not go through the index collector.
+        selected_indices = (
+            []
+            if tag == "__out_sim__"
+            else self._context_selection_indices(item, tag)
+        )
 
         if tag == "__port_idx__":
-            act_edit = QAction("Edit Assignment…", menu)
-            act_edit.triggered.connect(lambda: self._edit_port_dialog(int(idx)))
-            menu.addAction(act_edit)
+            if len(selected_indices) == 1:
+                act_edit = QAction("Edit Assignment…", menu)
+                act_edit.triggered.connect(lambda: self._edit_port_dialog(int(idx)))
+                menu.addAction(act_edit)
 
-            act_remove = QAction("Remove Assignment", menu)
-            act_remove.triggered.connect(lambda: self._remove_port_assignment(int(idx)))
+            remove_label = (
+                "Remove Assignment (Delete)" if len(selected_indices) == 1
+                else f"Remove {len(selected_indices)} Assignments (Delete)"
+            )
+            act_remove = QAction(remove_label, menu)
+            act_remove.triggered.connect(
+                lambda: self._remove_port_assignments(selected_indices)
+            )
             menu.addAction(act_remove)
 
         elif tag == "__sim_idx__":
-            act_edit = QAction("Edit Simulation…", menu)
-            act_edit.triggered.connect(lambda: self._edit_simulation_dialog(int(idx)))
-            menu.addAction(act_edit)
+            if len(selected_indices) == 1:
+                act_edit = QAction("Edit Simulation…", menu)
+                act_edit.triggered.connect(lambda: self._edit_simulation_dialog(int(idx)))
+                menu.addAction(act_edit)
+
+                sims = self._settings.get("simulations", [])
+                enabled = False
+                if isinstance(sims, list) and 0 <= int(idx) < len(sims) and isinstance(sims[int(idx)], dict):
+                    enabled = bool(sims[int(idx)].get("enabled", True))
+                act_toggle = QAction("Disable" if enabled else "Enable", menu)
+                act_toggle.triggered.connect(lambda: self._toggle_simulation_enabled(int(idx)))
+                menu.addAction(act_toggle)
+
+            remove_label = (
+                "Remove Simulation (Delete)" if len(selected_indices) == 1
+                else f"Remove {len(selected_indices)} Simulations (Delete)"
+            )
+            act_remove = QAction(remove_label, menu)
+            act_remove.triggered.connect(
+                lambda: self._remove_simulations(selected_indices)
+            )
+            menu.addAction(act_remove)
 
             sims = self._settings.get("simulations", [])
-            enabled = False
-            if isinstance(sims, list) and 0 <= int(idx) < len(sims) and isinstance(sims[int(idx)], dict):
-                enabled = bool(sims[int(idx)].get("enabled", True))
-            act_toggle = QAction("Disable" if enabled else "Enable", menu)
-            act_toggle.triggered.connect(lambda: self._toggle_simulation_enabled(int(idx)))
-            menu.addAction(act_toggle)
+            simulation_index = int(idx)
+            simulation_name = f"Simulation_{simulation_index + 1}"
+            if (
+                isinstance(sims, list)
+                and 0 <= simulation_index < len(sims)
+                and isinstance(sims[simulation_index], dict)
+            ):
+                simulation_name = (
+                    str(sims[simulation_index].get("name", simulation_name)).strip()
+                    or simulation_name
+                )
 
-            act_remove = QAction("Remove Simulation", menu)
-            act_remove.triggered.connect(lambda: self._remove_simulation(int(idx)))
-            menu.addAction(act_remove)
+            act_add_output = QAction("Add Output Plot…", menu)
+            act_add_output.triggered.connect(
+                lambda _checked=False, name=simulation_name: self._add_output_dialog(name)
+            )
+            menu.addAction(act_add_output)
+
+            act_add_simulation = QAction("Add Simulation…", menu)
+            act_add_simulation.triggered.connect(self._add_simulation_dialog)
+            menu.addAction(act_add_simulation)
         elif tag == "__mesh_default__":
             act_edit = QAction("Edit Default Mesh Resolution…", menu)
             act_edit.triggered.connect(self._edit_default_mesh_resolution)
             menu.addAction(act_edit)
         elif tag == "__mesh_refinement__":
             refinement_index = int(idx)
-            refinements = self._settings.get("mesh", {}).get("local_refinements", [])
-            enabled = False
-            if (
-                isinstance(refinements, list)
-                and 0 <= refinement_index < len(refinements)
-                and isinstance(refinements[refinement_index], dict)
-            ):
-                enabled = bool(refinements[refinement_index].get("enabled", True))
+            if len(selected_indices) == 1:
+                refinements = self._settings.get("mesh", {}).get("local_refinements", [])
+                enabled = False
+                if (
+                    isinstance(refinements, list)
+                    and 0 <= refinement_index < len(refinements)
+                    and isinstance(refinements[refinement_index], dict)
+                ):
+                    enabled = bool(refinements[refinement_index].get("enabled", True))
 
-            act_edit = QAction("Edit Refinement…", menu)
-            act_edit.triggered.connect(lambda: self._edit_local_mesh_refinement(refinement_index))
-            menu.addAction(act_edit)
+                act_edit = QAction("Edit Refinement…", menu)
+                act_edit.triggered.connect(lambda: self._edit_local_mesh_refinement(refinement_index))
+                menu.addAction(act_edit)
 
-            act_toggle = QAction("Disable" if enabled else "Enable", menu)
-            act_toggle.triggered.connect(lambda: self._toggle_local_mesh_refinement(refinement_index))
-            menu.addAction(act_toggle)
+                act_toggle = QAction("Disable" if enabled else "Enable", menu)
+                act_toggle.triggered.connect(lambda: self._toggle_local_mesh_refinement(refinement_index))
+                menu.addAction(act_toggle)
 
-            act_remove = QAction("Remove Refinement", menu)
-            act_remove.triggered.connect(lambda: self._remove_local_mesh_refinement(refinement_index))
+            remove_label = (
+                "Remove Refinement (Delete)" if len(selected_indices) == 1
+                else f"Remove {len(selected_indices)} Refinements (Delete)"
+            )
+            act_remove = QAction(remove_label, menu)
+            act_remove.triggered.connect(
+                lambda: self._remove_local_mesh_refinements(selected_indices)
+            )
             menu.addAction(act_remove)
         elif tag == "__out_idx__":
-            act_plot = QAction("Generate Plot", menu)
-            act_plot.triggered.connect(lambda: self._run_output_plot(int(idx)))
-            menu.addAction(act_plot)
+            if len(selected_indices) == 1:
+                act_plot = QAction("Generate Plot", menu)
+                act_plot.triggered.connect(lambda: self._run_output_plot(int(idx)))
+                menu.addAction(act_plot)
 
-            act_edit = QAction("Edit Output…", menu)
-            act_edit.triggered.connect(lambda: self._edit_output_dialog(int(idx)))
-            menu.addAction(act_edit)
+                act_edit = QAction("Edit Output…", menu)
+                act_edit.triggered.connect(lambda: self._edit_output_dialog(int(idx)))
+                menu.addAction(act_edit)
 
-            outputs = self._settings.get("outputs", [])
-            enabled = False
-            if isinstance(outputs, list) and 0 <= int(idx) < len(outputs) and isinstance(outputs[int(idx)], dict):
-                enabled = bool(outputs[int(idx)].get("enabled", True))
-            act_toggle = QAction("Disable" if enabled else "Enable", menu)
-            act_toggle.triggered.connect(lambda: self._toggle_output_enabled(int(idx)))
-            menu.addAction(act_toggle)
+                outputs = self._settings.get("outputs", [])
+                enabled = False
+                if isinstance(outputs, list) and 0 <= int(idx) < len(outputs) and isinstance(outputs[int(idx)], dict):
+                    enabled = bool(outputs[int(idx)].get("enabled", True))
+                act_toggle = QAction("Disable" if enabled else "Enable", menu)
+                act_toggle.triggered.connect(lambda: self._toggle_output_enabled(int(idx)))
+                menu.addAction(act_toggle)
 
-            act_remove = QAction("Remove Output", menu)
-            act_remove.triggered.connect(lambda: self._remove_output(int(idx)))
+            remove_label = (
+                "Remove Output (Delete)" if len(selected_indices) == 1
+                else f"Remove {len(selected_indices)} Outputs (Delete)"
+            )
+            act_remove = QAction(remove_label, menu)
+            act_remove.triggered.connect(
+                lambda: self._remove_outputs(selected_indices)
+            )
             menu.addAction(act_remove)
         elif tag == "__out_sim__":
             act_add = QAction("Add Output Plot…", menu)
             act_add.triggered.connect(lambda: self._add_output_dialog(str(idx)))
             menu.addAction(act_add)
+
+            act_add_simulation = QAction("Add Simulation…", menu)
+            act_add_simulation.triggered.connect(self._add_simulation_dialog)
+            menu.addAction(act_add_simulation)
         else:
             return
 
         menu.exec_(self._tree.viewport().mapToGlobal(pos))
 
-    def _remove_port_assignment(self, index: int) -> None:
-        ports = self._settings.get("ports", [])
-        if not (0 <= index < len(ports)):
+    def _context_selection_indices(
+        self, clicked_item: QTreeWidgetItem, tag: str
+    ) -> list[int]:
+        """Return selected indices of the clicked row's type, or just that row."""
+        selected_items = self._tree.selectedItems()
+        context_items = (
+            selected_items if clicked_item in selected_items else [clicked_item]
+        )
+        indices = {
+            int(role[1])
+            for selected in context_items
+            if (role := selected.data(0, Qt.UserRole))
+            and isinstance(role, tuple)
+            and len(role) == 2
+            and role[0] == tag
+        }
+        return sorted(indices)
+
+    def _delete_selected_entries(self) -> None:
+        """Delete selected entries only when they form one supported row type."""
+        selected_items = self._tree.selectedItems()
+        if not selected_items:
             return
-        port = ports[index]
-        name = str(port.get("name", f"Port {index + 1}"))
+
+        selected: list[tuple[str, int | str]] = []
+        for item in selected_items:
+            role = item.data(0, Qt.UserRole)
+            if (
+                isinstance(role, tuple)
+                and len(role) == 2
+                and role[0] in _DELETABLE_ROW_TAGS
+            ):
+                value = str(role[1]) if role[0] == "__mesh_obj__" else int(role[1])
+                selected.append((role[0], value))
+            else:
+                return
+        tags = {tag for tag, _index in selected}
+        if len(tags) != 1:
+            return
+
+        tag = next(iter(tags))
+        raw_values = {value for _tag, value in selected}
+        remove_handlers = {
+            "__bc_idx__": self._remove_object_boundary_assignments,
+            "__port_idx__": self._remove_port_assignments,
+            "__sim_idx__": self._remove_simulations,
+            "__mesh_obj__": self._remove_object_mesh_assignments,
+            "__mesh_refinement__": self._remove_local_mesh_refinements,
+            "__out_idx__": self._remove_outputs,
+        }
+        values = sorted(raw_values, key=str) if tag == "__mesh_obj__" else sorted(raw_values)
+        remove_handlers[tag](values)
+
+    def _remove_port_assignment(self, index: int) -> None:
+        self._remove_port_assignments([index])
+
+    def _remove_port_assignments(self, indices: list[int]) -> None:
+        ports = self._settings.get("ports", [])
+        if not isinstance(ports, list):
+            return
+        valid_indices = sorted({
+            int(index) for index in indices
+            if 0 <= int(index) < len(ports)
+        })
+        if not valid_indices:
+            return
+        names = [
+            str(
+                ports[index].get("name", f"Port {index + 1}")
+                if isinstance(ports[index], dict)
+                else f"Port {index + 1}"
+            )
+            for index in valid_indices
+        ]
+        prompt = (
+            f"Remove assignment '{names[0]}'?"
+            if len(names) == 1
+            else f"Remove {len(names)} port assignments?\n\n" + "\n".join(names)
+        )
         reply = QMessageBox.question(
             self,
-            "Remove Port Assignment",
-            f"Remove assignment '{name}'?",
+            "Remove Port Assignment" if len(names) == 1 else "Remove Port Assignments",
+            prompt,
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
-        ports.pop(index)
+        for index in reversed(valid_indices):
+            ports.pop(index)
         self._refresh_ports()
         self.settings_changed.emit()
 
@@ -1404,20 +1624,37 @@ class ProjectTreeWidget(QWidget):
         self.settings_changed.emit()
 
     def _remove_local_mesh_refinement(self, index: int) -> None:
+        self._remove_local_mesh_refinements([index])
+
+    def _remove_local_mesh_refinements(self, indices: list[int]) -> None:
         refinements = self._local_mesh_refinements()
-        if not (0 <= index < len(refinements)) or not isinstance(refinements[index], dict):
+        valid_indices = sorted({
+            int(index) for index in indices
+            if 0 <= int(index) < len(refinements)
+            and isinstance(refinements[int(index)], dict)
+        })
+        if not valid_indices:
             return
-        object_name = str(refinements[index].get("object", f"Refinement {index + 1}"))
+        names = [
+            str(refinements[index].get("object", f"Refinement {index + 1}"))
+            for index in valid_indices
+        ]
+        prompt = (
+            f"Remove local mesh refinement for '{names[0]}'?"
+            if len(names) == 1
+            else f"Remove {len(names)} local mesh refinements?\n\n" + "\n".join(names)
+        )
         reply = QMessageBox.question(
             self,
-            "Remove Mesh Refinement",
-            f"Remove local mesh refinement for '{object_name}'?",
+            "Remove Mesh Refinement" if len(names) == 1 else "Remove Mesh Refinements",
+            prompt,
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
-        refinements.pop(index)
+        for index in reversed(valid_indices):
+            refinements.pop(index)
         self._refresh_object_mesh_assignments()
         self._m_local_node.setExpanded(True)
         self.settings_changed.emit()
@@ -1529,21 +1766,55 @@ class ProjectTreeWidget(QWidget):
         self.settings_changed.emit()
 
     def _remove_simulation(self, index: int) -> None:
+        self._remove_simulations([index])
+
+    def _remove_simulations(self, indices: list[int]) -> None:
         sims = self._settings.get("simulations", [])
-        if not isinstance(sims, list) or not (0 <= index < len(sims)):
+        if not isinstance(sims, list):
             return
-        sim = sims[index] if isinstance(sims[index], dict) else {}
-        name = str(sim.get("name", f"Simulation_{index+1}"))
+        valid_indices = sorted({
+            int(index) for index in indices
+            if 0 <= int(index) < len(sims)
+        })
+        if not valid_indices:
+            return
+        removed_names = {
+            str(
+                sims[index].get("name", f"Simulation_{index + 1}")
+                if isinstance(sims[index], dict)
+                else f"Simulation_{index + 1}"
+            ).strip()
+            for index in valid_indices
+        }
+        remaining_original_names = {
+            str(item.get("name", "")).strip()
+            for index, item in enumerate(sims)
+            if index not in valid_indices and isinstance(item, dict)
+        }
+        names = [
+            str(
+                sims[index].get("name", f"Simulation_{index + 1}")
+                if isinstance(sims[index], dict)
+                else f"Simulation_{index + 1}"
+            )
+            for index in valid_indices
+        ]
+        prompt = (
+            f"Remove simulation '{names[0]}'?"
+            if len(names) == 1
+            else f"Remove {len(names)} simulations?\n\n" + "\n".join(names)
+        )
         reply = QMessageBox.question(
             self,
-            "Remove Simulation",
-            f"Remove simulation '{name}'?",
+            "Remove Simulation" if len(names) == 1 else "Remove Simulations",
+            prompt,
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
-        sims.pop(index)
+        for index in reversed(valid_indices):
+            sims.pop(index)
         if not sims:
             sims.append(_default_simulation_item())
         valid_sim_names = {
@@ -1551,11 +1822,13 @@ class ProjectTreeWidget(QWidget):
             for item in sims
             if isinstance(item, dict)
         }
+        removed_names.difference_update(remaining_original_names)
         outputs = self._settings.get("outputs", [])
         if isinstance(outputs, list):
             self._settings["outputs"] = [
                 output for output in outputs
                 if isinstance(output, dict)
+                and str(output.get("simulation", "")).strip() not in removed_names
                 and str(output.get("simulation", "")).strip() in valid_sim_names
             ]
         self._sync_legacy_simulation_from_list()
@@ -1607,21 +1880,42 @@ class ProjectTreeWidget(QWidget):
         self.settings_changed.emit()
 
     def _remove_output(self, index: int) -> None:
+        self._remove_outputs([index])
+
+    def _remove_outputs(self, indices: list[int]) -> None:
         outputs = self._settings.get("outputs", [])
-        if not isinstance(outputs, list) or not (0 <= index < len(outputs)):
+        if not isinstance(outputs, list):
             return
-        output = outputs[index] if isinstance(outputs[index], dict) else {}
-        name = str(output.get("name", f"Output_{index + 1}"))
+        valid_indices = sorted({
+            int(index) for index in indices
+            if 0 <= int(index) < len(outputs)
+        })
+        if not valid_indices:
+            return
+        names = [
+            str(
+                outputs[index].get("name", f"Output_{index + 1}")
+                if isinstance(outputs[index], dict)
+                else f"Output_{index + 1}"
+            )
+            for index in valid_indices
+        ]
+        prompt = (
+            f"Remove output '{names[0]}'?"
+            if len(names) == 1
+            else f"Remove {len(names)} outputs?\n\n" + "\n".join(names)
+        )
         reply = QMessageBox.question(
             self,
-            "Remove Output",
-            f"Remove output '{name}'?",
+            "Remove Output" if len(names) == 1 else "Remove Outputs",
+            prompt,
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No,
         )
         if reply != QMessageBox.Yes:
             return
-        outputs.pop(index)
+        for index in reversed(valid_indices):
+            outputs.pop(index)
         self._refresh_outputs()
         self.settings_changed.emit()
 
@@ -1663,9 +1957,33 @@ class ProjectTreeWidget(QWidget):
         cb_sim.setCurrentText(current_sim if current_sim in sim_names else sim_names[0])
 
         cb_type = QComboBox(dlg)
-        cb_type.addItems(_OUTPUT_PLOT_TYPES)
+        def selected_simulation_type() -> str:
+            selected_simulation = next(
+                (
+                    sim for sim in self._settings.get("simulations", [])
+                    if isinstance(sim, dict)
+                    and str(sim.get("name", "")).strip()
+                    == cb_sim.currentText().strip()
+                ),
+                {},
+            )
+            return str(selected_simulation.get("type", "")).strip().lower()
+
+        def available_plot_types() -> list[str]:
+            choices = list(_OUTPUT_PLOT_TYPES)
+            if selected_simulation_type() != "scatteredfield":
+                choices.remove("plot_sf_3d")
+            return choices
+
         current_type = str(initial.get("plot_type", "plot_sp")).strip()
-        cb_type.setCurrentText(current_type if current_type in _OUTPUT_PLOT_TYPES else "plot_sp")
+        if current_type == "plot_eigenmode":
+            current_type = "eigen_field"
+        cb_type.addItems(available_plot_types())
+        cb_type.setCurrentText(
+            current_type
+            if current_type in available_plot_types()
+            else "plot_sp"
+        )
 
         cb_enabled = QComboBox(dlg)
         cb_enabled.addItems(["Enabled", "Disabled"])
@@ -1715,18 +2033,48 @@ class ProjectTreeWidget(QWidget):
         s_parameter_matrix.resizeColumnsToContents()
 
         cb_plane = QComboBox(dlg)
+        cb_plane.setObjectName("outputPlane")
         cb_plane.addItems(["XY", "XZ", "YZ"])
         selected_plane = str(params.get("plane", "XY")).strip().upper()
         if selected_plane not in {"XY", "XZ", "YZ"}:
             selected_plane = "XY"
         cb_plane.setCurrentText(selected_plane)
 
+        cb_integration_object = QComboBox(dlg)
+        cb_integration_object.setObjectName("farfieldIntegrationObject")
+        cb_integration_object.setToolTip(
+            "Choose one closed MODEL object's boundary for the far-field integral. "
+            "For scattering, use a surface that encloses the target and is as close to it as practical."
+        )
+        cb_integration_object.addItem("Select integration object", "")
+        scene_names = sorted(self._scene_object_names, key=str.casefold)
+        for object_name in scene_names:
+            cb_integration_object.addItem(object_name, object_name)
+        selected_integration_object = str(
+            params.get("integration_object", "")
+        ).strip()
+        if (
+            selected_integration_object
+            and cb_integration_object.findData(selected_integration_object) < 0
+        ):
+            cb_integration_object.addItem(
+                f"{selected_integration_object} (missing from scene)",
+                selected_integration_object,
+            )
+        integration_index = cb_integration_object.findData(
+            selected_integration_object
+        )
+        if integration_index >= 0:
+            cb_integration_object.setCurrentIndex(integration_index)
+
         cb_polar_view = QComboBox(dlg)
+        cb_polar_view.setObjectName("outputPolarView")
         cb_polar_view.addItems(["2D polar", "3D polar"])
         polar_3d = bool(params.get("polar_3d", False))
         cb_polar_view.setCurrentText("3D polar" if polar_3d else "2D polar")
 
         farfield_frequency = QDoubleSpinBox(dlg)
+        farfield_frequency.setObjectName("outputFrequency")
         farfield_frequency.setRange(1e-6, 1e6)
         farfield_frequency.setDecimals(6)
         farfield_frequency.setSingleStep(0.1)
@@ -1743,6 +2091,114 @@ class ProjectTreeWidget(QWidget):
                 + float(selected_sim.get("Fmax_GHz", 10.0))
             ) / 2.0
         farfield_frequency.setValue(selected_frequency)
+        eigenmode_number = QSpinBox(dlg)
+        eigenmode_number.setObjectName("eigenmodePlotNumber")
+        eigenmode_number.setRange(1, 100000)
+        eigenmode_number.setValue(max(1, int(params.get("eigenmode_number", 1))))
+        eigenmode_number.setToolTip(
+            "Select the 1-based eigenmode solution to visualize."
+        )
+        eigen_field_level = QComboBox(dlg)
+        eigen_field_level.setObjectName("eigenFieldLevel")
+        eigen_field_level.addItem("Basic", "basic")
+        eigen_field_level.addItem("Advanced", "advanced")
+        selected_level = str(params.get("eigen_field_level", "basic")).strip().lower()
+        level_index = eigen_field_level.findData(selected_level)
+        eigen_field_level.setCurrentIndex(
+            level_index if level_index >= 0 else eigen_field_level.findData("basic")
+        )
+
+        field_component = QComboBox(dlg)
+        field_component.setObjectName("eigenFieldComponent")
+        for label, value in (
+            ("Ex", "Ex"), ("Ey", "Ey"), ("Ez", "Ez"),
+            ("Hx", "Hx"), ("Hy", "Hy"), ("Hz", "Hz"),
+            ("Electric field magnitude", "normE"),
+            ("Magnetic field magnitude", "normH"),
+        ):
+            field_component.addItem(label, value)
+        selected_component = str(params.get("field_component", "Ez")).strip()
+        component_index = field_component.findData(selected_component)
+        field_component.setCurrentIndex(
+            component_index if component_index >= 0 else field_component.findData("Ez")
+        )
+
+        field_metric = QComboBox(dlg)
+        field_metric.setObjectName("eigenFieldMetric")
+        for label, value in (
+            ("Real part", "real"),
+            ("Imaginary part", "imag"),
+            ("Magnitude", "abs"),
+        ):
+            field_metric.addItem(label, value)
+        selected_metric = str(params.get("field_metric", "real")).strip().lower()
+        metric_index = field_metric.findData(selected_metric)
+        field_metric.setCurrentIndex(
+            metric_index if metric_index >= 0 else field_metric.findData("real")
+        )
+
+        default_cut_positions = [0.25, 0.5, 0.75]
+        raw_cut_positions = params.get("cut_positions", default_cut_positions)
+        if (
+            isinstance(raw_cut_positions, list)
+            and raw_cut_positions
+            and all(
+                isinstance(value, (int, float))
+                and math.isfinite(float(value))
+                and 0.0 <= float(value) <= 1.0
+                for value in raw_cut_positions
+            )
+        ):
+            initial_cut_positions = raw_cut_positions
+        else:
+            initial_cut_positions = default_cut_positions
+        cut_positions = QLineEdit(
+            ", ".join(f"{float(value) * 100:g}" for value in initial_cut_positions)
+        )
+        cut_positions.setObjectName("eigenFieldCutPositions")
+        cut_positions.setToolTip(
+            "Comma-separated positions as percentages of the selected plane's normal axis."
+        )
+
+        cut_spacing = QDoubleSpinBox(dlg)
+        cut_spacing.setObjectName("eigenFieldCutSpacing")
+        cut_spacing.setRange(0.0, 10000.0)
+        cut_spacing.setDecimals(4)
+        cut_spacing.setSingleStep(0.1)
+        cut_spacing.setSuffix(" mm")
+        try:
+            initial_spacing_mm = float(params.get("cut_spacing_mm", 0.0) or 0.0)
+        except (TypeError, ValueError, OverflowError):
+            initial_spacing_mm = 0.0
+        if not math.isfinite(initial_spacing_mm) or initial_spacing_mm < 0.0:
+            initial_spacing_mm = 0.0
+        cut_spacing.setValue(initial_spacing_mm)
+        cut_spacing.setToolTip("Set to 0 to use automatic spacing.")
+
+        geometry_opacity = QDoubleSpinBox(dlg)
+        geometry_opacity.setObjectName("eigenFieldGeometryOpacity")
+        geometry_opacity.setRange(0.0, 1.0)
+        geometry_opacity.setDecimals(2)
+        geometry_opacity.setSingleStep(0.05)
+        try:
+            initial_opacity = float(params.get("geometry_opacity", 0.1))
+        except (TypeError, ValueError, OverflowError):
+            initial_opacity = 0.1
+        if not math.isfinite(initial_opacity):
+            initial_opacity = 0.1
+        geometry_opacity.setValue(min(1.0, max(0.0, initial_opacity)))
+
+        field_colormap = QComboBox(dlg)
+        field_colormap.setObjectName("eigenFieldColormap")
+        for colormap in ("rainbow", "coolwarm", "gray"):
+            field_colormap.addItem(colormap, colormap)
+        selected_colormap = str(params.get("colormap", "rainbow")).strip()
+        colormap_index = field_colormap.findData(selected_colormap)
+        field_colormap.setCurrentIndex(
+            colormap_index
+            if colormap_index >= 0
+            else field_colormap.findData("rainbow")
+        )
 
         form.addRow("Name", le_name)
         form.addRow("Simulation", cb_sim)
@@ -1750,12 +2206,28 @@ class ProjectTreeWidget(QWidget):
         form.addRow("State", cb_enabled)
         form.addRow("Plot timing", cb_plot_mode)
         form.addRow("S-parameters (output × input)", s_parameter_matrix)
-        form.addRow("Far-field plane", cb_plane)
+        form.addRow("Plane", cb_plane)
         form.addRow("Polar view", cb_polar_view)
-        form.addRow("Far-field frequency", farfield_frequency)
+        frequency_label = QLabel("Far-field frequency", dlg)
+        frequency_label.setObjectName("outputFrequencyLabel")
+        form.addRow(frequency_label, farfield_frequency)
+        integration_surface_row = form.rowCount()
+        form.addRow("Far-field integration object", cb_integration_object)
+        form.addRow("Eigenmode number", eigenmode_number)
+        form.addRow("Eigen field options", eigen_field_level)
+        form.addRow("Field component", field_component)
+        form.addRow("Field quantity", field_metric)
+        form.addRow("Cut positions (%)", cut_positions)
+        form.addRow("Cut spacing", cut_spacing)
+        form.addRow("Geometry opacity", geometry_opacity)
+        form.addRow("Colormap", field_colormap)
         s_parameter_rows = (5,)
-        farfield_rows = (6, 8)
+        plane_row = 6
         polar_view_rows = (7,)
+        farfield_frequency_row = 8
+        eigenmode_row = 10
+        eigen_field_rows = (11, 12, 13)
+        eigen_field_advanced_rows = (14, 15, 16, 17)
 
         def update_plot_mode_availability(_value: str = "") -> None:
             s_parameter_plot = cb_type.currentText().strip() in {"plot_sp", "plot_vswr", "smith", "plot"}
@@ -1791,15 +2263,53 @@ class ProjectTreeWidget(QWidget):
             for row in s_parameter_rows:
                 form.setRowVisible(row, is_s_parameter)
             is_farfield = plot_type in {"plot_ff", "plot_ff_polar", "plot_ff_3d"}
-            for row in farfield_rows:
-                form.setRowVisible(row, is_farfield)
+            is_scattered_field_3d = plot_type == "plot_sf_3d"
+            is_eigen_field = plot_type == "eigen_field"
+            form.setRowVisible(plane_row, is_farfield or is_eigen_field)
+            form.setRowVisible(
+                farfield_frequency_row, is_farfield or is_scattered_field_3d
+            )
+            frequency_label.setText(
+                "Frequency" if is_scattered_field_3d else "Far-field frequency"
+            )
+            form.setRowVisible(integration_surface_row, is_farfield)
             form.setRowVisible(4, is_s_parameter)
             is_3d_polar = plot_type == "plot_ff_3d"
             for row in polar_view_rows:
                 form.setRowVisible(row, is_3d_polar)
+            form.setRowVisible(eigenmode_row, is_eigen_field)
+            for row in eigen_field_rows:
+                form.setRowVisible(row, is_eigen_field)
+            is_advanced = (
+                is_eigen_field and eigen_field_level.currentData() == "advanced"
+            )
+            for row in eigen_field_advanced_rows:
+                form.setRowVisible(row, is_advanced)
 
         update_parameter_visibility(cb_type.currentText().strip())
         cb_type.currentTextChanged.connect(update_parameter_visibility)
+        cb_sim.currentTextChanged.connect(
+            lambda _text: update_parameter_visibility(cb_type.currentText().strip())
+        )
+
+        def update_available_plot_types(_simulation_name: str = "") -> None:
+            selected_type = cb_type.currentText().strip()
+            choices = available_plot_types()
+            if selected_type not in choices:
+                selected_type = "plot_sp"
+            cb_type.blockSignals(True)
+            cb_type.clear()
+            cb_type.addItems(choices)
+            cb_type.setCurrentText(selected_type)
+            cb_type.blockSignals(False)
+            update_parameter_visibility(selected_type)
+
+        cb_sim.currentTextChanged.connect(update_available_plot_types)
+        eigen_field_level.currentIndexChanged.connect(
+            lambda _index: update_parameter_visibility(
+                cb_type.currentText().strip()
+            )
+        )
 
         btns = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
         btns.accepted.connect(dlg.accept)
@@ -1818,22 +2328,122 @@ class ProjectTreeWidget(QWidget):
         if not selected_parameters:
             QMessageBox.warning(dlg, "Output", "Select at least one S-parameter in the matrix.")
             return None
+        is_eigen_field = cb_type.currentText().strip() == "eigen_field"
+        selected_simulation = next(
+            (
+                sim for sim in self._settings.get("simulations", [])
+                if isinstance(sim, dict)
+                and str(sim.get("name", "")).strip()
+                == cb_sim.currentText().strip()
+            ),
+            {},
+        )
+        is_scattered_field = (
+            str(selected_simulation.get("type", "")).strip().lower()
+            == "scatteredfield"
+        )
+        is_farfield = cb_type.currentText().strip() in {
+            "plot_ff", "plot_ff_polar", "plot_ff_3d"
+        }
+        is_scattered_field_3d = cb_type.currentText().strip() == "plot_sf_3d"
+        if is_scattered_field_3d and not is_scattered_field:
+            QMessageBox.warning(
+                dlg,
+                "Unsupported output",
+                "plot_sf_3d is available only for ScatteredField simulations.",
+            )
+            return None
+        if (
+            is_scattered_field
+            and is_farfield
+            and not str(cb_integration_object.currentData() or "").strip()
+        ):
+            QMessageBox.warning(
+                dlg,
+                "Far-field integration object required",
+                "Select a closed model object for the ScatteredField far-field integration.",
+            )
+            return None
+        if is_scattered_field and not (is_farfield or is_scattered_field_3d):
+            QMessageBox.warning(
+                dlg,
+                "Unsupported ScatteredField output",
+                "ScatteredField supports plot_ff, plot_ff_polar, plot_ff_3d, and plot_sf_3d output types.",
+            )
+            return None
+        if is_eigen_field and eigen_field_level.currentData() == "advanced":
+            try:
+                raw_positions = [
+                    float(position.strip())
+                    for position in cut_positions.text().split(",")
+                    if position.strip()
+                ]
+            except ValueError:
+                QMessageBox.warning(
+                    dlg, "Invalid cut positions",
+                    "Enter comma-separated cut positions from 0 to 100 percent.",
+                )
+                return None
+            if (
+                not raw_positions
+                or len(raw_positions) > 24
+                or any(
+                    not math.isfinite(position) or not 0.0 <= position <= 100.0
+                    for position in raw_positions
+                )
+                or len(set(raw_positions)) != len(raw_positions)
+            ):
+                QMessageBox.warning(
+                    dlg, "Invalid cut positions",
+                    "Enter 1 to 24 unique cut positions from 0 to 100 percent.",
+                )
+                return None
+            selected_cut_positions = [position / 100.0 for position in raw_positions]
+            selected_cut_spacing_mm = float(cut_spacing.value())
+            selected_geometry_opacity = float(geometry_opacity.value())
+            selected_colormap = str(field_colormap.currentData() or "rainbow")
+        else:
+            selected_cut_positions = [0.25, 0.5, 0.75]
+            selected_cut_spacing_mm = 0.0
+            selected_geometry_opacity = 0.1
+            selected_colormap = "rainbow"
         first_output, first_input = int(selected_parameters[0][1]), int(selected_parameters[0][2])
+        output_params = {
+            "s_parameter": selected_parameters[0],
+            "s_parameters": selected_parameters,
+            "port_i": first_output,
+            "port_j": first_input,
+            "plane": cb_plane.currentText().strip().upper() or "XY",
+            "polar_3d": cb_polar_view.currentText().strip() == "3D polar",
+            "frequency_GHz": float(farfield_frequency.value()),
+            "integration_object": str(
+                cb_integration_object.currentData() or ""
+            ).strip(),
+            "eigenmode_number": int(eigenmode_number.value()),
+        }
+        if is_scattered_field_3d:
+            output_params = {"frequency_GHz": float(farfield_frequency.value())}
+        if is_eigen_field:
+            output_params.update(
+                {
+                    "eigen_field_level": str(
+                        eigen_field_level.currentData() or "basic"
+                    ),
+                    "field_component": str(field_component.currentData() or "Ez"),
+                    "field_metric": str(field_metric.currentData() or "real"),
+                    "cut_positions": selected_cut_positions,
+                    "cut_spacing_mm": selected_cut_spacing_mm,
+                    "geometry_opacity": selected_geometry_opacity,
+                    "colormap": selected_colormap,
+                }
+            )
         return {
             "name": le_name.text().strip() or "Output",
             "simulation": cb_sim.currentText().strip(),
             "plot_type": cb_type.currentText().strip(),
             "plot_mode": str(cb_plot_mode.currentData() or "final"),
             "enabled": cb_enabled.currentText() == "Enabled",
-            "params": {
-                "s_parameter": selected_parameters[0],
-                "s_parameters": selected_parameters,
-                "port_i": first_output,
-                "port_j": first_input,
-                "plane": cb_plane.currentText().strip().upper() or "XY",
-                "polar_3d": cb_polar_view.currentText().strip() == "3D polar",
-                "frequency_GHz": float(farfield_frequency.value()),
-            },
+            "params": output_params,
         }
 
     def _simulation_dialog_data(self, initial: dict, title: str) -> dict | None:
@@ -1843,11 +2453,21 @@ class ProjectTreeWidget(QWidget):
 
         le_name = QLineEdit(str(initial.get("name", "Simulation_1")))
         cb_type = QComboBox(dlg)
-        cb_type.addItems(_SIMULATION_TYPES)
-        current_type = str(initial.get("type", "Sweep")).strip().title()
+        for simulation_type in _SIMULATION_TYPES:
+            label = (
+                "Eigenmode (Beta)"
+                if simulation_type == "Eigenmode"
+                else simulation_type
+            )
+            cb_type.addItem(label, simulation_type)
+        current_type = str(initial.get("type", "Sweep")).strip()
+        if current_type.lower() == "scatteredfield":
+            current_type = "ScatteredField"
+        else:
+            current_type = current_type.title()
         if current_type not in _SIMULATION_TYPES:
             current_type = "Sweep"
-        cb_type.setCurrentText(current_type)
+        cb_type.setCurrentIndex(cb_type.findData(current_type))
 
         cb_enabled = QComboBox(dlg)
         cb_enabled.addItems(["Enabled", "Disabled"])
@@ -1863,6 +2483,65 @@ class ProjectTreeWidget(QWidget):
         points_formula = str(initial.get("NumberOfPointsFormula") or "").strip()
         le_points = QLineEdit(points_formula or str(initial_points))
         le_modes = QLineEdit(str(int(initial.get("EigenmodeCount", 5))))
+        cb_scattered_definition = QComboBox(dlg)
+        cb_scattered_definition.setObjectName("scatteredFieldDefinition")
+        cb_scattered_definition.addItem("EA (elevation/azimuth)", "EA")
+        cb_scattered_definition.addItem("SPH (spherical)", "SPH")
+        cb_scattered_definition.setToolTip(
+            "EA uses theta as elevation; SPH uses theta as the polar angle from +Z. "
+            "Changing convention does not convert the numeric angles."
+        )
+        definition = str(initial.get("ScatteredDefinition", "EA")).strip().upper()
+        definition_index = cb_scattered_definition.findData(definition)
+        cb_scattered_definition.setCurrentIndex(
+            definition_index if definition_index >= 0 else 0
+        )
+
+        def _angle_spin(object_name: str, value: float) -> QDoubleSpinBox:
+            spin = QDoubleSpinBox(dlg)
+            spin.setObjectName(object_name)
+            spin.setRange(-360.0, 360.0)
+            spin.setDecimals(4)
+            spin.setSingleStep(1.0)
+            spin.setSuffix("°")
+            spin.setValue(float(value))
+            return spin
+
+        scattered_theta = _angle_spin(
+            "scatteredFieldTheta",
+            float(initial.get("ScatteredThetaDeg", 90.0)),
+        )
+        scattered_phi = _angle_spin(
+            "scatteredFieldPhi",
+            float(initial.get("ScatteredPhiDeg", 0.0)),
+        )
+        scattered_psi = _angle_spin(
+            "scatteredFieldPsi",
+            float(initial.get("ScatteredPsiDeg", 0.0)),
+        )
+        scattered_power_density = QDoubleSpinBox(dlg)
+        scattered_power_density.setObjectName("scatteredFieldPowerDensity")
+        scattered_power_density.setRange(0.0, 1e12)
+        scattered_power_density.setDecimals(8)
+        scattered_power_density.setSingleStep(0.1)
+        scattered_power_density.setSuffix(" W/m²")
+        scattered_power_density.setValue(
+            float(initial.get("ScatteredPowerDensity_W_m2", 1.0))
+        )
+        phase_origin = QLabel("Global coordinate system (GCS)")
+        phase_origin.setObjectName("scatteredFieldPhaseOrigin")
+        eigenmode_search_frequency = QDoubleSpinBox(dlg)
+        eigenmode_search_frequency.setObjectName("eigenmodeSearchFrequency")
+        eigenmode_search_frequency.setRange(1e-6, 1e6)
+        eigenmode_search_frequency.setDecimals(6)
+        eigenmode_search_frequency.setSingleStep(0.1)
+        eigenmode_search_frequency.setSuffix(" GHz")
+        eigenmode_search_frequency.setToolTip(
+            "Search near this frequency for the requested eigenmodes."
+        )
+        eigenmode_search_frequency.setValue(
+            float(initial.get("EigenmodeSearchFrequency_GHz", 1.0))
+        )
         le_param_values = QLineEdit(str(initial.get("ParamValues", "")))
         values_mode = str(
             initial.get("ParamValuesMode")
@@ -1914,7 +2593,7 @@ class ProjectTreeWidget(QWidget):
         fit_check.setChecked(bool(fit_config.get("enabled", False)))
         progressive_check = QCheckBox("Enable progressive S-parameter plotting", dlg)
         progressive_check.setToolTip(
-            "Plots Sweep frequency chunks or each completed Parametric frequency sweep. Requires EMERGE 3.0.0a16."
+            "Plots Sweep frequency chunks or each completed Parametric frequency sweep. Requires the EMERGE 3.0.0 API or later."
         )
         progressive_check.setChecked(bool(initial.get("progressive_sparams_enabled", False)))
         progressive_chunk_size = QSpinBox(dlg)
@@ -1925,6 +2604,46 @@ class ProjectTreeWidget(QWidget):
         )
         progressive_chunk_size.setToolTip(
             "Emit a chart update after this many frequency points for each sweep, including each Parametric value."
+        )
+        allow_oversized_mesh = QCheckBox(
+            "Allow an oversized EMerge mesh estimate", dlg
+        )
+        allow_oversized_mesh.setObjectName("allowOversizedMesh")
+        allow_oversized_mesh.setChecked(
+            bool(initial.get("allow_oversized_mesh", False))
+        )
+        allow_oversized_mesh.setToolTip(
+            "If EMerge stops on its estimated-element check, retry mesh generation "
+            "with that safety check disabled. This can require substantial RAM."
+        )
+        adaptive_mesh_refinement = QCheckBox(
+            "Enable adaptive mesh refinement", dlg
+        )
+        adaptive_mesh_refinement.setObjectName("adaptiveMeshRefinementEnabled")
+        adaptive_mesh_refinement.setChecked(
+            bool(initial.get("adaptive_mesh_refinement_enabled", False))
+        )
+        adaptive_mesh_refinement.setToolTip(
+            "Runs EMERGE adaptive refinement before the frequency sweep. "
+            "It can add several solver passes; choose a frequency near the expected "
+            "resonance or other passband of interest."
+        )
+        adaptive_mesh_refinement_frequency = QDoubleSpinBox(dlg)
+        adaptive_mesh_refinement_frequency.setObjectName(
+            "adaptiveMeshRefinementFrequency"
+        )
+        adaptive_mesh_refinement_frequency.setRange(0.0, 1e6)
+        adaptive_mesh_refinement_frequency.setDecimals(6)
+        adaptive_mesh_refinement_frequency.setSingleStep(0.1)
+        adaptive_mesh_refinement_frequency.setSpecialValueText("Set frequency")
+        adaptive_mesh_refinement_frequency.setSuffix(" GHz")
+        adaptive_mesh_refinement_frequency.setValue(
+            float(initial.get("adaptive_mesh_refinement_frequency_GHz", 0.0))
+        )
+        adaptive_mesh_refinement_frequency.setToolTip(
+            "Select a frequency within the sweep passband where the model is expected "
+            "to operate, preferably near a resonance. The frequency is passed to "
+            "EMERGE in Hz."
         )
         fit_points = QSpinBox(dlg)
         fit_points.setRange(8, 100001)
@@ -1944,6 +2663,19 @@ class ProjectTreeWidget(QWidget):
         form.addRow("Fstep [GHz]", le_fstep)
         form.addRow("Number of points", le_points)
         form.addRow("Eigenmode count", le_modes)
+        form.addRow("Eigenmode search frequency", eigenmode_search_frequency)
+        scattered_definition_row = form.rowCount()
+        form.addRow("Angular convention", cb_scattered_definition)
+        scattered_theta_row = form.rowCount()
+        form.addRow("Theta [deg]", scattered_theta)
+        scattered_phi_row = form.rowCount()
+        form.addRow("Phi [deg]", scattered_phi)
+        scattered_psi_row = form.rowCount()
+        form.addRow("Psi / polarization [deg]", scattered_psi)
+        scattered_power_row = form.rowCount()
+        form.addRow("Power density", scattered_power_density)
+        scattered_phase_row = form.rowCount()
+        form.addRow("Phase origin", phase_origin)
         form.addRow("Parametric name", cb_param_name)
         form.addRow("Parameter values mode", cb_param_values_mode)
         form.addRow("Parameter start", le_param_start)
@@ -1956,15 +2688,21 @@ class ProjectTreeWidget(QWidget):
         form.addRow("Fitting points", fit_points)
         form.addRow("Progressive plot", progressive_check)
         form.addRow("Update every N points", progressive_chunk_size)
+        form.addRow("Large mesh policy", allow_oversized_mesh)
+        form.addRow("Adaptive mesh refinement", adaptive_mesh_refinement)
+        form.addRow("Passband frequency", adaptive_mesh_refinement_frequency)
         form.addRow("Log verbosity", cb_log)
 
-        def _update_visibility(sim_type: str) -> None:
+        def _update_visibility() -> None:
+            sim_type = str(cb_type.currentData() or "")
             is_sweep = sim_type == "Sweep"
             is_eigen = sim_type == "Eigenmode"
             is_param = sim_type == "Parametric"
+            is_scattered = sim_type == "ScatteredField"
             for w in (le_fmin, le_fmax, le_fstep, le_points):
-                w.setVisible(is_sweep or is_param)
+                w.setVisible(is_sweep or is_param or is_scattered)
             le_modes.setVisible(is_eigen)
+            eigenmode_search_frequency.setVisible(is_eigen)
             cb_param_name.setVisible(is_param)
             cb_param_values_mode.setVisible(is_param)
             range_mode = cb_param_values_mode.currentData() == "range"
@@ -1974,22 +2712,42 @@ class ProjectTreeWidget(QWidget):
             fit_check.setVisible(is_sweep or is_param)
             fit_points.setVisible(is_sweep or is_param)
             fit_points.setEnabled(fit_check.isChecked() and (is_sweep or is_param))
+            adaptive_mesh_refinement.setVisible(is_sweep)
+            adaptive_mesh_refinement_frequency.setVisible(is_sweep)
+            adaptive_mesh_refinement_frequency.setEnabled(
+                is_sweep and adaptive_mesh_refinement.isChecked()
+            )
+            progressive_check.setVisible(is_sweep or is_param)
             progressive_check.setEnabled(is_sweep or is_param)
             progressive_chunk_size.setEnabled(
                 (is_sweep or is_param) and progressive_check.isChecked()
             )
+            for row in (
+                scattered_definition_row,
+                scattered_theta_row,
+                scattered_phi_row,
+                scattered_psi_row,
+                scattered_power_row,
+                scattered_phase_row,
+            ):
+                form.setRowVisible(row, is_scattered)
 
-        _update_visibility(current_type)
-        cb_type.currentTextChanged.connect(_update_visibility)
+        _update_visibility()
+        cb_type.currentIndexChanged.connect(lambda _index: _update_visibility())
         cb_param_values_mode.currentIndexChanged.connect(
-            lambda _index: _update_visibility(cb_type.currentText())
+            lambda _index: _update_visibility()
         )
         progressive_check.toggled.connect(
             lambda checked: progressive_chunk_size.setEnabled(
-                cb_type.currentText() in {"Sweep", "Parametric"} and bool(checked)
+                cb_type.currentData() in {"Sweep", "Parametric"} and bool(checked)
             )
         )
         fit_check.toggled.connect(lambda checked: fit_points.setEnabled(bool(checked)))
+        adaptive_mesh_refinement.toggled.connect(
+            lambda checked: adaptive_mesh_refinement_frequency.setEnabled(
+                cb_type.currentData() == "Sweep" and bool(checked)
+            )
+        )
 
         syncing_points = {"active": False}
 
@@ -2034,6 +2792,52 @@ class ProjectTreeWidget(QWidget):
 
         def _accept_simulation() -> None:
             if (
+                cb_type.currentData() == "ScatteredField"
+                and scattered_power_density.value() <= 0.0
+            ):
+                QMessageBox.warning(
+                    dlg,
+                    "Invalid power density",
+                    "ScatteredField power density must be greater than zero.",
+                )
+                return
+            if (
+                adaptive_mesh_refinement.isChecked()
+                and cb_type.currentData() == "Sweep"
+            ):
+                try:
+                    fmin_value = self._parse_formula_float(le_fmin.text())
+                    fmax_value = self._parse_formula_float(le_fmax.text())
+                    refinement_frequency = float(
+                        adaptive_mesh_refinement_frequency.value()
+                    )
+                except (TypeError, ValueError, OverflowError):
+                    QMessageBox.warning(
+                        dlg,
+                        "Invalid AMR frequency",
+                        "Enter a valid Sweep range and adaptive mesh refinement frequency.",
+                    )
+                    return
+                if (
+                    not math.isfinite(refinement_frequency)
+                    or refinement_frequency <= 0.0
+                ):
+                    QMessageBox.warning(
+                        dlg,
+                        "Invalid AMR frequency",
+                        "Set a positive passband frequency for adaptive mesh refinement.",
+                    )
+                    return
+                if not fmin_value <= refinement_frequency <= fmax_value:
+                    QMessageBox.warning(
+                        dlg,
+                        "AMR frequency outside sweep",
+                        "The adaptive mesh refinement frequency must be within the "
+                        "configured sweep range. Choose a frequency near the expected "
+                        "resonance or passband.",
+                    )
+                    return
+            if (
                 cb_type.currentText() == "Parametric"
                 and cb_param_values_mode.currentData() == "range"
             ):
@@ -2055,7 +2859,11 @@ class ProjectTreeWidget(QWidget):
             return None
 
         try:
-            sim_type = cb_type.currentText().strip().title()
+            sim_type = str(cb_type.currentData() or "").strip()
+            if sim_type.lower() == "scatteredfield":
+                sim_type = "ScatteredField"
+            else:
+                sim_type = sim_type.title()
             if sim_type not in _SIMULATION_TYPES:
                 sim_type = "Sweep"
             if sim_type == "Parametric" and not str(cb_param_name.currentData() or "").strip():
@@ -2069,6 +2877,9 @@ class ProjectTreeWidget(QWidget):
             fmax = self._parse_formula_float(le_fmax.text())
             fstep = self._parse_formula_float(le_fstep.text())
             points = max(2, int(round(self._parse_formula_float(le_points.text()))))
+            adaptive_mesh_refinement_frequency_ghz = float(
+                adaptive_mesh_refinement_frequency.value()
+            )
             modes = max(1, _parse_locale_int(le_modes.text()))
             name = le_name.text().strip() or "Simulation"
             log_v = cb_log.currentText().strip().title()
@@ -2088,6 +2899,25 @@ class ProjectTreeWidget(QWidget):
                 "NumberOfPointsFormula": le_points.text().strip() if re.search(r"[A-Za-z_]", le_points.text()) else "",
                 "ActiveVariable": str(active_variable.currentData() or ""),
                 "EigenmodeCount": int(modes),
+                "EigenmodeSearchFrequency_GHz": float(
+                    eigenmode_search_frequency.value()
+                ),
+                "adaptive_mesh_refinement_enabled": bool(
+                    adaptive_mesh_refinement.isChecked() and sim_type == "Sweep"
+                ),
+                "adaptive_mesh_refinement_frequency_GHz": (
+                    adaptive_mesh_refinement_frequency_ghz
+                ),
+                "ScatteredDefinition": str(
+                    cb_scattered_definition.currentData() or "EA"
+                ),
+                "ScatteredThetaDeg": float(scattered_theta.value()),
+                "ScatteredPhiDeg": float(scattered_phi.value()),
+                "ScatteredPsiDeg": float(scattered_psi.value()),
+                "ScatteredPowerDensity_W_m2": float(
+                    scattered_power_density.value()
+                ),
+                "ScatteredPhaseOrigin": "GCS",
                 "ParamName": str(cb_param_name.currentData() or "").strip(),
                 "ParamValues": (
                     ",".join(parametric_range["values"])
@@ -2104,6 +2934,7 @@ class ProjectTreeWidget(QWidget):
                 },
                 "progressive_sparams_enabled": bool(progressive_check.isChecked()),
                 "progressive_sparams_chunk_size": int(progressive_chunk_size.value()),
+                "allow_oversized_mesh": bool(allow_oversized_mesh.isChecked()),
                 "LogVerbosity": log_v,
             }
         except Exception:
@@ -2121,8 +2952,8 @@ class ProjectTreeWidget(QWidget):
         form = QFormLayout(dlg)
         combo = QComboBox()
         combo.addItems(_BOUNDARY_TYPES)
-        existing_types = {self._settings["boundaries"].get(key, "PML") for key in keys}
-        current = next(iter(existing_types)) if len(existing_types) == 1 else "PML"
+        existing_types = {self._settings["boundaries"].get(key, "Radiation") for key in keys}
+        current = next(iter(existing_types)) if len(existing_types) == 1 else "Radiation"
         if current in _BOUNDARY_TYPES:
             combo.setCurrentText(current)
         form.addRow(", ".join(keys), combo)
@@ -2230,7 +3061,13 @@ class ProjectTreeWidget(QWidget):
         self._refresh_ports()
         self.settings_changed.emit()
 
-    def assign_port_to_object(self, obj_name: str) -> None:
+    def assign_port_to_object(
+        self,
+        obj_name: str,
+        port_type: str | None = None,
+    ) -> None:
+        if port_type is not None and port_type not in (*_PORT_TYPES, "PlaneWave"):
+            raise ValueError(f"Unsupported port type: {port_type}")
         ports = self._settings.get("ports", [])
         existing_idx = next((i for i, p in enumerate(ports) if str(p.get("object", "")).strip() == obj_name), None)
 
@@ -2238,7 +3075,7 @@ class ProjectTreeWidget(QWidget):
             initial = _deep_copy(ports[existing_idx])
             title = f"Assign Port - {obj_name} (edit existing)"
         else:
-            port_type = "WaveguidePort"
+            default_port_type = port_type or "WaveguidePort"
             next_number = max(
                 [int(port.get("number", index + 1)) for index, port in enumerate(ports)]
                 or [0]
@@ -2246,13 +3083,23 @@ class ProjectTreeWidget(QWidget):
             initial = {
                 "number": next_number,
                 "name": f"Port_{obj_name}",
-                "type": port_type,
+                "type": default_port_type,
                 "x": 0.0,
                 "y": 0.0,
                 "z": 0.0,
-                "params": _deep_copy(_PORT_TYPE_DEFAULT_PARAMS.get(port_type, {})),
+                "params": _deep_copy(
+                    _PORT_TYPE_DEFAULT_PARAMS.get(default_port_type, {})
+                ),
             }
             title = f"Assign Port - {obj_name}"
+
+        if port_type is not None:
+            current_type = str(initial.get("type", "WaveguidePort"))
+            if current_type != port_type:
+                initial["params"] = _deep_copy(
+                    _PORT_TYPE_DEFAULT_PARAMS.get(port_type, {})
+                )
+            initial["type"] = port_type
 
         port = self._port_dialog_data(
             initial=initial,
@@ -2275,10 +3122,11 @@ class ProjectTreeWidget(QWidget):
         form = QFormLayout(dlg)
 
         current_type = str(initial.get("type", "WaveguidePort"))
-        if current_type not in _PORT_TYPES:
+        if current_type not in _PORT_TYPES and current_type != "PlaneWave":
             current_type = "WaveguidePort"
 
-        current_params = initial.get("params", {}) if isinstance(initial.get("params", {}), dict) else {}
+        source_params = initial.get("params", {})
+        current_params = _deep_copy(source_params) if isinstance(source_params, dict) else {}
         if current_type == "LumpedPort":
             # Backward compatibility: map old waveguide keys if present.
             if "Resistance_Ohm" not in current_params and "Impedance_Ohm" in current_params:
@@ -2291,8 +3139,15 @@ class ProjectTreeWidget(QWidget):
         sb_number.setRange(1, 9999)
         sb_number.setValue(max(1, int(initial.get("number", 1))))
         le_type = QComboBox()
-        le_type.addItems(_PORT_TYPES)
-        le_type.setCurrentText(current_type)
+        for port_type in _PORT_TYPES:
+            le_type.addItem(port_type, port_type)
+        if current_type == "PlaneWave":
+            le_type.addItem(
+                "PlaneWave (legacy - configure ScatteredField manually)",
+                "PlaneWave",
+            )
+        current_type_index = le_type.findData(current_type)
+        le_type.setCurrentIndex(max(0, current_type_index))
         le_obj = QLineEdit(str(fixed_object if fixed_object is not None else initial.get("object", "")))
         if fixed_object is not None:
             le_obj.setReadOnly(True)
@@ -2309,43 +3164,31 @@ class ProjectTreeWidget(QWidget):
         params_form = QFormLayout(params_container)
         params_form.setContentsMargins(0, 0, 0, 0)
         param_edits: Dict[str, QLineEdit] = {}
+        params_by_type: dict[str, dict[str, Any]] = {
+            current_type: {
+                key: current_params[key]
+                for key in _PORT_TYPE_DEFAULT_PARAMS.get(current_type, {})
+                if key in current_params
+            }
+        }
+        active_port_type = current_type
 
-        def _normalize_params_for_type(port_type: str) -> None:
-            """Normalize param keys when switching port types (e.g., WaveguidePort → LumpedPort)."""
-            if port_type == "LumpedPort":
-                # Map WaveguidePort keys to LumpedPort if needed
-                if "Impedance_Ohm" in current_params and "Resistance_Ohm" not in current_params:
-                    current_params["Resistance_Ohm"] = current_params["Impedance_Ohm"]
-                if "Excitation" in current_params and "Voltage_V" not in current_params:
-                    current_params["Voltage_V"] = current_params["Excitation"]
-                # Ensure core LumpedPort params exist with correct defaults
-                if "Resistance_Ohm" not in current_params:
-                    current_params["Resistance_Ohm"] = _PORT_TYPE_DEFAULT_PARAMS["LumpedPort"]["Resistance_Ohm"]
-                if "Voltage_V" not in current_params:
-                    current_params["Voltage_V"] = _PORT_TYPE_DEFAULT_PARAMS["LumpedPort"]["Voltage_V"]
-            elif port_type == "WaveguidePort":
-                # Map LumpedPort keys to WaveguidePort if needed
-                if "Resistance_Ohm" in current_params and "Impedance_Ohm" not in current_params:
-                    current_params["Impedance_Ohm"] = current_params["Resistance_Ohm"]
-                if "Voltage_V" in current_params and "Excitation" not in current_params:
-                    current_params["Excitation"] = current_params["Voltage_V"]
-                # Ensure core WaveguidePort params exist with correct defaults
-                if "Impedance_Ohm" not in current_params:
-                    current_params["Impedance_Ohm"] = _PORT_TYPE_DEFAULT_PARAMS["WaveguidePort"]["Impedance_Ohm"]
-                if "Excitation" not in current_params:
-                    current_params["Excitation"] = _PORT_TYPE_DEFAULT_PARAMS["WaveguidePort"]["Excitation"]
+        def _store_active_param_values() -> None:
+            values = params_by_type.setdefault(active_port_type, {})
+            for key, edit in param_edits.items():
+                values[key] = edit.text()
 
         def _rebuild_param_fields(port_type: str) -> None:
+            nonlocal active_port_type
+            _store_active_param_values()
             while params_form.rowCount() > 0:
                 params_form.removeRow(0)
             param_edits.clear()
-
-            # Normalize parameters for the selected type
-            _normalize_params_for_type(port_type)
+            active_port_type = port_type
 
             defaults = _PORT_TYPE_DEFAULT_PARAMS.get(port_type, {})
             for key, default_val in defaults.items():
-                value = current_params.get(key, default_val)
+                value = params_by_type.get(port_type, {}).get(key, default_val)
                 edit = QLineEdit(str(value))
                 if key in ("Resistance_Ohm",):
                     edit.setToolTip("Port impedance in Ohm (typically 50)")
@@ -2353,7 +3196,7 @@ class ProjectTreeWidget(QWidget):
                     axis = key[-1]  # X, Y or Z
                     edit.setToolTip(
                         f"{axis} component of the excitation field direction vector.\n"
-                        "Leave all Direction fields at 0 to auto-compute from plate geometry."
+                        "Leave all Direction fields at 0 to auto-compute from the assigned geometry."
                     )
                 params_form.addRow(key, edit)
                 param_edits[key] = edit
@@ -2364,7 +3207,9 @@ class ProjectTreeWidget(QWidget):
                 w.setVisible(not is_lumped)
 
         _rebuild_param_fields(current_type)
-        le_type.currentTextChanged.connect(_rebuild_param_fields)
+        le_type.currentIndexChanged.connect(
+            lambda _index: _rebuild_param_fields(str(le_type.currentData() or ""))
+        )
 
         form.addRow("Name", le_name)
         form.addRow("Port number", sb_number)
@@ -2380,7 +3225,7 @@ class ProjectTreeWidget(QWidget):
         form.addRow(btns)
         if dlg.exec_() == QDialog.Accepted:
             try:
-                port_type = le_type.currentText()
+                port_type = str(le_type.currentData() or "WaveguidePort")
                 defaults = _PORT_TYPE_DEFAULT_PARAMS.get(port_type, {})
                 parsed_params: Dict[str, Any] = {}
                 for key, edit in param_edits.items():

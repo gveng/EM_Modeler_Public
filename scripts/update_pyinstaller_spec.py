@@ -67,6 +67,10 @@ _runtime_hiddenimports = sorted({{
     if ".tests" not in _module and not _module.endswith(".conftest")
 }})
 _runtime_hiddenimports.append("graphlib")
+_runtime_hiddenimports.extend([
+    "em3d_modeler.emerge.ipc2581_board_json",
+    "em3d_modeler.emerge.ipc2581_padstack_geometry",
+])
 
 _mkl_bin = Path(sys.prefix) / "Library" / "bin"
 _mkl_dlls = []

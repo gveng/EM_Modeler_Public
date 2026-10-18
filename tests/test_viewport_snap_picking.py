@@ -129,6 +129,7 @@ def test_sub_element_vertex_pick_uses_point_picker_actor_transform(monkeypatch):
     dataset = _polydata_with_point((1.0, 2.0, 3.0))
     coordinates = []
     markers = []
+    status_message = Mock()
 
     class _Signal:
         def emit(self, *values):
@@ -149,7 +150,7 @@ def test_sub_element_vertex_pick_uses_point_picker_actor_transform(monkeypatch):
         _build_vertex_marker=lambda point, ref_actor: (point, ref_actor),
         clear_coords_requested=_Signal(),
         picked_coords=_Signal(),
-        status_message=_Signal(),
+        status_message=status_message,
     )
     viewport._sub_element_pick = MethodType(Viewport3DWidget._sub_element_pick, viewport)
     monkeypatch.setattr(
@@ -162,6 +163,9 @@ def test_sub_element_vertex_pick_uses_point_picker_actor_transform(monkeypatch):
 
     assert coordinates[0] == pytest.approx((11.0, 22.0, 33.0, "mm"))
     assert markers == [((11.0, 22.0, 33.0), actor)]
+    status_message.emit.assert_called_once_with(
+        "Vertex picked  (11.000, 22.000, 33.000)"
+    )
 
 
 def test_vertex_pick_actor_filter_keeps_request_armed_for_other_objects(monkeypatch):
@@ -516,6 +520,217 @@ def test_geometry_snap_records_owner_and_local_world_points(mode, monkeypatch):
     assert viewport._snap_records[-1]["object"] == "Assembly"
     assert viewport._snap_records[-1]["local"] == pytest.approx([2.0, 4.0, 6.0])
     assert viewport._snap_records[-1]["point"] == pytest.approx(position)
+
+
+@pytest.mark.parametrize(("units", "mm_per_unit"), [("mm", 1.0), ("inch", 25.4)])
+def test_step_surface_snap_projects_to_exact_brep_and_preserves_actor_transform(
+    units, mm_per_unit, monkeypatch
+):
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from em3d_modeler.emerge import occ_export_builder
+
+    actor = vtk.vtkActor()
+    actor.SetPosition(10.0, 20.0, 30.0)
+    actor.SetScale(2.0, 3.0, 4.0)
+    owner = SimpleNamespace(
+        name="STEP solid",
+        actor=actor,
+        all_actors=[actor],
+        step_source_path="part.step",
+        step_solid_name="STEP_Solid_1",
+    )
+    viewport = _bare_viewport(
+        _units=units,
+        scene=SimpleNamespace(objects=[owner]),
+    )
+    shape = BRepPrimAPI_MakeBox(1.0, 2.0, 3.0).Shape()
+    monkeypatch.setattr(occ_export_builder, "_read_step_shape", lambda _path: shape)
+    monkeypatch.setattr(
+        occ_export_builder,
+        "_select_shape_for_mesh_object",
+        lambda _owner, root_shape: root_shape,
+    )
+    approximate_local = (0.4 / mm_per_unit, 0.7 / mm_per_unit, 3.02 / mm_per_unit)
+    approximate_world = Viewport3DWidget._actor_point_to_world(actor, approximate_local)
+    dataset = vtk.vtkPolyData()
+    monkeypatch.setattr(
+        viewport_module.vtk,
+        "vtkCellPicker",
+        lambda: _CellPicker(actor, dataset, approximate_world),
+    )
+
+    result = viewport._snap_to_visible_geometry(200, 150, None, snap_mode="face")
+
+    exact_local = (0.4 / mm_per_unit, 0.7 / mm_per_unit, 3.0 / mm_per_unit)
+    exact_world = Viewport3DWidget._actor_point_to_world(actor, exact_local)
+    assert result[0] == pytest.approx(exact_world)
+    assert result[0] != pytest.approx(approximate_world)
+    assert viewport._snap_records[-1]["local"] == pytest.approx(exact_local)
+    assert viewport._snap_records[-1]["point"] == pytest.approx(exact_world)
+
+    history_point = Viewport3DWidget._creation_history_points(
+        [result[0]], viewport._snap_records
+    )[0]
+    stored_snap = history_point["snap"]
+    assert history_point["value"] == pytest.approx(exact_world)
+    assert stored_snap["local"] == pytest.approx(exact_local)
+    assert stored_snap["point"] == pytest.approx(exact_world)
+
+    from em3d_modeler.ui.main_window import MainWindow
+
+    re_resolved = MainWindow._resolve_creation_snap(
+        SimpleNamespace(),
+        stored_snap,
+        {owner.name: [owner]},
+    )
+    assert re_resolved == pytest.approx(exact_world)
+
+    from em3d_modeler.scene.em_objects import PlateObject
+
+    second_point = (exact_world[0] + 1.0, exact_world[1] + 1.0, exact_world[2])
+    dependent_plate = PlateObject(
+        "Dependent plate",
+        exact_world[0],
+        exact_world[1],
+        exact_world[2],
+        second_point[0],
+        second_point[1],
+        second_point[2],
+    )
+    dependent_plate.creation_history = {
+        "mode": "planar",
+        "plane": "XY",
+        "points": [
+            history_point,
+            {"value": list(second_point), "snap": {"kind": "grid"}},
+        ],
+    }
+    window = SimpleNamespace()
+    window._resolve_creation_snap = lambda snap, objects: MainWindow._resolve_creation_snap(
+        window, snap, objects
+    )
+    MainWindow._regenerate_snap_dependent_objects(
+        window, [dependent_plate, owner]
+    )
+    assert (dependent_plate.x1, dependent_plate.y1) == pytest.approx(exact_world[:2])
+    assert dependent_plate.creation_history["points"][0]["snap"]["local"] == pytest.approx(
+        exact_local
+    )
+
+
+def test_step_surface_snap_reports_when_exact_brep_cannot_be_loaded(monkeypatch):
+    from em3d_modeler.emerge import occ_export_builder
+
+    actor = vtk.vtkActor()
+    owner = SimpleNamespace(
+        name="STEP solid",
+        actor=actor,
+        all_actors=[actor],
+        step_source_path="missing.step",
+        step_solid_name="STEP_Solid_1",
+    )
+    status_message = Mock()
+    viewport = _bare_viewport(
+        scene=SimpleNamespace(objects=[owner]),
+        status_message=status_message,
+    )
+    dataset = vtk.vtkPolyData()
+    monkeypatch.setattr(
+        viewport_module.vtk,
+        "vtkCellPicker",
+        lambda: _CellPicker(actor, dataset, (1.0, 2.0, 3.0)),
+    )
+    monkeypatch.setattr(occ_export_builder, "_read_step_shape", lambda _path: None)
+
+    assert viewport._snap_to_visible_geometry(200, 150, None, snap_mode="face") is None
+    status_message.emit.assert_called_once()
+    assert "No approximate snap was applied" in status_message.emit.call_args.args[0]
+
+
+def test_modified_step_surface_snap_uses_export_aligned_brep(monkeypatch):
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.gp import gp_Pnt
+    from em3d_modeler.emerge import occ_export_builder
+    from em3d_modeler.scene.em_objects import MeshObject
+
+    mesh_source = vtk.vtkCubeSource()
+    mesh_source.SetBounds(0.0, 1.0, 0.0, 1.997, 0.0, 3.0)
+    mesh_source.Update()
+    owner = MeshObject(
+        "Modified STEP solid",
+        mesh_source.GetOutput(),
+        step_source_path="modified.step",
+        step_solid_name="STEP_Solid_1",
+    )
+    owner.step_geometry_modified = True
+    actor = owner.actor
+    actor.SetPosition(10.0, 20.0, 30.0)
+    actor.SetScale(2.0, 3.0, 4.0)
+    viewport = _bare_viewport(scene=SimpleNamespace(objects=[owner]))
+    source_shape = BRepPrimAPI_MakeBox(
+        gp_Pnt(0.0, 0.0, 0.0),
+        gp_Pnt(1.0, 2.0, 3.0),
+    ).Shape()
+    monkeypatch.setattr(occ_export_builder, "_read_step_shape", lambda _path: source_shape)
+    monkeypatch.setattr(
+        occ_export_builder,
+        "_select_shape_for_mesh_object",
+        lambda _owner, root_shape: root_shape,
+    )
+    approximate_local = (0.4, 1.997, 1.5)
+    approximate_world = Viewport3DWidget._actor_point_to_world(actor, approximate_local)
+    dataset = vtk.vtkPolyData()
+    monkeypatch.setattr(
+        viewport_module.vtk,
+        "vtkCellPicker",
+        lambda: _CellPicker(actor, dataset, approximate_world),
+    )
+
+    result = viewport._snap_to_visible_geometry(200, 150, None, snap_mode="face")
+
+    root_shape = occ_export_builder._read_step_shape("modified.step")
+    export_shape = occ_export_builder.build_occ_shape_for_export(owner, {})
+    expected_world = viewport_module._closest_step_brep_surface_point(
+        export_shape,
+        approximate_world,
+    )
+    raw_local = viewport_module._closest_step_brep_surface_point(
+        root_shape,
+        approximate_local,
+    )
+    assert result[0] == pytest.approx(expected_world)
+    assert result[0] != pytest.approx(
+        Viewport3DWidget._actor_point_to_world(actor, raw_local)
+    )
+    assert viewport._snap_records[-1]["local"] == pytest.approx(
+        Viewport3DWidget._actor_point_to_local(actor, expected_world)
+    )
+
+
+def test_modified_step_brep_alignment_preserves_matching_axis_span():
+    from OCP.BRepPrimAPI import BRepPrimAPI_MakeBox
+    from OCP.gp import gp_Pnt
+    from em3d_modeler.emerge.occ_export_builder import (
+        _align_occ_shape_to_actor_bounds,
+        _shape_bounds,
+    )
+    from em3d_modeler.scene.em_objects import MeshObject
+
+    mesh_source = vtk.vtkCubeSource()
+    mesh_source.SetBounds(-0.4, 0.4, -1.0, 1.0, -1.4, 1.4)
+    mesh_source.Update()
+    owner = MeshObject("Modified STEP solid", mesh_source.GetOutput())
+    owner.actor.SetPosition(0.1, 3.0, 0.2)
+    source_shape = BRepPrimAPI_MakeBox(
+        gp_Pnt(0.0, 0.0, 0.0),
+        gp_Pnt(1.0, 2.0, 3.0),
+    ).Shape()
+
+    aligned_shape = _align_occ_shape_to_actor_bounds(source_shape, owner)
+
+    assert _shape_bounds(aligned_shape) == pytest.approx(
+        (-0.3, 0.5, 2.0, 4.0, -1.2, 1.6)
+    )
 
 
 def test_drawing_snap_uses_selection_mode_at_each_call():

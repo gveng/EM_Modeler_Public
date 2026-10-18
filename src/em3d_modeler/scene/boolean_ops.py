@@ -768,8 +768,9 @@ def _decimate_polydata(
 def fuse_many(objects: list["EMObject"], target_reduction: float = 0.0) -> vtk.vtkPolyData:
     """Fuse 2..N objects into one polydata.
 
-    Uses sequential boolean union first; if a step fails, falls back to
-    append+clean so union of disjoint bodies still returns a valid merged mesh.
+    Overlapping closed solids are merged with a validated surface union; open
+    or non-manifold meshes (and unions that fail validation) are kept as
+    separate shells in one appended mesh, so no input geometry is dropped.
     """
     if len(objects) < 2:
         raise ValueError("Select at least 2 objects for fuse")
@@ -802,32 +803,100 @@ def fuse_many(objects: list["EMObject"], target_reduction: float = 0.0) -> vtk.v
     if box_fuse is not None:
         return finish(box_fuse)
 
-    current = world_polys[0]
-    for idx, nxt in enumerate(world_polys[1:], start=1):
-        try:
-            # Validate inputs before operation
-            if current.GetNumberOfPoints() == 0 or nxt.GetNumberOfPoints() == 0:
-                raise RuntimeError("One of the input polydata has no points")
+    # Merge each mesh into the bodies it overlaps. A surface boolean is trusted
+    # only for closed solids whose result keeps the expected volume; anything
+    # else (open via walls, disjoint layers, failed unions) stays a separate
+    # shell so no geometry is dropped from the fused result.
+    bodies: list[vtk.vtkPolyData] = [world_polys[0]]
+    for nxt in world_polys[1:]:
+        merged = nxt
+        separate: list[vtk.vtkPolyData] = []
+        for body in bodies:
+            fused = (
+                _try_union(body, merged) if _bounds_overlap(body, merged) else None
+            )
+            if fused is None:
+                separate.append(body)
+            else:
+                merged = fused
+        bodies = separate + [merged]
 
-            # Disjoint solids cannot have their common volume removed.
-            if not _bounds_overlap(current, nxt):
-                raise RuntimeError("Inputs are disjoint; using append fallback")
+    if len(bodies) == 1:
+        return finish(bodies[0])
 
-            current = _boolean_polydata("fuse", current, nxt)
-        except Exception as e:
-            # Boolean union failed; use append for remaining objects
-            append = vtk.vtkAppendPolyData()
-            append.AddInputData(current)
-            # Add all remaining polydata starting from index idx
-            for p in world_polys[idx:]:
-                append.AddInputData(p)
-            append.Update()
-            result = append.GetOutput()
-            if result is None or result.GetNumberOfPoints() == 0:
-                raise RuntimeError(
-                    f"Boolean fuse failed at step {idx} and append fallback also produced empty result. "
-                    f"Original error: {str(e)}"
-                )
-                return finish(result)
+    append = vtk.vtkAppendPolyData()
+    for body in bodies:
+        append.AddInputData(body)
+    append.Update()
+    result = append.GetOutput()
+    if result is None or result.GetNumberOfPoints() == 0:
+        raise RuntimeError("Boolean fuse produced an empty result")
+    if reduction > 0.0:
+        return _decimate_polydata(result, reduction, auto_orient=False)
+    return _postprocess(result, auto_orient=False)
 
-            return finish(current)
+
+def _is_closed_manifold(poly: vtk.vtkPolyData) -> bool:
+    """Return whether ``poly`` is a closed surface without non-manifold edges."""
+    if poly is None or poly.GetNumberOfCells() == 0:
+        return False
+    # Normal splitting duplicates points along sharp edges; weld them first.
+    weld = vtk.vtkCleanPolyData()
+    weld.SetInputData(poly)
+    weld.ToleranceIsAbsoluteOn()
+    weld.SetAbsoluteTolerance(0.0)
+    weld.Update()
+    edges = vtk.vtkFeatureEdges()
+    edges.SetInputData(weld.GetOutput())
+    edges.BoundaryEdgesOn()
+    edges.NonManifoldEdgesOn()
+    edges.FeatureEdgesOff()
+    edges.ManifoldEdgesOff()
+    edges.Update()
+    return edges.GetOutput().GetNumberOfCells() == 0
+
+
+def _mesh_volume(poly: vtk.vtkPolyData) -> float:
+    triangles = vtk.vtkTriangleFilter()
+    triangles.SetInputData(poly)
+    triangles.Update()
+    properties = vtk.vtkMassProperties()
+    properties.SetInputData(triangles.GetOutput())
+    properties.Update()
+    return abs(properties.GetVolume())
+
+
+def _try_union(a: vtk.vtkPolyData, b: vtk.vtkPolyData) -> vtk.vtkPolyData | None:
+    """Return a validated surface union of two closed solids, else ``None``."""
+    if not (_is_closed_manifold(a) and _is_closed_manifold(b)):
+        return None
+    try:
+        union = _boolean_polydata("fuse", a, b)
+        if union is None or union.GetNumberOfCells() == 0:
+            return None
+        bounds_a, bounds_b = a.GetBounds(), b.GetBounds()
+        expected = [
+            min(bounds_a[0], bounds_b[0]), max(bounds_a[1], bounds_b[1]),
+            min(bounds_a[2], bounds_b[2]), max(bounds_a[3], bounds_b[3]),
+            min(bounds_a[4], bounds_b[4]), max(bounds_a[5], bounds_b[5]),
+        ]
+        extent = max(
+            expected[1] - expected[0],
+            expected[3] - expected[2],
+            expected[5] - expected[4],
+        )
+        tolerance = max(extent * 1e-3, 1e-9)
+        if any(
+            abs(actual - wanted) > tolerance
+            for actual, wanted in zip(union.GetBounds(), expected)
+        ):
+            return None
+        volume_a, volume_b = _mesh_volume(a), _mesh_volume(b)
+        volume = _mesh_volume(union)
+        if volume < max(volume_a, volume_b) * (1.0 - 1e-3) or volume > (
+            volume_a + volume_b
+        ) * (1.0 + 1e-3):
+            return None
+        return union
+    except Exception:
+        return None

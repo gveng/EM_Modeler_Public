@@ -24,7 +24,11 @@ import re
 
 import vtk
 
-from .occ_export_builder import build_occ_shape_for_export, _rebuild_object_from_snapshot
+from .occ_export_builder import (
+    _rebuild_object_from_snapshot,
+    build_occ_shape_for_export,
+    build_occ_swept_surface_shape,
+)
 
 
 _NAME_SANITIZE_RE = re.compile(r"[^A-Za-z0-9_-]+")
@@ -155,7 +159,11 @@ def _count_open_or_nonmanifold_edges(poly: vtk.vtkPolyData) -> int:
     return int(fe.GetOutput().GetNumberOfCells())
 
 
-def _repair_polydata_for_step(poly: vtk.vtkPolyData) -> Tuple[vtk.vtkPolyData, Dict[str, int]]:
+def _repair_polydata_for_step(
+    poly: vtk.vtkPolyData,
+    *,
+    preserve_open: bool = False,
+) -> Tuple[vtk.vtkPolyData, Dict[str, int]]:
     in_poly = vtk.vtkPolyData()
     in_poly.DeepCopy(poly)
     in_edges = _count_open_or_nonmanifold_edges(in_poly)
@@ -168,13 +176,16 @@ def _repair_polydata_for_step(poly: vtk.vtkPolyData) -> Tuple[vtk.vtkPolyData, D
     tri.SetInputData(clean.GetOutput())
     tri.Update()
 
-    fill = vtk.vtkFillHolesFilter()
-    fill.SetInputData(tri.GetOutput())
-    fill.SetHoleSize(1e12)
-    fill.Update()
+    repaired_input = tri.GetOutput()
+    if not preserve_open:
+        fill = vtk.vtkFillHolesFilter()
+        fill.SetInputData(repaired_input)
+        fill.SetHoleSize(1e12)
+        fill.Update()
+        repaired_input = fill.GetOutput()
 
     normals = vtk.vtkPolyDataNormals()
-    normals.SetInputData(fill.GetOutput())
+    normals.SetInputData(repaired_input)
     normals.AutoOrientNormalsOn()
     normals.ConsistencyOn()
     normals.SplittingOff()
@@ -345,6 +356,19 @@ def _world_polydata_from_actor(actor: vtk.vtkActor) -> vtk.vtkPolyData:
     return out
 
 
+def _bounds_distance(a: tuple[float, ...], b: tuple[float, ...]) -> float:
+    """Conservative axis-aligned distance used only to flag uncertain BREP builds."""
+    squared = 0.0
+    for axis in (0, 2, 4):
+        gap = max(
+            0.0,
+            float(b[axis]) - float(a[axis + 1]),
+            float(a[axis]) - float(b[axis + 1]),
+        )
+        squared += gap * gap
+    return math.sqrt(squared)
+
+
 def _boolean_source_items(obj: Any) -> List[Any]:
     items = list(getattr(obj, "source_objects", []) or [])
     if items:
@@ -374,6 +398,7 @@ def export_debug_scene_step(
     step_path: Path,
     log_callback: Callable[[str, str], None] | None = None,
     mm_per_unit: float = 1.0,
+    phase_callback: Callable[[int, int, str, str, float], None] | None = None,
 ) -> Dict[str, Any]:
     """Export simulation objects as one colored, named STEP assembly for inspection."""
     mm_per_unit = float(mm_per_unit)
@@ -382,6 +407,7 @@ def export_debug_scene_step(
     candidates = [obj for obj in objects if bool(getattr(obj, "is_model", True))]
     if not candidates:
         raise RuntimeError("No simulation model objects are available for the debug STEP export")
+    total_phases = len(candidates) + 1
 
     last_error: Exception | None = None
     for package in ("OCP", "OCC.Core"):
@@ -414,12 +440,25 @@ def export_debug_scene_step(
             color_tool = XCAFDoc_DocumentTool.ColorTool_s(document.Main())
             skipped: list[str] = []
             exported = 0
+            completed_objects = 0
             occ_cache: Dict[str, Any] = {}
 
             for obj in candidates:
                 object_name = str(getattr(obj, "name", "Object"))
+                if phase_callback is not None:
+                    phase_callback(
+                        completed_objects,
+                        total_phases,
+                        object_name,
+                        "Building assembly geometry",
+                        0.0,
+                    )
                 shape = build_occ_shape_for_export(obj, cache=occ_cache)
                 if shape is None:
+                    if getattr(obj, "ipc2581_step_geometry", None) is not None:
+                        raise RuntimeError(
+                            f"{object_name}: native IPC-2581 STEP geometry could not be built"
+                        )
                     actor = getattr(obj, "actor", None)
                     poly = _world_polydata_from_actor(actor) if actor is not None else vtk.vtkPolyData()
                     poly = _scale_polydata(poly, mm_per_unit)
@@ -428,8 +467,25 @@ def export_debug_scene_step(
                     shape = _scale_shape(shape, mm_per_unit)
                 if shape is None:
                     skipped.append(object_name)
+                    if phase_callback is not None:
+                        phase_callback(
+                            completed_objects,
+                            total_phases,
+                            object_name,
+                            "Skipped: no STEP shape",
+                            1.0,
+                        )
+                    completed_objects += 1
                     continue
 
+                if phase_callback is not None:
+                    phase_callback(
+                        completed_objects,
+                        total_phases,
+                        object_name,
+                        "Adding shape to STEP assembly",
+                        0.75,
+                    )
                 component = shape_tool.AddShape(shape, False)
                 TDataStd_Name.Set_s(component, TCollection_ExtendedString(object_name))
                 try:
@@ -444,10 +500,27 @@ def export_debug_scene_step(
                 color_tool.SetColor(component, color, XCAFDoc_ColorType.XCAFDoc_ColorGen)
                 color_tool.SetColor(component, color, XCAFDoc_ColorType.XCAFDoc_ColorSurf)
                 exported += 1
+                if phase_callback is not None:
+                    phase_callback(
+                        completed_objects,
+                        total_phases,
+                        object_name,
+                        "Assembly geometry ready",
+                        1.0,
+                    )
+                completed_objects += 1
 
             if exported == 0:
                 raise RuntimeError("No simulation object geometry could be converted to STEP")
 
+            if phase_callback is not None:
+                phase_callback(
+                    completed_objects,
+                    total_phases,
+                    "Complete scene",
+                    "Writing colored STEP assembly",
+                    0.0,
+                )
             writer = STEPCAFControl_Writer()
             writer.SetColorMode(True)
             writer.SetNameMode(True)
@@ -457,6 +530,14 @@ def export_debug_scene_step(
             status = int(writer.Write(str(step_path)))
             if not _step_write_succeeded(step_path, status):
                 raise RuntimeError(f"XCAF STEP writer failed with status={status}")
+            if phase_callback is not None:
+                phase_callback(
+                    completed_objects,
+                    total_phases,
+                    "Complete scene",
+                    "Colored STEP assembly written",
+                    1.0,
+                )
 
             result = {"step_file": step_path.name, "exported": exported, "skipped": skipped}
             if log_callback is not None:
@@ -483,10 +564,15 @@ def _write_step_from_polydata(
     poly: vtk.vtkPolyData,
     step_path: Path,
     log_callback: Callable[[str, str], None] | None = None,
+    *,
+    preserve_open: bool = False,
 ) -> None:
     temp_stl = step_path.with_suffix(".tmp.stl")
 
-    repaired_poly, repair_stats = _repair_polydata_for_step(poly)
+    repaired_poly, repair_stats = _repair_polydata_for_step(
+        poly,
+        preserve_open=preserve_open,
+    )
     if log_callback is not None:
         log_callback(
             "DEBUG",
@@ -678,6 +764,8 @@ def export_objects_to_step_bundle(
     material_priorities: Dict[str, int] | None = None,
     excluded_object_names: set[str] | None = None,
     mm_per_unit: float = 1.0,
+    object_priorities: Dict[str, int] | None = None,
+    phase_callback: Callable[[int, int, str, str, float], None] | None = None,
 ) -> Dict[str, Any]:
     """Export one STEP file per model object, excluding only named port plates.
 
@@ -692,9 +780,12 @@ def export_objects_to_step_bundle(
         log_callback: Optional callback for log messages
         debug_boolean_sources_only: If True, export only boolean source objects
         material_priorities: Optional dict mapping material names to priority values
+        object_priorities: Optional dict mapping object names to priority overrides
     """
     if material_priorities is None:
         material_priorities = {}
+    if object_priorities is None:
+        object_priorities = {}
     mm_per_unit = float(mm_per_unit)
     if not math.isfinite(mm_per_unit) or mm_per_unit <= 0.0:
         raise ValueError("STEP export scale factor must be finite and positive")
@@ -730,14 +821,36 @@ def export_objects_to_step_bundle(
         nonlocal done
 
         obj_type = type(export_obj).__name__
+        preserve_open = obj_type == "SweptSurfaceObject"
         material = str(getattr(export_obj, "material", "PEC"))
+
+        def report_phase(phase: str, fraction: float) -> None:
+            if phase_callback is not None:
+                phase_callback(done, total, export_name, phase, fraction)
+
+        def write_mesh_step() -> None:
+            if preserve_open:
+                _write_step_from_polydata(
+                    poly,
+                    step_path,
+                    log_callback=log_callback,
+                    preserve_open=True,
+                )
+            else:
+                _write_step_from_polydata(
+                    poly,
+                    step_path,
+                    log_callback=log_callback,
+                )
 
         if log_callback is not None:
             log_callback("DEBUG", f"object_start name={export_name} type={obj_type} material={material}")
 
+        report_phase("Reading scene geometry", 0.0)
         actor = getattr(export_obj, "actor", None)
         if actor is None:
             skipped.append(f"{export_name} ({obj_type}: no actor)")
+            report_phase("Skipped: no scene actor", 1.0)
             if log_callback is not None:
                 log_callback("WARNING", f"object_skip name={export_name} reason=no_actor")
             done += 1
@@ -746,8 +859,10 @@ def export_objects_to_step_bundle(
             return
 
         poly = _scale_polydata(_world_polydata_from_actor(actor), mm_per_unit)
+        report_phase("Scene geometry ready", 0.2)
         if poly.GetNumberOfPoints() <= 0:
             skipped.append(f"{export_name} ({obj_type}: empty geometry)")
+            report_phase("Skipped: empty scene geometry", 1.0)
             if log_callback is not None:
                 log_callback("WARNING", f"object_skip name={export_name} reason=empty_geometry")
             done += 1
@@ -766,13 +881,68 @@ def export_objects_to_step_bundle(
         step_path = bundle_dir / filename
         export_mode = "mesh_roundtrip"
         solid_count = -1
+        connection_metadata: Dict[str, Any] = {}
         try:
             boolean_op = str(getattr(export_obj, "boolean_op", "") or "").strip().lower()
             has_step_source = bool(str(getattr(export_obj, "step_source_path", "") or "").strip())
-            prefer_occ = (obj_type != "MeshObject") or bool(boolean_op) or has_step_source
-            shape = shape_override if shape_override is not None else (
-                build_occ_shape_for_export(export_obj, cache=occ_cache) if prefer_occ else None
+            has_ipc_native_geometry = (
+                getattr(export_obj, "ipc2581_step_geometry", None) is not None
             )
+            prefer_occ = (
+                (obj_type != "MeshObject")
+                or bool(boolean_op)
+                or has_step_source
+                or has_ipc_native_geometry
+            )
+            report_phase(
+                "Building STEP BREP" if prefer_occ else "Preparing mesh STEP",
+                0.4,
+            )
+            if shape_override is not None:
+                shape = shape_override
+            elif obj_type in {"SweptSurfaceObject", "PlateObject"}:
+                if obj_type == "SweptSurfaceObject":
+                    source_shapes = []
+                    if (
+                        bool(getattr(export_obj, "_closed", False))
+                        and getattr(export_obj, "_profile_curve", None) is None
+                    ):
+                        for source_obj in export_candidates:
+                            if source_obj is export_obj:
+                                continue
+                            if type(source_obj).__name__ == "SweptSurfaceObject":
+                                continue
+                            source_shape = build_occ_shape_for_export(
+                                source_obj,
+                                cache=occ_cache,
+                            )
+                            if source_shape is not None:
+                                source_shapes.append(
+                                    (
+                                        str(getattr(source_obj, "name", "Object")),
+                                        source_shape,
+                                    )
+                                )
+                    shape = build_occ_swept_surface_shape(
+                        export_obj,
+                        source_shapes,
+                        log_callback=log_callback,
+                        mm_per_unit=mm_per_unit,
+                        connection_metadata=connection_metadata,
+                    )
+                else:
+                    shape = build_occ_shape_for_export(
+                        export_obj,
+                        cache=occ_cache,
+                    )
+            else:
+                shape = (
+                    build_occ_shape_for_export(export_obj, cache=occ_cache)
+                    if prefer_occ
+                    else None
+                )
+            if has_ipc_native_geometry and shape is None:
+                raise RuntimeError("native IPC-2581 STEP geometry could not be built")
 
             if shape is not None:
                 if mm_per_unit != 1.0:
@@ -792,20 +962,32 @@ def export_objects_to_step_bundle(
                 if log_callback is not None:
                     log_callback("DEBUG", f"occ_candidate name={export_name} solids={solid_count}")
                 try:
+                    report_phase("Writing STEP BREP", 0.75)
                     _write_step_from_occ_shape(shape, step_path)
                     export_mode = "brep_direct"
                     if log_callback is not None:
                         log_callback("INFO", f"occ_export_ok name={export_name} file={filename}")
                 except Exception as occ_exc:
+                    if has_ipc_native_geometry:
+                        raise RuntimeError(
+                            f"native IPC-2581 BREP export failed: {occ_exc}"
+                        ) from occ_exc
                     if log_callback is not None:
-                        log_callback("WARNING", f"occ_export_failed name={export_name} error={occ_exc}; falling back to scene geometry")
-                    _write_step_from_polydata(poly, step_path, log_callback=log_callback)
+                        log_callback(
+                            "WARNING",
+                            f"occ_export_failed name={export_name} error={occ_exc}; "
+                            "falling back to scene geometry",
+                        )
+                    report_phase("Writing mesh-derived STEP fallback", 0.75)
+                    write_mesh_step()
             else:
                 if log_callback is not None:
                     log_callback("DEBUG", f"scene_geometry_export name={export_name} points={poly.GetNumberOfPoints()} polys={poly.GetNumberOfPolys()}")
-                _write_step_from_polydata(poly, step_path, log_callback=log_callback)
+                report_phase("Writing mesh-derived STEP", 0.75)
+                write_mesh_step()
         except Exception as exc:
             skipped.append(f"{export_name} ({obj_type}: export failed: {exc})")
+            report_phase(f"STEP export failed: {exc}", 1.0)
             if log_callback is not None:
                 log_callback("ERROR", f"object_failed name={export_name} mode={export_mode} file={filename} error={exc}")
             done += 1
@@ -814,11 +996,15 @@ def export_objects_to_step_bundle(
             return
 
         done += 1
+        report_phase("STEP file written", 1.0)
         if progress_callback is not None:
             progress_callback(done, total, export_name)
 
         # Calculate priority from material_priorities dict or use default (base + index)
-        material_priority = material_priorities.get(material, 0) if material_priorities else 0
+        material_priority = object_priorities.get(
+            str(getattr(export_obj, "name", export_name)),
+            material_priorities.get(material, 0),
+        )
         priority_value = 5000 + idx + (material_priority * 100)
 
         entries.append(
@@ -835,6 +1021,16 @@ def export_objects_to_step_bundle(
                 "bounds_mm": tuple(float(value) for value in poly.GetBounds()),
                 "boolean_op": str(getattr(export_obj, "boolean_op", "") or "").strip().lower() or None,
                 "source_count": len(list(getattr(export_obj, "source_objects", []) or [])),
+                **(
+                    {
+                        "swept_profile_perimeter_mm": connection_metadata["profile_perimeter_mm"],
+                        "swept_extrusion_length_mm": connection_metadata["extrusion_length_mm"],
+                        "swept_direction": tuple(connection_metadata["direction"]),
+                    }
+                    if obj_type == "SweptSurfaceObject"
+                    and "profile_perimeter_mm" in connection_metadata
+                    else {}
+                ),
             }
         )
 

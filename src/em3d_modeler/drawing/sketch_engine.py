@@ -728,6 +728,95 @@ class SketchEngine:
         region = regions[0]
         return region[0] if len(region) == 1 else region
 
+    def operation_sweep_contour(self) -> tuple[list[UV], bool]:
+        """Return one ordered closed or open contour for a sheet sweep."""
+        def closed_contour(points) -> tuple[list[UV], bool]:
+            contour = list(points)
+            if len(contour) > 1 and math.dist(contour[0], contour[-1]) <= 1e-8:
+                contour.pop()
+            return contour, True
+
+        selected = self.selected_region_profiles()
+        if selected:
+            if len(selected) != 1 or len(selected[0]) != 1:
+                raise ValueError("Select exactly one sketch contour without holes")
+            return closed_contour(selected[0][0])
+
+        faces = self._bounded_faces()
+        if faces:
+            if len(faces) != 1:
+                raise ValueError("Select or draw exactly one sketch contour")
+            contours = self._polygon_profile(faces[0])
+            if len(contours) != 1:
+                raise ValueError("Sheet sweep currently requires a contour without holes")
+            return closed_contour(contours[0])
+
+        self._ensure_entity_records()
+        segments = []
+        for entity in self.entities:
+            if getattr(entity, "construction", False):
+                continue
+            tag = entity[0]
+            if tag == "line":
+                segment = [entity[1], entity[2]]
+            elif tag == "polyline":
+                segment = list(entity[1])
+            elif tag == "arc":
+                segment = _arc_polyline(entity[1], entity[2], entity[3])
+            elif tag == "circle":
+                segment = _circle_polyline(entity[1], entity[2])
+            elif tag == "rect":
+                segment = _rect_polyline(
+                    entity[1],
+                    entity[2],
+                    getattr(entity, "rectangle_mode", None) or "corner-corner",
+                )
+            else:
+                continue
+            cleaned = []
+            for point in segment:
+                point = (float(point[0]), float(point[1]))
+                if not cleaned or math.dist(point, cleaned[-1]) > 1e-9:
+                    cleaned.append(point)
+            if len(cleaned) >= 2:
+                segments.append(cleaned)
+
+        if not segments:
+            raise ValueError("Sketch needs one non-construction contour for a sheet sweep")
+
+        paths = []
+        while segments:
+            path = segments.pop(0)
+            while True:
+                joined = False
+                for index, segment in enumerate(segments):
+                    if math.dist(path[-1], segment[0]) <= 1e-8:
+                        path.extend(segment[1:])
+                    elif math.dist(path[-1], segment[-1]) <= 1e-8:
+                        path.extend(reversed(segment[:-1]))
+                    elif math.dist(path[0], segment[-1]) <= 1e-8:
+                        path = segment[:-1] + path
+                    elif math.dist(path[0], segment[0]) <= 1e-8:
+                        path = list(reversed(segment))[1:] + path
+                    else:
+                        continue
+                    segments.pop(index)
+                    joined = True
+                    break
+                if not joined:
+                    break
+            paths.append(path)
+
+        if len(paths) != 1:
+            raise ValueError("Select or draw exactly one connected sketch contour")
+        path = paths[0]
+        closed = len(path) > 2 and math.dist(path[0], path[-1]) <= 1e-8
+        if closed:
+            path.pop()
+        if len(path) < (3 if closed else 2):
+            raise ValueError("The sketch contour has too few distinct points to sweep")
+        return path, closed
+
     def delete_entity(self, entity: Union[SketchEntityRef, str]) -> bool:
         entity_id = entity.entity_id if isinstance(entity, SketchEntityRef) else str(entity)
         index = self._entity_index(entity_id)

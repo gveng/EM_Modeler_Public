@@ -67,6 +67,84 @@ def test_fuse_many_applies_requested_reduction():
     assert 0 < result.GetNumberOfPolys() < original_polys
 
 
+def _closed_box(bounds):
+    source = vtk.vtkCubeSource()
+    source.SetBounds(*bounds)
+    source.Update()
+    triangles = vtk.vtkTriangleFilter()
+    triangles.SetInputData(source.GetOutput())
+    triangles.Update()
+    polydata = vtk.vtkPolyData()
+    polydata.DeepCopy(triangles.GetOutput())
+    return polydata
+
+
+def _open_cylinder_wall(z_bottom, z_top):
+    source = vtk.vtkCylinderSource()
+    source.SetRadius(0.2)
+    source.SetHeight(z_top - z_bottom)
+    source.SetResolution(32)
+    source.CappingOff()
+    source.Update()
+    transform = vtk.vtkTransform()
+    transform.RotateX(90)
+    transform.Translate(0.0, (z_top + z_bottom) / 2.0, 0.0)
+    moved = vtk.vtkTransformPolyDataFilter()
+    moved.SetTransform(transform)
+    moved.SetInputData(source.GetOutput())
+    moved.Update()
+    polydata = vtk.vtkPolyData()
+    polydata.DeepCopy(moved.GetOutput())
+    return polydata
+
+
+def test_fuse_many_keeps_disjoint_layers_and_open_via_walls(monkeypatch):
+    # Layers separated in Z plus an open via wall: the union must keep every shell.
+    monkeypatch.setattr("em3d_modeler.scene.boolean_ops._occ_boolean", lambda *_: None)
+    layers = [
+        MeshObject("TOP", _sphere(16)),
+        MeshObject("MID", _sphere(16)),
+        MeshObject("BOTTOM", _sphere(16)),
+    ]
+    layers[1].actor.SetPosition(0.0, 0.0, 5.0)
+    layers[2].actor.SetPosition(0.0, 0.0, 10.0)
+    via = MeshObject("Via", _open_cylinder_wall(0.0, 10.0))
+    objects = layers + [via]
+
+    result = fuse_many(objects)
+
+    def surface_area(polydata):
+        triangles = vtk.vtkTriangleFilter()
+        triangles.SetInputData(polydata)
+        triangles.Update()
+        mass = vtk.vtkMassProperties()
+        mass.SetInputData(triangles.GetOutput())
+        mass.Update()
+        return mass.GetSurfaceArea()
+
+    input_area = sum(
+        surface_area(obj.actor.GetMapper().GetInput()) for obj in objects
+    )
+    assert surface_area(result) == pytest.approx(input_area, rel=1e-6)
+    assert result.GetBounds()[4:] == pytest.approx((-0.5, 10.5), abs=1e-6)
+
+
+def test_fuse_many_unions_overlapping_closed_solids_without_losing_volume(monkeypatch):
+    monkeypatch.setattr("em3d_modeler.scene.boolean_ops._occ_boolean", lambda *_: None)
+    first = MeshObject("First", _sphere(32))
+    second = MeshObject("Second", _sphere(32))
+    second.actor.SetPosition(0.5, 0.0, 0.0)
+    distant = MeshObject("Distant", _sphere(32))
+    distant.actor.SetPosition(10.0, 0.0, 0.0)
+    sphere_volume = _mesh_volume(_sphere(32))
+
+    result = fuse_many([first, second, distant])
+
+    assert result.GetBounds()[:2] == pytest.approx((-0.5, 10.5), abs=1e-2)
+    assert sphere_volume * 2 < _mesh_volume(result) < sphere_volume * 3
+    assert _mesh_volume(result) < sphere_volume * 3 - 0.05
+
+
 @pytest.mark.parametrize("target_reduction", [0.0, 0.2])
 def test_cut_scaled_mesh_tool_removes_contained_volume(monkeypatch, target_reduction):
     def box(bounds):

@@ -42,6 +42,7 @@ class ProjectFile:
         global_material_db_path: str | None = None,
         camera: dict | None = None,
         display_settings: dict | None = None,
+        object_groups: list | None = None,
     ) -> None:
         data = {
             "version":      ProjectFile.VERSION,
@@ -54,6 +55,7 @@ class ProjectFile:
             },
             "emerge_settings": settings,
             "objects":     objects_json,
+            "object_groups": object_groups or [],
             "reference_planes":  reference_planes or [],
             "active_plane_name": active_plane_name,
             "project_materials": project_materials or [],

@@ -106,3 +106,100 @@ def test_global_material_can_be_edited_and_saved(monkeypatch, tmp_path):
     dialog.close()
     dialog.deleteLater()
     app.processEvents()
+
+
+def test_project_material_color_can_be_edited(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    store = MaterialStore()
+    original = store.add_project_material("Copper", family="Metals", color="#112233")
+    dialog = MaterialLibraryDialog(None, store, lambda: None)
+    updated = MaterialRecord(
+        original.uid,
+        original.name,
+        original.family,
+        original.er,
+        original.ur,
+        original.tan_d,
+        original.sigma,
+        color="#445566",
+        opacity=original.opacity,
+        source="project",
+    )
+
+    class AcceptedEditor:
+        result_record = updated
+
+        def __init__(self, *_args):
+            pass
+
+        def exec_(self):
+            return QDialog.Accepted
+
+    monkeypatch.setattr(material_library_dialog, "_MaterialEditorDialog", AcceptedEditor)
+    copper_row = next(
+        index
+        for index in range(dialog._list.count())
+        if dialog._list.item(index).text() == "Copper"
+    )
+    dialog._list.setCurrentRow(copper_row)
+    dialog._edit_material()
+
+    assert store.project_records()["Copper"].color == "#445566"
+    assert store.project_materials_to_json()[0]["color"] == "#445566"
+    dialog.close()
+    dialog.deleteLater()
+    app.processEvents()
+
+
+def test_builtin_material_can_be_copied_to_project_then_color_edited(monkeypatch):
+    app = QApplication.instance() or QApplication([])
+    store = MaterialStore()
+    dialog = MaterialLibraryDialog(None, store, lambda: None)
+    pec_row = next(
+        index
+        for index in range(dialog._list.count())
+        if dialog._list.item(index).text() == "PEC"
+    )
+    dialog._list.setCurrentRow(pec_row)
+
+    assert dialog._current_record().source == "builtin"
+    assert not dialog._edit_btn.isEnabled()
+    assert dialog._copy_btn.isEnabled()
+
+    dialog._copy_to_project()
+    copied_record = store.get_record("PEC")
+    assert copied_record.source == "project"
+    assert dialog._edit_btn.isEnabled()
+    assert not dialog._copy_btn.isEnabled()
+
+    recolored = MaterialRecord(
+        copied_record.uid,
+        copied_record.name,
+        copied_record.family,
+        copied_record.er,
+        copied_record.ur,
+        copied_record.tan_d,
+        copied_record.sigma,
+        color="#123456",
+        opacity=copied_record.opacity,
+        source="project",
+    )
+
+    class AcceptedEditor:
+        result_record = recolored
+
+        def __init__(self, *_args):
+            pass
+
+        def exec_(self):
+            return QDialog.Accepted
+
+    monkeypatch.setattr(material_library_dialog, "_MaterialEditorDialog", AcceptedEditor)
+    dialog._edit_material()
+
+    assert store.get_record("PEC").color == "#123456"
+    assert store._builtin["PEC"].color != "#123456"
+    assert store.project_materials_to_json()[0]["color"] == "#123456"
+    dialog.close()
+    dialog.deleteLater()
+    app.processEvents()

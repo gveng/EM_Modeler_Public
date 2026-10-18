@@ -1,0 +1,91 @@
+{
+  "features": [
+    {
+      "attributes": {},
+      "bbox": [10.0, 1.0, 12.0, 3.0],
+      "geometry": {
+        "closed": true,
+        "points": [
+          {"x": 10.0, "y": 1.0},
+          {"x": 12.0, "y": 1.0},
+          {"x": 12.0, "y": 3.0},
+          {"x": 10.0, "y": 1.0}
+        ],
+        "segments": [
+          {"kind": "polystepsegment", "to": {"x": 12.0, "y": 1.0}},
+          {"kind": "polystepsegment", "to": {"x": 12.0, "y": 3.0}},
+          {"kind": "polystepsegment", "to": {"x": 10.0, "y": 1.0}}
+        ]
+      },
+      "kind": "polygon",
+      "layer": "Top",
+      "net": "SIG",
+      "source_tag": "Polygon"
+    }
+  ],
+  "layers": [
+    {"function": "SIGNAL", "name": "Top", "polarity": "POSITIVE", "side": "TOP"},
+    {"function": "SIGNAL", "name": "Bottom", "polarity": "POSITIVE", "side": "BOTTOM"}
+  ],
+  "nets": [
+    {
+      "class_override": null,
+      "effective_class": "GND",
+      "inferred_class": "GND",
+      "name": "GND"
+    },
+    {
+      "class_override": null,
+      "effective_class": "OTHER",
+      "inferred_class": "OTHER",
+      "name": "N/C"
+    },
+    {
+      "class_override": null,
+      "effective_class": "SIGNAL",
+      "inferred_class": "SIGNAL",
+      "name": "SIG"
+    }
+  ],
+  "revision": "B",
+  "stackups": [
+    {
+      "layers": [
+        {
+          "conductivity": null,
+          "conductivity_unit": null,
+          "function": null,
+          "loss_tangent": null,
+          "material": "Copper",
+          "name": "Top",
+          "relative_permittivity": null,
+          "thickness": 0.035
+        },
+        {
+          "conductivity": null,
+          "conductivity_unit": null,
+          "function": null,
+          "loss_tangent": null,
+          "material": "FR4",
+          "name": "Core",
+          "relative_permittivity": null,
+          "thickness": 1.53
+        },
+        {
+          "conductivity": null,
+          "conductivity_unit": null,
+          "function": null,
+          "loss_tangent": null,
+          "material": "Copper",
+          "name": "Bottom",
+          "relative_permittivity": null,
+          "thickness": 0.035
+        }
+      ],
+      "name": "Main",
+      "overall_thickness": 1.6
+    }
+  ],
+  "units": "millimeter",
+  "warnings": []
+}

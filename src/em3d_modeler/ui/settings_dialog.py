@@ -42,6 +42,8 @@ from PySide6.QtWidgets import (
 )
 from .formula_widgets import FormulaDoubleSpinBox as QDoubleSpinBox
 from .unit_options import UNIT_OPTIONS
+from ..emerge.solver_capabilities import MULTIPROCESSING_SOLVERS
+from ..emerge.mesh_algorithms import MESH_ALGORITHM_OPTIONS, normalize_mesh_algorithm
 
 
 _SELECTION_COLOR_PRESETS: Dict[str, Tuple[float, float, float]] = {
@@ -138,13 +140,24 @@ class SettingsDialog(QDialog):
 
         self._solver_combo = QComboBox(self._simulation_tab)
         self._solver_combo.addItems([
-            "PARDISO", "SUPERLU", "UMFPACK", "CUDSS", "AASDS", "MUMPS",
+            "PARDISO", "SUPERLU", "UMFPACK", "CUDSS", "AASDS", "MUMPS", "SPARTA",
         ])
         sim_form.addRow("Solver", self._solver_combo)
 
-        self._parallel_check = QCheckBox("Enable parallel computation", self._simulation_tab)
+        self._cudss_precision_combo = QComboBox(self._simulation_tab)
+        self._cudss_precision_combo.addItem("Automatic (EMERGE)", "auto")
+        self._cudss_precision_combo.addItem("Single", "single")
+        self._cudss_precision_combo.addItem("Double", "double")
+        sim_form.addRow("CUDSS precision", self._cudss_precision_combo)
+
+        self._parallel_check = QCheckBox("Enable multiprocessing", self._simulation_tab)
         self._parallel_check.setChecked(True)
         sim_form.addRow("", self._parallel_check)
+
+        self._worker_processes_spin = QSpinBox(self._simulation_tab)
+        self._worker_processes_spin.setRange(1, 256)
+        self._worker_processes_spin.setValue(2)
+        sim_form.addRow("Worker processes", self._worker_processes_spin)
 
         self._pardiso_threads_spin = QSpinBox(self._simulation_tab)
         self._pardiso_threads_spin.setRange(1, 256)
@@ -155,6 +168,9 @@ class SettingsDialog(QDialog):
         self._acc_threads_spin.setRange(1, 256)
         self._acc_threads_spin.setValue(10)
         sim_form.addRow("ACC threads", self._acc_threads_spin)
+
+        self._solver_combo.currentTextChanged.connect(self._on_solver_changed)
+        self._on_solver_changed(self._solver_combo.currentText())
 
         self._plot_sparams_check = QCheckBox("Plot S-parameters after simulation", self._simulation_tab)
         self._plot_sparams_check.setChecked(True)
@@ -180,10 +196,26 @@ class SettingsDialog(QDialog):
         self._mesh_resolution_spin.setSingleStep(0.05)
         mesh_form.addRow("Resolution (1/λ)", self._mesh_resolution_spin)
 
+        self._mesh_algorithm_combo = QComboBox(self._mesh_tab)
+        for label, algorithm in MESH_ALGORITHM_OPTIONS:
+            self._mesh_algorithm_combo.addItem(label, algorithm)
+        mesh_form.addRow("3D meshing algorithm", self._mesh_algorithm_combo)
+
+        self._curved_boundary_meshing_check = QCheckBox(
+            "Enable curved-boundary meshing in EMERGE",
+            self._mesh_tab,
+        )
+        self._curved_boundary_meshing_check.setChecked(True)
+        self._curved_boundary_meshing_check.setToolTip(
+            "When disabled, generated EMERGE scripts omit the curved-boundary meshing call. "
+            "The segment count still applies when importing STEP profiles."
+        )
+        mesh_form.addRow("", self._curved_boundary_meshing_check)
+
         self._curved_boundary_resolution_spin = QSpinBox(self._mesh_tab)
         self._curved_boundary_resolution_spin.setRange(3, 1000)
         self._curved_boundary_resolution_spin.setValue(20)
-        mesh_form.addRow("Curved boundary segments", self._curved_boundary_resolution_spin)
+        mesh_form.addRow("Curved-boundary segments", self._curved_boundary_resolution_spin)
 
         mesh_form.addRow(QLabel("Note: 0.3 = 3.3 lines/wavelength (fine mesh)"))
 
@@ -217,6 +249,18 @@ class SettingsDialog(QDialog):
         self._refinement_max_size_spin.setSpecialValueText("Automatic")
         self._refinement_max_size_spin.setSuffix(" mm")
         mesh_form.addRow("Maximum size", self._refinement_max_size_spin)
+
+        self._save_mesh_after_sweep_check = QCheckBox(
+            "Save mesh after a successful sweep",
+            self._mesh_tab,
+        )
+        mesh_form.addRow("", self._save_mesh_after_sweep_check)
+
+        self._allow_oversized_mesh_check = QCheckBox(
+            "Allow oversized meshes",
+            self._mesh_tab,
+        )
+        mesh_form.addRow("", self._allow_oversized_mesh_check)
 
         self._utility_tab = QWidget(self)
         self._tabs.addTab(self._utility_tab, "Utility")
@@ -296,6 +340,14 @@ class SettingsDialog(QDialog):
         color = _SELECTION_COLOR_PRESETS.get(value, self._custom_color)
         self._update_color_preview(color)
 
+    def _on_solver_changed(self, solver: str) -> None:
+        supports_multiprocessing = solver.strip().upper() in MULTIPROCESSING_SOLVERS
+        self._parallel_check.setEnabled(supports_multiprocessing)
+        self._worker_processes_spin.setEnabled(supports_multiprocessing)
+        self._cudss_precision_combo.setEnabled(solver.strip().upper() == "CUDSS")
+        if not supports_multiprocessing:
+            self._parallel_check.setChecked(False)
+
     def _on_units_changed(self, units: str) -> None:
         old_units = self._current_units
         if old_units == units:
@@ -353,15 +405,21 @@ class SettingsDialog(QDialog):
         selection_color: Tuple[float, float, float],
         locale: QLocale,
         solver: str = "PARDISO",
+        cudss_precision: str = "auto",
         parallel_enabled: bool = True,
+        worker_processes: int = 2,
         pardiso_threads: int = 8,
         acc_threads: int = 10,
         mesh_resolution: float = 0.3,
+        mesh_algorithm: str = "DELAUNAY",
         curved_boundary_resolution: int = 20,
         refinement_boundary_size_mm: float = 0.25,
         refinement_face_size_mm: float = 0.1,
         refinement_growth_rate: float = 3.0,
         refinement_max_size_mm: float = 0.0,
+        save_mesh_after_sweep: bool = False,
+        allow_oversized_mesh: bool = False,
+        curved_boundary_meshing_enabled: bool = True,
         plot_sparams_after_sim: bool = True,
         export_sparams_after_sim: bool = True,
         export_full_scene_step: bool = False,
@@ -394,7 +452,14 @@ class SettingsDialog(QDialog):
         # Simulation settings
         if solver in [self._solver_combo.itemText(i) for i in range(self._solver_combo.count())]:
             self._solver_combo.setCurrentText(solver)
+        precision = str(cudss_precision).strip().lower()
+        precision_index = self._cudss_precision_combo.findData(
+            precision if precision in {"auto", "single", "double"} else "auto"
+        )
+        self._cudss_precision_combo.setCurrentIndex(max(0, precision_index))
         self._parallel_check.setChecked(bool(parallel_enabled))
+        self._worker_processes_spin.setValue(int(worker_processes))
+        self._on_solver_changed(self._solver_combo.currentText())
         self._pardiso_threads_spin.setValue(int(pardiso_threads))
         self._acc_threads_spin.setValue(int(acc_threads))
         self._plot_sparams_check.setChecked(bool(plot_sparams_after_sim))
@@ -402,11 +467,20 @@ class SettingsDialog(QDialog):
 
         # Mesh settings
         self._mesh_resolution_spin.setValue(float(mesh_resolution))
+        algorithm = normalize_mesh_algorithm(mesh_algorithm)
+        self._mesh_algorithm_combo.setCurrentIndex(
+            max(0, self._mesh_algorithm_combo.findData(algorithm))
+        )
+        self._curved_boundary_meshing_check.setChecked(
+            bool(curved_boundary_meshing_enabled)
+        )
         self._curved_boundary_resolution_spin.setValue(int(curved_boundary_resolution))
         self._refinement_boundary_size_spin.setValue(float(refinement_boundary_size_mm))
         self._refinement_face_size_spin.setValue(float(refinement_face_size_mm))
         self._refinement_growth_rate_spin.setValue(float(refinement_growth_rate))
         self._refinement_max_size_spin.setValue(float(refinement_max_size_mm))
+        self._save_mesh_after_sweep_check.setChecked(bool(save_mesh_after_sweep))
+        self._allow_oversized_mesh_check.setChecked(bool(allow_oversized_mesh))
         self._export_full_scene_step_check.setChecked(bool(export_full_scene_step))
         self._boolean_decimation_check.setChecked(bool(boolean_decimation_enabled))
         self._workspace_path_edit.setText(str(workspace_path or ""))
@@ -424,15 +498,23 @@ class SettingsDialog(QDialog):
             "plane_triad_size": float(self._triad_size_spin.value()),
             "selection_color": color,
             "solver": self._solver_combo.currentText(),
+            "cudss_precision": str(self._cudss_precision_combo.currentData()),
             "parallel_enabled": bool(self._parallel_check.isChecked()),
+            "worker_processes": int(self._worker_processes_spin.value()),
             "pardiso_threads": int(self._pardiso_threads_spin.value()),
             "acc_threads": int(self._acc_threads_spin.value()),
             "mesh_resolution": float(self._mesh_resolution_spin.value()),
+            "mesh_algorithm": str(self._mesh_algorithm_combo.currentData()),
+            "curved_boundary_meshing_enabled": bool(
+                self._curved_boundary_meshing_check.isChecked()
+            ),
             "curved_boundary_resolution": int(self._curved_boundary_resolution_spin.value()),
             "refinement_boundary_size_mm": float(self._refinement_boundary_size_spin.value()),
             "refinement_face_size_mm": float(self._refinement_face_size_spin.value()),
             "refinement_growth_rate": float(self._refinement_growth_rate_spin.value()),
             "refinement_max_size_mm": float(self._refinement_max_size_spin.value()),
+            "save_mesh_after_sweep": bool(self._save_mesh_after_sweep_check.isChecked()),
+            "allow_oversized_mesh": bool(self._allow_oversized_mesh_check.isChecked()),
             "plot_sparams_after_sim": bool(self._plot_sparams_check.isChecked()),
             "export_sparams_after_sim": bool(self._export_sparams_check.isChecked()),
             "export_full_scene_step": bool(self._export_full_scene_step_check.isChecked()),

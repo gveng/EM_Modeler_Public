@@ -7,11 +7,17 @@ from PySide6.QtCore import Qt
 from PySide6.QtTest import QTest
 from PySide6.QtWidgets import QApplication, QMenu
 
-from em3d_modeler.scene.em_objects import BoxObject, ExtrudedObject, RevolvedObject
+from em3d_modeler.scene.em_objects import (
+    BoxObject,
+    ExtrudedObject,
+    RevolvedObject,
+    SweptSurfaceObject,
+)
 from em3d_modeler.ui import materials_widget
 from em3d_modeler.ui.materials_widget import (
     MaterialsWidget,
     _ROLE_FEATURE_EDIT,
+    _ROLE_OBJ_ID,
     _ROLE_SKETCH_EDIT,
 )
 
@@ -123,4 +129,24 @@ def test_sketch_row_edit_interactions_without_scene_selection(qapp, monkeypatch)
     monkeypatch.setattr(materials_widget, "QMenu", TriggeringMenu)
     widget._on_context_menu(sketch_rect.center())
     assert requested == [obj, obj]
+    widget.close()
+
+
+def test_swept_surface_appears_as_selectable_material_tree_object_row(qapp):
+    sheet = SweptSurfaceObject(
+        "SurfaceSheet",
+        profile_pts=[(0, 0, 0), (2, 0, 0)],
+        displacement=(0, 0, 3),
+        closed=False,
+    )
+    widget = MaterialsWidget()
+    widget.refresh({"PEC": [sheet]})
+
+    material_row = widget._tree.topLevelItem(0)
+    object_row = material_row.child(0)
+    assert object_row.text(0) == "SurfaceSheet"
+    assert object_row.data(0, _ROLE_OBJ_ID) == id(sheet)
+
+    widget.highlight(sheet)
+    assert object_row.isSelected()
     widget.close()

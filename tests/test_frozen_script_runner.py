@@ -115,6 +115,7 @@ def test_run_button_uses_script_runner_arguments(monkeypatch, tmp_path, frozen, 
     script_path = tmp_path / "simulation_master.py"
     events = []
     window = SimpleNamespace(
+        _sim_ready=True,
         _save_project=lambda: events.append("save") or True,
         _generate_simulation_assets=lambda **_kwargs: events.append("generate") or "master script",
         _write_cached_simulation_scripts=lambda: script_path,
@@ -141,6 +142,7 @@ def test_simulation_does_not_start_when_project_save_is_cancelled():
     generate_assets = Mock()
     log = Mock()
     window = SimpleNamespace(
+        _sim_ready=True,
         _sim_process=None,
         _save_project=lambda: False,
         _generate_simulation_assets=generate_assets,
@@ -152,4 +154,25 @@ def test_simulation_does_not_start_when_project_save_is_cancelled():
     generate_assets.assert_not_called()
     log.assert_called_once_with(
         "[warn] Simulation not started because the project was not saved."
+    )
+
+
+def test_simulation_does_not_start_before_successful_check():
+    save_project = Mock()
+    generate_assets = Mock()
+    log = Mock()
+    window = SimpleNamespace(
+        _sim_ready=False,
+        _sim_process=None,
+        _save_project=save_project,
+        _generate_simulation_assets=generate_assets,
+        _append_sim_log=log,
+    )
+
+    main_window.MainWindow._on_sim_run(window)
+
+    save_project.assert_not_called()
+    generate_assets.assert_not_called()
+    log.assert_called_once_with(
+        "[warn] Simulation not started because Check Simulation has not succeeded for the current inputs."
     )

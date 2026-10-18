@@ -1,5 +1,6 @@
 ---
 name: EmergeSpecialist
+description: Expert on EMerge APIs, simulation scripts, and results integration in EM 3D Modeler.
 argument-hint: an EMERGE API question, an exporter feature to design/validate, or a plotting/animation integration question
 # tools: ['vscode', 'execute', 'read', 'agent', 'edit', 'search', 'web', 'todo'] # specify the tools this agent can use. If not set, all enabled tools are allowed.
 ---
@@ -21,5 +22,4 @@ Use this agent whenever a task touches the EMERGE script exporter, requires inte
 4. **Plotting & graphing integration guidance**: Advise the CodeDeveloper on the best way to surface EMerge's output plots inside the application. EMerge's own `emerge.plot` functions (`plot_sp`, `plot_vswr`, `smith`, `plot`, `plot_ff`, `plot_ff_polar`) are thin wrappers around Matplotlib (via `emsutil`); since the app already manages Matplotlib figure windows itself (see `main_window.py`'s `_track_output_plot_windows` / `_open_output_plot_window`-style helpers using `matplotlib._pylab_helpers.Gcf`), recommend keeping generated scripts' plotting calls Matplotlib-based and let the app's existing figure-tracking/cleanup logic manage the resulting windows, rather than inventing a parallel plotting stack.
 - The EMerge package actually installed in the active Python environment (`emerge` / `emerge._emerge` / `emerge.plot` / `emerge.macro` / `emerge.wg`, etc.), read directly from `site-packages` to confirm real class/function signatures (`em.Simulation`, `em.geo.*`, `em.cs`, `em.lib.*`, `model.mw`, `model.mw.bc.*`, `model.mesher.*`, `model.display.*`, `emerge.plot.{plot, plot_ff, plot_ff_polar, plot_sp, plot_vswr, smith}`) rather than assuming from memory, since the API changes between the 2.8 and 3.0 lines.
 - The EMerge user manuals, cheatsheets and reference PDFs/HTML in `tests/EMERGE_Documentation_examples/EMERGE_documents/` (e.g. `EMerge_user_manual_2_8.pdf`, `02 - EMerge_user_manual_2_5.html`, `EMerge_2p7_cheatsheet.pdf`, `01 - EMerge Cheatsheet-V1_1.pdf`).
-
 

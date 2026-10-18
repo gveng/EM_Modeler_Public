@@ -17,16 +17,17 @@
 """Scene manager: owns all EM objects and the VTK renderer."""
 from __future__ import annotations
 from copy import deepcopy
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 import re
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Callable, Dict, List, Optional, Tuple
+from uuid import uuid4
 
 import vtk
 
 from .em_objects import (
     EMObject, BoxObject, CylinderObject, ConeObject, SphereObject, MeshObject,
     PlateObject, PyramidObject, WedgeObject, TorusObject, EllipsoidObject,
-    ExtrudedObject, RevolvedObject,
+    ExtrudedObject, RevolvedObject, SweptSurfaceObject,
 )
 from .grid_actor import build_grid_actor, build_axes_widget, project_bounds_to_plane
 
@@ -43,6 +44,7 @@ _OBJECT_CLASSES = {
     "EllipsoidObject": EllipsoidObject,
     "ExtrudedObject": ExtrudedObject,
     "RevolvedObject": RevolvedObject,
+    "SweptSurfaceObject": SweptSurfaceObject,
 }
 
 
@@ -54,12 +56,25 @@ class ReferencePlane:
     normal: Tuple[float, float, float]
 
 
+@dataclass(eq=False)
+class SceneObjectGroup:
+    """Organizational group; it does not combine or transform its objects."""
+
+    name: str
+    objects: List[EMObject] = field(default_factory=list)
+    subgroups: List[SceneObjectGroup] = field(default_factory=list)
+    group_id: str = field(default_factory=lambda: uuid4().hex)
+    priority: int | None = None
+
+
 class SceneManager:
     """Owns VTK renderer + all EM objects.  One instance per project."""
 
     def __init__(self, renderer: vtk.vtkRenderer):
         self.renderer = renderer
         self.objects: List[EMObject] = []
+        self.object_groups: List[SceneObjectGroup] = []
+        self._object_added_callback: Callable[[EMObject], None] | None = None
         self.selected: Optional[EMObject] = None
         self.selection: List[EMObject] = []   # multi-selection list
         self._mesh_json_cache: Dict[int, Tuple[vtk.vtkPolyData, int, Dict[str, Any]]] = {}
@@ -157,6 +172,12 @@ class SceneManager:
         return self._grid_spacing
 
     # ─────────────────────────────────────────────────── object management
+    def set_object_added_callback(
+        self, callback: Callable[[EMObject], None] | None
+    ) -> None:
+        """Set a temporary callback invoked before a new object's actors are added."""
+        self._object_added_callback = callback
+
     def add_object(self, obj: EMObject, *, preserve_name: bool = False) -> None:
         used_names = {str(existing.name).strip() for existing in self.objects}
         requested_name = str(getattr(obj, "name", "")).strip() or type(obj).__name__
@@ -168,12 +189,20 @@ class SceneManager:
                 index += 1
             obj.name = f"{prefix}_{index}"
         self.objects.append(obj)
+        if self._object_added_callback is not None:
+            self._object_added_callback(obj)
         for actor in obj.all_actors:
             self.renderer.AddActor(actor)
         self.refresh_adaptive_grid()
 
     def remove_object(self, obj: EMObject) -> None:
         if obj in self.objects:
+            for group in self.object_groups:
+                if obj in group.objects:
+                    group.objects.remove(obj)
+                for subgroup in group.subgroups:
+                    if obj in subgroup.objects:
+                        subgroup.objects.remove(obj)
             self.objects.remove(obj)
             for actor in obj.all_actors:
                 self.renderer.RemoveActor(actor)
@@ -182,6 +211,305 @@ class SceneManager:
             if obj in self.selection:
                 self.selection.remove(obj)
             self.refresh_adaptive_grid()
+
+    @staticmethod
+    def _normalized_group_name(name: str) -> str:
+        if not isinstance(name, str):
+            raise ValueError("Group name must be text.")
+        normalized = name.strip()
+        if not normalized:
+            raise ValueError("Group name cannot be empty.")
+        return normalized
+
+    @staticmethod
+    def _unique_objects(objects: List[EMObject]) -> List[EMObject]:
+        return list(dict.fromkeys(objects))
+
+    def _validate_group_objects(self, objects: List[EMObject]) -> List[EMObject]:
+        unique = self._unique_objects(list(objects))
+        if not unique:
+            raise ValueError("Select at least one scene object.")
+        if any(obj not in self.objects for obj in unique):
+            raise ValueError("Groups can only contain objects currently in the scene.")
+        return unique
+
+    @staticmethod
+    def _group_members(group: SceneObjectGroup) -> list[EMObject]:
+        return [
+            *group.objects,
+            *(obj for subgroup in group.subgroups for obj in subgroup.objects),
+        ]
+
+    @staticmethod
+    def _validate_single_group_material(objects: list[EMObject]) -> None:
+        materials = {
+            str(getattr(obj, "material", "")).strip()
+            for obj in objects
+            if str(getattr(obj, "material", "")).strip()
+        }
+        if len(materials) > 1:
+            raise ValueError(
+                "All objects in a group, including its subgroups, must use the same material."
+            )
+
+    def _unassign_group_objects(self, objects: List[EMObject]) -> None:
+        moving = set(objects)
+        for group in self.object_groups:
+            group.objects[:] = [obj for obj in group.objects if obj not in moving]
+            for subgroup in group.subgroups:
+                subgroup.objects[:] = [
+                    obj for obj in subgroup.objects if obj not in moving
+                ]
+
+    def create_object_group(
+        self,
+        name: str,
+        objects: List[EMObject],
+    ) -> SceneObjectGroup:
+        name = self._normalized_group_name(name)
+        if any(group.name.casefold() == name.casefold() for group in self.object_groups):
+            raise ValueError(f"A group named '{name}' already exists.")
+        members = self._validate_group_objects(objects)
+        self._validate_single_group_material(members)
+        self._unassign_group_objects(members)
+        group = SceneObjectGroup(name=name, objects=members)
+        self.object_groups.append(group)
+        return group
+
+    def create_object_subgroup(
+        self,
+        parent: SceneObjectGroup,
+        name: str,
+        objects: List[EMObject] | None = None,
+    ) -> SceneObjectGroup:
+        if parent not in self.object_groups:
+            raise ValueError("The parent group is no longer in the scene.")
+        name = self._normalized_group_name(name)
+        if any(
+            subgroup.name.casefold() == name.casefold()
+            for subgroup in parent.subgroups
+        ):
+            raise ValueError(
+                f"A subgroup named '{name}' already exists in group '{parent.name}'."
+            )
+        members = self._validate_group_objects(list(objects or [])) if objects else []
+        self._validate_single_group_material([*self._group_members(parent), *members])
+        self._unassign_group_objects(members)
+        subgroup = SceneObjectGroup(name=name, objects=members)
+        parent.subgroups.append(subgroup)
+        return subgroup
+
+    def assign_objects_to_group(
+        self,
+        objects: List[EMObject],
+        group: SceneObjectGroup,
+        subgroup: SceneObjectGroup | None = None,
+    ) -> None:
+        if group not in self.object_groups:
+            raise ValueError("The target group is no longer in the scene.")
+        if subgroup is not None and subgroup not in group.subgroups:
+            raise ValueError("The target subgroup is not a child of that group.")
+        members = self._validate_group_objects(objects)
+        moving = set(members)
+        remaining = [
+            obj for obj in self._group_members(group)
+            if obj not in moving
+        ]
+        self._validate_single_group_material([*remaining, *members])
+        self._unassign_group_objects(members)
+        (subgroup.objects if subgroup is not None else group.objects).extend(members)
+
+    def delete_object_subgroup(
+        self,
+        parent: SceneObjectGroup,
+        subgroup: SceneObjectGroup,
+    ) -> None:
+        if parent not in self.object_groups or subgroup not in parent.subgroups:
+            raise ValueError("The subgroup is no longer in the scene.")
+        parent.objects.extend(subgroup.objects)
+        parent.subgroups.remove(subgroup)
+
+    def delete_object_group(self, group: SceneObjectGroup) -> None:
+        if group not in self.object_groups:
+            raise ValueError("The group is no longer in the scene.")
+        self.object_groups.remove(group)
+
+    def group_for_object(
+        self,
+        obj: EMObject,
+    ) -> tuple[SceneObjectGroup, SceneObjectGroup | None] | None:
+        for group in self.object_groups:
+            if obj in group.objects:
+                return group, None
+            for subgroup in group.subgroups:
+                if obj in subgroup.objects:
+                    return group, subgroup
+        return None
+
+    def groups_with_mixed_materials(self) -> list[str]:
+        return [
+            group.name
+            for group in self.object_groups
+            if len({
+                str(getattr(obj, "material", "")).strip()
+                for obj in self._group_members(group)
+                if str(getattr(obj, "material", "")).strip()
+            }) > 1
+        ]
+
+    def material_assignment_error(
+        self,
+        objects: List[EMObject],
+        material: str,
+    ) -> str | None:
+        target_material = str(material).strip()
+        if not target_material:
+            return "Select a material before applying it."
+        selected = set(objects)
+        affected_groups = {
+            membership[0]
+            for obj in objects
+            if (membership := self.group_for_object(obj)) is not None
+        }
+        for group in affected_groups:
+            projected_materials = set()
+            for obj in self._group_members(group):
+                obj_material = (
+                    target_material if obj in selected
+                    else str(obj.material).strip()
+                )
+                if obj_material:
+                    projected_materials.add(obj_material)
+            if len(projected_materials) > 1:
+                return (
+                    f"Group '{group.name}' must contain objects with one material. "
+                    "Apply the same material to all group members, or ungroup the object first."
+                )
+        return None
+
+    def set_object_group_priority(
+        self,
+        group: SceneObjectGroup,
+        priority: int,
+    ) -> SceneObjectGroup:
+        root = group if group in self.object_groups else next(
+            (parent for parent in self.object_groups if group in parent.subgroups),
+            None,
+        )
+        if root is None:
+            raise ValueError("The target group is no longer in the scene.")
+        self._validate_single_group_material(self._group_members(root))
+        root.priority = int(priority)
+        return root
+
+    def group_object_priorities(self) -> dict[str, int]:
+        return {
+            obj.name: int(group.priority)
+            for group in self.object_groups
+            if group.priority is not None
+            for obj in self._group_members(group)
+        }
+
+    def object_groups_to_json(self) -> list[dict[str, Any]]:
+        return [
+            {
+                "id": group.group_id,
+                "name": group.name,
+                "priority": group.priority,
+                "objects": [obj.name for obj in group.objects],
+                "subgroups": [
+                    {
+                        "id": subgroup.group_id,
+                        "name": subgroup.name,
+                        "objects": [obj.name for obj in subgroup.objects],
+                    }
+                    for subgroup in group.subgroups
+                ],
+            }
+            for group in self.object_groups
+        ]
+
+    def object_groups_from_json(self, data: Any) -> None:
+        if not isinstance(data, list):
+            raise ValueError("Project object_groups must be a list.")
+        object_by_name = {obj.name: obj for obj in self.objects}
+        restored: list[SceneObjectGroup] = []
+        used_group_ids: set[str] = set()
+        used_object_ids: set[int] = set()
+
+        def read_members(raw_names: Any, label: str) -> list[EMObject]:
+            if not isinstance(raw_names, list):
+                raise ValueError(f"{label} objects must be a list.")
+            members = []
+            for raw_name in raw_names:
+                name = str(raw_name)
+                obj = object_by_name.get(name)
+                if obj is None:
+                    raise ValueError(
+                        f"{label} references missing scene object '{name}'."
+                    )
+                if id(obj) in used_object_ids:
+                    raise ValueError(
+                        f"Scene object '{name}' belongs to more than one group."
+                    )
+                used_object_ids.add(id(obj))
+                members.append(obj)
+            return members
+
+        def read_id(item: dict[str, Any], label: str) -> str:
+            group_id = str(item.get("id") or uuid4().hex)
+            if group_id in used_group_ids:
+                raise ValueError(f"Duplicate group identifier in {label}.")
+            used_group_ids.add(group_id)
+            return group_id
+
+        root_names: set[str] = set()
+        for index, raw_group in enumerate(data):
+            label = f"Group {index + 1}"
+            if not isinstance(raw_group, dict):
+                raise ValueError(f"{label} must be an object.")
+            name = self._normalized_group_name(raw_group.get("name", ""))
+            normalized = name.casefold()
+            if normalized in root_names:
+                raise ValueError(f"Duplicate group name '{name}'.")
+            root_names.add(normalized)
+            group = SceneObjectGroup(
+                name=name,
+                objects=read_members(raw_group.get("objects", []), label),
+                group_id=read_id(raw_group, label),
+                priority=(
+                    int(raw_group["priority"])
+                    if raw_group.get("priority") is not None
+                    else None
+                ),
+            )
+            raw_subgroups = raw_group.get("subgroups", [])
+            if not isinstance(raw_subgroups, list):
+                raise ValueError(f"Subgroups in '{name}' must be a list.")
+            subgroup_names: set[str] = set()
+            for subgroup_index, raw_subgroup in enumerate(raw_subgroups):
+                subgroup_label = f"Subgroup {subgroup_index + 1} in '{name}'"
+                if not isinstance(raw_subgroup, dict):
+                    raise ValueError(f"{subgroup_label} must be an object.")
+                subgroup_name = self._normalized_group_name(
+                    raw_subgroup.get("name", "")
+                )
+                subgroup_key = subgroup_name.casefold()
+                if subgroup_key in subgroup_names:
+                    raise ValueError(
+                        f"Duplicate subgroup name '{subgroup_name}' in '{name}'."
+                    )
+                subgroup_names.add(subgroup_key)
+                group.subgroups.append(SceneObjectGroup(
+                    name=subgroup_name,
+                    objects=read_members(
+                        raw_subgroup.get("objects", []),
+                        subgroup_label,
+                    ),
+                    group_id=read_id(raw_subgroup, subgroup_label),
+                ))
+            restored.append(group)
+        self.object_groups = restored
 
     def select(self, obj: Optional[EMObject]) -> None:
         """Single-select: deselects all, selects one."""
@@ -220,6 +548,9 @@ class SceneManager:
 
     def assign_material_to_selection(self, material: str) -> None:
         """Bulk-assign material to all selected objects."""
+        error = self.material_assignment_error(self.selection, material)
+        if error:
+            raise ValueError(error)
         for o in self.selection:
             o.material = material
             o.refresh_appearance()
@@ -448,6 +779,7 @@ class SceneManager:
 
     def from_json(self, data: list) -> None:
         # Remove all existing objects
+        self.object_groups.clear()
         for obj in list(self.objects):
             self.remove_object(obj)
         self.selected = None
@@ -525,7 +857,7 @@ class SceneManager:
                               p["CenterX"], p["CenterY"], p["CenterZ"],
                               p["RadiusX"], p["RadiusY"], p["RadiusZ"],
                               p.get("Material", "PEC"))
-                elif t in ("ExtrudedObject", "RevolvedObject"):
+                elif t in ("ExtrudedObject", "RevolvedObject", "SweptSurfaceObject"):
                     obj = cls(item.get("name", ""))
                     obj.set_parameters(p)
                 else:
@@ -587,4 +919,5 @@ class SceneManager:
     def clear(self) -> None:
         for obj in list(self.objects):
             self.remove_object(obj)
+        self.object_groups.clear()
         self.reference_planes_from_json([])

@@ -44,8 +44,9 @@ import vtk
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QSizePolicy, QToolBar, QInputDialog, QDialog,
     QFormLayout, QDoubleSpinBox, QComboBox, QCheckBox, QDialogButtonBox,
+    QMessageBox,
 )
-from PySide6.QtCore    import Signal, Qt
+from PySide6.QtCore    import Signal, Qt, QEvent, QTimer
 from PySide6.QtGui     import QIcon, QAction, QKeySequence, QShortcut, QImage
 
 try:
@@ -70,6 +71,60 @@ from .measurement import measurement_arrow_size, normal_for_planar_points
 
 
 _ICONS_DIR = Path(__file__).parent.parent.parent.parent / "Icons"
+_MM_PER_SCENE_UNIT = {
+    "mm": 1.0,
+    "um": 0.001,
+    "cm": 10.0,
+    "m": 1000.0,
+    "mil": 0.0254,
+    "inch": 25.4,
+}
+
+
+def _closest_step_brep_surface_point(shape, point, face_index: int | None = None):
+    """Project a local STEP point onto the selected exact BREP face/surface."""
+    try:
+        from OCP.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+        from OCP.BRepExtrema import BRepExtrema_DistShapeShape
+        from OCP.TopAbs import TopAbs_FACE
+        from OCP.TopExp import TopExp_Explorer
+        from OCP.TopoDS import TopoDS
+        from OCP.gp import gp_Pnt
+        face_cast = TopoDS.Face_s
+    except ImportError:
+        from OCC.Core.BRepBuilderAPI import BRepBuilderAPI_MakeVertex
+        from OCC.Core.BRepExtrema import BRepExtrema_DistShapeShape
+        from OCC.Core.TopAbs import TopAbs_FACE
+        from OCC.Core.TopExp import TopExp_Explorer
+        from OCC.Core.TopoDS import topods
+        from OCC.Core.gp import gp_Pnt
+        face_cast = topods.Face
+
+    explorer = TopExp_Explorer(shape, TopAbs_FACE)
+    faces = []
+    while explorer.More():
+        faces.append(face_cast(explorer.Current()))
+        explorer.Next()
+    if not faces:
+        return None
+
+    if face_index is not None and 1 <= face_index <= len(faces):
+        faces = [faces[face_index - 1]]
+
+    vertex = BRepBuilderAPI_MakeVertex(gp_Pnt(*point)).Vertex()
+    closest = None
+    closest_distance = math.inf
+    for face in faces:
+        distance = BRepExtrema_DistShapeShape(vertex, face)
+        distance.Perform()
+        if not distance.IsDone() or distance.NbSolution() < 1:
+            continue
+        candidate_distance = float(distance.Value())
+        if candidate_distance < closest_distance:
+            exact = distance.PointOnShape2(1)
+            closest = (float(exact.X()), float(exact.Y()), float(exact.Z()))
+            closest_distance = candidate_distance
+    return closest
 
 
 def _icon(name: str) -> QIcon:
@@ -379,11 +434,38 @@ PLANE_ORIGIN = {"XY": (0, 0, 0), "XZ": (0, 0, 0), "YZ": (0, 0, 0)}
 
 class _PersistentQVTKRenderWindowInteractor(QVTKRenderWindowInteractor):
     def __init__(self, parent=None):
+        if parent is not None:
+            parent.setAttribute(Qt.WA_DontCreateNativeAncestors)
         super().__init__(parent)
+        self._render_paused = False
+        self._render_resume_timer = QTimer(self)
+        self._render_resume_timer.setSingleShot(True)
+        self._render_resume_timer.timeout.connect(self._resume_rendering)
+        self._geometry_event_source = parent.window() if parent is not None else None
+        if self._geometry_event_source is not None:
+            self._geometry_event_source.installEventFilter(self)
         if parent is not None:
             parent.destroyed.connect(self.Finalize, Qt.DirectConnection)
 
+    def eventFilter(self, watched, event):
+        if (
+            watched is self._geometry_event_source
+            and event.type() in (QEvent.Type.Move, QEvent.Type.Resize)
+        ):
+            self._render_paused = True
+            self._render_resume_timer.start(120)
+        return super().eventFilter(watched, event)
+
+    def paintEvent(self, event) -> None:
+        if not self._render_paused:
+            super().paintEvent(event)
+
+    def _resume_rendering(self) -> None:
+        self._render_paused = False
+        self.update()
+
     def closeEvent(self, event) -> None:
+        self._render_resume_timer.stop()
         event.accept()
 
 
@@ -428,6 +510,7 @@ class Viewport3DWidget(QWidget):
     sketch_extrude_requested = Signal(list, float, tuple, tuple, str, bool)
     sketch_cut_requested     = Signal(list, float, tuple, tuple)
     sketch_revolve_requested = Signal(list, float, tuple, tuple, tuple, tuple)
+    sketch_sweep_requested   = Signal(list, float, tuple, bool, bool, object)
     sketch_finished          = Signal()
 
     def __init__(self, parent=None):
@@ -486,6 +569,13 @@ class Viewport3DWidget(QWidget):
         self._draw_pts: list = []               # world-coord points collected so far
         self._snap_records: list[dict] = []
         self._preview_actor: Optional[vtk.vtkActor] = None
+        self._surface_sweep_preview_actor: Optional[vtk.vtkActor] = None
+        self._surface_sweep_preview_mapper: Optional[vtk.vtkPolyDataMapper] = None
+        self._surface_sweep_preview_profile = None
+        self._surface_sweep_preview_anchor = None
+        self._surface_sweep_preview_normal = None
+        self._surface_sweep_preview_closed = False
+        self._surface_sweep_endpoint_snap_mode: str | None = None
         self._selection_point_actors: list[vtk.vtkActor] = []
 
         # Custom reference plane (set via ReferencePlaneDialog)
@@ -506,7 +596,8 @@ class Viewport3DWidget(QWidget):
         self._last_drawing_snap_kind: str = "grid"
 
         # One-shot pick request from external dialogs
-        # tuple (kind, callback) where kind ∈ {'point','vertex','face_normal','face_origin_normal'}
+        # tuple (kind, callback, actor_filter); snapped_point uses the active
+        # geometry snap mode and falls back to the drawing/reference grid.
         self._pick_request = None
         self._measurement_active = False
         self._measurement_features: list[dict] = []
@@ -1279,9 +1370,12 @@ class Viewport3DWidget(QWidget):
 
         Parameters
         ----------
-        kind : 'point' | 'vertex' | 'face_normal' | 'face_origin_normal' | 'plane'
+        kind : 'point' | 'vertex' | 'snapped_point' | 'face_normal' |
+               'face_origin_normal' | 'plane'
             - 'point'              : callback(world_xyz)
             - 'vertex'             : callback(world_xyz)  (snaps to nearest mesh vertex)
+            - 'snapped_point'      : callback(world_xyz)  (vertex/edge/face snap,
+                                     with active-grid fallback)
             - 'face_normal'        : callback(world_normal_xyz)
             - 'face_origin_normal' : callback(world_xyz, world_normal_xyz)
             - 'plane'              : callback(surface_plane_dict) for a planar face
@@ -1289,7 +1383,10 @@ class Viewport3DWidget(QWidget):
         actor_filter : vtk.vtkActor, optional
             If provided, only accept a pick on this actor.
         """
-        if kind not in ("point", "vertex", "face_normal", "face_origin_normal", "plane"):
+        if kind not in (
+            "point", "vertex", "snapped_point", "face_normal",
+            "face_origin_normal", "plane", "surface_sweep_target",
+        ):
             raise ValueError(f"Unknown pick kind: {kind}")
         self._cancel_draw()
         self._pick_request = (kind, callback, actor_filter)
@@ -1297,16 +1394,21 @@ class Viewport3DWidget(QWidget):
         msg = {
             "point":              "Click on geometry to pick a point",
             "vertex":             "Click near a vertex to snap to it",
+            "snapped_point":      "Pick a point; nearby geometry snaps apply, with active-grid fallback",
             "face_normal":        "Click on a face to capture its normal",
             "face_origin_normal": "Click on a face to set origin + normal",
             "plane":              "Click on a planar surface",
+            "surface_sweep_target": "Click a target face for normal extrusion",
         }[kind]
         self.status_message.emit(f"{msg}  (Esc to cancel)")
 
     def cancel_pick(self) -> None:
         if self._pick_request is not None:
+            kind = self._pick_request[0]
             self._pick_request = None
             self.unsetCursor()
+            if kind in {"snapped_point", "surface_sweep_target"} and self._surface_sweep_preview_profile is not None:
+                self._clear_surface_sweep_preview()
             self.status_message.emit("Pick cancelled.")
 
     def _handle_pick_request(self, sx: int, sy: int) -> bool:
@@ -1314,6 +1416,38 @@ class Viewport3DWidget(QWidget):
         if self._pick_request is None:
             return False
         kind, callback, actor_filter = self._pick_request
+        if kind == "surface_sweep_target":
+            target = self._surface_sweep_target_at_screen(sx, sy)
+            if target is None:
+                self._hide_surface_sweep_preview()
+                self.status_message.emit(
+                    "Surface Extrusion needs a picked target face; no grid or closest-point fallback was used. Try again."
+                )
+                return True
+            if actor_filter is not None and target["actor"] is not actor_filter:
+                self.status_message.emit("Pick a target face on the selected object.")
+                return True
+            self._pick_request = None
+            self.unsetCursor()
+            try:
+                callback(target)
+            except Exception as exc:
+                self.status_message.emit(f"Pick callback error: {exc}")
+            return True
+        if kind == "snapped_point":
+            point = self._surface_sweep_endpoint_at_screen(sx, sy)
+            if point is None:
+                self.status_message.emit(
+                    "Could not determine an endpoint here; move onto geometry or the active grid and try again."
+                )
+                return True
+            self._pick_request = None
+            self.unsetCursor()
+            try:
+                callback(tuple(point))
+            except Exception as exc:
+                self.status_message.emit(f"Pick callback error: {exc}")
+            return True
 
         picker = vtk.vtkCellPicker()
         mode = "vertex" if kind == "vertex" else "face"
@@ -1512,7 +1646,15 @@ class Viewport3DWidget(QWidget):
             or any(candidate is actor for candidate in getattr(obj, "all_actors", ()))
         ), None)
 
-    def _snap_to_visible_geometry(self, sx: int, sy: int, fallback_pt: tuple, snap_mode: str = "all") -> tuple | None:
+    def _snap_to_visible_geometry(
+        self,
+        sx: int,
+        sy: int,
+        fallback_pt: tuple,
+        snap_mode: str = "all",
+        *,
+        record_snap: bool = True,
+    ) -> tuple | None:
         """Try snapping against visible geometry using the requested filter.
 
         snap_mode: 'all' | 'vertex' | 'edge' | 'face'
@@ -1535,13 +1677,14 @@ class Viewport3DWidget(QWidget):
                 local = point_data.GetPoint(point_id)
                 point = self._actor_point_to_world(point_actor, local)
                 source = self._owner_for_actor(point_actor)
-                self._snap_records.append({
-                    "kind": "vertex",
-                    "object": str(source.name) if source is not None else "",
-                    "point_id": int(point_id),
-                    "local": [float(local[i]) for i in range(3)],
-                    "point": list(point),
-                })
+                if record_snap:
+                    self._snap_records.append({
+                        "kind": "vertex",
+                        "object": str(source.name) if source is not None else "",
+                        "point_id": int(point_id),
+                        "local": [float(local[i]) for i in range(3)],
+                        "point": list(point),
+                    })
                 return (point, "vertex")
             if mode == "vertex":
                 return None
@@ -1563,31 +1706,330 @@ class Viewport3DWidget(QWidget):
                 _, closest_local = edge_pick
                 point = self._actor_point_to_world(actor, closest_local)
                 source = self._owner_for_actor(actor)
-                self._snap_records.append({
-                    "kind": "edge",
-                    "object": str(source.name) if source is not None else "",
-                    "cell_id": int(cell_id),
-                    "local": [float(closest_local[i]) for i in range(3)],
-                    "point": list(point),
-                })
+                if record_snap:
+                    self._snap_records.append({
+                        "kind": "edge",
+                        "object": str(source.name) if source is not None else "",
+                        "cell_id": int(cell_id),
+                        "local": [float(closest_local[i]) for i in range(3)],
+                        "point": list(point),
+                    })
                 return (point, "edge")
             if mode == "edge":
                 return None
 
         if mode in {"all", "face"}:
-            point = tuple(pos)
             source = self._owner_for_actor(actor)
             local = self._actor_point_to_local(actor, pos)
-            self._snap_records.append({
-                "kind": "surface",
-                "object": str(source.name) if source is not None else "",
-                "cell_id": int(cell_id),
-                "local": list(local),
-                "point": list(point),
-            })
+            step_path = str(getattr(source, "step_source_path", "") or "").strip()
+            if source is not None and step_path:
+                if bool(getattr(source, "step_geometry_modified", False)):
+                    matrix = actor.GetMatrix()
+                    actor_bounds = actor.GetBounds()
+                    mapper = actor.GetMapper()
+                    mesh_data = mapper.GetInput() if mapper is not None else None
+                    mesh_mtime = int(mesh_data.GetMTime()) if mesh_data is not None else None
+                    try:
+                        step_mtime = Path(step_path).stat().st_mtime_ns
+                    except OSError:
+                        step_mtime = None
+                    signature = (
+                        step_path,
+                        str(getattr(source, "step_solid_name", "") or ""),
+                        tuple(
+                            float(matrix.GetElement(row, column))
+                            for row in range(4)
+                            for column in range(4)
+                        ),
+                        tuple(float(value) for value in actor_bounds) if actor_bounds else None,
+                        mesh_mtime,
+                        tuple(getattr(source, "step_export_offset", ())),
+                        step_mtime,
+                    )
+                    cache = getattr(self, "_step_snap_export_brep_cache", None)
+                    if cache is None:
+                        cache = {}
+                        self._step_snap_export_brep_cache = cache
+                    cached = cache.get(id(source))
+                    shape = cached[1] if cached is not None and cached[0] == signature else None
+                    if shape is None:
+                        try:
+                            from ..emerge.occ_export_builder import build_occ_shape_for_export
+
+                            shape = build_occ_shape_for_export(source, {})
+                        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+                            self.status_message.emit(
+                                f"Exact exported STEP surface snap failed for '{source.name}': "
+                                f"{exc}. No approximate snap was applied."
+                            )
+                            return None
+                        if shape is None:
+                            self.status_message.emit(
+                                f"Could not build the export-aligned STEP BREP for "
+                                f"'{source.name}'. No approximate snap was applied."
+                            )
+                            return None
+                        cache[id(source)] = (signature, shape)
+
+                    face_index = None
+                    cell_data = ds.GetCellData()
+                    face_ids = (
+                        cell_data.GetArray("OCCFaceId")
+                        if cell_data is not None
+                        else None
+                    )
+                    if face_ids is not None and cell_id < face_ids.GetNumberOfTuples():
+                        face_index = int(face_ids.GetTuple1(cell_id))
+                    try:
+                        exact_world_point = _closest_step_brep_surface_point(
+                            shape,
+                            tuple(float(value) for value in pos),
+                            face_index=face_index,
+                        )
+                    except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+                        self.status_message.emit(
+                            f"Exact exported STEP surface snap failed for '{source.name}': "
+                            f"{exc}. No approximate snap was applied."
+                        )
+                        return None
+                    if exact_world_point is None:
+                        self.status_message.emit(
+                            f"Could not project the picked point onto the export-aligned "
+                            f"STEP BREP for '{source.name}'. No approximate snap was applied."
+                        )
+                        return None
+                    point = exact_world_point
+                    local = self._actor_point_to_local(actor, point)
+                else:
+                    point = None
+                if point is None:
+                    cache = getattr(self, "_step_snap_brep_cache", None)
+                    if cache is None:
+                        cache = {}
+                        self._step_snap_brep_cache = cache
+                    cache_key = (
+                        step_path,
+                        str(getattr(source, "step_solid_name", "") or ""),
+                    )
+                    shape = cache.get(cache_key)
+                    if shape is None:
+                        from ..emerge.occ_export_builder import (
+                            _read_step_shape,
+                            _select_shape_for_mesh_object,
+                        )
+
+                        try:
+                            root_shape = _read_step_shape(step_path)
+                            shape = (
+                                _select_shape_for_mesh_object(source, root_shape)
+                                if root_shape is not None
+                                else None
+                            )
+                        except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+                            self.status_message.emit(
+                                f"Exact STEP surface snap failed for '{source.name}': {exc}. "
+                                "No approximate snap was applied."
+                            )
+                            return None
+                        if shape is None:
+                            self.status_message.emit(
+                                f"Could not load the exact STEP BREP for '{source.name}'. "
+                                "No approximate snap was applied."
+                            )
+                            return None
+                        cache[cache_key] = shape
+
+                    mm_per_unit = _MM_PER_SCENE_UNIT.get(
+                        str(getattr(self, "_units", "mm")).lower(), 1.0
+                    )
+                    face_index = None
+                    cell_data = ds.GetCellData()
+                    face_ids = (
+                        cell_data.GetArray("OCCFaceId")
+                        if cell_data is not None
+                        else None
+                    )
+                    if face_ids is not None and cell_id < face_ids.GetNumberOfTuples():
+                        face_index = int(face_ids.GetTuple1(cell_id))
+                    try:
+                        exact_source_point = _closest_step_brep_surface_point(
+                            shape,
+                            tuple(float(value) * mm_per_unit for value in local),
+                            face_index=face_index,
+                        )
+                    except (ImportError, RuntimeError, TypeError, ValueError) as exc:
+                        self.status_message.emit(
+                            f"Exact STEP surface snap failed for '{source.name}': {exc}. "
+                            "No approximate snap was applied."
+                        )
+                        return None
+                    if exact_source_point is None:
+                        self.status_message.emit(
+                            f"Could not project the picked point onto the exact STEP BREP "
+                            f"for '{source.name}'. No approximate snap was applied."
+                        )
+                        return None
+                    local = tuple(float(value) / mm_per_unit for value in exact_source_point)
+                    point = self._actor_point_to_world(actor, local)
+            else:
+                point = tuple(pos)
+            if record_snap:
+                self._snap_records.append({
+                    "kind": "surface",
+                    "object": str(source.name) if source is not None else "",
+                    "cell_id": int(cell_id),
+                    "local": list(local),
+                    "point": list(point),
+                })
             return (point, "surface")
 
         return None
+
+    def _surface_sweep_endpoint_at_screen(self, sx: int, sy: int) -> tuple | None:
+        """Resolve a world endpoint using geometry snapping, then the active grid."""
+        mode = getattr(self, "_surface_sweep_endpoint_snap_mode", None)
+        if mode is None:
+            mode = self._selection_mode if self._selection_mode != "object" else "all"
+        if mode != "grid":
+            snapped = self._snap_to_visible_geometry(
+                sx,
+                sy,
+                None,
+                snap_mode=mode,
+                record_snap=False,
+            )
+            if snapped is not None:
+                point, kind = snapped
+                self._last_drawing_snap_kind = str(kind)
+                return tuple(float(value) for value in point)
+
+        plane_point = self._ray_plane_intersect(sx, sy)
+        if plane_point is None:
+            return None
+        self._last_drawing_snap_kind = "grid"
+        return tuple(float(value) for value in self._snap(plane_point))
+
+    def _surface_sweep_target_at_screen(self, sx: int, sy: int) -> dict | None:
+        """Return the exact picked face metadata; never substitute a grid point."""
+        picker = vtk.vtkCellPicker()
+        picker.SetTolerance(self._pick_tolerance_for_mode("face"))
+        picker.Pick(sx, sy, 0, self._renderer)
+        actor = picker.GetActor()
+        data = picker.GetDataSet()
+        cell_id = int(picker.GetCellId())
+        if actor is None or data is None or cell_id < 0:
+            return None
+
+        picked_point = tuple(float(value) for value in picker.GetPickPosition())
+        cell_data = data.GetCellData()
+        face_ids = cell_data.GetArray("OCCFaceId") if cell_data is not None else None
+        occ_face_id = None
+        if face_ids is not None and cell_id < face_ids.GetNumberOfTuples():
+            occ_face_id = int(face_ids.GetTuple1(cell_id))
+        return {
+            "actor": actor,
+            "data": data,
+            "cell_id": cell_id,
+            "picked_point": picked_point,
+            "occ_face_id": occ_face_id,
+            "owner": self._owner_for_actor(actor),
+        }
+
+    @staticmethod
+    def _line_triangle_parameter(origin, direction, first, second, third):
+        """Return a signed line parameter when the line hits one bounded triangle."""
+        edge_one = tuple(second[i] - first[i] for i in range(3))
+        edge_two = tuple(third[i] - first[i] for i in range(3))
+        cross = (
+            direction[1] * edge_two[2] - direction[2] * edge_two[1],
+            direction[2] * edge_two[0] - direction[0] * edge_two[2],
+            direction[0] * edge_two[1] - direction[1] * edge_two[0],
+        )
+        determinant = sum(edge_one[i] * cross[i] for i in range(3))
+        if abs(determinant) <= 1e-12:
+            return None
+        inverse = 1.0 / determinant
+        offset = tuple(origin[i] - first[i] for i in range(3))
+        u = inverse * sum(offset[i] * cross[i] for i in range(3))
+        if u < -1e-10 or u > 1.0 + 1e-10:
+            return None
+        q = (
+            offset[1] * edge_one[2] - offset[2] * edge_one[1],
+            offset[2] * edge_one[0] - offset[0] * edge_one[2],
+            offset[0] * edge_one[1] - offset[1] * edge_one[0],
+        )
+        v = inverse * sum(direction[i] * q[i] for i in range(3))
+        if v < -1e-10 or u + v > 1.0 + 1e-10:
+            return None
+        parameter = inverse * sum(edge_two[i] * q[i] for i in range(3))
+        return parameter if math.isfinite(parameter) else None
+
+    def _surface_sweep_intersection(self, target: dict):
+        """Resolve the nearest hit of the signed profile normal with the picked face."""
+        anchor = self._surface_sweep_preview_anchor
+        normal = self._surface_sweep_preview_normal
+        if anchor is None or normal is None:
+            raise ValueError("The profile normal is unavailable.")
+        picked_point = tuple(float(value) for value in target["picked_point"])
+        toward_target = sum(
+            (picked_point[i] - anchor[i]) * normal[i] for i in range(3)
+        )
+        if not math.isfinite(toward_target) or abs(toward_target) <= 1e-9:
+            return None
+        direction = tuple(
+            (1.0 if toward_target > 0.0 else -1.0) * component
+            for component in normal
+        )
+
+        owner = target.get("owner")
+        step_path = str(getattr(owner, "step_source_path", "") or "").strip()
+        if step_path:
+            face_id = target.get("occ_face_id")
+            if face_id is None:
+                raise ValueError(
+                    "The picked STEP mesh face has no OCCFaceId; exact face intersection is unavailable."
+                )
+            from ..emerge.occ_export_builder import intersect_step_mesh_face_line
+
+            mm_per_unit = _MM_PER_SCENE_UNIT.get(
+                str(getattr(self, "_units", "mm")).lower(), 1.0
+            )
+            export_origin = tuple(component * mm_per_unit for component in anchor)
+            hits = intersect_step_mesh_face_line(
+                owner, face_id, export_origin, direction
+            )
+            valid_hits = [
+                (float(parameter), point)
+                for parameter, point in hits
+                if math.isfinite(float(parameter)) and float(parameter) > 1e-9
+            ]
+            if not valid_hits:
+                return None
+            parameter, point = min(valid_hits, key=lambda hit: hit[0])
+            endpoint = tuple(float(component) / mm_per_unit for component in point)
+            return endpoint, direction, parameter / mm_per_unit
+
+        data = target["data"]
+        cell = data.GetCell(int(target["cell_id"]))
+        if cell is None or cell.GetNumberOfPoints() < 3:
+            raise ValueError("The picked target face has no bounded polygon.")
+        actor = target["actor"]
+        points = [
+            self._actor_point_to_world(actor, data.GetPoint(cell.GetPointId(index)))
+            for index in range(cell.GetNumberOfPoints())
+        ]
+        parameters = []
+        for index in range(1, len(points) - 1):
+            parameter = self._line_triangle_parameter(
+                anchor, direction, points[0], points[index], points[index + 1]
+            )
+            if parameter is not None and parameter > 1e-9:
+                parameters.append(parameter)
+        if not parameters:
+            return None
+        length = min(parameters)
+        endpoint = tuple(anchor[i] + direction[i] * length for i in range(3))
+        return endpoint, direction, length
 
     def _drawing_snap_point(self, sx: int, sy: int) -> Optional[tuple]:
         """Return a drawing point using either the selected geometry filter or grid only."""
@@ -1764,6 +2206,95 @@ class Viewport3DWidget(QWidget):
         actor.PickableOff()
         self._renderer.AddActor(actor)
 
+    def _begin_surface_sweep_preview(
+        self,
+        profile: list[tuple[float, float, float]],
+        anchor: tuple[float, float, float],
+        closed: bool,
+        normal: tuple[float, float, float] | None = None,
+        endpoint_snap_mode: str | None = None,
+    ) -> None:
+        self._clear_surface_sweep_preview()
+        self._surface_sweep_preview_profile = [
+            tuple(float(value) for value in point) for point in profile
+        ]
+        self._surface_sweep_preview_anchor = tuple(float(value) for value in anchor)
+        self._surface_sweep_preview_normal = (
+            tuple(float(value) for value in normal) if normal is not None else None
+        )
+        self._surface_sweep_preview_closed = bool(closed)
+        self._surface_sweep_endpoint_snap_mode = endpoint_snap_mode
+
+    def _hide_surface_sweep_preview(self) -> None:
+        actor = self._surface_sweep_preview_actor
+        if actor is not None and actor.GetVisibility():
+            actor.VisibilityOff()
+            self._render()
+
+    def _update_surface_sweep_preview(self, endpoint) -> bool:
+        """Update the live uncapped sheet preview; reject null/non-finite vectors."""
+        profile = self._surface_sweep_preview_profile
+        anchor = self._surface_sweep_preview_anchor
+        if profile is None or anchor is None:
+            return False
+        try:
+            endpoint = tuple(float(value) for value in endpoint)
+            if len(endpoint) != 3 or not all(math.isfinite(value) for value in endpoint):
+                raise ValueError
+            displacement = tuple(
+                endpoint[axis] - anchor[axis] for axis in range(3)
+            )
+            length = math.hypot(*displacement)
+            if not math.isfinite(length) or length <= 1e-9:
+                self._hide_surface_sweep_preview()
+                return False
+            surface = scene_objects.SweptSurfaceObject._make_surface(
+                profile,
+                displacement,
+                self._surface_sweep_preview_closed,
+            )
+        except (OverflowError, TypeError, ValueError):
+            self._hide_surface_sweep_preview()
+            return False
+        if surface.GetNumberOfPolys() <= 0:
+            self._hide_surface_sweep_preview()
+            return False
+
+        if self._surface_sweep_preview_actor is None:
+            self._surface_sweep_preview_mapper = vtk.vtkPolyDataMapper()
+            self._surface_sweep_preview_actor = vtk.vtkActor()
+            self._surface_sweep_preview_actor.SetMapper(
+                self._surface_sweep_preview_mapper
+            )
+            prop = self._surface_sweep_preview_actor.GetProperty()
+            prop.SetColor(0.1, 0.78, 0.95)
+            prop.SetOpacity(0.48)
+            prop.EdgeVisibilityOn()
+            prop.SetEdgeColor(1.0, 0.55, 0.08)
+            prop.LightingOff()
+            self._surface_sweep_preview_actor.PickableOff()
+            self._renderer.AddActor(self._surface_sweep_preview_actor)
+
+        self._surface_sweep_preview_mapper.SetInputData(surface)
+        self._surface_sweep_preview_mapper.Update()
+        self._surface_sweep_preview_actor.VisibilityOn()
+        self._render()
+        return True
+
+    def _clear_surface_sweep_preview(self) -> None:
+        actor = self._surface_sweep_preview_actor
+        if actor is not None:
+            self._renderer.RemoveActor(actor)
+        self._surface_sweep_preview_actor = None
+        self._surface_sweep_preview_mapper = None
+        self._surface_sweep_preview_profile = None
+        self._surface_sweep_preview_anchor = None
+        self._surface_sweep_preview_normal = None
+        self._surface_sweep_preview_closed = False
+        self._surface_sweep_endpoint_snap_mode = None
+        if actor is not None:
+            self._render()
+
     def _preview_box(self, x1, y1, z1, x2, y2, z2) -> None:
         src = vtk.vtkCubeSource()
         src.SetBounds(
@@ -1864,6 +2395,29 @@ class Viewport3DWidget(QWidget):
             self._selection_click(sx, sy, ctrl)
 
     def _on_mouse_move(self, sx: int, sy: int) -> None:
+        if (
+            self._pick_request is not None
+            and self._pick_request[0] in {"snapped_point", "surface_sweep_target"}
+            and self._surface_sweep_preview_profile is not None
+        ):
+            if self._pick_request[0] == "surface_sweep_target":
+                target = self._surface_sweep_target_at_screen(sx, sy)
+                try:
+                    result = (
+                        self._surface_sweep_intersection(target)
+                        if target is not None
+                        else None
+                    )
+                except (ImportError, RuntimeError, TypeError, ValueError):
+                    result = None
+                endpoint = result[0] if result is not None else None
+            else:
+                endpoint = self._surface_sweep_endpoint_at_screen(sx, sy)
+            if endpoint is None:
+                self._hide_surface_sweep_preview()
+            else:
+                self._update_surface_sweep_preview(endpoint)
+            return
         if self._sketch_engine is not None:
             self._sketch_mouse_move(sx, sy)
             return
@@ -1965,7 +2519,7 @@ class Viewport3DWidget(QWidget):
             self.picked_coords.emit(float(pos[0]), float(pos[1]), float(pos[2]), self._units)
             self.status_message.emit(
                 f"Face picked  cell={cell_id}  on {owner.name if owner else '?'}  "
-                f"({pos[0]:.2f}, {pos[1]:.2f}, {pos[2]:.2f})"
+                f"({pos[0]:.3f}, {pos[1]:.3f}, {pos[2]:.3f})"
             )
         elif mode == "edge":
             self._last_face_pick = None
@@ -1992,7 +2546,7 @@ class Viewport3DWidget(QWidget):
             self.picked_coords.emit(float(edge_world[0]), float(edge_world[1]), float(edge_world[2]), self._units)
             self.status_message.emit(
                 f"Edge picked  on {owner.name if owner else '?'}  "
-                f"({edge_world[0]:.2f}, {edge_world[1]:.2f}, {edge_world[2]:.2f})"
+                f"({edge_world[0]:.3f}, {edge_world[1]:.3f}, {edge_world[2]:.3f})"
             )
         else:  # vertex
             self._last_face_pick = None
@@ -2001,7 +2555,7 @@ class Viewport3DWidget(QWidget):
             marker = self._build_vertex_marker(vp, actor)
             self.picked_coords.emit(float(vp[0]), float(vp[1]), float(vp[2]), self._units)
             self.status_message.emit(
-                f"Vertex picked  ({vp[0]:.2f}, {vp[1]:.2f}, {vp[2]:.2f})"
+                f"Vertex picked  ({vp[0]:.3f}, {vp[1]:.3f}, {vp[2]:.3f})"
             )
 
         if marker is not None:
@@ -2563,7 +3117,7 @@ class Viewport3DWidget(QWidget):
             self._draw_pts = [pt]
             self._draw_state = 1
             self.status_message.emit(
-                f"Box: click opposite corner  [{pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f}]"
+                f"Box: click opposite corner  [{pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}]"
             )
         elif state == 1:        # second corner → base defined, now drag height
             self._draw_pts.append(pt)
@@ -2592,7 +3146,7 @@ class Viewport3DWidget(QWidget):
             p1 = self._draw_pts[0]
             # Show flat base rect (height = 0)
             self._preview_box(p1[0], p1[1], p1[2], pt[0], pt[1], pt[2])
-            coord_str = f"[{pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f}]"
+            coord_str = f"[{pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}]"
             self.status_message.emit(f"Box: second corner {coord_str}{self._drawing_snap_status_suffix()}")
         elif state == 2:
             p1 = self._draw_pts[0]
@@ -2601,7 +3155,7 @@ class Viewport3DWidget(QWidget):
             h = self._height_from_cursor(sx, sy, p1[axis_idx]) or 0.1
             p2[axis_idx] = p1[axis_idx] + h
             self._preview_box(p1[0], p1[1], p1[2], p2[0], p2[1], p2[2])
-            self.status_message.emit(f"Box: height = {h:.2f} {self._units}{self._drawing_snap_status_suffix()}")
+            self.status_message.emit(f"Box: height = {h:.3f} {self._units}{self._drawing_snap_status_suffix()}")
 
     # ────────────── CYLINDER FSM ──────────────
     def _fsm_cylinder_click(self, pt, sx, sy, state):
@@ -2612,7 +3166,7 @@ class Viewport3DWidget(QWidget):
             self._draw_pts = [pt]   # base centre
             self._draw_state = 1
             self.status_message.emit(
-                f"Cylinder: base at [{pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f}]  "
+                f"Cylinder: base at [{pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}]  "
                 "— move mouse to set radius, then click"
             )
         elif state == 1:
@@ -2621,7 +3175,7 @@ class Viewport3DWidget(QWidget):
             self._draw_pts.append(r)
             self._draw_state = 2
             self.status_message.emit(
-                f"Cylinder: r = {r:.2f} {self._units}  "
+                f"Cylinder: r = {r:.3f} {self._units}  "
                 "— move mouse upward to set height, then click"
             )
         elif state == 2:
@@ -2649,13 +3203,13 @@ class Viewport3DWidget(QWidget):
             r = self._plane_radius(pt, base) or 0.1
             # Show thin disk at the base (h≈0 so no offset needed)
             self._preview_cylinder(base[0], base[1], base[2], r, max(r * 0.05, 0.05), axis)
-            self.status_message.emit(f"Cylinder: radius = {r:.2f} {self._units}{self._drawing_snap_status_suffix()}")
+            self.status_message.emit(f"Cylinder: radius = {r:.3f} {self._units}{self._drawing_snap_status_suffix()}")
         elif state == 2:
             r = self._draw_pts[1]
             h = self._height_from_cursor(sx, sy, base[axis_idx]) or 0.1
             geom = self._geom_center_from_base(base, h, axis)
             self._preview_cylinder(geom[0], geom[1], geom[2], r, abs(h), axis)
-            self.status_message.emit(f"Cylinder: height = {h:.2f} {self._units}{self._drawing_snap_status_suffix()}")
+            self.status_message.emit(f"Cylinder: height = {h:.3f} {self._units}{self._drawing_snap_status_suffix()}")
 
     # ────────────── CONE FSM ──────────────
     def _fsm_cone_click(self, pt, sx, sy, state):
@@ -2666,7 +3220,7 @@ class Viewport3DWidget(QWidget):
             self._draw_pts = [pt]   # base centre
             self._draw_state = 1
             self.status_message.emit(
-                f"Cone: base at [{pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f}]  "
+                f"Cone: base at [{pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}]  "
                 "— move mouse to set base radius, then click"
             )
         elif state == 1:
@@ -2675,7 +3229,7 @@ class Viewport3DWidget(QWidget):
             self._draw_pts.append(r)
             self._draw_state = 2
             self.status_message.emit(
-                f"Cone: r = {r:.2f} {self._units}  "
+                f"Cone: r = {r:.3f} {self._units}  "
                 "— move mouse upward to set height, then click"
             )
         elif state == 2:
@@ -2702,13 +3256,13 @@ class Viewport3DWidget(QWidget):
                 return
             r = self._plane_radius(pt, base) or 0.1
             self._preview_cone(base[0], base[1], base[2], r, max(r * 0.5, 0.1), axis)
-            self.status_message.emit(f"Cone: radius = {r:.2f} {self._units}{self._drawing_snap_status_suffix()}")
+            self.status_message.emit(f"Cone: radius = {r:.3f} {self._units}{self._drawing_snap_status_suffix()}")
         elif state == 2:
             r = self._draw_pts[1]
             h = self._height_from_cursor(sx, sy, base[axis_idx]) or 0.1
             geom = self._geom_center_from_base(base, h, axis)
             self._preview_cone(geom[0], geom[1], geom[2], r, abs(h), axis)
-            self.status_message.emit(f"Cone: height = {h:.2f} {self._units}{self._drawing_snap_status_suffix()}")
+            self.status_message.emit(f"Cone: height = {h:.3f} {self._units}{self._drawing_snap_status_suffix()}")
 
     # ────────────── SPHERE FSM ──────────────
     def _fsm_sphere_click(self, pt, sx, sy, state):
@@ -2716,7 +3270,7 @@ class Viewport3DWidget(QWidget):
             self._draw_pts = [pt]
             self._draw_state = 1
             self.status_message.emit(
-                f"Sphere: centre at [{pt[0]:.1f}, {pt[1]:.1f}, {pt[2]:.1f}]  "
+                f"Sphere: centre at [{pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}]  "
                 "— move mouse to set radius, then click"
             )
         elif state == 1:
@@ -2737,7 +3291,7 @@ class Viewport3DWidget(QWidget):
                 return
             r = self._plane_radius(pt, ctr) or 0.1
             self._preview_sphere(ctr[0], ctr[1], ctr[2], r)
-            self.status_message.emit(f"Sphere: radius = {r:.2f} {self._units}{self._drawing_snap_status_suffix()}")
+            self.status_message.emit(f"Sphere: radius = {r:.3f} {self._units}{self._drawing_snap_status_suffix()}")
 
     def _circular_plate_radius(self, center, point):
         _, normal = self._active_draw_origin_normal()
@@ -2766,7 +3320,7 @@ class Viewport3DWidget(QWidget):
             self._draw_pts = [center]
             self._draw_state = 1
             self.status_message.emit(
-                f"Circular Plate: center [{center[0]:.2f}, {center[1]:.2f}, {center[2]:.2f}]"
+                f"Circular Plate: center [{center[0]:.3f}, {center[1]:.3f}, {center[2]:.3f}]"
                 " — click radius"
             )
             return
@@ -2855,7 +3409,7 @@ class Viewport3DWidget(QWidget):
                 return
             p1 = self._draw_pts[0]
             self._preview_box(p1[0], p1[1], p1[2], pt[0], pt[1], pt[2])
-            self.status_message.emit(f"Plate: second corner [{pt[0]:.1f}, {pt[1]:.1f}]{self._drawing_snap_status_suffix()}")
+            self.status_message.emit(f"Plate: second corner [{pt[0]:.3f}, {pt[1]:.3f}]{self._drawing_snap_status_suffix()}")
         elif state == 2:
             p1 = self._draw_pts[0]
             p2 = list(self._draw_pts[1])
@@ -2869,13 +3423,13 @@ class Viewport3DWidget(QWidget):
         if state == 0:
             self._draw_pts = [pt]
             self._draw_state = 1
-            self.status_message.emit(f"Pyramid: base centre at [{pt[0]:.1f}, {pt[1]:.1f}]")
+            self.status_message.emit(f"Pyramid: base centre at [{pt[0]:.3f}, {pt[1]:.3f}]")
         elif state == 1:
             ctr = self._draw_pts[0]
             r = self._plane_radius(pt, ctr) or 1.0
             self._draw_pts.append(r)
             self._draw_state = 2
-            self.status_message.emit(f"Pyramid: base radius = {r:.2f} {self._units}  — move to set height")
+            self.status_message.emit(f"Pyramid: base radius = {r:.3f} {self._units}  — move to set height")
         elif state == 2:
             base = self._draw_pts[0]
             r = self._draw_pts[1]
@@ -2897,11 +3451,11 @@ class Viewport3DWidget(QWidget):
             if pt is None:
                 return
             r = self._plane_radius(pt, base) or 0.1
-            self.status_message.emit(f"Pyramid: base radius = {r:.2f} {self._units}{self._drawing_snap_status_suffix()}")
+            self.status_message.emit(f"Pyramid: base radius = {r:.3f} {self._units}{self._drawing_snap_status_suffix()}")
         elif state == 2:
             r = self._draw_pts[1]
             h = self._height_from_cursor(sx, sy, base[axis_idx]) or 0.1
-            self.status_message.emit(f"Pyramid: height = {abs(h):.2f} {self._units}{self._drawing_snap_status_suffix()}")
+            self.status_message.emit(f"Pyramid: height = {abs(h):.3f} {self._units}{self._drawing_snap_status_suffix()}")
 
     # ────────────── WEDGE FSM ──────────────────────────────────
     def _fsm_wedge_click(self, pt, sx, sy, state):
@@ -2936,7 +3490,7 @@ class Viewport3DWidget(QWidget):
             axis_idx = self._active_plane_axis_index()
             height = self._height_from_cursor(sx, sy, base[axis_idx])
             self.status_message.emit(
-                f"Wedge: height = {abs(height):.2f} {self._units}"
+                f"Wedge: height = {abs(height):.3f} {self._units}"
                 f"{self._drawing_snap_status_suffix()}"
             )
         elif state >= 1:
@@ -2947,13 +3501,13 @@ class Viewport3DWidget(QWidget):
         if state == 0:
             self._draw_pts = [pt]
             self._draw_state = 1
-            self.status_message.emit(f"Torus: centre at [{pt[0]:.1f}, {pt[1]:.1f}]")
+            self.status_message.emit(f"Torus: centre at [{pt[0]:.3f}, {pt[1]:.3f}]")
         elif state == 1:
             ctr = self._draw_pts[0]
             major_r = self._plane_radius(pt, ctr) or 5.0
             self._draw_pts.append(major_r)
             self._draw_state = 2
-            self.status_message.emit(f"Torus: major radius = {major_r:.2f} {self._units}  — click to set minor radius")
+            self.status_message.emit(f"Torus: major radius = {major_r:.3f} {self._units}  — click to set minor radius")
         elif state == 2:
             ctr = self._draw_pts[0]
             pt_ref = (ctr[0] + self._draw_pts[1], ctr[1], ctr[2]) if self._draw_plane == "XY" else (ctr[0], ctr[1] + self._draw_pts[1], ctr[2])
@@ -2973,20 +3527,20 @@ class Viewport3DWidget(QWidget):
             if pt is None:
                 return
             r = self._plane_radius(pt, ctr) or 0.1
-            self.status_message.emit(f"Torus: major radius = {r:.2f} {self._units}{self._drawing_snap_status_suffix()}")
+            self.status_message.emit(f"Torus: major radius = {r:.3f} {self._units}{self._drawing_snap_status_suffix()}")
 
     # ────────────── ELLIPSOID FSM ──────────────────────────────────
     def _fsm_ellipsoid_click(self, pt, sx, sy, state):
         if state == 0:
             self._draw_pts = [pt]
             self._draw_state = 1
-            self.status_message.emit(f"Ellipsoid: centre at [{pt[0]:.1f}, {pt[1]:.1f}]")
+            self.status_message.emit(f"Ellipsoid: centre at [{pt[0]:.3f}, {pt[1]:.3f}]")
         elif state == 1:
             ctr = self._draw_pts[0]
             plane_r = self._plane_radius(pt, ctr) or 1.0
             self._draw_pts.append(plane_r)
             self._draw_state = 2
-            self.status_message.emit(f"Ellipsoid: plane radius = {plane_r:.2f} {self._units}  — move to set height radius")
+            self.status_message.emit(f"Ellipsoid: plane radius = {plane_r:.3f} {self._units}  — move to set height radius")
         elif state == 2:
             ctr = self._draw_pts[0]
             plane_r = self._draw_pts[1]
@@ -3020,12 +3574,12 @@ class Viewport3DWidget(QWidget):
                 return
             r = self._plane_radius(pt, ctr) or 0.1
             self._preview_sphere(ctr[0], ctr[1], ctr[2], r)
-            self.status_message.emit(f"Ellipsoid: plane radius = {r:.2f} {self._units}{self._drawing_snap_status_suffix()}")
+            self.status_message.emit(f"Ellipsoid: plane radius = {r:.3f} {self._units}{self._drawing_snap_status_suffix()}")
         elif state == 2:
             r = self._draw_pts[1]
             axis_idx = {"XY": 2, "XZ": 1, "YZ": 0}[self._draw_plane]
             h_r = self._height_from_cursor(sx, sy, ctr[axis_idx]) or r
-            self.status_message.emit(f"Ellipsoid: height radius = {abs(h_r):.2f} {self._units}{self._drawing_snap_status_suffix()}")
+            self.status_message.emit(f"Ellipsoid: height radius = {abs(h_r):.3f} {self._units}{self._drawing_snap_status_suffix()}")
 
     # ────────────── PLANAR FSM (2-point planar structure) ─────────────────────
     def _fsm_planar_click(self, pt, sx, sy, state):
@@ -3066,7 +3620,7 @@ class Viewport3DWidget(QWidget):
         p2[axis_idx] = p1[axis_idx]
         self._preview_box(p1[0], p1[1], p1[2], p2[0], p2[1], p2[2])
         self.status_message.emit(
-            f"Planar: second point [{pt[0]:.2f}, {pt[1]:.2f}, {pt[2]:.2f}]{self._drawing_snap_status_suffix()}"
+            f"Planar: second point [{pt[0]:.3f}, {pt[1]:.3f}, {pt[2]:.3f}]{self._drawing_snap_status_suffix()}"
         )
 
     # ──────────────────────────────────────────────────────── finish / cancel
@@ -3222,11 +3776,13 @@ class Viewport3DWidget(QWidget):
             "Cancel the current tool")
         tb.addSeparator()
         add("Extrude",   "Part_Extrude",     self._sketch_request_extrude,
-            "Extrude the sketch profile")
+            "Solid-extrude a closed sketch profile only; use Surface Extrusion outside Sketch mode for a body edge")
         add("Extruded Cut", "Part_Cut", self._sketch_request_extruded_cut,
             "Subtract the sketch extrusion from the selected base object")
         add("Revolve",   "Part_Revolve",     self._sketch_begin_revolve,
             "Revolve: pick a sketch line as axis")
+        add("Surface Extrusion", "Part_Revolve", self._request_surface_sweep,
+            "In Sketch mode, sweep the sketch contour. For a body edge, exit Sketch mode and select it in Edge mode; the terminal face is then selectable.")
         add("Exit",      "Sketch_Exit",      lambda: self.exit_sketch(commit=False),
             "Exit sketch mode without committing")
         return tb
@@ -3504,6 +4060,330 @@ class Viewport3DWidget(QWidget):
         normal = tuple(self._sketch_engine.plane_normal)
         self.sketch_cut_requested.emit(list(profile), float(depth), origin, normal)
         self.exit_sketch(commit=True)
+
+    @staticmethod
+    def _fit_complete_edge_circle(points) -> tuple[list[tuple[float, float, float]], tuple[float, float, float]]:
+        """Validate and fit the complete, ordered feature-edge chain of a circle."""
+        try:
+            chain = [tuple(float(value) for value in point) for point in points]
+        except (TypeError, ValueError):
+            raise ValueError("The selected feature edge is not a valid circular chain.")
+        if any(len(point) != 3 or not all(math.isfinite(value) for value in point)
+               for point in chain):
+            raise ValueError("The selected feature edge is not a valid circular chain.")
+        if len(chain) > 1 and math.dist(chain[0], chain[-1]) <= 1e-9:
+            chain.pop()
+        if len(chain) < 6:
+            raise ValueError(
+                "Surface Extrusion requires a complete circular feature edge, not a partial or straight edge."
+            )
+
+        scale = max(
+            max(max(point[axis] for point in chain) - min(point[axis] for point in chain)
+                for axis in range(3)),
+            1.0,
+        )
+        origin = chain[0]
+        area = [0.0, 0.0, 0.0]
+        for index, point in enumerate(chain):
+            following = chain[(index + 1) % len(chain)]
+            first = tuple(point[axis] - origin[axis] for axis in range(3))
+            second = tuple(following[axis] - origin[axis] for axis in range(3))
+            cross = (
+                first[1] * second[2] - first[2] * second[1],
+                first[2] * second[0] - first[0] * second[2],
+                first[0] * second[1] - first[1] * second[0],
+            )
+            for axis in range(3):
+                area[axis] += cross[axis]
+        area_length = math.hypot(*area)
+        if area_length <= scale * scale * 1e-10:
+            raise ValueError(
+                "Surface Extrusion requires a complete circular feature edge; the selected edge is partial or noncircular."
+            )
+        normal = tuple(component / area_length for component in area)
+
+        first_chord = tuple(chain[1][axis] - origin[axis] for axis in range(3))
+        chord_length = math.hypot(*first_chord)
+        if chord_length <= scale * 1e-10:
+            raise ValueError("The selected feature edge contains a zero-length segment.")
+        u_axis = tuple(component / chord_length for component in first_chord)
+        v_axis = (
+            normal[1] * u_axis[2] - normal[2] * u_axis[1],
+            normal[2] * u_axis[0] - normal[0] * u_axis[2],
+            normal[0] * u_axis[1] - normal[1] * u_axis[0],
+        )
+        coordinates = []
+        for point in chain:
+            relative = tuple(point[axis] - origin[axis] for axis in range(3))
+            coordinates.append((
+                sum(relative[axis] * u_axis[axis] for axis in range(3)),
+                sum(relative[axis] * v_axis[axis] for axis in range(3)),
+            ))
+
+        # Solve the least-squares circle equation x²+y²+A*x+B*y+C=0.
+        matrix = [[0.0] * 4 for _ in range(3)]
+        for x_value, y_value in coordinates:
+            row = (x_value, y_value, 1.0)
+            rhs = -(x_value * x_value + y_value * y_value)
+            for row_index in range(3):
+                matrix[row_index][3] += row[row_index] * rhs
+                for column_index in range(3):
+                    matrix[row_index][column_index] += row[row_index] * row[column_index]
+        for pivot in range(3):
+            best = max(range(pivot, 3), key=lambda row: abs(matrix[row][pivot]))
+            if abs(matrix[best][pivot]) <= scale * scale * 1e-12:
+                raise ValueError("The selected feature edge is noncircular or incomplete.")
+            matrix[pivot], matrix[best] = matrix[best], matrix[pivot]
+            divisor = matrix[pivot][pivot]
+            matrix[pivot] = [value / divisor for value in matrix[pivot]]
+            for row_index in range(3):
+                if row_index == pivot:
+                    continue
+                factor = matrix[row_index][pivot]
+                matrix[row_index] = [
+                    matrix[row_index][column] - factor * matrix[pivot][column]
+                    for column in range(4)
+                ]
+        coeff_a, coeff_b, coeff_c = (matrix[index][3] for index in range(3))
+        center_u, center_v = -coeff_a / 2.0, -coeff_b / 2.0
+        radius_squared = center_u * center_u + center_v * center_v - coeff_c
+        if not math.isfinite(radius_squared) or radius_squared <= 0.0:
+            raise ValueError("The selected feature edge is noncircular or incomplete.")
+        radius = math.sqrt(radius_squared)
+        center = tuple(
+            origin[axis] + center_u * u_axis[axis] + center_v * v_axis[axis]
+            for axis in range(3)
+        )
+        radial_tolerance = max(radius * 0.02, scale * 1e-7)
+        plane_tolerance = max(radius * 0.01, scale * 1e-7)
+        angles = []
+        for point in chain:
+            relative = tuple(point[axis] - center[axis] for axis in range(3))
+            plane_distance = abs(sum(relative[axis] * normal[axis] for axis in range(3)))
+            projected = tuple(
+                relative[axis] - normal[axis] * sum(relative[i] * normal[i] for i in range(3))
+                for axis in range(3)
+            )
+            point_radius = math.hypot(*projected)
+            if plane_distance > plane_tolerance or abs(point_radius - radius) > radial_tolerance:
+                raise ValueError("The selected feature edge is not circular.")
+            angles.append(math.atan2(
+                sum(projected[axis] * v_axis[axis] for axis in range(3)),
+                sum(projected[axis] * u_axis[axis] for axis in range(3)),
+            ))
+
+        steps = [
+            math.atan2(math.sin(angles[index + 1] - angles[index]),
+                       math.cos(angles[index + 1] - angles[index]))
+            for index in range(len(angles) - 1)
+        ]
+        nonzero_steps = [step for step in steps if abs(step) > 1e-8]
+        if len(nonzero_steps) != len(steps):
+            raise ValueError("The selected feature edge contains duplicate points.")
+        direction = 1.0 if sum(nonzero_steps) >= 0.0 else -1.0
+        if any(step * direction <= 0.0 for step in nonzero_steps):
+            raise ValueError("The selected feature edge is not one ordered circular chain.")
+        typical_step = sorted(abs(step) for step in nonzero_steps)[len(nonzero_steps) // 2]
+        closing_step = (direction * (angles[0] - angles[-1])) % (2.0 * math.pi)
+        if closing_step <= 1e-8 or closing_step > max(typical_step * 2.5, math.radians(45.0)):
+            raise ValueError(
+                "Surface Extrusion requires a complete circular feature edge; the picked edge chain is partial."
+            )
+        return chain, center
+
+    def _request_surface_sweep(self) -> None:
+        """Extrude a profile along its normal to a picked face intersection."""
+        from_sketch = self._sketch_engine is not None
+        profile_curve = None
+        if from_sketch:
+            engine = self._sketch_engine
+            try:
+                contour, closed = engine.operation_sweep_contour()
+                profile = [
+                    uv_to_world(point, engine.plane_origin, engine.u_axis, engine.v_axis)
+                    for point in contour
+                ]
+                anchor = scene_objects.SweptSurfaceObject._compute_anchor(profile, closed)
+                profile_normal = tuple(float(value) for value in engine.plane_normal)
+            except (ValueError, TypeError) as exc:
+                self.status_message.emit(f"Surface Extrusion: {exc}")
+                return
+            source_label = "closed sketch contour" if closed else "open sketch contour"
+        else:
+            pick = self._last_edge_pick
+            if not isinstance(pick, dict) or not pick.get("points"):
+                self.status_message.emit(
+                    "Surface Extrusion requires one sketch contour, or a complete circular edge selected in Edge mode."
+                )
+                return
+            if pick.get("owner") is None:
+                self.status_message.emit(
+                    "Surface Extrusion edge input must be selected on a body in Edge mode."
+                )
+                return
+            try:
+                profile, anchor = self._fit_complete_edge_circle(pick["points"])
+            except ValueError as exc:
+                self.status_message.emit(f"Surface Extrusion: {exc}")
+                return
+            # The fitted circle plane supplies the normal, while the picked face
+            # (never contour winding) chooses which of its two signs to use.
+            relative = [
+                tuple(float(point[axis]) - anchor[axis] for axis in range(3))
+                for point in profile
+            ]
+            area = [0.0, 0.0, 0.0]
+            for index, point in enumerate(relative):
+                following = relative[(index + 1) % len(relative)]
+                cross = (
+                    point[1] * following[2] - point[2] * following[1],
+                    point[2] * following[0] - point[0] * following[2],
+                    point[0] * following[1] - point[1] * following[0],
+                )
+                for axis in range(3):
+                    area[axis] += cross[axis]
+            area_length = math.hypot(*area)
+            if area_length <= 1e-12:
+                self.status_message.emit(
+                    "Surface Extrusion could not determine the circular edge normal."
+                )
+                return
+            profile_normal = tuple(component / area_length for component in area)
+            closed = True
+            owner = pick["owner"]
+            if str(getattr(owner, "step_source_path", "") or "").strip():
+                try:
+                    from ..emerge.occ_export_builder import (
+                        resolve_exact_step_circle_profile,
+                    )
+
+                    profile_curve = resolve_exact_step_circle_profile(
+                        owner, pick["points"]
+                    )
+                    profile = scene_objects.SweptSurfaceObject.sample_profile_curve(
+                        profile_curve, len(profile)
+                    )
+                    anchor = tuple(profile_curve["center"])
+                    profile_normal = tuple(
+                        float(value) for value in profile_curve["normal"]
+                    )
+                except (RuntimeError, TypeError, ValueError) as exc:
+                    self.status_message.emit(
+                        f"Surface Extrusion cannot resolve the exact STEP edge: {exc}"
+                    )
+                    return
+                source_label = "exact circular STEP edge"
+            else:
+                source_label = "picked circular edge"
+
+        def confirm_and_emit(extrusion_length, direction, preview_details: str) -> None:
+            try:
+                extrusion_length = float(extrusion_length)
+                direction = tuple(float(value) for value in direction)
+                direction_length = math.hypot(*direction)
+                if (
+                    not math.isfinite(extrusion_length)
+                    or extrusion_length <= 1e-9
+                    or not math.isfinite(direction_length)
+                    or direction_length <= 1e-12
+                ):
+                    raise ValueError("Extrusion length and direction must be non-zero.")
+                direction = tuple(value / direction_length for value in direction)
+            except (TypeError, ValueError) as exc:
+                self.status_message.emit(f"Surface Extrusion is invalid: {exc}")
+                return
+            message = (
+                f"Profile: {source_label} ({len(profile)} points; "
+                f"{'closed' if closed else 'open'})\n"
+                f"Anchor: ({anchor[0]:.6g}, {anchor[1]:.6g}, {anchor[2]:.6g}) {self._units}\n"
+                f"{preview_details}\n"
+                f"Extrusion length: {extrusion_length:.6g} {self._units}\n"
+                f"Direction: ({direction[0]:.6g}, {direction[1]:.6g}, "
+                f"{direction[2]:.6g})\n\n"
+                "Preview: create one uncapped, zero-thickness sheet only (no cap or thickening). "
+                "The sheet boundary is not trimmed to the target face."
+            )
+            answer = QMessageBox.question(
+                self,
+                "Surface Extrusion Preview",
+                message,
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            self._clear_surface_sweep_preview()
+            if answer != QMessageBox.Yes:
+                self.status_message.emit(
+                    "Surface Extrusion cancelled; sketch and selection are unchanged."
+                )
+                return
+            self.sketch_sweep_requested.emit(
+                list(profile),
+                extrusion_length,
+                direction,
+                bool(closed),
+                bool(from_sketch),
+                profile_curve,
+            )
+            if from_sketch:
+                self.exit_sketch(commit=True)
+
+        normal_length = math.hypot(*profile_normal)
+        if not math.isfinite(normal_length) or normal_length <= 1e-12:
+            self.status_message.emit(
+                "Surface Extrusion could not determine a finite profile normal."
+            )
+            return
+        profile_normal = tuple(value / normal_length for value in profile_normal)
+
+        def accept_target(target) -> None:
+            try:
+                intersection = self._surface_sweep_intersection(target)
+            except (ImportError, RuntimeError, TypeError, ValueError, KeyError) as exc:
+                self.status_message.emit(
+                    f"Surface Extrusion could not intersect the selected target face: {exc}"
+                )
+                self._hide_surface_sweep_preview()
+                self.request_pick("surface_sweep_target", accept_target)
+                return
+            if intersection is None:
+                self.status_message.emit(
+                    "Surface Extrusion profile normal does not intersect the selected "
+                    "target face in the picked direction. Pick another face; no grid or "
+                    "closest-point endpoint was substituted."
+                )
+                self._hide_surface_sweep_preview()
+                self.request_pick("surface_sweep_target", accept_target)
+                return
+            endpoint, direction, extrusion_length = intersection
+
+            if not self._update_surface_sweep_preview(endpoint):
+                self.status_message.emit(
+                    "Surface Extrusion could not preview the normal/face intersection. "
+                    "Pick another face."
+                )
+                self.request_pick("surface_sweep_target", accept_target)
+                return
+            confirm_and_emit(
+                extrusion_length,
+                direction,
+                f"Selected target face; normal-line intersection: "
+                f"({endpoint[0]:.6g}, {endpoint[1]:.6g}, "
+                f"{endpoint[2]:.6g}) {self._units}",
+            )
+
+        self._begin_surface_sweep_preview(
+            profile,
+            anchor,
+            closed,
+            normal=profile_normal,
+        )
+        self.request_pick("surface_sweep_target", accept_target)
+        self.status_message.emit(
+            "Surface Extrusion: pick the target face. Extrusion follows the profile "
+            "normal toward that face and ends at the nearest normal-line intersection. "
+            "Esc to cancel."
+        )
 
     @staticmethod
     def _sketch_revolve_axis_segments(engine) -> list:

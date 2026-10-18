@@ -5,7 +5,7 @@ geometries and exporting them to the EMERGE simulation workflow. It combines a
 VTK viewport, parametric primitives, CAD import, material assignment, boolean
 modeling, and EMERGE-oriented project export in one application.
 
-Current version: `1.4.7`
+Current version: `1.5.2`
 
 ## What You Can Do
 
@@ -14,6 +14,8 @@ Current version: `1.4.7`
 - Draw boxes, cylinders, cones, spheres, planar structures, and other supported
 	primitives directly in the 3D viewport.
 - Create parametric sketches, then extrude or revolve them into 3D geometry.
+- Sweep an open or closed sketch contour, or a circular body edge, into an
+  open surface with no automatic caps or thickness.
 - Work on the XY, XZ, YZ, or a custom reference plane with a configurable grid
 	and snap support for vertices, edges, and surfaces.
 - Move, rotate, scale, duplicate, and delete selected objects.
@@ -44,6 +46,9 @@ Current version: `1.4.7`
 - Export EMERGE scripts and STEP bundles from the current model.
 - Open the simulation panel to generate and run EMERGE Python workflows and
 	review their output.
+- Generated Python workflows target the EMERGE 3.0.0 API or later and explicitly
+	select the `msgpack` result-storage backend. The separate legacy text exporter
+	remains intended for EMERGE v2.x scripts.
 
 ## Typical Workflow
 

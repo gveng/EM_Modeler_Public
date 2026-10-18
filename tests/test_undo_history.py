@@ -61,7 +61,10 @@ def test_parameter_edits_are_undoable_one_at_a_time():
 
     MainWindow._undo(window)
 
-    assert restored == [[{"state": {"value": 1}}]]
+    assert restored == [{
+        "objects": [{"state": {"value": 1}}],
+        "object_groups": [],
+    }]
 
 
 def test_deleting_selected_object_records_an_undo_state():
@@ -75,8 +78,14 @@ def test_deleting_selected_object_records_an_undo_state():
     MainWindow._delete_selected(window)
 
     assert window._history_undo == [
-        [{"state": {"objects": ["Part"]}}],
-        [{"state": {"objects": []}}],
+        {
+            "objects": [{"state": {"objects": ["Part"]}}],
+            "object_groups": [],
+        },
+        {
+            "objects": [{"state": {"objects": []}}],
+            "object_groups": [],
+        },
     ]
 
 
