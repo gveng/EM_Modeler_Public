@@ -21,7 +21,7 @@
   <div class="eyebrow">EM 3D Modeler · User documentation</div>
   <h1>Build the model.<br>Prepare the simulation.</h1>
   <p>A practical guide to the desktop workspace, geometry tools, project setup, EMERGE export and result plotting. UI screenshots below are genuine captures of the application's Qt widgets populated with reproducible example values.</p>
-  <div class="version">Version 1.5.2 · Release date 2026-10-17</div>
+  <div class="version">Version 1.5.4 · Release date 2026-10-21</div>
 </header>
 <div class="layout">
 <nav class="toc" aria-label="Contents">
@@ -229,6 +229,7 @@
 <p>For a formula-driven row, <strong>Value</strong> retains the expression and <strong>Resolved</strong> shows the evaluated numeric value. While typing a project variable in a Value cell, matching variable names are suggested; choose one or press Enter to complete the current name without replacing the rest of the formula. Press Ctrl+Space to show all available variables. Hover over the formula value to see its expression and resolved number. A plain number is also accepted.</p>
 <p>With multiple objects selected, the geometry table is hidden. The panel provides shared material, opacity and color controls plus <strong>Apply material to all selected</strong>; the simulation-role selector is disabled for multi-selection. Enable or disable <strong>Apply color in bulk</strong> to control whether the bulk action replaces existing colors.</p>
 <h3>Material Library</h3><p>Use <strong>Tools → Material Library</strong> to search and manage project and global records. Material fields include family, relative permittivity (<code>er</code>), relative permeability (<code>ur</code>), loss tangent (<code>tan d</code>), conductivity (<code>sigma [S/m]</code>), color and opacity. Global database location and reload commands are under <strong>File</strong>.</p>
+<p>For isotropic frequency-dependent <code>er</code> or <code>ur</code>, enter sample frequencies in GHz and real/imaginary values. The EMERGE 3.x Python exporter interpolates between samples; below the first frequency it uses that value, and above the last frequency it keeps the last value. The simulation sweep is not restricted to the sample range. This export requires EMERGE 3.0.0 or later. The legacy EMERGE v2.x text exporter remains scalar-valued.</p>
 </section>
 
 <section class="section" id="context-menus">
@@ -349,7 +350,7 @@
 </tbody></table>
 <p>For an S-parameter matrix, rows represent output ports and columns input ports: row 2, column 1 is <code>S21</code>. The optional automatic post-run S-parameter plot is separate from Project Tree output definitions. Far-field entries request field saving; they are not plotted by the ordinary automatic S-parameter plotting step. The Polar 2D/3D display selector is currently not consumed by the plotting handler.</p>
 <p>When <strong>Export S-parameters Touchstone after simulation</strong> is enabled in <strong>Settings → Simulation</strong>, Sweep and Parametric results are written to <code>_EmergeSim/Touchstone</code>, leaving generated job scripts and STEP models in the bundle root. With fitting disabled, one <code>*_fit.sNp</code> file contains the original solver samples. With fitting enabled and successful, <code>*_original.sNp</code> contains the raw samples and <code>*_fit.sNp</code> contains the fitted curve; <code>n</code> is the number of ports. If fitting fails, the original file is still saved, no fitted file is written, and the log reports the fitting warning. A fitting failure does not by itself mean the EMERGE solve failed. If automatic plotting is enabled, it falls back to the raw samples when fitting fails.</p>
-<p><strong>Generate Plot</strong> uses the newest matching saved Touchstone export when available, without reloading <code>simdata.emerge</code>. New Touchstone filenames include the simulation name; older project-only filenames remain supported. If no usable Touchstone export exists, plotting falls back to EMERGE result data.</p>
+<p><strong>Generate Plot</strong> uses the newest matching saved Touchstone export when available, without reloading <code>simdata.emerge</code>. New Touchstone filenames include the simulation name; older project-only filenames remain supported. New <code>.sNp</code> files use GHz and magnitude/angle data and include an EMERGE/EM 3D Modeler metadata header, sweep and mesh settings, and each port's connected object. The generated time in the header and filename is captured when result export begins, after the solver has completed. If no usable Touchstone export exists, plotting falls back to EMERGE result data.</p>
 <p>Use <strong>Load Touchstone</strong> in an S-parameter chart to open a saved <code>.sNp</code> file in a separate chart window. Existing Touchstone files in the simulation bundle root are organized into the <code>Touchstone</code> folder when the file picker opens; duplicate names are preserved with a <code>_legacy_n</code> suffix.</p>
 </section>
 
@@ -410,10 +411,10 @@
 </tbody></table>
 <h3>Common issues</h3><ul><li><strong>Boolean result is empty or wrong:</strong> verify selection order, solid overlap and valid closed geometry. Try a smaller operation.</li><li><strong>Preflight reports PML:</strong> configure an explicit PML shell, or choose supported PEC/PMC/Open/Radiation faces consistent with the domain.</li><li><strong>Port validation fails:</strong> confirm the assigned object is a suitable Plate; for a LumpedPort check two conductor contacts and a non-zero direction; for a WaveguidePort confirm the AIR end face.</li><li><strong>Plot is empty:</strong> confirm the job completed, the needed results/fields were saved and the chosen frequency is available.</li><li><strong>Solver cannot start:</strong> confirm the selected backend is installed and usable in the active EMERGE Python environment.</li></ul>
 <h3>Units at a glance</h3><p>Geometry inputs use the selected display length unit; exported geometry uses metres. Frequency inputs use GHz. Resistance uses ohms, conductivity uses S/m, angles use degrees, and local mesh sizes are entered in mm.</p>
-<p class="muted">This guide describes EM 3D Modeler 1.5.2. Optional solver behavior depends on the installed EMERGE environment. Genuine dialog and Project Tree screenshots are generated by <code>scripts/capture_help_screenshots.py</code>. Capture the embedded sketch toolbar with <code>python scripts/capture_help_screenshots.py --sketch-toolbar-only</code>. See <a href="SNAPSHOT_CAPTURE.md">the capture instructions</a>.</p>
+<p class="muted">This guide describes EM 3D Modeler 1.5.4. Optional solver behavior depends on the installed EMERGE environment. Genuine dialog and Project Tree screenshots are generated by <code>scripts/capture_help_screenshots.py</code>. Capture the embedded sketch toolbar with <code>python scripts/capture_help_screenshots.py --sketch-toolbar-only</code>. See <a href="SNAPSHOT_CAPTURE.md">the capture instructions</a>.</p>
 </section>
 </main>
 </div>
-<footer>EM 3D Modeler · Help version 1.5.2 · <a href="#top">Return to the top</a></footer>
+<footer>EM 3D Modeler · Help version 1.5.4 · <a href="#top">Return to the top</a></footer>
 </body>
 </html>

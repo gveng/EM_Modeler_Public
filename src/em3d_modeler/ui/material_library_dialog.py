@@ -16,6 +16,7 @@
 
 from __future__ import annotations
 
+import math
 from pathlib import Path
 from typing import Callable, Optional
 import uuid
@@ -26,7 +27,6 @@ from PySide6.QtWidgets import (
     QComboBox,
     QDialog,
     QDialogButtonBox,
-    
     QFileDialog,
     QFormLayout,
     QFrame,
@@ -37,6 +37,8 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QMessageBox,
     QPushButton,
+    QTableWidget,
+    QTableWidgetItem,
     QVBoxLayout,
     QWidget,
 )
@@ -48,11 +50,107 @@ from ..emerge.material_store import DEFAULT_COLOR, MaterialRecord, MaterialStore
 _FAMILIES = ["Common", "Metals", "Dielectrics", "Foams", "Semiconductors", "Liquids"]
 
 
+class _FrequencyDataDialog(QDialog):
+    """Edit isotropic material data in GHz; values returned to the model use Hz."""
+
+    def __init__(self, parent=None, frequency_data=None, property_name: str = "er"):
+        super().__init__(parent)
+        self.setWindowTitle(f"{property_name} Frequency Data")
+        self.resize(460, 300)
+        self.frequency_data_hz: list[dict[str, float]] | None = None
+
+        layout = QVBoxLayout(self)
+        layout.addWidget(QLabel(
+            "Enter frequency in GHz and the real and imaginary components."
+        ))
+
+        self._table = QTableWidget(0, 3)
+        self._table.setHorizontalHeaderLabels(["Frequency [GHz]", "Real", "Imaginary"])
+        self._table.horizontalHeader().setStretchLastSection(True)
+        layout.addWidget(self._table, 1)
+
+        row_buttons = QHBoxLayout()
+        self._add_row_btn = QPushButton("Add Row")
+        self._remove_row_btn = QPushButton("Remove Row")
+        self._add_row_btn.clicked.connect(self._add_row)
+        self._remove_row_btn.clicked.connect(self._remove_row)
+        row_buttons.addWidget(self._add_row_btn)
+        row_buttons.addWidget(self._remove_row_btn)
+        row_buttons.addStretch(1)
+        layout.addLayout(row_buttons)
+
+        for point in frequency_data or []:
+            self._add_row(
+                float(point["frequency_hz"]) / 1e9,
+                float(point["real"]),
+                float(point["imag"]),
+            )
+
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel)
+        buttons.accepted.connect(self._accept)
+        buttons.rejected.connect(self.reject)
+        layout.addWidget(buttons)
+
+    def _add_row(
+        self, frequency_ghz: float = 1.0, real: float = 1.0, imag: float = 0.0
+    ) -> None:
+        row = self._table.rowCount()
+        self._table.insertRow(row)
+        for column, value in enumerate((frequency_ghz, real, imag)):
+            self._table.setItem(row, column, QTableWidgetItem(format(value, ".12g")))
+
+    def _remove_row(self) -> None:
+        row = self._table.currentRow()
+        if row >= 0:
+            self._table.removeRow(row)
+
+    def _accept(self) -> None:
+        points: list[dict[str, float]] = []
+        try:
+            for row in range(self._table.rowCount()):
+                values = []
+                for column in range(3):
+                    item = self._table.item(row, column)
+                    if item is None or not item.text().strip():
+                        raise ValueError(f"Row {row + 1} must have all three values.")
+                    value = float(item.text())
+                    if not math.isfinite(value):
+                        raise ValueError(f"Row {row + 1} values must be finite.")
+                    values.append(value)
+
+                frequency_hz = values[0] * 1e9
+                if not math.isfinite(frequency_hz) or frequency_hz <= 0:
+                    raise ValueError(
+                        f"Row {row + 1} frequency must be positive and finite."
+                    )
+                points.append({
+                    "frequency_hz": frequency_hz,
+                    "real": values[1],
+                    "imag": values[2],
+                })
+        except ValueError as exc:
+            QMessageBox.warning(self, "Frequency Data", str(exc))
+            return
+
+        points.sort(key=lambda point: point["frequency_hz"])
+        if any(
+            points[index - 1]["frequency_hz"] == points[index]["frequency_hz"]
+            for index in range(1, len(points))
+        ):
+            QMessageBox.warning(
+                self, "Frequency Data", "Frequencies must be unique."
+            )
+            return
+
+        self.frequency_data_hz = points
+        self.accept()
+
+
 class _MaterialEditorDialog(QDialog):
     def __init__(self, parent=None, record: MaterialRecord | None = None):
         super().__init__(parent)
         self.setWindowTitle("Material")
-        self.resize(360, 260)
+        self.resize(460, 520)
 
         self._record = record
         self._color = str(record.color if record is not None else DEFAULT_COLOR)
@@ -76,12 +174,30 @@ class _MaterialEditorDialog(QDialog):
         self._er.setDecimals(6)
         self._er.setValue(float(record.er) if record is not None else 1.0)
         form.addRow("er", self._er)
+        self._er_frequency_data = [
+            dict(point) for point in record.er_frequency_data
+        ] if record is not None else []
+        self._er_frequency_btn = QPushButton()
+        self._er_frequency_btn.clicked.connect(
+            lambda: self._edit_frequency_data("er")
+        )
+        form.addRow("er frequency data", self._er_frequency_btn)
+        self._refresh_frequency_button("er")
 
         self._ur = QDoubleSpinBox()
         self._ur.setRange(0.0, 1e9)
         self._ur.setDecimals(6)
         self._ur.setValue(float(record.ur) if record is not None else 1.0)
         form.addRow("ur", self._ur)
+        self._ur_frequency_data = [
+            dict(point) for point in record.ur_frequency_data
+        ] if record is not None else []
+        self._ur_frequency_btn = QPushButton()
+        self._ur_frequency_btn.clicked.connect(
+            lambda: self._edit_frequency_data("ur")
+        )
+        form.addRow("ur frequency data", self._ur_frequency_btn)
+        self._refresh_frequency_button("ur")
 
         self._tan_d = QDoubleSpinBox()
         self._tan_d.setRange(0.0, 1.0)
@@ -123,6 +239,21 @@ class _MaterialEditorDialog(QDialog):
 
         self.result_record: MaterialRecord | None = None
 
+    def _refresh_frequency_button(self, property_name: str) -> None:
+        points = getattr(self, f"_{property_name}_frequency_data")
+        button = getattr(self, f"_{property_name}_frequency_btn")
+        button.setText(
+            f"Edit... ({len(points)} point{'s' if len(points) != 1 else ''})"
+        )
+
+    def _edit_frequency_data(self, property_name: str) -> None:
+        points = getattr(self, f"_{property_name}_frequency_data")
+        dialog = _FrequencyDataDialog(self, points, property_name)
+        if dialog.exec_() != QDialog.Accepted or dialog.frequency_data_hz is None:
+            return
+        setattr(self, f"_{property_name}_frequency_data", dialog.frequency_data_hz)
+        self._refresh_frequency_button(property_name)
+
     def _update_color_preview(self) -> None:
         self._color_preview.setStyleSheet(f"background:{self._color};")
         self._color_label.setText(self._color)
@@ -150,7 +281,10 @@ class _MaterialEditorDialog(QDialog):
             sigma=float(self._sigma.value()),
             color=self._color,
             opacity=float(self._opacity.value()),
-            source="project",
+            source=self._record.source if self._record is not None else "project",
+            priority=self._record.priority if self._record is not None else 0,
+            er_frequency_data=self._er_frequency_data,
+            ur_frequency_data=self._ur_frequency_data,
         )
         self.accept()
 

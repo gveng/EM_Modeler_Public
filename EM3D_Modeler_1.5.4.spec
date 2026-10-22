@@ -28,6 +28,10 @@ _runtime_hiddenimports = sorted({
     if ".tests" not in _module and not _module.endswith(".conftest")
 })
 _runtime_hiddenimports.append("graphlib")
+_runtime_hiddenimports.extend([
+    "em3d_modeler.emerge.ipc2581_board_json",
+    "em3d_modeler.emerge.ipc2581_padstack_geometry",
+])
 
 _mkl_bin = Path(sys.prefix) / "Library" / "bin"
 _mkl_dlls = []
@@ -81,7 +85,7 @@ exe = EXE(
     a.scripts,
     [],
     exclude_binaries=True,
-    name='EM3D_Modeler_1.4.6',
+    name='EM3D_Modeler_1.5.4',
     icon='D:\\\\Visual_Studio_Code\\\\EM_3D_Modeler\\\\Icons\\\\SplashScreen\\\\EM_Logo.ico',
     debug=False,
     bootloader_ignore_signals=False,
@@ -101,5 +105,5 @@ coll = COLLECT(
     strip=False,
     upx=True,
     upx_exclude=[],
-    name='EM3D_Modeler_1.4.6',
+    name='EM3D_Modeler_1.5.4',
 )

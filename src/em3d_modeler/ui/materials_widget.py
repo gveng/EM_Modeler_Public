@@ -20,7 +20,7 @@ Shows user-defined object groups and organizes ungrouped objects by material.
 Clicking an item selects the corresponding 3D object or group members.
 """
 from __future__ import annotations
-from typing import Dict, List, Optional
+from typing import Dict, Iterator, List, Optional
 
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QLabel, QTreeWidget, QTreeWidgetItem,
@@ -47,6 +47,7 @@ _ROLE_SKETCH_EDIT = Qt.UserRole + 10  # int(id(EMObject)) on a sketch row
 _ROLE_GROUP_ID = Qt.UserRole + 11  # str(SceneObjectGroup.group_id)
 _ROLE_GROUPS_ROOT = Qt.UserRole + 12  # True on the object groups header
 _ROLE_IS_SUBGROUP = Qt.UserRole + 13  # bool on a group/subgroup row
+_ROLE_NON_MODEL_ROOT = Qt.UserRole + 14  # True on the NON MODEL root row
 
 
 class MaterialsWidget(QWidget):
@@ -116,6 +117,60 @@ class MaterialsWidget(QWidget):
         self._object_group_map: Dict[int, tuple[SceneObjectGroup, SceneObjectGroup | None]] = {}
         self._material_priorities: Dict[str, int] = {}
 
+    def _tree_item_token(self, item: QTreeWidgetItem) -> tuple:
+        for role in (
+            _ROLE_PLANES_ROOT,
+            _ROLE_GROUPS_ROOT,
+            _ROLE_NON_MODEL_ROOT,
+            _ROLE_GROUP_ID,
+            _ROLE_MATERIAL,
+            _ROLE_OBJ_ID,
+            _ROLE_PLANE_ID,
+            _ROLE_TRANSFORM_ID,
+            _ROLE_PATTERN_EDIT,
+            _ROLE_FEATURE_EDIT,
+            _ROLE_SKETCH_EDIT,
+        ):
+            value = item.data(0, role)
+            if value is not None:
+                return ("role", role, repr(value))
+        return ("text", item.text(0))
+
+    def _iter_tree_item_state_keys(self) -> Iterator[tuple[QTreeWidgetItem, tuple]]:
+        top_level_items = [
+            self._tree.topLevelItem(index)
+            for index in range(self._tree.topLevelItemCount())
+        ]
+        pending = [(top_level_items, ())]
+        while pending:
+            siblings, parent_key = pending.pop()
+            occurrences = {}
+            child_groups = []
+            for item in siblings:
+                token = self._tree_item_token(item)
+                occurrence = occurrences.get(token, 0)
+                occurrences[token] = occurrence + 1
+                state_key = parent_key + ((token, occurrence),)
+                yield item, state_key
+
+                children = [
+                    item.child(index) for index in range(item.childCount())
+                ]
+                if children:
+                    child_groups.append((children, state_key))
+            pending.extend(reversed(child_groups))
+
+    def _capture_expansion_state(self) -> Dict[tuple, bool]:
+        state = {}
+        for item, state_key in self._iter_tree_item_state_keys():
+            state[state_key] = item.isExpanded()
+        return state
+
+    def _restore_expansion_state(self, state: Dict[tuple, bool]) -> None:
+        for item, state_key in self._iter_tree_item_state_keys():
+            if state_key in state:
+                item.setExpanded(state[state_key])
+
     # ─────────────────────────────────────────────────── public API
     def refresh(self, by_material: Dict[str, List[EMObject]],
                 planes: Optional[List] = None,
@@ -133,6 +188,8 @@ class MaterialsWidget(QWidget):
         planes       : optional list of ReferencePlane
         active_plane : the currently active ReferencePlane (highlighted)
         """
+        expansion_state = self._capture_expansion_state()
+
         # Preserve current tree selection
         prev_selected_ids = set()
         for it in self._tree.selectedItems():
@@ -155,7 +212,7 @@ class MaterialsWidget(QWidget):
             planes_root.setData(0, _ROLE_PLANES_ROOT, True)
             planes_root.setToolTip(0, "Right-click to add a new reference plane.")
             self._tree.addTopLevelItem(planes_root)
-            # Always keep expanded (user can manually close)
+            # New roots start expanded; refresh restores the user's prior state.
             planes_root.setExpanded(True)
 
             triad_marker = "\u2611" if plane_triad_visible else "\u2610"
@@ -331,7 +388,7 @@ class MaterialsWidget(QWidget):
             font.setBold(True)
             mat_item.setFont(0, font)
             self._tree.addTopLevelItem(mat_item)
-            # Always keep expanded (user can manually close)
+            # New material rows start expanded; refresh restores prior state.
             mat_item.setExpanded(True)
             for obj in model_objects:
                 add_object_row(mat_item, obj)
@@ -342,6 +399,7 @@ class MaterialsWidget(QWidget):
             font.setBold(True)
             non_model_item.setFont(0, font)
             non_model_item.setForeground(0, QBrush(QColor(150, 160, 175)))
+            non_model_item.setData(0, _ROLE_NON_MODEL_ROOT, True)
             self._tree.addTopLevelItem(non_model_item)
             for obj in sorted(non_model_objects, key=lambda item: str(item.name).casefold()):
                 if id(obj) in grouped_object_ids:
@@ -349,6 +407,7 @@ class MaterialsWidget(QWidget):
                 add_object_row(non_model_item, obj, show_material=True)
             non_model_item.setExpanded(False)
 
+        self._restore_expansion_state(expansion_state)
         self._tree.blockSignals(False)
 
     def highlight(self, objects) -> None:

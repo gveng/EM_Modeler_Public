@@ -2194,8 +2194,8 @@ class MainWindow(QMainWindow):
         self._workspace_toolbar = tb
 
         act_play = QAction(_icon("media-playback-start"), "Play", self)
-        act_play.setToolTip("Open simulation panel (EMERGE Python script + verbose output)")
-        act_play.triggered.connect(self._open_simulation_window)
+        act_play.setToolTip("Open the simulation panel and start the checked simulation")
+        act_play.triggered.connect(self._on_play_simulation)
         self._play_action = act_play
         act_play.setEnabled(getattr(self, "_sim_ready", False))
 
@@ -6037,6 +6037,10 @@ class MainWindow(QMainWindow):
             if progress is not None:
                 progress.close()
 
+    def _on_play_simulation(self) -> None:
+        self._open_simulation_window()
+        self._on_sim_run()
+
     def _open_simulation_window(self) -> None:
         dlg = getattr(self, "_sim_dlg", None)
         if dlg is None:
@@ -6787,7 +6791,6 @@ class MainWindow(QMainWindow):
             "    jobs = [\n"
             f"{jobs_literal}\n"
             "    ]\n"
-            "    run_id = time.strftime('%Y%m%d-%H%M%S') + f'-{time.time_ns() % 1000000:06d}'\n"
             "    for job in jobs:\n"
             "        if os.path.exists(cancel_file):\n"
             "            print('[master] Cancellation requested; remaining jobs will not start.')\n"
@@ -6798,7 +6801,6 @@ class MainWindow(QMainWindow):
             "        env['PYTHONIOENCODING'] = 'utf-8'\n"
             "        env['PYTHONUTF8'] = '1'\n"
             "        env['EM3D_RUN_IN_APP'] = '1'\n"
-            "        env['EM3D_RUN_ID'] = run_id\n"
             "        if job.get('parameter_index') is not None:\n"
             "            env['EM3D_PARAMETRIC_INDEX'] = str(job['parameter_index'])\n"
             "            env['EM3D_PARAMETRIC_TOTAL'] = str(job['parameter_total'])\n"

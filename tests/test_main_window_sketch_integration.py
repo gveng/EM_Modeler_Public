@@ -2623,6 +2623,7 @@ def test_sketch_toolbar_shows_select_delete_and_exit_actions():
     window._bool_dissolve = Mock()
     window._import_step = Mock()
     window._open_simulation_window = Mock()
+    window._on_play_simulation = Mock()
     window._open_measure_tool = Mock()
     window._open_project_parameters = Mock()
     window._recompute_model = Mock()

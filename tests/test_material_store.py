@@ -87,3 +87,103 @@ def test_copy_builtin_material_rejects_missing_or_existing_project_record():
     store.add_project_material("PEC")
     with pytest.raises(ValueError, match="already exists"):
         store.copy_builtin_to_project("PEC")
+
+
+def test_legacy_material_json_and_positional_constructor_remain_compatible():
+    legacy = {
+        "uid": "legacy-id",
+        "name": "Legacy",
+        "family": "Common",
+        "er": 2.5,
+        "ur": 1.0,
+        "tan_d": 0.0,
+        "sigma": 0.0,
+    }
+
+    record = MaterialRecord("old-id", "Old", "Common", 2.5, 1.0, 0.0, 0.0)
+    loaded = MaterialRecord.from_dict(legacy)
+
+    assert record.er_frequency_data == []
+    assert record.ur_frequency_data == []
+    assert loaded.er_frequency_data == []
+    assert loaded.ur_frequency_data == []
+    assert loaded.to_dict()["er_frequency_data"] == []
+    assert loaded.to_dict()["ur_frequency_data"] == []
+
+
+def test_frequency_data_round_trips_project_and_global_json(tmp_path):
+    er_data = [
+        {"frequency_hz": 1e9, "real": 4.2, "imag": -0.03},
+        {"frequency_hz": 2e9, "real": 4.0, "imag": -0.05},
+    ]
+    ur_data = [{"frequency_hz": 1.5e9, "real": 1.2, "imag": 0.01}]
+    store = MaterialStore()
+    project = MaterialRecord(
+        "freq-id", "Frequency Material", "Dielectrics", 4.0, 1.0, 0.0, 0.0,
+        er_frequency_data=er_data,
+        ur_frequency_data=ur_data,
+    )
+    store.upsert_project_record(project)
+    project_json = store.project_materials_to_json()
+    reloaded_project = MaterialStore()
+    reloaded_project.load_project_materials(project_json)
+    assert reloaded_project.get_record("Frequency Material").er_frequency_data == er_data
+    assert reloaded_project.get_record("Frequency Material").ur_frequency_data == ur_data
+
+    db_path = tmp_path / "frequency-materials.json"
+    db_path.write_text(json.dumps({"materials": []}), encoding="utf-8")
+    store.set_global_db_path(str(db_path), create_if_missing=False)
+    store.upsert_global_record(project)
+    reloaded_global = MaterialStore()
+    reloaded_global.set_global_db_path(str(db_path), create_if_missing=False)
+    saved = reloaded_global.global_records()["Frequency Material"]
+    assert saved.er_frequency_data == er_data
+    assert saved.ur_frequency_data == ur_data
+
+
+def test_frequency_data_is_preserved_when_copying_or_appending_materials(tmp_path):
+    points = [{"frequency_hz": 1e9, "real": 3.0, "imag": -0.1}]
+    store = MaterialStore()
+    source = MaterialRecord(
+        "frequency-id", "Frequency Material", "Dielectrics", 3.0, 1.0, 0.0, 0.0,
+        er_frequency_data=points,
+    )
+    copied = store.upsert_project_record(source)
+    assert copied.er_frequency_data == points
+
+    db_path = tmp_path / "frequency-materials.json"
+    db_path.write_text(json.dumps({"materials": [source.to_dict()]}), encoding="utf-8")
+    store.set_global_db_path(str(db_path), create_if_missing=False)
+    added = store.append_global_to_project(["Frequency Material"])
+    assert added == ["Frequency Material"]
+    assert store.get_record("Frequency Material").er_frequency_data == points
+
+
+@pytest.mark.parametrize(
+    "points, message",
+    [
+        ([{"frequency_hz": 0, "real": 1, "imag": 0}], "must be positive"),
+        ([{"frequency_hz": float("inf"), "real": 1, "imag": 0}], "must be finite"),
+        ([{"frequency_hz": 1, "real": float("nan"), "imag": 0}], "must be finite"),
+        (
+            [
+                {"frequency_hz": 2, "real": 1, "imag": 0},
+                {"frequency_hz": 1, "real": 1, "imag": 0},
+            ],
+            "sorted in strictly increasing",
+        ),
+        (
+            [
+                {"frequency_hz": 1, "real": 1, "imag": 0},
+                {"frequency_hz": 1, "real": 2, "imag": 0},
+            ],
+            "sorted in strictly increasing",
+        ),
+    ],
+)
+def test_frequency_data_validation_rejects_invalid_points(points, message):
+    with pytest.raises(ValueError, match=message):
+        MaterialRecord(
+            "invalid", "Invalid", "Common", 1.0, 1.0, 0.0, 0.0,
+            er_frequency_data=points,
+        )

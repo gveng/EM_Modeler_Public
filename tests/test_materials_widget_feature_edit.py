@@ -13,10 +13,14 @@ from em3d_modeler.scene.em_objects import (
     RevolvedObject,
     SweptSurfaceObject,
 )
+from em3d_modeler.scene.scene_manager import SceneObjectGroup
 from em3d_modeler.ui import materials_widget
 from em3d_modeler.ui.materials_widget import (
     MaterialsWidget,
     _ROLE_FEATURE_EDIT,
+    _ROLE_GROUP_ID,
+    _ROLE_GROUPS_ROOT,
+    _ROLE_MATERIAL,
     _ROLE_OBJ_ID,
     _ROLE_SKETCH_EDIT,
 )
@@ -149,4 +153,61 @@ def test_swept_surface_appears_as_selectable_material_tree_object_row(qapp):
 
     widget.highlight(sheet)
     assert object_row.isSelected()
+    widget.close()
+
+
+def test_refresh_preserves_material_and_group_expansion_state(qapp):
+    copper_object = BoxObject("Copper object")
+    pec_object = BoxObject("PEC object")
+    grouped_object = BoxObject("Grouped object")
+    group = SceneObjectGroup("My group", objects=[grouped_object])
+    by_material = {"Copper": [copper_object], "PEC": [pec_object]}
+
+    widget = MaterialsWidget()
+    widget.refresh(by_material, groups=[group])
+
+    material_rows = {
+        widget._tree.topLevelItem(index).data(0, _ROLE_MATERIAL):
+        widget._tree.topLevelItem(index)
+        for index in range(widget._tree.topLevelItemCount())
+        if widget._tree.topLevelItem(index).data(0, _ROLE_MATERIAL) is not None
+    }
+    groups_root = next(
+        widget._tree.topLevelItem(index)
+        for index in range(widget._tree.topLevelItemCount())
+        if widget._tree.topLevelItem(index).data(0, _ROLE_GROUPS_ROOT)
+    )
+    group_row = next(
+        groups_root.child(index)
+        for index in range(groups_root.childCount())
+        if groups_root.child(index).data(0, _ROLE_GROUP_ID) == group.group_id
+    )
+    material_rows["Copper"].setExpanded(False)
+    material_rows["PEC"].setExpanded(True)
+    groups_root.setExpanded(False)
+    group_row.setExpanded(False)
+
+    widget.refresh(by_material, groups=[group])
+
+    material_rows = {
+        widget._tree.topLevelItem(index).data(0, _ROLE_MATERIAL):
+        widget._tree.topLevelItem(index)
+        for index in range(widget._tree.topLevelItemCount())
+        if widget._tree.topLevelItem(index).data(0, _ROLE_MATERIAL) is not None
+    }
+    groups_root = next(
+        widget._tree.topLevelItem(index)
+        for index in range(widget._tree.topLevelItemCount())
+        if widget._tree.topLevelItem(index).data(0, _ROLE_GROUPS_ROOT)
+    )
+    group_row = next(
+        groups_root.child(index)
+        for index in range(groups_root.childCount())
+        if groups_root.child(index).data(0, _ROLE_GROUP_ID) == group.group_id
+    )
+
+    assert not material_rows["Copper"].isExpanded()
+    assert material_rows["PEC"].isExpanded()
+    assert not groups_root.isExpanded()
+    assert not group_row.isExpanded()
     widget.close()

@@ -133,7 +133,7 @@ def _safe_token(value: str) -> str:
 
 
 def read_touchstone_ri(path: Path) -> dict:
-    """Read Touchstone v1 S-parameter files using RI data and standard port ordering."""
+    """Read Touchstone v1 S-parameter data and return complex values in standard port order."""
     path = Path(path)
     match = _TOUCHSTONE_SUFFIX.search(path.name)
     if match is None:

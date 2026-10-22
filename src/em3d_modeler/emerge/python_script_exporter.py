@@ -99,11 +99,60 @@ def _to_float(value: Any, default: float) -> float:
         return float(default)
 
 
+def _frequency_samples(value: Any) -> List[tuple[float, float, float]]:
+    """Return finite (frequency, real, imaginary) rows from a material record."""
+    if not isinstance(value, list):
+        return []
+
+    samples: List[tuple[float, float, float]] = []
+    for sample in value:
+        if not isinstance(sample, dict):
+            continue
+        frequency_hz = _to_float(sample.get("frequency_hz"), float("nan"))
+        real = _to_float(sample.get("real"), float("nan"))
+        imag = _to_float(sample.get("imag"), float("nan"))
+        if all(math.isfinite(component) for component in (frequency_hz, real, imag)):
+            samples.append((frequency_hz, real, imag))
+    return samples
+
+
 def _material_block(
     used_materials: List[str],
     materials_catalog: Dict[str, Dict[str, Any]] | None,
 ) -> List[str]:
     lines: List[str] = ["materials = {}", ""]
+    frequency_samples: Dict[str, tuple[List[tuple[float, float, float]], List[tuple[float, float, float]]]] = {}
+    for name in used_materials:
+        rec = (materials_catalog or {}).get(name, {})
+        frequency_samples[name] = (
+            _frequency_samples(rec.get("er_frequency_data")),
+            _frequency_samples(rec.get("ur_frequency_data")),
+        )
+
+    if any(er_samples or ur_samples for er_samples, ur_samples in frequency_samples.values()):
+        lines += [
+            "def _make_frequency_dependent_scalar(samples):",
+            "    points = tuple(",
+            "        (float(frequency_hz), complex(real, imag))",
+            "        for frequency_hz, real, imag in samples",
+            "    )",
+            "    if not points:",
+            "        raise ValueError('Frequency-dependent material data cannot be empty.')",
+            "    def _value_at_frequency(frequency_hz):",
+            "        frequency_hz = float(frequency_hz)",
+            "        if frequency_hz <= points[0][0]:",
+            "            return points[0][1]",
+            "        for index in range(1, len(points)):",
+            "            lower_frequency, lower_value = points[index - 1]",
+            "            upper_frequency, upper_value = points[index]",
+            "            if frequency_hz <= upper_frequency:",
+            "                fraction = (frequency_hz - lower_frequency) / (upper_frequency - lower_frequency)",
+            "                return lower_value + (upper_value - lower_value) * fraction",
+            "        return points[-1][1]",
+            "    return _value_at_frequency",
+            "",
+        ]
+
     for name in used_materials:
         up = name.upper()
         if up == "PEC":
@@ -118,13 +167,26 @@ def _material_block(
         rec = (materials_catalog or {}).get(name, {})
         er = _to_float(rec.get("er", 1.0), 1.0)
         ur = _to_float(rec.get("ur", 1.0), 1.0)
+        er_samples, ur_samples = frequency_samples[name]
+        er_expression = str(er)
+        ur_expression = str(ur)
+        if er_samples:
+            er_expression = (
+                "em.FreqDependent(scalar=_make_frequency_dependent_scalar("
+                f"{json.dumps(er_samples, allow_nan=False)}))"
+            )
+        if ur_samples:
+            ur_expression = (
+                "em.FreqDependent(scalar=_make_frequency_dependent_scalar("
+                f"{json.dumps(ur_samples, allow_nan=False)}))"
+            )
         tan_d = _to_float(rec.get("tan_d", 0.0), 0.0)
         sigma = _to_float(rec.get("sigma", 0.0), 0.0)
         color = str(rec.get("color", "#bebebe"))
         opacity = _to_float(rec.get("opacity", 0.85), 0.85)
 
         lines += [
-            f"materials[{_q(name)}] = em.Material(name={_q(name)}, er={er}, ur={ur}, tand={tan_d}, cond={sigma})",
+            f"materials[{_q(name)}] = em.Material(name={_q(name)}, er={er_expression}, ur={ur_expression}, tand={tan_d}, cond={sigma})",
             f"materials[{_q(name)}].color = {_q(color)}",
             f"materials[{_q(name)}].opacity = {opacity}",
             "",
@@ -463,6 +525,11 @@ def export_emerge_python_script(
             if not isinstance(port, dict)
             or str(port.get("type", "")).strip() != "PlaneWave"
         ]
+    touchstone_port_names = [
+        str(port.get("plate_name", "")).strip()
+        for port in ports
+        if isinstance(port, dict)
+    ]
     all_swept_surface_names = {
         str(entry.get("object_name", "")).strip()
         for entry in step_entries
@@ -898,6 +965,7 @@ def export_emerge_python_script(
         f"JOB_NAME = {_q(sim_name)}",
         f"JOB_TYPE = {_q(sim_type)}",
         f"PROJECT_NAME = {_q(project_name)}",
+        f"EM3D_MODELER_VERSION = {_q(_em3d_modeler_version)}",
         f"MULTIPROCESSING_ENABLED = {multiprocessing_enabled!r}",
         f"WORKER_PROCESSES = {worker_processes}",
         "FREQUENCY_GROUP_SIZE = 8",
@@ -915,6 +983,9 @@ def export_emerge_python_script(
         f"FSTEP_GHZ = {fstep}",
         f"NPOINTS = {npoints}",
         f"MESH_RESOLUTION = {mesh_resolution:.6f}",
+        f"ADAPTIVE_MESH_REFINEMENT_ENABLED = {adaptive_mesh_refinement_enabled!r}",
+        f"ADAPTIVE_MESH_REFINEMENT_FREQUENCY_GHZ = {adaptive_mesh_refinement_frequency_ghz!r}",
+        f"TOUCHSTONE_PORT_NAMES = {touchstone_port_names!r}",
         f"CURVED_BOUNDARY_RESOLUTION = {curved_boundary_resolution}",
         f"OBJECT_MESH_SIZES_M = {repr(object_mesh_sizes)}",
         f"ALLOW_OVERSIZED_MESH = {allow_oversized_mesh!r}",
@@ -1206,20 +1277,46 @@ def export_emerge_python_script(
         "def _write_sputility_touchstone(grid, fit_result=None, suffix=''):",
         "    nports = _number_of_ports(grid)",
         "    extension = f'.s{nports}p'",
-        "    timestamp = os.environ.get('EM3D_RUN_ID') or globals().setdefault('_TOUCHSTONE_RUN_TIMESTAMP', datetime.now().strftime('%Y%m%d-%H%M%S'))",
+        "    generated_at = globals().setdefault('_TOUCHSTONE_GENERATED_AT', datetime.now())",
+        "    timestamp = generated_at.strftime('%Y%m%d-%H%M%S')",
         "    touchstone_dir = os.path.join(SCRIPT_DIR, 'Touchstone')",
         "    os.makedirs(touchstone_dir, exist_ok=True)",
         "    suffix_token = f'_{_safe_token(suffix)}' if suffix else ''",
         "    output_base = os.path.join(touchstone_dir, f'{_safe_token(PROJECT_NAME)}_{_safe_token(JOB_NAME)}{suffix_token}_{timestamp}')",
+        "    script_path = os.path.abspath(__file__).replace(os.sep, '/')",
+        "    design_name = os.path.basename(__file__)",
+        "    adaptive_frequency = (f'{ADAPTIVE_MESH_REFINEMENT_FREQUENCY_GHZ:g} GHz' if ADAPTIVE_MESH_REFINEMENT_ENABLED else 'N/A')",
+        "    def _comment_value(value):",
+        "        clean = str(value).replace('\\r', ' ').replace('\\n', ' ')",
+        "        return clean.encode('ascii', 'backslashreplace').decode('ascii')",
         "    def _write_touchstone(output_path, frequencies, curves):",
         "        with open(output_path, 'w', encoding='ascii', newline='\\n') as touchstone_file:",
-        "            touchstone_file.write('# HZ S RI R 50.0\\n')",
+        "            touchstone_file.write(f'! Touchstone file exported from EMERGE version {RUNTIME_EMERGE_VERSION}\\n')",
+        "            touchstone_file.write(f'!        File:           {_comment_value(script_path)}\\n')",
+        "            touchstone_file.write(f'!        Generated:      {generated_at.strftime(\"%I:%M:%S %p %b %d, %Y\")}\\n')",
+        "            touchstone_file.write(f'!        Design:         {_comment_value(design_name)}\\n')",
+        "            touchstone_file.write(f'!        Project:        {_comment_value(PROJECT_NAME)}\\n')",
+        "            touchstone_file.write(f'!        Generated by:   EM 3D Modeler Ver. {EM3D_MODELER_VERSION}\\n')",
+        "            touchstone_file.write(f'!        Solution:       {_comment_value(JOB_TYPE.title())}\\n')",
+        "            touchstone_file.write(f'!        Start Freq:     {FMIN_GHZ:g} GHz\\n')",
+        "            touchstone_file.write(f'!        Stop Freq:      {FMAX_GHZ:g} GHz\\n')",
+        "            touchstone_file.write(f'!        Step:           {FSTEP_GHZ:g} GHz\\n')",
+        "            touchstone_file.write(f'!        Mesh Resolution: {MESH_RESOLUTION:g} (1/lambda)\\n')",
+        "            touchstone_file.write(f'!        Scale factor:   {GEOMETRY_SCALE_FACTOR:g}\\n')",
+        "            touchstone_file.write(f'!        Adaptive meshing: {\"Yes\" if ADAPTIVE_MESH_REFINEMENT_ENABLED else \"No\"}\\n')",
+        "            touchstone_file.write(f'!        Frequency:      {adaptive_frequency}\\n')",
+        "            touchstone_file.write('# GHz S MA R 50.000000\\n')",
+        "            touchstone_file.write('! Terminal data exported\\n')",
+        "            for port_index, port_name in enumerate(TOUCHSTONE_PORT_NAMES[:nports], start=1):",
+        "                touchstone_file.write(f'! Port[{port_index}] = {_comment_value(port_name)}\\n')",
         "            for sample_index, frequency in enumerate(frequencies):",
-        "                row = [f'{float(frequency):.16g}']",
+        "                row = [f'{float(frequency) / 1e9:.16g}']",
         "                for input_port in range(1, nports + 1):",
         "                    for output_port in range(1, nports + 1):",
         "                        value = complex(curves[(output_port, input_port)][sample_index])",
-        "                        row.extend((f'{value.real:.16g}', f'{value.imag:.16g}'))",
+        "                        magnitude = math.hypot(value.real, value.imag)",
+        "                        phase_degrees = math.degrees(math.atan2(value.imag, value.real))",
+        "                        row.extend((f'{magnitude:.16g}', f'{phase_degrees:.16g}'))",
         "                touchstone_file.write(' '.join(row) + '\\n')",
         "    original_frequencies = grid.freq",
         "    original_curves = {(i, j): grid.S(i, j) for i in range(1, nports + 1) for j in range(1, nports + 1)}",

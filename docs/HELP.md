@@ -1,6 +1,6 @@
 # EM 3D Modeler Help
 
-**Version 1.5.2** · Release date 2026-10-17
+**Version 1.5.4** · Release date 2026-10-21
 
 The complete, illustrated user guide is [HELP.html](HELP.html). It contains a linked contents panel, workflow instructions, troubleshooting, and genuine screenshots captured from the application's PySide6 widgets.
 
@@ -13,6 +13,10 @@ The complete, illustrated user guide is [HELP.html](HELP.html). It contains a li
 - Sweep, Eigenmode, Parametric, and ScatteredField simulation jobs, ports, domains, boundaries, and local refinements
 - Outputs, progressive S-parameter plots, PyQtGraph chart controls, S-parameter fitting and raw/fitted Touchstone export, simulation checks, script generation, and EMERGE execution
 - Keyboard shortcuts, troubleshooting, and units
+
+## Frequency-dependent materials
+
+The Material Library supports isotropic frequency-dependent relative permittivity (`er`) and relative permeability (`ur`). For either property, enter frequency samples in GHz with real and imaginary values. The EMERGE 3.x Python exporter interpolates the complex values linearly between samples. Frequencies below the first sample use its value; frequencies above the last sample use the last value. The simulation sweep is not restricted to the material's sample range. This export requires EMERGE 3.0.0 or later. The legacy EMERGE v2.x text exporter remains scalar-valued.
 
 ## IPC-2581B board import
 
@@ -45,7 +49,7 @@ When importing an IPC-2581B simulation model, choose the number of linear segmen
 - For an Eigenmode simulation, add an Output Plot of type `eigen_field` and choose the 1-based mode number. **Basic** settings let you choose the field component, real/imaginary/magnitude quantity, and XY/XZ/YZ cut plane; three evenly spaced cuts and automatic resolution are used. **Advanced** settings also let you set cut positions (percentages of the plane-normal axis), spacing in millimeters (0 selects automatic spacing), geometry opacity, and colormap. Cut positions are limited to 24 and the viewer rejects resolutions estimated to exceed two million field samples.
 - If S-parameter fitting fails after a successful solve, the raw Touchstone samples are retained and automatic plots fall back to those samples; a fitted Touchstone file is not produced.
 - Touchstone exports are stored in the simulation bundle's `Touchstone` folder. Use **Load Touchstone** in an S-parameter chart to open current or previous `.sNp` results; legacy files in the bundle root are organized into that folder when the picker opens.
-- **Generate Plot** uses the latest matching saved Touchstone export when available, avoiding a reload of `simdata.emerge`; exports identify the simulation in their filename. Older project-only Touchstone names remain supported. If no usable Touchstone export exists, plots fall back to EMERGE result data.
+- **Generate Plot** uses the latest matching saved Touchstone export when available, avoiding a reload of `simdata.emerge`; exports identify the simulation in their filename. New `.sNp` files use GHz and magnitude/angle data and include an EMERGE/EM 3D Modeler metadata header, sweep and mesh settings, and each port's connected object. The generated time in the header and filename is captured when result export begins, after the solver has completed. Older project-only Touchstone names remain supported. If no usable Touchstone export exists, plots fall back to EMERGE result data.
 - Cartesian S-parameter, VSWR, and Touchstone charts use PyQtGraph for interactive zoom/pan, X/Y linear or logarithmic scales, automatic/manual ranges, and movable measurement markers. Smith and 2D far-field charts retain the EMERGE/Matplotlib renderer; 3D far-field plots open in EMERGE's separate interactive window. The 3D normE surface uses a 40 dB range below the peak for its radius, while its color scale retains absolute dBV/m values.
 - Chart display modes, axis and marker/legend sizing, and per-trace styles are retained per chart. Datasets added with **Append** or **Load Touchstone** are restored when the chart is reopened. For configured S-parameter outputs, restored datasets show only the S-parameters selected in that output's settings.
 - In chart **Settings → Equation**, create an equation with a result name and formula. Select a source parameter (shown as dataset and parameter), assign it a variable name, and optionally add named finite numeric constants. Formulas support numeric literals, parentheses, `pi`, `e`, unary `+`/`-`, and `+`, `-`, `*`, `/`, `//`, `%`, and `**`. Whitelisted functions are `abs`, `angle`, `arccos`, `arcsin`, `arctan`, `conj`, `cos`, `exp`, `imag`, `log`, `log10`, `maximum`, `minimum`, `real`, `sin`, `sqrt`, and `tan`. Variables refer to raw source values (including complex values); the chart's active display mode transforms the calculated result. Combined variables must share the same X values; scalar results are broadcast across that grid. Formula and calculation errors are shown in the Equation tab, and invalid results are not plotted. Calculated traces appear in the **Equations** dataset. Equations, constants, and source bindings are saved per chart and recalculated when chart data changes or is reloaded.

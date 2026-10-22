@@ -23,7 +23,9 @@ Provides three sources:
 """
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field
+import math
+from numbers import Real
 from pathlib import Path
 from typing import Any, Dict, Iterable, List, Optional
 import json
@@ -31,6 +33,48 @@ import uuid
 
 
 DEFAULT_COLOR = "#bebebe"
+
+
+def _normalize_frequency_data(value: Any, property_name: str) -> List[Dict[str, float]]:
+    """Validate and copy frequency points, requiring strictly increasing frequencies."""
+    if value is None:
+        return []
+    if not isinstance(value, list):
+        raise ValueError(f"{property_name} frequency data must be a list")
+
+    normalized: List[Dict[str, float]] = []
+    previous_frequency = 0.0
+    for index, point in enumerate(value):
+        if not isinstance(point, dict):
+            raise ValueError(f"{property_name} frequency point {index + 1} must be an object")
+
+        converted: Dict[str, float] = {}
+        for key in ("frequency_hz", "real", "imag"):
+            component = point.get(key)
+            if isinstance(component, bool) or not isinstance(component, Real):
+                raise ValueError(
+                    f"{property_name} frequency point {index + 1} {key} must be numeric"
+                )
+            component = float(component)
+            if not math.isfinite(component):
+                raise ValueError(
+                    f"{property_name} frequency point {index + 1} {key} must be finite"
+                )
+            converted[key] = component
+
+        frequency = converted["frequency_hz"]
+        if frequency <= 0:
+            raise ValueError(
+                f"{property_name} frequency point {index + 1} frequency_hz must be positive"
+            )
+        if frequency <= previous_frequency:
+            raise ValueError(
+                f"{property_name} frequencies must be sorted in strictly increasing order"
+            )
+        previous_frequency = frequency
+        normalized.append(converted)
+
+    return normalized
 
 
 @dataclass
@@ -46,8 +90,20 @@ class MaterialRecord:
     opacity: float = 0.85
     source: str = "project"  # builtin | project | global
     priority: int = 0  # priority level for material (higher = higher priority)
+    er_frequency_data: List[Dict[str, float]] = field(default_factory=list)
+    ur_frequency_data: List[Dict[str, float]] = field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        self.er_frequency_data = _normalize_frequency_data(
+            self.er_frequency_data, "er"
+        )
+        self.ur_frequency_data = _normalize_frequency_data(
+            self.ur_frequency_data, "ur"
+        )
 
     def to_dict(self) -> Dict[str, Any]:
+        er_frequency_data = _normalize_frequency_data(self.er_frequency_data, "er")
+        ur_frequency_data = _normalize_frequency_data(self.ur_frequency_data, "ur")
         return {
             "uid": self.uid,
             "name": self.name,
@@ -60,6 +116,8 @@ class MaterialRecord:
             "opacity": self.opacity,
             "source": self.source,
             "priority": self.priority,
+            "er_frequency_data": er_frequency_data,
+            "ur_frequency_data": ur_frequency_data,
         }
 
     @staticmethod
@@ -76,6 +134,8 @@ class MaterialRecord:
             opacity=float(data.get("opacity", 0.85)),
             source=str(data.get("source") or source_fallback),
             priority=int(data.get("priority", 0)),
+            er_frequency_data=data.get("er_frequency_data", []),
+            ur_frequency_data=data.get("ur_frequency_data", []),
         )
 
 
@@ -189,6 +249,8 @@ class MaterialStore:
         sigma: float = 0.0,
         color: str = DEFAULT_COLOR,
         opacity: float = 0.85,
+        er_frequency_data: List[Dict[str, float]] | None = None,
+        ur_frequency_data: List[Dict[str, float]] | None = None,
     ) -> MaterialRecord:
         rec = MaterialRecord(
             uid=str(uuid.uuid4()),
@@ -201,6 +263,8 @@ class MaterialStore:
             color=color or DEFAULT_COLOR,
             opacity=float(opacity),
             source="project",
+            er_frequency_data=[] if er_frequency_data is None else er_frequency_data,
+            ur_frequency_data=[] if ur_frequency_data is None else ur_frequency_data,
         )
         self._project[rec.name] = rec
         return rec
@@ -215,6 +279,8 @@ class MaterialStore:
         sigma: float = 0.0,
         color: str = DEFAULT_COLOR,
         opacity: float = 0.85,
+        er_frequency_data: List[Dict[str, float]] | None = None,
+        ur_frequency_data: List[Dict[str, float]] | None = None,
     ) -> MaterialRecord:
         rec = MaterialRecord(
             uid=str(uuid.uuid4()),
@@ -227,6 +293,8 @@ class MaterialStore:
             color=color or DEFAULT_COLOR,
             opacity=float(opacity),
             source="global",
+            er_frequency_data=[] if er_frequency_data is None else er_frequency_data,
+            ur_frequency_data=[] if ur_frequency_data is None else ur_frequency_data,
         )
         return self.upsert_global_record(rec)
 
@@ -242,6 +310,9 @@ class MaterialStore:
             color=str(record.color or DEFAULT_COLOR),
             opacity=float(record.opacity),
             source="project",
+            priority=int(record.priority),
+            er_frequency_data=record.er_frequency_data,
+            ur_frequency_data=record.ur_frequency_data,
         )
         self._project[rec.name] = rec
         return rec
@@ -266,6 +337,8 @@ class MaterialStore:
                 opacity=record.opacity,
                 source="project",
                 priority=record.priority,
+                er_frequency_data=record.er_frequency_data,
+                ur_frequency_data=record.ur_frequency_data,
             )
         )
 
@@ -284,6 +357,8 @@ class MaterialStore:
             opacity=float(record.opacity),
             source="global",
             priority=int(record.priority),
+            er_frequency_data=record.er_frequency_data,
+            ur_frequency_data=record.ur_frequency_data,
         )
         previous_records = self._global
         self._global = {
@@ -323,6 +398,9 @@ class MaterialStore:
                 color=rec.color,
                 opacity=rec.opacity,
                 source="project",
+                priority=rec.priority,
+                er_frequency_data=rec.er_frequency_data,
+                ur_frequency_data=rec.ur_frequency_data,
             )
             self._project[cloned.name] = cloned
             added.append(cloned.name)

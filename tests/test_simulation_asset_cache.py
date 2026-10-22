@@ -479,7 +479,7 @@ def test_parametric_bundle_exports_one_geometry_and_worker_per_value(
     assert [script["parameter_index"] for script in bundle["scripts"]] == [1, 2]
     assert [script["completion_name"] for script in bundle["scripts"]] == ["", "Simulation_2"]
     assert all(Path(script["filename"]).parts[0] == "Model_Simulation_2" for script in bundle["scripts"])
-    assert "EM3D_RUN_ID" in bundle["master"]
+    assert "EM3D_RUN_ID" not in bundle["master"]
     progress_messages = [update[0] for update in progress_updates]
     assert any(message.startswith("Recomputing geometry 1/2") for message in progress_messages)
     assert any(message.startswith("STEP 1/2: Body") for message in progress_messages)
@@ -1349,6 +1349,18 @@ def test_simulation_input_changes_invalidate_play_readiness():
     assert window._sim_full_scene_step_dirty is True
     play_action.setEnabled.assert_called_once_with(False)
     window._sim_btn_run.setEnabled.assert_called_once_with(False)
+
+
+def test_play_opens_simulation_panel_then_starts_run():
+    calls = []
+    window = SimpleNamespace(
+        _open_simulation_window=lambda: calls.append("open"),
+        _on_sim_run=lambda: calls.append("run"),
+    )
+
+    main_window.MainWindow._on_play_simulation(window)
+
+    assert calls == ["open", "run"]
 
 
 def test_project_settings_change_invalidates_play_readiness():
